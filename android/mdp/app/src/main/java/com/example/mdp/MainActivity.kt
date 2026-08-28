@@ -129,7 +129,7 @@ class MainActivity : ComponentActivity() {
                 val robotStatus by viewModel.robotStatus.collectAsStateWithLifecycle()
 
                 Scaffold(modifier = Modifier.fillMaxSize()) { innerPadding ->
-                    ControllerScreen(
+                    IntegratedControllerScreen(
                         status = statusLabel(state),
                         robotStatus = robotStatus,
                         isConnected = state is ConnectionState.Connected,
@@ -144,6 +144,8 @@ class MainActivity : ComponentActivity() {
                         onTurnLeft = viewModel::turnLeft,
                         onTurnRight = viewModel::turnRight,
                         onStop = viewModel::stop,
+                        incomingMessages = viewModel.incoming,
+                        onArenaOutbound = viewModel::sendArenaMessage,
                         modifier = Modifier.padding(innerPadding),
                     )
 

@@ -24,3 +24,4 @@ dependencyResolutionManagement {
 
 rootProject.name = "mdp"
 include(":app")
+include(":arena-ui")

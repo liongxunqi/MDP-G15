@@ -72,6 +72,9 @@ class ControllerViewModel(app: Application) : AndroidViewModel(app) {
     fun turnRight() = bt.sendCommand(RobotCommand.TURN_RIGHT)
     fun stop() = bt.sendCommand(RobotCommand.STOP)
 
+    /** Hands a complete arena application message to the existing Bluetooth send queue. */
+    fun sendArenaMessage(message: String) = bt.send(message)
+
     override fun onCleared() {
         bt.shutdown()
     }

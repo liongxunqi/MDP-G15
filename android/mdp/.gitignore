@@ -2,7 +2,6 @@
 .gradle
 
 /gradle/gradle-daemon-jvm.properties
-/gradle/libs.versions.toml
 .idea
 
 

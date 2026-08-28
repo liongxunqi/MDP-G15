@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="arena_background">#EAF4FA</color>
+    <color name="arena_grid_line">#4F6B7A</color>
+    <color name="arena_axis_text">#1F2933</color>
+    <color name="arena_obstacle">#174A6E</color>
+    <color name="arena_selected">#F5B700</color>
+    <color name="arena_target_face">#E63946</color>
+    <color name="arena_robot">#2A9D8F</color>
+    <color name="arena_robot_direction">#072E2A</color>
+    <color name="arena_panel_background">#F7F9FB</color>
+    <color name="arena_feedback_error">#B42318</color>
+    <color name="arena_feedback_normal">#364152</color>
+</resources>

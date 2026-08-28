@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="arena_title">Arena</string>
+    <string name="arena_content_description">20 by 20 exploration arena</string>
+    <string name="status_title">Robot status</string>
+    <string name="status_ready">Ready to start</string>
+    <string name="robot_pose_title">Robot pose</string>
+    <string name="robot_pose_unavailable">Not available</string>
+    <string name="selected_obstacle_title">Selected obstacle</string>
+    <string name="selected_obstacle_none">None</string>
+    <string name="obstacle_count_title">Obstacles</string>
+    <string name="obstacle_count_zero">0</string>
+    <string name="feedback_title">Arena feedback</string>
+    <string name="feedback_ready">Ready</string>
+    <string name="target_face_title">Target face</string>
+    <string name="face_north">North</string>
+    <string name="face_east">East</string>
+    <string name="face_south">South</string>
+    <string name="face_west">West</string>
+    <string name="face_north_short">N</string>
+    <string name="face_east_short">E</string>
+    <string name="face_south_short">S</string>
+    <string name="face_west_short">W</string>
+    <string name="add_obstacle">Add obstacle</string>
+    <string name="cancel_add_obstacle">Cancel adding</string>
+    <string name="undo">Undo</string>
+    <string name="redo">Redo</string>
+    <string name="reset_arena">Reset arena</string>
+    <string name="reset_arena_title">Reset arena?</string>
+    <string name="reset_arena_message">All obstacles and the robot pose will be cleared.</string>
+    <string name="reset">Reset</string>
+    <string name="cancel">Cancel</string>
+</resources>

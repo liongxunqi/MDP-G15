@@ -1,0 +1,376 @@
+package com.mdp.g15.arena.view
+
+import android.content.Context
+import android.graphics.Canvas
+import android.graphics.Color
+import android.graphics.Paint
+import android.graphics.Path
+import android.graphics.RectF
+import android.os.Handler
+import android.os.Looper
+import android.util.AttributeSet
+import android.util.TypedValue
+import android.view.MotionEvent
+import android.view.View
+import android.view.ViewConfiguration
+import androidx.core.content.ContextCompat
+import com.mdp.g15.arena.R
+import com.mdp.g15.arena.domain.ArenaState
+import com.mdp.g15.arena.domain.Direction
+import com.mdp.g15.arena.domain.GridCoordinate
+import com.mdp.g15.arena.domain.Obstacle
+import kotlin.math.hypot
+import kotlin.math.min
+
+class ArenaGridView @JvmOverloads constructor(
+    context: Context,
+    attrs: AttributeSet? = null,
+    defStyleAttr: Int = 0,
+) : View(context, attrs, defStyleAttr) {
+    var interactionListener: ArenaInteractionListener? = null
+
+    private var state = ArenaState()
+    private var placementMode = false
+    private val geometry = ArenaGeometry()
+    private val density = resources.displayMetrics.density
+    private val axisPadding = 30f * density
+    private val outerPadding = 8f * density
+    private val handler = Handler(Looper.getMainLooper())
+    private val touchSlop = ViewConfiguration.get(context).scaledTouchSlop.toFloat()
+
+    private val backgroundPaint = fillPaint(R.color.arena_background)
+    private val gridPaint = strokePaint(R.color.arena_grid_line, 1f * density)
+    private val axisTextPaint = textPaint(R.color.arena_axis_text, 10f, Paint.Align.CENTER)
+    private val obstaclePaint = fillPaint(R.color.arena_obstacle)
+    private val obstacleTextPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.WHITE
+        textSize = sp(12f)
+        textAlign = Paint.Align.CENTER
+        typeface = android.graphics.Typeface.DEFAULT_BOLD
+    }
+    private val selectedPaint = strokePaint(R.color.arena_selected, 3f * density)
+    private val facePaint = strokePaint(R.color.arena_target_face, 4f * density)
+    private val robotPaint = fillPaint(R.color.arena_robot)
+    private val robotDirectionPaint = fillPaint(R.color.arena_robot_direction)
+    private val dragPaint = Paint(obstaclePaint).apply { alpha = 165 }
+    private val dragInvalidPaint = Paint().apply {
+        color = ContextCompat.getColor(context, R.color.arena_target_face)
+        style = Paint.Style.STROKE
+        strokeWidth = 3f * density
+    }
+
+    private var downX = 0f
+    private var downY = 0f
+    private var dragX = 0f
+    private var dragY = 0f
+    private var pressedObstacleId: Int? = null
+    private var draggingObstacleId: Int? = null
+    private var longPressTriggered = false
+
+    private val longPressRunnable = Runnable {
+        val obstacleId = pressedObstacleId ?: return@Runnable
+        draggingObstacleId = obstacleId
+        longPressTriggered = true
+        parent?.requestDisallowInterceptTouchEvent(true)
+        announceForAccessibility("Moving obstacle $obstacleId")
+        invalidate()
+    }
+
+    init {
+        isFocusable = true
+        isClickable = true
+        contentDescription = context.getString(R.string.arena_content_description)
+    }
+
+    fun render(state: ArenaState, placementMode: Boolean) {
+        this.state = state
+        this.placementMode = placementMode
+        contentDescription = buildContentDescription(state)
+        requestLayout()
+        invalidate()
+    }
+
+    override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
+        val desired = (520f * density).toInt()
+        val measuredWidth = resolveSize(desired, widthMeasureSpec)
+        val measuredHeight = resolveSize(desired, heightMeasureSpec)
+        setMeasuredDimension(measuredWidth, measuredHeight)
+    }
+
+    override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
+        super.onSizeChanged(w, h, oldw, oldh)
+        updateGeometry(w, h)
+    }
+
+    override fun onDraw(canvas: Canvas) {
+        super.onDraw(canvas)
+        updateGeometry(width, height)
+        drawArena(canvas)
+        drawObstacles(canvas)
+        state.robot?.let { drawRobot(canvas, it.position, it.direction) }
+        drawDragPreview(canvas)
+    }
+
+    override fun onTouchEvent(event: MotionEvent): Boolean {
+        when (event.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                downX = event.x
+                downY = event.y
+                dragX = event.x
+                dragY = event.y
+                longPressTriggered = false
+                val coordinate = geometry.coordinateAt(event.x, event.y)
+                pressedObstacleId = coordinate?.let(::obstacleAt)?.id
+                if (pressedObstacleId != null) {
+                    handler.postDelayed(longPressRunnable, ViewConfiguration.getLongPressTimeout().toLong())
+                }
+                return coordinate != null || pressedObstacleId != null
+            }
+
+            MotionEvent.ACTION_MOVE -> {
+                dragX = event.x
+                dragY = event.y
+                if (!longPressTriggered && hypot(event.x - downX, event.y - downY) > touchSlop) {
+                    handler.removeCallbacks(longPressRunnable)
+                }
+                if (draggingObstacleId != null) invalidate()
+                return true
+            }
+
+            MotionEvent.ACTION_UP -> {
+                handler.removeCallbacks(longPressRunnable)
+                val draggedId = draggingObstacleId
+                if (draggedId != null) {
+                    val destination = geometry.coordinateAt(event.x, event.y)
+                    if (destination == null) {
+                        interactionListener?.onRemoveObstacle(draggedId)
+                        announceForAccessibility("Obstacle $draggedId removed")
+                    } else {
+                        interactionListener?.onMoveObstacle(draggedId, destination)
+                    }
+                } else {
+                    performClick()
+                    val coordinate = geometry.coordinateAt(event.x, event.y)
+                    if (coordinate != null) {
+                        val obstacle = obstacleAt(coordinate)
+                        when {
+                            placementMode -> interactionListener?.onAddObstacle(coordinate)
+                            obstacle != null -> interactionListener?.onSelectObstacle(obstacle.id)
+                            else -> interactionListener?.onSelectObstacle(null)
+                        }
+                    }
+                }
+                clearGesture()
+                invalidate()
+                return true
+            }
+
+            MotionEvent.ACTION_CANCEL -> {
+                handler.removeCallbacks(longPressRunnable)
+                clearGesture()
+                invalidate()
+                return true
+            }
+        }
+        return super.onTouchEvent(event)
+    }
+
+    override fun performClick(): Boolean {
+        super.performClick()
+        return true
+    }
+
+    override fun onDetachedFromWindow() {
+        handler.removeCallbacks(longPressRunnable)
+        super.onDetachedFromWindow()
+    }
+
+    private fun drawArena(canvas: Canvas) {
+        val left = geometry.arenaLeft
+        val top = geometry.arenaTop
+        val arenaWidth = geometry.arenaWidth
+        val arenaHeight = geometry.arenaHeight
+        canvas.drawRect(left, top, left + arenaWidth, top + arenaHeight, backgroundPaint)
+
+        for (column in 0..state.config.columns) {
+            val x = left + column * geometry.cellSize
+            canvas.drawLine(x, top, x, top + arenaHeight, gridPaint)
+        }
+        for (row in 0..state.config.rows) {
+            val y = top + row * geometry.cellSize
+            canvas.drawLine(left, y, left + arenaWidth, y, gridPaint)
+        }
+
+        axisTextPaint.textSize = min(sp(10f), geometry.cellSize * 0.42f)
+        for (column in 0 until state.config.columns) {
+            val bounds = geometry.cellBounds(GridCoordinate(column, 0))
+            canvas.drawText(
+                column.toString(),
+                bounds.centerX,
+                geometry.arenaTop + geometry.arenaHeight + axisTextPaint.textSize + 2f * density,
+                axisTextPaint,
+            )
+        }
+        axisTextPaint.textAlign = Paint.Align.RIGHT
+        for (row in 0 until state.config.rows) {
+            val bounds = geometry.cellBounds(GridCoordinate(0, row))
+            canvas.drawText(
+                row.toString(),
+                geometry.arenaLeft - 4f * density,
+                bounds.centerY - (axisTextPaint.ascent() + axisTextPaint.descent()) / 2f,
+                axisTextPaint,
+            )
+        }
+        axisTextPaint.textAlign = Paint.Align.CENTER
+    }
+
+    private fun drawObstacles(canvas: Canvas) {
+        val draggingId = draggingObstacleId
+        state.obstacles.toSortedMap().values.forEach { obstacle ->
+            if (obstacle.id != draggingId) drawObstacle(canvas, obstacle)
+        }
+    }
+
+    private fun drawObstacle(canvas: Canvas, obstacle: Obstacle) {
+        val bounds = geometry.cellBounds(obstacle.position)
+        val inset = geometry.cellSize * 0.08f
+        val rect = RectF(
+            bounds.left + inset,
+            bounds.top + inset,
+            bounds.right - inset,
+            bounds.bottom - inset,
+        )
+        canvas.drawRect(rect, obstaclePaint)
+
+        obstacleTextPaint.textSize = if (obstacle.targetId == null) {
+            geometry.cellSize * 0.38f
+        } else {
+            geometry.cellSize * 0.56f
+        }
+        val label = obstacle.targetId ?: obstacle.id.toString()
+        canvas.drawText(
+            label,
+            rect.centerX(),
+            rect.centerY() - (obstacleTextPaint.ascent() + obstacleTextPaint.descent()) / 2f,
+            obstacleTextPaint,
+        )
+
+        obstacle.targetFace?.let { drawFace(canvas, rect, it) }
+        if (state.selectedObstacleId == obstacle.id) canvas.drawRect(rect, selectedPaint)
+    }
+
+    private fun drawFace(canvas: Canvas, rect: RectF, direction: Direction) {
+        when (direction) {
+            Direction.NORTH -> canvas.drawLine(rect.left, rect.top, rect.right, rect.top, facePaint)
+            Direction.EAST -> canvas.drawLine(rect.right, rect.top, rect.right, rect.bottom, facePaint)
+            Direction.SOUTH -> canvas.drawLine(rect.left, rect.bottom, rect.right, rect.bottom, facePaint)
+            Direction.WEST -> canvas.drawLine(rect.left, rect.top, rect.left, rect.bottom, facePaint)
+        }
+    }
+
+    private fun drawRobot(canvas: Canvas, coordinate: GridCoordinate, direction: Direction) {
+        val bounds = geometry.cellBounds(coordinate)
+        val radius = geometry.cellSize * 0.38f
+        canvas.drawCircle(bounds.centerX, bounds.centerY, radius, robotPaint)
+
+        val nose = Path()
+        val halfBase = radius * 0.42f
+        when (direction) {
+            Direction.NORTH -> nose.apply {
+                moveTo(bounds.centerX, bounds.centerY - radius * 1.28f)
+                lineTo(bounds.centerX - halfBase, bounds.centerY - radius * 0.2f)
+                lineTo(bounds.centerX + halfBase, bounds.centerY - radius * 0.2f)
+            }
+            Direction.EAST -> nose.apply {
+                moveTo(bounds.centerX + radius * 1.28f, bounds.centerY)
+                lineTo(bounds.centerX + radius * 0.2f, bounds.centerY - halfBase)
+                lineTo(bounds.centerX + radius * 0.2f, bounds.centerY + halfBase)
+            }
+            Direction.SOUTH -> nose.apply {
+                moveTo(bounds.centerX, bounds.centerY + radius * 1.28f)
+                lineTo(bounds.centerX - halfBase, bounds.centerY + radius * 0.2f)
+                lineTo(bounds.centerX + halfBase, bounds.centerY + radius * 0.2f)
+            }
+            Direction.WEST -> nose.apply {
+                moveTo(bounds.centerX - radius * 1.28f, bounds.centerY)
+                lineTo(bounds.centerX - radius * 0.2f, bounds.centerY - halfBase)
+                lineTo(bounds.centerX - radius * 0.2f, bounds.centerY + halfBase)
+            }
+        }
+        nose.close()
+        canvas.drawPath(nose, robotDirectionPaint)
+    }
+
+    private fun drawDragPreview(canvas: Canvas) {
+        val obstacleId = draggingObstacleId ?: return
+        val destination = geometry.coordinateAt(dragX, dragY)
+        if (destination == null) {
+            val radius = geometry.cellSize * 0.45f
+            canvas.drawCircle(dragX, dragY, radius, dragInvalidPaint)
+            canvas.drawLine(dragX - radius, dragY - radius, dragX + radius, dragY + radius, dragInvalidPaint)
+            return
+        }
+        val bounds = geometry.cellBounds(destination)
+        val inset = geometry.cellSize * 0.08f
+        val rect = RectF(bounds.left + inset, bounds.top + inset, bounds.right - inset, bounds.bottom - inset)
+        canvas.drawRect(rect, dragPaint)
+        obstacleTextPaint.textSize = geometry.cellSize * 0.38f
+        canvas.drawText(
+            obstacleId.toString(),
+            rect.centerX(),
+            rect.centerY() - (obstacleTextPaint.ascent() + obstacleTextPaint.descent()) / 2f,
+            obstacleTextPaint,
+        )
+    }
+
+    private fun obstacleAt(coordinate: GridCoordinate): Obstacle? =
+        state.obstacles.values.firstOrNull { it.position == coordinate }
+
+    private fun clearGesture() {
+        pressedObstacleId = null
+        draggingObstacleId = null
+        longPressTriggered = false
+        parent?.requestDisallowInterceptTouchEvent(false)
+    }
+
+    private fun updateGeometry(width: Int, height: Int) {
+        geometry.update(width, height, state.config, axisPadding, outerPadding)
+    }
+
+    private fun buildContentDescription(state: ArenaState): String {
+        val robot = state.robot?.let {
+            "Robot at ${it.position.x}, ${it.position.y}, facing ${it.direction.name.lowercase()}."
+        } ?: "Robot position unavailable."
+        return "${state.config.columns} by ${state.config.rows} exploration arena. " +
+            "${state.obstacles.size} obstacles. $robot"
+    }
+
+    private fun fillPaint(colorRes: Int): Paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = ContextCompat.getColor(context, colorRes)
+        style = Paint.Style.FILL
+    }
+
+    private fun strokePaint(colorRes: Int, width: Float): Paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = ContextCompat.getColor(context, colorRes)
+        style = Paint.Style.STROKE
+        strokeWidth = width
+    }
+
+    private fun textPaint(
+        colorRes: Int,
+        sizeSp: Float,
+        align: Paint.Align,
+        bold: Boolean = false,
+    ): Paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = ContextCompat.getColor(context, colorRes)
+        textSize = sp(sizeSp)
+        textAlign = align
+        typeface = if (bold) android.graphics.Typeface.DEFAULT_BOLD else android.graphics.Typeface.DEFAULT
+    }
+
+    private fun sp(value: Float): Float = TypedValue.applyDimension(
+        TypedValue.COMPLEX_UNIT_SP,
+        value,
+        resources.displayMetrics,
+    )
+}
