@@ -219,7 +219,8 @@ class BluetoothConnectionManager(
     /** Drain the outgoing queue to the socket, framing each message. */
     private suspend fun writeLoop(output: OutputStream) {
         for (message in outgoing) {                   // suspends until something is queued
-            val framed = message + DELIMITER
+            // val framed = message + DELIMITER
+            val framed = message
             try {
                 output.write(framed.toByteArray(Charsets.UTF_8))
                 output.flush()
