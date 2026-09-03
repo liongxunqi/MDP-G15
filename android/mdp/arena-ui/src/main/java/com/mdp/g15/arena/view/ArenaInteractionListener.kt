@@ -7,4 +7,5 @@ interface ArenaInteractionListener {
     fun onSelectObstacle(obstacleId: Int?)
     fun onMoveObstacle(obstacleId: Int, destination: GridCoordinate)
     fun onRemoveObstacle(obstacleId: Int)
+    fun onMoveRobot(destination: GridCoordinate)
 }

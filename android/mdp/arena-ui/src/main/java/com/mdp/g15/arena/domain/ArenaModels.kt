@@ -65,11 +65,13 @@ data class ArenaEditSnapshot(
     val obstacles: Map<Int, Obstacle>,
     val selectedObstacleId: Int?,
     val nextObstacleId: Int,
+    val robot: RobotPose?,
 ) {
     fun applyTo(state: ArenaState): ArenaState = state.copy(
         obstacles = obstacles,
         selectedObstacleId = selectedObstacleId?.takeIf(obstacles::containsKey),
         nextObstacleId = nextObstacleId,
+        robot = robot,
     )
 
     companion object {
@@ -77,6 +79,7 @@ data class ArenaEditSnapshot(
             obstacles = state.obstacles,
             selectedObstacleId = state.selectedObstacleId,
             nextObstacleId = state.nextObstacleId,
+            robot = state.robot,
         )
     }
 }

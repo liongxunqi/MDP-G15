@@ -55,6 +55,7 @@ class ArenaGridViewInstrumentedTest {
             override fun onSelectObstacle(obstacleId: Int?) = Unit
             override fun onMoveObstacle(obstacleId: Int, destination: GridCoordinate) = Unit
             override fun onRemoveObstacle(obstacleId: Int) = Unit
+            override fun onMoveRobot(destination: GridCoordinate) = Unit
         }
 
         onMain {
@@ -78,6 +79,7 @@ class ArenaGridViewInstrumentedTest {
                 moved.set(obstacleId to destination)
             }
             override fun onRemoveObstacle(obstacleId: Int) = Unit
+            override fun onMoveRobot(destination: GridCoordinate) = Unit
         }
         val state = ArenaState(
             obstacles = mapOf(1 to Obstacle(1, GridCoordinate(1, 1))),

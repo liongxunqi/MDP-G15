@@ -56,6 +56,7 @@ fun ArenaScreen(
                 viewModel.moveObstacle(obstacleId, destination)
 
             override fun onRemoveObstacle(obstacleId: Int) = viewModel.removeObstacle(obstacleId)
+            override fun onMoveRobot(destination: GridCoordinate) = viewModel.moveRobot(destination)
         }
     }
 

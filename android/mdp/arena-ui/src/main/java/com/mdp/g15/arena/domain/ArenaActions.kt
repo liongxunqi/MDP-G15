@@ -13,6 +13,7 @@ sealed interface ArenaAction {
     ) : ArenaAction
 
     data class ApplyRobotPose(val pose: RobotPose) : ArenaAction
+    data class MoveRobot(val destination: GridCoordinate) : ArenaAction
     data object Reset : ArenaAction
 }
 

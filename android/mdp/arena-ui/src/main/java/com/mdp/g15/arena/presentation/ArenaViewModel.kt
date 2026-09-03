@@ -74,6 +74,11 @@ class ArenaViewModel(
         "Obstacle $obstacleId removed.",
     )
 
+    fun moveRobot(destination: GridCoordinate) = dispatchLocal(
+        ArenaAction.MoveRobot(destination),
+        "Robot moved to (${destination.x}, ${destination.y}).",
+    )
+
     fun selectObstacle(obstacleId: Int?) {
         applyReduction(reducer.reduce(_uiState.value.arena, ArenaAction.SelectObstacle(obstacleId))) {
             _uiState.value = _uiState.value.copy(

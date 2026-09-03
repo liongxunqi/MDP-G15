@@ -96,15 +96,25 @@ class ArenaGridView @JvmOverloads constructor(
     private var dragY = 0f
     private var pressedObstacleId: Int? = null
     private var draggingObstacleId: Int? = null
+    private var robotPressed = false
+    private var draggingRobot = false
     private var longPressTriggered = false
     private var multiTouchOccurred = false
 
     private val longPressRunnable = Runnable {
-        val obstacleId = pressedObstacleId ?: return@Runnable
-        draggingObstacleId = obstacleId
+        when {
+            pressedObstacleId != null -> {
+                draggingObstacleId = pressedObstacleId
+                announceForAccessibility("Moving obstacle $draggingObstacleId")
+            }
+            robotPressed -> {
+                draggingRobot = true
+                announceForAccessibility("Moving robot")
+            }
+            else -> return@Runnable
+        }
         longPressTriggered = true
         parent?.requestDisallowInterceptTouchEvent(true)
-        announceForAccessibility("Moving obstacle $obstacleId")
         invalidate()
     }
 
@@ -143,7 +153,9 @@ class ArenaGridView @JvmOverloads constructor(
         canvas.scale(scale, scale)
         drawArena(canvas)
         drawObstacles(canvas)
-        state.robot?.let { drawRobot(canvas, it.position, it.direction) }
+        if (!draggingRobot) {
+            state.robot?.let { drawRobot(canvas, it.position, it.direction) }
+        }
         drawDragPreview(canvas)
         canvas.restoreToCount(saveCount)
     }
@@ -160,18 +172,22 @@ class ArenaGridView @JvmOverloads constructor(
                 longPressTriggered = false
                 multiTouchOccurred = false
                 val coordinate = geometry.coordinateAt(toContentX(event.x), toContentY(event.y))
-                pressedObstacleId = coordinate?.let(::obstacleAt)?.id
-                if (pressedObstacleId != null) {
+                val robotHere = coordinate != null && coordinate == state.robot?.position
+                pressedObstacleId = if (robotHere) null else coordinate?.let(::obstacleAt)?.id
+                robotPressed = robotHere
+                if (pressedObstacleId != null || robotPressed) {
                     handler.postDelayed(longPressRunnable, ViewConfiguration.getLongPressTimeout().toLong())
                 }
-                return coordinate != null || pressedObstacleId != null
+                return coordinate != null || pressedObstacleId != null || robotPressed
             }
 
             MotionEvent.ACTION_POINTER_DOWN -> {
-                // A second finger means pinch/pan, not an obstacle drag: cancel any pending gesture.
+                // A second finger means pinch/pan, not a drag: cancel any pending gesture.
                 handler.removeCallbacks(longPressRunnable)
                 pressedObstacleId = null
                 draggingObstacleId = null
+                robotPressed = false
+                draggingRobot = false
                 longPressTriggered = false
                 multiTouchOccurred = true
                 parent?.requestDisallowInterceptTouchEvent(true)
@@ -186,7 +202,7 @@ class ArenaGridView @JvmOverloads constructor(
                 if (!longPressTriggered && hypot(event.x - downX, event.y - downY) > touchSlop) {
                     handler.removeCallbacks(longPressRunnable)
                 }
-                if (draggingObstacleId != null) invalidate()
+                if (draggingObstacleId != null || draggingRobot) invalidate()
                 return true
             }
 
@@ -205,6 +221,12 @@ class ArenaGridView @JvmOverloads constructor(
                             announceForAccessibility("Obstacle $draggedId removed")
                         } else {
                             interactionListener?.onMoveObstacle(draggedId, destination)
+                        }
+                    }
+                    draggingRobot -> {
+                        val destination = geometry.coordinateAt(toContentX(event.x), toContentY(event.y))
+                        if (destination != null) {
+                            interactionListener?.onMoveRobot(destination)
                         }
                     }
                     multiTouchOccurred -> Unit
@@ -363,14 +385,19 @@ class ArenaGridView @JvmOverloads constructor(
     }
 
     private fun drawDragPreview(canvas: Canvas) {
-        val obstacleId = draggingObstacleId ?: return
+        val obstacleId = draggingObstacleId
+        when {
+            obstacleId != null -> drawObstacleDragPreview(canvas, obstacleId)
+            draggingRobot -> drawRobotDragPreview(canvas)
+        }
+    }
+
+    private fun drawObstacleDragPreview(canvas: Canvas, obstacleId: Int) {
         val contentX = toContentX(dragX)
         val contentY = toContentY(dragY)
         val destination = geometry.coordinateAt(contentX, contentY)
         if (destination == null) {
-            val radius = geometry.cellSize * 0.45f
-            canvas.drawCircle(contentX, contentY, radius, dragInvalidPaint)
-            canvas.drawLine(contentX - radius, contentY - radius, contentX + radius, contentY + radius, dragInvalidPaint)
+            drawInvalidDropIndicator(canvas, contentX, contentY)
             return
         }
         val bounds = geometry.cellBounds(destination)
@@ -386,12 +413,32 @@ class ArenaGridView @JvmOverloads constructor(
         )
     }
 
+    private fun drawRobotDragPreview(canvas: Canvas) {
+        val direction = state.robot?.direction ?: return
+        val contentX = toContentX(dragX)
+        val contentY = toContentY(dragY)
+        val destination = geometry.coordinateAt(contentX, contentY)
+        if (destination == null) {
+            drawInvalidDropIndicator(canvas, contentX, contentY)
+            return
+        }
+        drawRobot(canvas, destination, direction)
+    }
+
+    private fun drawInvalidDropIndicator(canvas: Canvas, x: Float, y: Float) {
+        val radius = geometry.cellSize * 0.45f
+        canvas.drawCircle(x, y, radius, dragInvalidPaint)
+        canvas.drawLine(x - radius, y - radius, x + radius, y + radius, dragInvalidPaint)
+    }
+
     private fun obstacleAt(coordinate: GridCoordinate): Obstacle? =
         state.obstacles.values.firstOrNull { it.position == coordinate }
 
     private fun clearGesture() {
         pressedObstacleId = null
         draggingObstacleId = null
+        robotPressed = false
+        draggingRobot = false
         longPressTriggered = false
         multiTouchOccurred = false
         parent?.requestDisallowInterceptTouchEvent(false)

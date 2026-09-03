@@ -9,6 +9,7 @@ class ArenaReducer {
         is ArenaAction.SetTargetFace -> setTargetFace(state, action.obstacleId, action.face)
         is ArenaAction.ApplyTarget -> applyTarget(state, action)
         is ArenaAction.ApplyRobotPose -> applyRobotPose(state, action.pose)
+        is ArenaAction.MoveRobot -> moveRobot(state, action.destination)
         ArenaAction.Reset -> ArenaReduction.Success(ArenaState(config = state.config))
     }
 
@@ -112,6 +113,20 @@ class ArenaReducer {
             )
         }
         return ArenaReduction.Success(state.copy(robot = pose))
+    }
+
+    private fun moveRobot(state: ArenaState, destination: GridCoordinate): ArenaReduction {
+        val robot = state.robot ?: return ArenaReduction.Failure("Robot position is not set.")
+        if (!state.config.contains(destination)) {
+            return ArenaReduction.Failure("Destination is outside the arena.")
+        }
+        if (state.obstacles.values.any { it.position == destination }) {
+            return ArenaReduction.Failure("An obstacle already occupies that cell.")
+        }
+        if (robot.position == destination) {
+            return ArenaReduction.Success(state)
+        }
+        return ArenaReduction.Success(state.copy(robot = robot.copy(position = destination)))
     }
 
     private fun validateFreeCell(state: ArenaState, position: GridCoordinate): String? = when {
