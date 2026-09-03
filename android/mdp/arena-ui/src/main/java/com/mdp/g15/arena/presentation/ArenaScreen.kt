@@ -1,8 +1,10 @@
 package com.mdp.g15.arena.presentation
 
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.aspectRatio
@@ -139,17 +141,44 @@ private fun ArenaCanvas(
     interactions: ArenaInteractionListener,
     modifier: Modifier,
 ) {
-    AndroidView(
-        factory = { context ->
-            ArenaGridView(context).apply { interactionListener = interactions }
-        },
-        update = { view ->
-            view.interactionListener = interactions
-            view.render(state.arena, state.placementMode)
-        },
-        onRelease = { view -> view.interactionListener = null },
-        modifier = modifier.testTag("arena_grid"),
-    )
+    var gridView by remember { mutableStateOf<ArenaGridView?>(null) }
+
+    Box(modifier = modifier) {
+        AndroidView(
+            factory = { context ->
+                ArenaGridView(context).apply {
+                    interactionListener = interactions
+                    gridView = this
+                }
+            },
+            update = { view ->
+                view.interactionListener = interactions
+                view.render(state.arena, state.placementMode)
+            },
+            onRelease = { view ->
+                view.interactionListener = null
+                gridView = null
+            },
+            modifier = Modifier.fillMaxSize().testTag("arena_grid"),
+        )
+        Row(
+            modifier = Modifier
+                .align(Alignment.BottomEnd)
+                .padding(8.dp),
+            horizontalArrangement = Arrangement.spacedBy(4.dp),
+        ) {
+            OutlinedButton(
+                onClick = { gridView?.zoomOut() },
+                modifier = Modifier.size(40.dp),
+                contentPadding = PaddingValues(0.dp),
+            ) { Text("−") }
+            OutlinedButton(
+                onClick = { gridView?.zoomIn() },
+                modifier = Modifier.size(40.dp),
+                contentPadding = PaddingValues(0.dp),
+            ) { Text("+") }
+        }
+    }
 }
 
 @Composable
