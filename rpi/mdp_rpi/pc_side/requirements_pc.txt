@@ -1,0 +1,6 @@
+# Install on PC:
+#   pip install -r requirements_pc.txt
+
+ultralytics
+opencv-python
+python-dotenv

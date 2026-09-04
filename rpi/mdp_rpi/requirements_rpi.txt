@@ -1,0 +1,10 @@
+# Install on RPi:
+#   pip install -r requirements_rpi.txt
+
+python-dotenv
+pyserial
+# picamera2 is installed via apt, not pip:
+#   sudo apt install python3-picamera2
+# PyBluez is also typically installed via apt:
+#   sudo apt install python3-bluetooth
+#   or: pip install PyBluez  (may need bluez headers)
