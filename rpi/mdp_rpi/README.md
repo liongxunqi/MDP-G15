@@ -92,8 +92,19 @@ Expected: prints the saved image path in `captured_images/`
 python3 test_stm.py
 ```
 
-Type `W050` and press Enter. The car should move forward.
+Type `F10` and press Enter. The car should move forward ~10 cm, and `OK` arrives
+**after it stops** — the reply comes when the move finishes, not when it starts.
 Type `q` to quit.
+
+To prove the link without moving the robot at all:
+
+```bash
+python3 test_stm.py --bringup
+```
+
+That runs stages 3–5 of the bring-up ladder in `PROTOCOL.md` §9 (`S` → `OK`,
+`XYZ` → `RESEND`, `?VER` → `VER,...`). If those pass and `F10` then fails, the
+problem is motion, not the link.
 
 ---
 
@@ -153,11 +164,41 @@ Order of startup matters:
 ### STM → RPi (Serial)
 | Message | Meaning |
 |---|---|
-| `OK` | Command completed, ready for next |
-| `RESEND` | Error, please retransmit last command |
+| `OK` | The whole **line** completed, ready for next |
+| `RESEND` | Parse error — nothing executed, safe to retransmit (cap at 3) |
+| `FAIL,TIMEOUT` | Watchdog fired mid-move: wheel stalled or encoder dead |
+| `FAIL,WRONGWAY` | Arc rotated away from target and was aborted |
+| `<TAG>,<fields>` | Answer to a query, e.g. `US,42` — no separate `OK` |
+
+`FAIL,*` means **the robot is not where you think it is** — stop and re-plan.
 
 ### RPi → STM (Serial)
-4-character commands: `W050` (forward 50), `S050` (back 50), `D100` (right), `A100` (left)
+
+Variable-length comma-separated tokens, newline-terminated, **one reply per
+line**: `FR90,F20,S\n` → one `OK` when the whole line finishes.
+
+| Token | Meaning |
+|---|---|
+| `F<n>` | Forward n cm (`F0` = forward until obstacle) |
+| `R<n>` | Reverse n cm |
+| `FR<n>` / `FL<n>` | Arc forward-right / forward-left, n degrees |
+| `RR<n>` / `RL<n>` | Arc reverse-right / reverse-left |
+| `S` | Stop — brake and recentre. **Not backward**; backward is `R<n>` |
+| `RST` | Emergency abort — replies **nothing at all**, never wait for it |
+
+Queries (`?US`, `?IR`, `?POSE`, `?STAT`, `?VER`, …) are single-token lines and
+are answered immediately, even mid-move. Config is `!PROF0/1/2` and `!ZERO`.
+
+> The superseded 4-character dialect (`W050`/`S050`/`D100`/`A100`) is rejected
+> by the firmware. Note the trap: `S050` used to mean reverse, and `S` now means
+> **stop**.
+
+**Never send the next line until the previous one is answered.** A line arriving
+mid-execution is appended to the same queue and you get one reply for two lines
+— permanently one reply out of step, silently.
+
+Full spec: `PROTOCOL.md` at the root of the firmware repo, which is
+authoritative wherever it disagrees with this table.
 
 ---
 
