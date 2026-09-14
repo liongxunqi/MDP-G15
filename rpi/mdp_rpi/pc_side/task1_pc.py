@@ -132,7 +132,7 @@ def compute_path(obstacles: list) -> dict:
     still.
 
     It emits S rather than a guess because the chassis is Ackermann (PROTOCOL.md
-    §7) — it cannot turn on the spot, every turn is an arc of radius 291-318mm,
+    §8) — it cannot turn on the spot, every turn is an arc of radius 291-318mm,
     and a 90 degree turn consumes ~291mm in BOTH axes of a 2000mm arena. A
     plausible-looking guess at that geometry would not be a harmless placeholder;
     it would drive the robot into things. Emitting a no-op is the honest stub.

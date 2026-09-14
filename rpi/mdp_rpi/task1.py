@@ -45,7 +45,7 @@ load_dotenv()
 
 from communications.android import Android
 from communications.pc import PC
-from communications.stm import STM, validate_line
+from communications.stm import PROTOCOL_VERSION, STM, validate_line
 from image_capture.camera import Camera
 
 logging.basicConfig(
@@ -503,7 +503,7 @@ class Task1:
                 # so they can never be mistaken for a movement reply here.
                 stm_msg = self.stm.wait_reply()
                 if not stm_msg:
-                    # PROTOCOL.md §10: past the 15s watchdog this is a lost
+                    # PROTOCOL.md §11: past the 15s watchdog this is a lost
                     # link, not a slow move.
                     if self.started and not self.halted:
                         self._halt_mission("no reply from STM — link presumed lost")
@@ -605,7 +605,7 @@ class Task1:
 
     def _stm_startup_check(self) -> None:
         """
-        PROTOCOL.md §9 stage 5 — prove the link before trusting it with motion.
+        PROTOCOL.md §10 stage 5 — prove the link before trusting it with motion.
 
         ?VER costs one round trip and distinguishes "the firmware is alive and
         talking protocol v1" from "the port opened but nothing is listening",
@@ -624,10 +624,22 @@ class Task1:
         else:
             logging.info(f"STM: {ver}")
             fields = ver.split(",")
-            if len(fields) >= 3 and fields[2].strip() != "1":
+            proto = fields[2].strip() if len(fields) >= 3 else ""
+            # This client implements protocol 2. v2 is a pure SUPERSET of v1 —
+            # movement is byte-for-byte identical and v2 only adds ?CAL and the
+            # !CAL* setters — so v1 firmware is not a problem for Task 1, it just
+            # cannot save or restore calibration. Only an unrecognised version
+            # deserves a warning; treating v1 as an error would cry wolf.
+            if proto == "1":
+                logging.info(
+                    "STM: firmware is protocol 1. Movement is unaffected, but "
+                    "?CAL and the !CAL* setters will RESEND (PROTOCOL.md §7)."
+                )
+            elif proto != str(PROTOCOL_VERSION):
                 logging.warning(
-                    f"STM: firmware reports protocol version {fields[2].strip()}, "
-                    "this client implements version 1 — re-read PROTOCOL.md."
+                    f"STM: firmware reports protocol version {proto!r}, this "
+                    f"client implements version {PROTOCOL_VERSION} — "
+                    "re-read PROTOCOL.md."
                 )
 
         if self.arc_profile is None:

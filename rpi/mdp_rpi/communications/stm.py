@@ -43,9 +43,26 @@ this class owns a single reader thread: it is the only thing that touches
 serial.readline(). Movement replies go to a queue consumed by the caller's
 segment pump; query replies are handed back to whichever thread asked.
 
-CAUTION: config commands (§6, !PROF0/1/2 and !ZERO) reply plain "OK", which is
-indistinguishable from a movement OK. They are therefore sent down the MOVEMENT
-path, not the query path, and must not be issued while a move is outstanding.
+CAUTION: config commands (§6, !PROF0/1/2 and !ZERO) and the calibration setters
+(§7, !CALD/!CALL/!CALT) reply plain "OK", which is indistinguishable from a
+movement OK. They are therefore sent down the MOVEMENT path, not the query path,
+and must not be issued while a move is outstanding.
+
+Calibration (§7, protocol 2):
+    ?CAL            read the decel, brake lag and steering trim learned this
+                    power-on — all three are RAM-only and lost at power-off
+    !CALD<n>        arc deceleration, dps² ×10
+    !CALL<n>        brake lag, milliseconds ×10
+    !CALT<n>        steering trim, µs — the ONE signed argument in the protocol
+
+  RESEND from a setter means BUSY, not malformed: the firmware refuses one that
+  would land mid-arc because Motion_Tick() is reading those numbers. That is the
+  single exception to the §3 rule that RESEND means "your bytes were bad", and
+  _send_cal_token() tells the two apart with ?STAT rather than guessing.
+
+Protocol 2 is a pure superset of 1 — movement is byte-for-byte identical, and
+v2 only adds ?CAL and the three setters. A v1 firmware still runs everything
+here except calibration save/restore.
 """
 
 import logging
@@ -64,12 +81,12 @@ load_dotenv()
 _SERIAL_PORT = os.getenv("SERIAL_PORT", "/dev/ttyACM0")
 _BAUD_RATE = int(os.getenv("BAUD_RATE", "115200"))
 
-# PROTOCOL.md §10: the firmware per-primitive watchdog is 15s. A read timeout
+# PROTOCOL.md §11: the firmware per-primitive watchdog is 15s. A read timeout
 # must sit comfortably above that — 20s — and expiry means "lost link", not
 # "slow move". The old value here was 1s, shorter than a single legitimate move.
 _READ_TIMEOUT = float(os.getenv("STM_READ_TIMEOUT_S", "20.0"))
 
-# PROTOCOL.md §9 stage 2: the firmware prints a banner and run reports on this
+# PROTOCOL.md §10 stage 2: the firmware prints a banner and run reports on this
 # port while no host is connected. The first valid command latches that off.
 # Drain whatever is already buffered before we start believing what we read.
 _BANNER_DRAIN_S = float(os.getenv("STM_BANNER_DRAIN_S", "1.0"))
@@ -79,13 +96,40 @@ MAX_LINE_BYTES = 128
 MAX_PRIMITIVES = 16
 
 # PROTOCOL.md §5 — every tag the firmware can answer a query with.
-QUERY_TAGS = {"US", "IR", "IRR", "POSE", "DIST", "TURN", "STAT", "IMU", "XCHK", "VER"}
+# CAL is protocol 2. It must appear here twice over: once so validate_token()
+# will let "?CAL" be sent at all, and once so classify_reply() routes the
+# "CAL,..." answer to the waiting thread instead of discarding it as banner
+# noise. Missing from either place and the query fails silently.
+QUERY_TAGS = {"US", "IR", "IRR", "POSE", "DIST", "TURN", "STAT", "IMU", "XCHK",
+              "VER", "CAL"}
+
+# This client implements protocol 2. Compared against the ?VER reply at startup.
+PROTOCOL_VERSION = 2
 
 _MOVE_RE = re.compile(r"^(FR|FL|RR|RL|F|R)(\d+)$", re.IGNORECASE)
 _QUERY_RE = re.compile(r"^\?([A-Z]+)$", re.IGNORECASE)
 _CONFIG_RE = re.compile(r"^!(PROF[012]|ZERO)$", re.IGNORECASE)
 
-# PROTOCOL.md §8 — the parser returns a parse failure for these, so a line
+# PROTOCOL.md §7 — the three calibration setters, protocol 2. !CALT is the ONLY
+# token anywhere in this protocol that may carry a negative argument: every
+# movement argument is a magnitude with its direction in the opcode, but a
+# steering trim has no opcode to carry its sign.
+_CAL_SET_RE = re.compile(r"^!CAL([DLT])(-?\d+)$", re.IGNORECASE)
+
+# Accepted ranges, read out of the FIRMWARE rather than the prose in §7 — they
+# disagree, and the firmware is the thing that will actually refuse you.
+# Motion_SetArcDecel() tests `<=` and `>=`, so BOTH decel endpoints are
+# exclusive: §7 says "50-3000 dps²", which reads inclusive and is not.
+#
+# Out of range is refused, not clamped (§7 rule 3) — a value the firmware's own
+# learner would discard is a sender bug, and clamping would hide it behind OK.
+CAL_LIMITS = {
+    "D": (501, 29999, "dps² ×10", "50 < decel < 3000 dps²"),
+    "L": (0, 2500, "ms ×10", "0 ≤ lag ≤ 250 ms"),
+    "T": (-80, 80, "µs, signed", "±80 µs"),
+}
+
+# PROTOCOL.md §9 — the parser returns a parse failure for these, so a line
 # containing one gets RESEND. Matched explicitly so the validator can say *why*
 # rather than just "unrecognised".
 _RESERVED_RE = re.compile(r"^(FU|FIRO|FILO|FIR|FIL|SR|SL)(\d*)$", re.IGNORECASE)
@@ -114,7 +158,7 @@ def validate_token(token: str) -> Tuple[bool, str]:
     # rejected with a confusing message, and FIR/FIL look nothing like F<n>.
     if _RESERVED_RE.match(tok):
         return False, (
-            f"'{tok}' is reserved but not implemented (PROTOCOL.md §8) — "
+            f"'{tok}' is reserved but not implemented (PROTOCOL.md §9) — "
             "the firmware will RESEND the whole line"
         )
 
@@ -135,6 +179,26 @@ def validate_token(token: str) -> Tuple[bool, str]:
         return True, ""
 
     if _CONFIG_RE.match(tok):
+        return True, ""
+
+    # PROTOCOL.md §7 — calibration setters, checked before the legacy pattern so
+    # a range failure says so rather than being mistaken for something else.
+    m = _CAL_SET_RE.match(tok)
+    if m:
+        kind, digits = m.group(1).upper(), m.group(2)
+        value = int(digits)
+        lo, hi, unit, prose = CAL_LIMITS[kind]
+        if kind != "T" and value < 0:
+            return False, (
+                f"'{tok}': only !CALT may be negative (PROTOCOL.md §7) — the "
+                "firmware parses the other two as unsigned and will RESEND"
+            )
+        if not (lo <= value <= hi):
+            return False, (
+                f"'{tok}': {value} is outside {lo}..{hi} ({unit}, i.e. {prose}) — "
+                "the firmware refuses out-of-range values rather than clamping "
+                "(PROTOCOL.md §7 rule 3)"
+            )
         return True, ""
 
     if _LEGACY_RE.match(tok):
@@ -250,7 +314,7 @@ class STM:
 
     def _drain_banner(self) -> None:
         """
-        PROTOCOL.md §9 stage 2 — the firmware prints a banner and run reports
+        PROTOCOL.md §10 stage 2 — the firmware prints a banner and run reports
         until the first valid command latches them off. Anything already in the
         buffer at connect time is not a reply to us, so discard it rather than
         let the first wait_reply() mistake it for one.
@@ -275,7 +339,7 @@ class STM:
             logging.info(
                 "STM: no startup banner seen. If the link looks dead later, note "
                 "that the banner only prints while no host is connected and latches "
-                "off after the first valid command (PROTOCOL.md §9 stage 2)."
+                "off after the first valid command (PROTOCOL.md §10 stage 2)."
             )
 
     def disconnect(self) -> None:
@@ -405,7 +469,7 @@ class STM:
     def wait_reply(self, timeout: Optional[float] = None) -> Optional[str]:
         """
         Block until the STM answers the line we sent: OK / RESEND / FAIL,*.
-        Returns None on timeout, which per §10 means a lost link rather than a
+        Returns None on timeout, which per §11 means a lost link rather than a
         slow move — the firmware watchdog would have fired at 15s.
         """
         effective = timeout if timeout is not None else _READ_TIMEOUT
@@ -414,7 +478,7 @@ class STM:
         except Empty:
             logging.error(
                 f"STM: no reply within {effective}s — treat as lost link "
-                "(PROTOCOL.md §10)."
+                "(PROTOCOL.md §11)."
             )
             # Released on timeout too: the line is never going to be answered,
             # and holding the guard would block recovery for good.
@@ -505,3 +569,133 @@ class STM:
             return False
         reply = self.wait_reply(timeout)
         return reply is not None and reply.strip().upper() == "OK"
+
+    def is_busy(self, timeout: float = 2.0) -> Optional[bool]:
+        """
+        The `busy` field of ?STAT: True while a primitive is running.
+
+        Returns None if the query timed out or the reply was malformed —
+        deliberately tri-state, because "I could not find out" and "it is idle"
+        must not collapse into the same answer for the caller below.
+        """
+        fields = self.query_fields("?STAT", timeout)
+        if fields is None or len(fields) < 2:
+            return None
+        return fields[1].strip() == "1"
+
+    # ── Calibration (PROTOCOL.md §7) ──────────────────────────────────────────
+
+    def read_cal(self, timeout: float = 2.0) -> Optional[Tuple[int, int, int]]:
+        """
+        ?CAL — everything the firmware has learned this power-on, as
+        (decel_dps2_x10, lag_ms_x10, trim_us). Returns None on timeout.
+
+        Safe to call mid-move like any other query: it only reads.
+
+        All three live in RAM and are lost at power-off, so a cold robot spends
+        its first three or four arcs converging. Store what this returns against
+        the surface, battery and weight it was taken on, and push it back with
+        set_cal() after the next power-on to skip the warm-up.
+        """
+        fields = self.query_fields("?CAL", timeout)
+        if fields is None:
+            return None
+        if len(fields) < 3:
+            logging.error(f"STM: malformed CAL reply — expected 3 fields, got {fields}.")
+            return None
+        try:
+            return int(fields[0]), int(fields[1]), int(fields[2])
+        except ValueError:
+            logging.error(f"STM: non-integer field in CAL reply {fields}.")
+            return None
+
+    def _send_cal_token(self, tok: str, retries: int, retry_delay: float) -> bool:
+        """
+        Send one !CAL* token, retrying while the firmware is busy.
+
+        RESEND from a calibration setter does NOT mean "malformed", and this is
+        the one place in the protocol where the §3 advice is the wrong response.
+        Motion_Tick() reads the braking model on every tick of a turn, so the
+        firmware refuses a setter that would land mid-arc — RESEND there means
+        BUSY, and the fix is to wait for idle and send the same bytes again,
+        not to give up after three tries and report a bad command.
+
+        The two causes are told apart with ?STAT: a RESEND while idle is a
+        genuine out-of-range rejection (§7 rule 3) and retrying cannot help.
+        """
+        for attempt in range(1, retries + 1):
+            if not self.send_line([tok]):
+                return False  # local validation already logged why; nothing sent
+
+            reply = self.wait_reply()
+            if reply is None:
+                logging.error(f"STM: no reply to {tok} — lost link (PROTOCOL.md §11).")
+                return False
+
+            if reply.strip().upper() == "OK":
+                return True
+
+            busy = self.is_busy()
+            if busy is False:
+                logging.error(
+                    f"STM: {tok} refused with RESEND while idle — the value is out "
+                    "of range, not a timing collision. The firmware refuses rather "
+                    "than clamping (PROTOCOL.md §7 rule 3); retrying will not help."
+                )
+                return False
+
+            reason = "busy" if busy else "busy state unknown"
+            logging.info(
+                f"STM: {tok} refused ({reason}) — attempt {attempt}/{retries}, "
+                f"waiting {retry_delay}s for idle."
+            )
+            time.sleep(retry_delay)
+
+        logging.error(
+            f"STM: {tok} still refused after {retries} attempts — the robot never "
+            "went idle. Calibration not restored."
+        )
+        return False
+
+    def set_cal(self, decel_x10: Optional[int] = None,
+                lag_ms_x10: Optional[int] = None,
+                trim_us: Optional[int] = None,
+                retries: int = 3, retry_delay: float = 0.2) -> bool:
+        """
+        Restore saved calibration (PROTOCOL.md §7). Any argument left None is
+        not sent. Returns True only if every value asked for was accepted.
+
+        Each value goes as its OWN line — the firmware carries one argument per
+        command, which is why there are three setters rather than one.
+
+        These reply plain "OK", indistinguishable from a movement OK, so like
+        set_profile() they travel the MOVEMENT path and MUST NOT be issued while
+        a movement line is outstanding. Call this during startup, before the
+        segment pump begins.
+        """
+        wanted = [
+            ("D", decel_x10, "!CALD"),
+            ("L", lag_ms_x10, "!CALL"),
+            ("T", trim_us, "!CALT"),
+        ]
+        pending = [(k, v, p) for k, v, p in wanted if v is not None]
+        if not pending:
+            logging.warning("STM: set_cal() called with nothing to set.")
+            return False
+
+        all_ok = True
+        for kind, value, prefix in pending:
+            lo, hi, unit, prose = CAL_LIMITS[kind]
+            # Checked here as well as in validate_token so the failure names the
+            # VALUE the caller passed, not the token string it got mangled into.
+            if not (lo <= int(value) <= hi):
+                logging.error(
+                    f"STM: {prefix} value {value} is outside {lo}..{hi} "
+                    f"({unit}, i.e. {prose}) — not sending (PROTOCOL.md §7)."
+                )
+                all_ok = False
+                continue
+            if not self._send_cal_token(f"{prefix}{int(value)}", retries, retry_delay):
+                all_ok = False
+
+        return all_ok

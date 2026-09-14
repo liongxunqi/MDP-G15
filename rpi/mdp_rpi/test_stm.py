@@ -4,7 +4,7 @@ test_stm.py  —  Interactive STM command sender for debugging
 Run on the RPi with the STM32 physically connected:
 
     python3 test_stm.py            # interactive prompt
-    python3 test_stm.py --bringup  # walk PROTOCOL.md §9 stages 3-5 (no motion)
+    python3 test_stm.py --bringup  # walk PROTOCOL.md §10 stages 3-5 (no motion)
 
 Type whole lines the way the firmware expects them:
 
@@ -14,14 +14,27 @@ Type whole lines the way the firmware expects them:
     !PROF1              select the CLEAN arc profile    -> OK
     RST                 emergency abort                 -> NO reply, never waits
 
+    ?VER                identity + protocol version     -> "VER,MDPG15-STM32,2"
+    ?CAL                learned decel, lag, trim        -> "CAL,1234,180,-3"
+    !CALT-3             restore steering trim, us       -> OK  (signed!)
+
     q                   quit
+
+Calibration (PROTOCOL.md §7) is a script you send, not a firmware mode. The
+sequence that converges it:
+
+    !PROF0 / F600 / FR90 / RR90 / FR90 / RR90, with ?CAL after each —
+    stop when decel and lag stop moving.
+
+A setter answering RESEND while the robot is moving means BUSY, not malformed:
+wait for ?STAT to report busy 0 and send the same bytes again.
 
 Why this waits instead of sleeping
 ──────────────────────────────────
 The reply comes when the MOVE FINISHES, which is seconds, not milliseconds.
 An earlier version of this tool slept 0.3s and then did a non-blocking read, so
 every real movement command looked like it had failed. It now blocks on
-wait_reply() with the §10 read timeout (20s, comfortably above the firmware's
+wait_reply() with the §11 read timeout (20s, comfortably above the firmware's
 15s watchdog).
 """
 
@@ -55,7 +68,7 @@ def send_and_report(stm: STM, line: str) -> None:
 
     reply = stm.wait_reply()
     if reply is None:
-        print("  (no reply — lost link? see PROTOCOL.md §10)")
+        print("  (no reply — lost link? see PROTOCOL.md §11)")
         return
 
     print(f"  {reply}")
@@ -65,7 +78,7 @@ def send_and_report(stm: STM, line: str) -> None:
 
 def bringup(stm: STM) -> None:
     """
-    PROTOCOL.md §9 stages 3-5. No motion at all — these prove the link.
+    PROTOCOL.md §10 stages 3-5. No motion at all — these prove the link.
     If these pass and a later F10 fails, the problem is motion, not the link.
     """
     print("\n-- Stage 3: send S (expect OK, nothing moves) --")
@@ -90,7 +103,7 @@ def main() -> None:
     parser.add_argument(
         "--bringup",
         action="store_true",
-        help="run PROTOCOL.md §9 stages 3-5 (no motion), then exit",
+        help="run PROTOCOL.md §10 stages 3-5 (no motion), then exit",
     )
     args = parser.parse_args()
 
@@ -112,7 +125,7 @@ def main() -> None:
         return
 
     print("\nSTM connected. Enter a command line (q to quit).")
-    print("Examples: F50 | FR90,F20,S | ?US | !PROF1 | RST\n")
+    print("Examples: F50 | FR90,F20,S | ?US | !PROF1 | ?CAL | !CALT-3 | RST\n")
 
     try:
         while True:

@@ -21,7 +21,7 @@ from typing import List, Optional, Tuple
 MAX_PRIMITIVES = 16
 MAX_LINE_BYTES = 128
 
-# ── PROTOCOL.md §7 — measured turn radii, by floor chord ──────────────────────
+# ── PROTOCOL.md §8 — measured turn radii, by floor chord ──────────────────────
 # The planner MUST use the radius of the profile the robot is actually running
 # (task1.Task1.arc_profile / STM_ARC_PROFILE). Planning a TIGHT path and running
 # it on CLEAN puts every turn 27mm wide, and the error compounds across turns.
@@ -33,7 +33,7 @@ TURN_RADIUS_MM = {
 }
 PROFILE_NAMES = {PROFILE_TIGHT: "TIGHT", PROFILE_CLEAN: "CLEAN", PROFILE_SLOW: "SLOW"}
 
-# ── PROTOCOL.md §7 — chassis ──────────────────────────────────────────────────
+# ── PROTOCOL.md §8 — chassis ──────────────────────────────────────────────────
 ROBOT_WIDTH_CM = 18.8
 ROBOT_LENGTH_CM = 23.0
 ARENA_CM = 200.0
@@ -100,7 +100,7 @@ def is_valid_token(token: str) -> bool:
     return not (value == 0 and op.upper() != "F")
 
 
-# ── Ackermann geometry (PROTOCOL.md §7) ───────────────────────────────────────
+# ── Ackermann geometry (PROTOCOL.md §8) ───────────────────────────────────────
 # The chassis CANNOT turn on the spot. Every turn is an arc with forward or
 # reverse travel, and the swept area has to be planned for.
 
