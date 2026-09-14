@@ -42,7 +42,6 @@ import argparse
 import json
 import logging
 import os
-import statistics
 import sys
 from datetime import datetime
 from typing import List, Optional, Tuple
@@ -53,6 +52,25 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s",
 from communications.stm import STM, CAL_LIMITS, PROTOCOL_VERSION
 
 PROFILE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cal_profiles")
+
+
+def _mean(vals) -> float:
+    """
+    Arithmetic mean, computed here rather than with statistics.fmean().
+
+    fmean() is Python 3.8+, and the Pi runs older than that. This is the only
+    thing that needed it, so a two-line helper is cheaper than a version
+    requirement on a robot that is awkward to upgrade mid-project.
+    """
+    return sum(vals) / float(len(vals))
+
+
+def _stdev(vals) -> float:
+    """Sample standard deviation. Zero for a single sample rather than raising."""
+    if len(vals) < 2:
+        return 0.0
+    m = _mean(vals)
+    return (sum((v - m) ** 2 for v in vals) / (len(vals) - 1)) ** 0.5
 
 # PROTOCOL.md §7. NOTE the straight is F50, not the F600 the document prints:
 # F<n> is CENTIMETRES (§4), so F600 is six metres and does not fit a 2.0m arena.
@@ -179,9 +197,7 @@ def run(stm: STM, arcs: int, profile: int, keep_first: bool
 
     def summarise(idx: int):
         vals = [s[idx] for s in used]
-        mean = statistics.fmean(vals)
-        sd = statistics.stdev(vals) if len(vals) > 1 else 0.0
-        return mean, sd, min(vals), max(vals)
+        return _mean(vals), _stdev(vals), min(vals), max(vals)
 
     d_mean, d_sd, d_lo, d_hi = summarise(0)
     l_mean, l_sd, l_lo, l_hi = summarise(1)
@@ -326,7 +342,8 @@ def report(p: dict) -> None:
 def main() -> int:
     ap = argparse.ArgumentParser(
         description="Run and store the PROTOCOL.md §7 calibration sequence.")
-    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub = ap.add_subparsers(dest="cmd")
+    sub.required = True
 
     r = sub.add_parser("run", help="drive the sequence and save a profile")
     r.add_argument("name", help="profile name, e.g. arena-full-battery")
