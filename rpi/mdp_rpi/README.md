@@ -168,9 +168,17 @@ Order of startup matters:
 | `RESEND` | Parse error — nothing executed, safe to retransmit (cap at 3) |
 | `FAIL,TIMEOUT` | Watchdog fired mid-move: wheel stalled or encoder dead |
 | `FAIL,WRONGWAY` | Arc rotated away from target and was aborted |
+| `FAIL,NOECHO` | `FU<n>` had no usable ultrasound reading — **nothing moved** |
 | `<TAG>,<fields>` | Answer to a query, e.g. `US,42` — no separate `OK` |
 
 `FAIL,*` means **the robot is not where you think it is** — stop and re-plan.
+
+`FAIL,NOECHO` is the one exception, and it is worth knowing. `FU` refuses to
+drive at something it cannot see, so the robot did **not** move and the pose is
+still exactly what it was. The firmware drops the rest of that line rather than
+run it from the wrong place, so the plan is still stale — but the thing to go
+and look at is the ultrasound, not the wheels, and a retry can start from where
+the robot is standing instead of re-localising.
 
 ### RPi → STM (Serial)
 
@@ -179,7 +187,8 @@ line**: `FR90,F20,S\n` → one `OK` when the whole line finishes.
 
 | Token | Meaning |
 |---|---|
-| `F<n>` | Forward n cm (`F0` = forward until obstacle) |
+| `F<n>` | Forward n cm (`F0` = forward until obstacle, a fixed 15 cm trip-wire) |
+| `FU<n>` | Forward until the ultrasound reads **n** cm — n is yours to pick, 5–200 |
 | `R<n>` | Reverse n cm |
 | `FR<n>` / `FL<n>` | Arc forward-right / forward-left, n degrees |
 | `RR<n>` / `RL<n>` | Arc reverse-right / reverse-left |
@@ -192,6 +201,43 @@ are answered immediately, even mid-move. Config is `!PROF0/1/2` and `!ZERO`.
 > The superseded 4-character dialect (`W050`/`S050`/`D100`/`A100`) is rejected
 > by the firmware. Note the trap: `S050` used to mean reverse, and `S` now means
 > **stop**.
+
+#### Standing off at a chosen distance — `FU<n>`
+
+`F<n>` is pure odometry: `F50` drives 50 cm and **ignores the ultrasound
+entirely**, obstacle or not. `F0` does watch it, but only as a trip-wire at a
+fixed 15 cm — and it trips on a reading that is already about 120 ms old, which
+at cruise is roughly 4 cm, and a *different* 4 cm each run. Measured overshoot:
+3.9–5.3 cm.
+
+`FU<n>` is the one to use when the standoff matters. It does not trip on the
+sensor at all — it stands still to **measure**, drives the gap on **odometry**,
+then re-measures and corrects, up to four passes. It lands within ±2 cm.
+
+```
+FU30            put me 30 cm off whatever is in front
+F150,FU20       cover the distance fast, then close the last bit precisely
+```
+
+Three things that surprise people:
+
+* **It is not a distance cap.** `FU30` with the wall 180 cm away drives 150 cm.
+  It closes whatever gap it measures, anywhere in 5–200 cm. If you want "go at
+  most 50 cm", that decision belongs here on the Pi — ask `?US` first.
+* **It needs something to see.** Nothing in range is `FAIL,NOECHO` and the
+  robot does not move. It will not creep forward hopefully.
+* **It costs time.** Each pass pays a 400 ms stationary settle: roughly 1.2 s
+  for a short approach, 4 s from a metre, 8.6 s worst case. Do not read a long
+  silence as a dead link — the read timeout is 20 s for exactly this reason.
+
+It is also **precise but not accurate**: the sensor reads about 1.3 cm long and
+every pass reads through that same offset, so it cannot average out. `FU20`
+settles around 18.7 cm from the obstacle, repeatably. Ask for `FU21`, or use
+`stm_tokens.fwd_until(20, compensate=True)` — and re-measure the offset on your
+own sensor before trusting it.
+
+Confirm with `?US`, not `?DIST`: `?DIST` reports only the last leg of the
+approach, which after a correction pass is a couple of centimetres.
 
 **Never send the next line until the previous one is answered.** A line arriving
 mid-execution is appended to the same queue and you get one reply for two lines

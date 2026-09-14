@@ -8,17 +8,26 @@ Run on the RPi with the STM32 physically connected:
 
 Type whole lines the way the firmware expects them:
 
-    F50                 forward 50 cm
+    F50                 forward 50 cm (odometry only — IGNORES the ultrasound)
+    FU30                forward until the ultrasound reads 30 cm  -> OK
+    F150,FU20           travel fast, then close the last bit precisely
     FR90,F20,S          arc right 90, forward 20, stop  -> ONE OK at the end
     ?US                 query front distance            -> "US,42", no OK
     !PROF1              select the CLEAN arc profile    -> OK
     RST                 emergency abort                 -> NO reply, never waits
 
-    ?VER                identity + protocol version     -> "VER,MDPG15-STM32,2"
+    ?VER                identity + protocol version     -> "VER,MDPG15-STM32,3"
     ?CAL                learned decel, lag, trim        -> "CAL,1234,180,-3"
     !CALT-3             restore steering trim, us       -> OK  (signed!)
 
     q                   quit
+
+FU<n> is protocol 3 and behaves unlike anything else here (§4.1). It is not a
+distance cap: it closes whatever gap it measures, so FU30 with the wall 180 cm
+out drives 150 cm. It needs something to see — nothing in range answers
+FAIL,NOECHO and the robot does not move. And it is slow on purpose, standing
+still for 400 ms between passes: about 1.2 s for a short approach, 4 s from a
+metre, 8.6 s worst case. Do not mistake that silence for a dead link.
 
 Calibration (PROTOCOL.md §7) is a script you send, not a firmware mode. The
 sequence that converges it:
@@ -73,13 +82,29 @@ def send_and_report(stm: STM, line: str) -> None:
 
     print(f"  {reply}")
     if reply.upper().startswith("FAIL"):
-        print("  ^ the robot is NOT where you think it is — stop and re-plan.")
+        # NOECHO is the exception to the usual advice. FU refuses to drive at
+        # something it cannot see, so nothing moved and the pose is intact —
+        # telling the operator to re-plan would send them after the wrong
+        # problem entirely.
+        if reply.strip().upper().endswith("NOECHO"):
+            print("  ^ FU had no usable ultrasound reading. NOTHING MOVED, the")
+            print("    pose is unchanged, and the rest of the line was dropped.")
+            print("    Check the wiring and that something is actually in front;")
+            print("    ?US should answer with a distance, not 65535.")
+        else:
+            print("  ^ the robot is NOT where you think it is — stop and re-plan.")
 
 
 def bringup(stm: STM) -> None:
     """
-    PROTOCOL.md §10 stages 3-5. No motion at all — these prove the link.
-    If these pass and a later F10 fails, the problem is motion, not the link.
+    PROTOCOL.md §10 stages 3-5, plus stage 9. No motion at all — these prove
+    the link and the sensor. If they pass and a later F10 fails, the problem is
+    motion, not the link.
+
+    Stage 9 is here rather than left to the motion stages because it is the one
+    thing worth knowing BEFORE trusting FU with the robot: FU navigates on what
+    the ultrasound tells it, and a sensor that answers 65535 will simply refuse
+    to move. Cheaper to find out standing still.
     """
     print("\n-- Stage 3: send S (expect OK, nothing moves) --")
     send_and_report(stm, "S")
@@ -94,8 +119,16 @@ def bringup(stm: STM) -> None:
     print("\n-- Stage 5: send ?VER (expect VER,<name>,<proto>) --")
     send_and_report(stm, "?VER")
 
-    print("\nStages 3-5 done. If all three passed, the link is good.")
-    print("Next, by hand: F10 (stage 6), then FR90,F20,S (stage 7 — exactly ONE OK).\n")
+    print("\n-- Stage 9: send ?US, box ~50 cm ahead (expect US,~50) --")
+    print("   65535 means NO READING — fix that before sending any FU.")
+    send_and_report(stm, "?US")
+
+    print("\nStages 3-5 and 9 done. If they passed, the link and the sensor are good.")
+    print("Next, by hand and with the floor clear:")
+    print("  stage 6   F10                  moves ~10 cm, OK AFTER it stops")
+    print("  stage 7   FR90,F20,S           exactly ONE OK, at the end")
+    print("  stage 10  FU20, box ~1 m out   OK after ~4 s, then ?US reads 18-22")
+    print("  stage 11  FU20, sensor unplugged   FAIL,NOECHO, nothing moves\n")
 
 
 def main() -> None:
@@ -103,7 +136,7 @@ def main() -> None:
     parser.add_argument(
         "--bringup",
         action="store_true",
-        help="run PROTOCOL.md §10 stages 3-5 (no motion), then exit",
+        help="run PROTOCOL.md §10 stages 3-5 and 9 (no motion), then exit",
     )
     args = parser.parse_args()
 
@@ -125,7 +158,8 @@ def main() -> None:
         return
 
     print("\nSTM connected. Enter a command line (q to quit).")
-    print("Examples: F50 | FR90,F20,S | ?US | !PROF1 | ?CAL | !CALT-3 | RST\n")
+    print("Examples: F50 | FU30 | F150,FU20 | FR90,F20,S | ?US | ?CAL | RST")
+    print("FU waits while it settles between passes — up to ~8.6 s. That is normal.\n")
 
     try:
         while True:
