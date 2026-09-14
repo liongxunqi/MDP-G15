@@ -68,28 +68,123 @@ def run_detection(image_path: str):
 
 
 # ── Pathfinding ────────────────────────────────────────────────────────────────
-# Replace compute_path() with your actual algorithm when it's ready.
-# Must return a dict with these keys:
-#   "segments"     — list of lists of STM commands, one sublist per obstacle
-#                    e.g. [ ["W050", "D100"], ["W030"], ["A100", "W020"] ]
-#   "obstacle_ids" — obstacle IDs in the order they will be visited
-#                    e.g. [2, 1, 3]
-#   "dirs"         — optional list of robot direction dicts (can be [])
+# compute_path() must return a dict with these keys:
+#   "segments"          — list of lists of STM tokens, one sublist per LINE
+#                         e.g. [ ["FR90", "F20", "S"], ["F30", "S"] ]
+#   "obstacle_ids"      — obstacle IDs in the order they will be visited
+#   "segment_obstacles" — parallel to "segments": the obstacle to photograph
+#                         after that line finishes, or None for pure travel.
+#                         Segments are NOT 1:1 with obstacles any more — see
+#                         stm_tokens.chunk_tokens.
+#   "dirs"              — optional robot direction dicts for the Android map
+
+from stm_tokens import (  # noqa: E402
+    PROFILE_NAMES,
+    TURN_RADIUS_MM,
+    TokenError,
+    arc,
+    chunk_tokens,
+    fwd,
+    rev,
+    stop,
+)
+
+# Must match the profile the robot is actually running. The Pi does not send
+# !PROF unless STM_ARC_PROFILE is set, so the default here is the FIRMWARE's
+# default — TIGHT, radius 291mm. Planning for one radius and driving another
+# puts every turn wide, and the error compounds across turns.
+ARC_PROFILE = int(os.getenv("STM_ARC_PROFILE", "0"))
+
+
+def _visit_order(obstacles: list) -> list:
+    """
+    Nearest-neighbour visit order from the start corner (0,0).
+
+    Real, but greedy — it is a reasonable seed, not an optimal tour. Swap in a
+    proper TSP/Dubins ordering when the planner lands.
+    """
+    remaining = list(obstacles)
+    ordered = []
+    cx, cy = 0.0, 0.0
+    while remaining:
+        nearest = min(
+            remaining,
+            key=lambda o: (o.get("x", 0) - cx) ** 2 + (o.get("y", 0) - cy) ** 2,
+        )
+        remaining.remove(nearest)
+        ordered.append(nearest)
+        cx, cy = nearest.get("x", 0), nearest.get("y", 0)
+    return ordered
+
 
 def compute_path(obstacles: list) -> dict:
     """
-    STUB — replace with your pathfinding algorithm.
-    Currently returns one dummy segment per obstacle so nothing crashes
-    while you integrate the real algorithm.
+    STUB — the visit ORDER is real, the MOTION is not.
+
+    What is real here: the token vocabulary, the §2 line chunking, the visit
+    ordering, and the segment/obstacle mapping. All of that is tested and the
+    RPi side depends on it.
+
+    What is NOT real: the actual motion between obstacles. Each approach emits a
+    single "S" — a legal token that replies OK and moves the robot zero
+    centimetres. That is the deliberate analogue of the old ["W000"] no-op: the
+    pipeline runs end to end, every message is well-formed, and the robot stays
+    still.
+
+    It emits S rather than a guess because the chassis is Ackermann (PROTOCOL.md
+    §8) — it cannot turn on the spot, every turn is an arc of radius 291-318mm,
+    and a 90 degree turn consumes ~291mm in BOTH axes of a 2000mm arena. A
+    plausible-looking guess at that geometry would not be a harmless placeholder;
+    it would drive the robot into things. Emitting a no-op is the honest stub.
+
+    To write the real thing, use the helpers in stm_tokens: fwd/rev/arc/stop to
+    build tokens, arc_displacement() for where an arc actually lands the robot,
+    arc_fits_in_arena() as a clearance guard, and chunk_tokens() at the end so
+    the §2 caps are respected automatically.
     """
     logging.warning(
-        "compute_path() is using the STUB — replace with your real algorithm."
+        "compute_path() is using the STUB — visit order is real, motion is a "
+        "no-op (each approach emits 'S'). Replace the marked block below."
     )
-    sorted_obs = sorted(obstacles, key=lambda o: o.get("id", 0))
+    logging.info(
+        f"Planning against arc profile {ARC_PROFILE} "
+        f"({PROFILE_NAMES.get(ARC_PROFILE, '?')}, radius "
+        f"{TURN_RADIUS_MM.get(ARC_PROFILE, '?')}mm) — this MUST match the profile "
+        f"the robot is actually running. Confirm with ?STAT (last field)."
+    )
+
+    ordered = _visit_order(obstacles)
+
+    segments: list = []
+    segment_obstacles: list = []
+
+    for obstacle in ordered:
+        # ── REPLACE THIS BLOCK ────────────────────────────────────────────────
+        # Build the real token stream that drives from the current pose to a
+        # viewing pose for `obstacle`, e.g.:
+        #     tokens = [arc(True, True, 90), fwd(20), stop()]
+        try:
+            tokens = [stop()]
+        except TokenError as exc:
+            logging.error(f"Token build failed for obstacle {obstacle.get('id')}: {exc}")
+            continue
+        # ── END REPLACE ───────────────────────────────────────────────────────
+
+        # chunk_tokens enforces the §2 caps. One approach may become several
+        # lines; only the last of them gets the obstacle id, because the photo
+        # is taken when the whole approach finishes, not partway through it.
+        lines = chunk_tokens(tokens)
+        for i, line in enumerate(lines):
+            segments.append(line)
+            segment_obstacles.append(
+                obstacle.get("id") if i == len(lines) - 1 else None
+            )
+
     return {
-        "segments":     [["W000"] for _ in sorted_obs],
-        "obstacle_ids": [o["id"] for o in sorted_obs],
-        "dirs":         [],
+        "segments":          segments,
+        "obstacle_ids":      [o.get("id") for o in ordered],
+        "segment_obstacles": segment_obstacles,
+        "dirs":              [],
     }
 
 
