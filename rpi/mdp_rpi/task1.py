@@ -45,7 +45,13 @@ load_dotenv()
 
 from communications.android import Android
 from communications.pc import PC
-from communications.stm import PROTOCOL_VERSION, STM, validate_line
+from communications.stm import (
+    CAL_MIN_PROTOCOL,
+    FU_MIN_PROTOCOL,
+    PROTOCOL_VERSION,
+    STM,
+    validate_line,
+)
 from image_capture.camera import Camera
 
 logging.basicConfig(
@@ -516,8 +522,28 @@ class Task1:
                     # ── Move did not complete (§3) ─────────────────────────────
                     # FAIL,TIMEOUT  → wheel stalled or encoder dead
                     # FAIL,WRONGWAY → arc rotated away from target, aborted
-                    # Either way the pose is now unknown. Do not continue.
+                    # FAIL,NOECHO   → FU<n> had no reading; NOTHING MOVED (§4.1)
                     detail = stm_msg.strip().split(",", 1)[1] if "," in stm_msg else "UNKNOWN"
+
+                    if detail == "NOECHO":
+                        # Worth its own message. The other two mean the pose is
+                        # unknown; this one means the pose is exactly what it
+                        # was, because FU refuses to drive at something it
+                        # cannot see. The firmware dropped the rest of the line
+                        # rather than run it from the wrong place, so the plan
+                        # is still stale and the mission still stops — but the
+                        # thing to go and look at is the ultrasound, not the
+                        # wheels, and a recovery can start from the last known
+                        # pose instead of re-localising.
+                        self._halt_mission(
+                            "STM reported FAIL,NOECHO — FU had no usable ultrasound "
+                            "reading, so nothing moved and the rest of the line was "
+                            "dropped (PROTOCOL.md §4.1). The pose is unchanged. "
+                            "Check the sensor wiring and that something is actually "
+                            "in front of the robot, then resend from here."
+                        )
+                        continue
+
                     self._halt_mission(
                         f"STM reported {stm_msg.strip()} — the move did not complete "
                         f"({detail}). Re-plan from the robot's actual pose."
@@ -608,8 +634,10 @@ class Task1:
         PROTOCOL.md §10 stage 5 — prove the link before trusting it with motion.
 
         ?VER costs one round trip and distinguishes "the firmware is alive and
-        talking protocol v1" from "the port opened but nothing is listening",
-        which otherwise only shows up as a mysteriously silent first move.
+        talking a protocol version we know" from "the port opened but nothing
+        is listening", which otherwise only shows up as a mysteriously silent
+        first move. It is also the only way to find out whether FU<n> exists
+        before a segment containing one earns a RESEND.
 
         Runs BEFORE the segment pump starts, so sending !PROF here cannot
         collide with a movement OK (see STM.set_profile).
@@ -625,21 +653,46 @@ class Task1:
             logging.info(f"STM: {ver}")
             fields = ver.split(",")
             proto = fields[2].strip() if len(fields) >= 3 else ""
-            # This client implements protocol 2. v2 is a pure SUPERSET of v1 —
-            # movement is byte-for-byte identical and v2 only adds ?CAL and the
-            # !CAL* setters — so v1 firmware is not a problem for Task 1, it just
-            # cannot save or restore calibration. Only an unrecognised version
-            # deserves a warning; treating v1 as an error would cry wolf.
-            if proto == "1":
-                logging.info(
-                    "STM: firmware is protocol 1. Movement is unaffected, but "
-                    "?CAL and the !CAL* setters will RESEND (PROTOCOL.md §7)."
-                )
-            elif proto != str(PROTOCOL_VERSION):
+            # This client implements protocol 3. Every version is a pure
+            # SUPERSET of the one before — the movement tokens are byte-for-byte
+            # identical back to v1 — so an older firmware is a CAPABILITY gap,
+            # not an incompatibility, and saying so is more useful than a flat
+            # version-mismatch warning that would cry wolf on a board that runs
+            # Task 1 perfectly well.
+            #
+            # The gap that can actually bite is FU<n>: on v1 or v2 it is still a
+            # reserved token, so a segment containing one is a parse failure and
+            # the WHOLE line RESENDs. That is a silent planning bug if nobody is
+            # told, hence the explicit warning rather than an info line.
+            try:
+                proto_num = int(proto)
+            except ValueError:
+                proto_num = -1
+
+            if proto_num < 0:
                 logging.warning(
-                    f"STM: firmware reports protocol version {proto!r}, this "
-                    f"client implements version {PROTOCOL_VERSION} — "
-                    "re-read PROTOCOL.md."
+                    f"STM: could not read a protocol version out of {ver!r} — "
+                    "re-read PROTOCOL.md §5."
+                )
+            elif proto_num < CAL_MIN_PROTOCOL:
+                logging.info(
+                    f"STM: firmware is protocol {proto_num}. Movement is "
+                    "unaffected, but ?CAL and the !CAL* setters will RESEND "
+                    "(PROTOCOL.md §7)."
+                )
+            elif proto_num < FU_MIN_PROTOCOL:
+                logging.warning(
+                    f"STM: firmware is protocol {proto_num}. Movement and "
+                    "calibration are fine, but FU<n> is still RESERVED there — "
+                    "any segment containing one will RESEND the entire line "
+                    "(PROTOCOL.md §9). Plan with F0 or flash a v"
+                    f"{FU_MIN_PROTOCOL} build."
+                )
+            elif proto_num > PROTOCOL_VERSION:
+                logging.warning(
+                    f"STM: firmware reports protocol {proto_num}, newer than "
+                    f"the {PROTOCOL_VERSION} this client implements. Anything "
+                    "it added is unused here — re-read PROTOCOL.md."
                 )
 
         if self.arc_profile is None:

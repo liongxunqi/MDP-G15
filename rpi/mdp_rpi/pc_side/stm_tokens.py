@@ -11,6 +11,10 @@ copies must change.
 
 Everything here is real and tested. The path *selection* that consumes it (in
 task1_pc.compute_path) is still a stub — see the note there.
+
+Protocol 3 adds fwd_until() (FU<n>, §4.1). It is the token to reach for when a
+photo has to be taken from a known standoff: F0 trips on a stale reading and
+scatters by 4-5 cm, FU measures from a standstill and lands within ±2 cm.
 """
 
 import math
@@ -20,6 +24,23 @@ from typing import List, Optional, Tuple
 # ── PROTOCOL.md §2 — line caps ────────────────────────────────────────────────
 MAX_PRIMITIVES = 16
 MAX_LINE_BYTES = 128
+
+# ── PROTOCOL.md §4.1 — FU<n> standoff bounds, cm ──────────────────────────────
+# Restated here rather than imported, for the same reason the §2 caps are: this
+# module ships to the algorithm PC and must not import pyserial. Keep in step
+# with communications/stm.py.
+#
+# Out of range is a parse failure, not a clamp — so a planner that emits FU3
+# does not get a short approach, it gets the whole line rejected.
+FU_MIN_CM = 5
+FU_MAX_CM = 200
+FU_TOL_CM = 2
+
+# The sensor reads about this much LONG (§4.1). FU removes the scatter but not
+# this offset, because every pass of the approach reads through it — ask for
+# FU20 and the robot settles ~18.7 cm out, repeatably. fwd_until(compensate=True)
+# corrects for it. MEASURE IT ON THE DAY before trusting this number.
+US_BIAS_CM = 1.3
 
 # ── PROTOCOL.md §8 — measured turn radii, by floor chord ──────────────────────
 # The planner MUST use the radius of the profile the robot is actually running
@@ -38,7 +59,9 @@ ROBOT_WIDTH_CM = 18.8
 ROBOT_LENGTH_CM = 23.0
 ARENA_CM = 200.0
 
-_TOKEN_RE = re.compile(r"^(FR|FL|RR|RL|F|R)(\d+)$|^(S|RST)$", re.IGNORECASE)
+# FU before F, exactly as the firmware's own parser orders its prefixes — "fu"
+# would otherwise be eaten by "f".
+_TOKEN_RE = re.compile(r"^(FR|FL|FU|RR|RL|F|R)(\d+)$|^(S|RST)$", re.IGNORECASE)
 
 
 class TokenError(ValueError):
@@ -61,6 +84,39 @@ def fwd(cm: int) -> str:
 def fwd_until_obstacle() -> str:
     """F0 — forward until the ultrasonic stops it at 15cm. §4."""
     return "F0"
+
+
+def fwd_until(cm: int, compensate: bool = False) -> str:
+    """
+    FU<n> — forward until the ultrasound reads n cm, protocol 3 (§4.1).
+
+    Prefer this to F0 whenever the standoff matters. F0 is a trip-wire on a
+    reading that is already ~120 ms old, so it overshoots by a different 3.9 to
+    5.3 cm every run; FU measures from a standstill and closes the gap on
+    odometry, landing within FU_TOL_CM.
+
+    It buys that with time — roughly 1.2 s for a short approach, 4 s from a
+    metre — so do not send it for the whole journey. F150,FU20 rather than
+    FU20 from across the arena, which also keeps the measurement inside the
+    range where the beam is still narrow enough to trust.
+
+    compensate=True subtracts the sensor's known long bias, so the robot ends
+    up n cm from the obstacle rather than n cm by the sensor's reckoning. Off
+    by default: US_BIAS_CM is a measurement, and silently shifting every
+    approach by an unverified constant is worse than a known offset.
+
+    Raises TokenError outside FU_MIN_CM..FU_MAX_CM — the firmware treats that
+    as a parse failure and RESENDs the entire line, so catching it here is the
+    difference between one bad segment and a stalled mission.
+    """
+    target = int(round(cm + US_BIAS_CM)) if compensate else int(round(cm))
+    if not (FU_MIN_CM <= target <= FU_MAX_CM):
+        raise TokenError(
+            f"fwd_until({cm}): {target} cm is outside {FU_MIN_CM}..{FU_MAX_CM} "
+            "(PROTOCOL.md §4.1) — the firmware rejects the whole line rather "
+            "than clamping"
+        )
+    return f"FU{target}"
 
 
 def rev(cm: int) -> str:
@@ -97,6 +153,11 @@ def is_valid_token(token: str) -> bool:
     if op is None:
         return True  # S or RST
     value = int(digits)
+    # FU carries a standoff, not a travel distance, so it has a floor as well
+    # as a ceiling (§4.1). Checked before the zero rule, which would otherwise
+    # pass FU0 — legal-looking to that rule and a parse failure on the wire.
+    if op.upper() == "FU":
+        return FU_MIN_CM <= value <= FU_MAX_CM
     return not (value == 0 and op.upper() != "F")
 
 

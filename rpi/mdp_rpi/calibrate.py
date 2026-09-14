@@ -49,7 +49,7 @@ from typing import List, Optional, Tuple
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s",
                     datefmt="%H:%M:%S")
 
-from communications.stm import STM, CAL_LIMITS, PROTOCOL_VERSION
+from communications.stm import STM, CAL_LIMITS, CAL_MIN_PROTOCOL, PROTOCOL_VERSION
 
 PROFILE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cal_profiles")
 
@@ -132,13 +132,36 @@ def check_version(stm: STM) -> bool:
     logging.info(f"STM: {ver}")
     fields = ver.split(",")
     proto = fields[2].strip() if len(fields) >= 3 else ""
-    if proto != str(PROTOCOL_VERSION):
+
+    # A FLOOR, not an equality test. This tool needs ?CAL and the !CAL*
+    # setters and nothing else, and those have been there since protocol 2 —
+    # so anything from 2 upwards can be calibrated. The old exact match
+    # rejected a v3 board that supports every single thing used here, which
+    # turned a firmware upgrade into a calibration outage.
+    try:
+        proto_num = int(proto)
+    except ValueError:
         logging.error(
-            f"Firmware reports protocol {proto!r}, this tool needs "
-            f"{PROTOCOL_VERSION}. Calibration read/write does not exist before "
-            "protocol 2 — flash a v2 build first."
+            f"Could not read a protocol version out of {ver!r} — expected "
+            "VER,<name>,<proto> (PROTOCOL.md §5)."
         )
         return False
+
+    if proto_num < CAL_MIN_PROTOCOL:
+        logging.error(
+            f"Firmware reports protocol {proto_num}, this tool needs at least "
+            f"{CAL_MIN_PROTOCOL}. Calibration read/write does not exist before "
+            f"protocol {CAL_MIN_PROTOCOL} — flash a newer build first."
+        )
+        return False
+
+    if proto_num > PROTOCOL_VERSION:
+        logging.warning(
+            f"Firmware reports protocol {proto_num}, newer than the "
+            f"{PROTOCOL_VERSION} this client implements. Calibration is "
+            "unaffected — ?CAL and the setters have not changed — but re-read "
+            "PROTOCOL.md before trusting anything else."
+        )
     return True
 
 

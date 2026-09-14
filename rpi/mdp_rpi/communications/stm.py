@@ -19,6 +19,7 @@ Wire format (PROTOCOL.md §2 — that document is authoritative):
 
 Movement tokens (PROTOCOL.md §4):
     F<n>   forward n cm          F0  forward until obstacle (ultrasonic, 15cm)
+    FU<n>  forward until the ultrasound reads n cm — n is YOURS to pick, 5..200
     R<n>   reverse n cm
     FR<n> / FL<n>   arc forward-right / forward-left, n degrees
     RR<n> / RL<n>   arc reverse-right / reverse-left, n degrees
@@ -33,9 +34,15 @@ Replies (PROTOCOL.md §3):
     RESEND          parse failure, nothing executed, safe to retransmit
     FAIL,TIMEOUT    watchdog fired mid-move — wheel stalled or encoder dead
     FAIL,WRONGWAY   arc rotated away from target and was aborted
+    FAIL,NOECHO     FU<n> had no usable reading — THE ROBOT DID NOT MOVE (v3)
     <TAG>,<fields>  answer to a query (§5)
 
   FAIL,* means "the robot is not where you think it is". Stop and re-plan.
+
+  NOECHO is the one worth telling apart: nothing moved, so the pose is still
+  whatever it was before the line, and the rest of that line was dropped by the
+  firmware rather than run from the wrong place. The fix is the sensor, not the
+  odometry.
 
 Queries (§5) bypass the movement queue and are answered immediately, even
 mid-move. The reply IS the data — there is no separate OK. Because of that
@@ -60,9 +67,31 @@ Calibration (§7, protocol 2):
   single exception to the §3 rule that RESEND means "your bytes were bad", and
   _send_cal_token() tells the two apart with ?STAT rather than guessing.
 
-Protocol 2 is a pure superset of 1 — movement is byte-for-byte identical, and
-v2 only adds ?CAL and the three setters. A v1 firmware still runs everything
-here except calibration save/restore.
+Sensor-terminated movement (§4.1, protocol 3):
+    FU<n>           drive until the front ultrasound reads n cm
+
+  NOT a trip-wire like F0. The firmware stands still to MEASURE the gap — a
+  rolling reading is ~120 ms stale, which is ~4 cm at cruise and a different
+  4 cm every run — then drives it on odometry and re-measures, up to four
+  passes, each paying a 400 ms stationary settle. Lands within ±2 cm of n.
+
+  Two consequences for this client. A single FU line can take 8.6 s worst
+  case, which is why _READ_TIMEOUT is sized off the LINE and not off one move.
+  And FU is precise, not accurate: the sensor reads ~1.3 cm long and every
+  pass reads through that same offset, so FU20 settles ~18.7 cm out. Correct
+  for it here (US_BIAS_CM) rather than in the firmware, where it needs a
+  reflash to change.
+
+Every version so far has been a pure SUPERSET of the one before — movement
+tokens are byte-for-byte identical all the way back to v1. Older firmware is
+therefore a capability question, not a compatibility one:
+
+    v1   everything here except ?CAL / !CAL* (RESEND) and FU (RESEND)
+    v2   everything except FU — still reserved there, so the whole line RESENDs
+    v3   everything
+
+Check with ?VER at startup and degrade deliberately. Do not treat an older
+firmware as an error it is not.
 """
 
 import logging
@@ -84,6 +113,12 @@ _BAUD_RATE = int(os.getenv("BAUD_RATE", "115200"))
 # PROTOCOL.md §11: the firmware per-primitive watchdog is 15s. A read timeout
 # must sit comfortably above that — 20s — and expiry means "lost link", not
 # "slow move". The old value here was 1s, shorter than a single legitimate move.
+#
+# Size it off the LINE, not off one primitive. FU<n> (§4.1) is several moves
+# plus up to four 400 ms settles under a single reply, and the measured worst
+# case — FU5 from 2 m — is 8.6 s. A sender that gave up early would abandon a
+# line the firmware is still working on, and every reply after that would land
+# against the wrong command.
 _READ_TIMEOUT = float(os.getenv("STM_READ_TIMEOUT_S", "20.0"))
 
 # PROTOCOL.md §10 stage 2: the firmware prints a banner and run reports on this
@@ -95,6 +130,34 @@ _BANNER_DRAIN_S = float(os.getenv("STM_BANNER_DRAIN_S", "1.0"))
 MAX_LINE_BYTES = 128
 MAX_PRIMITIVES = 16
 
+# PROTOCOL.md §4.1 — bounds on the FU<n> standoff, cm. Out of range is a PARSE
+# FAILURE, not a clamp, so one bad value costs the whole line a RESEND.
+#
+# The floor is not the sensor's 2 cm limit; it is where the approach still has
+# room to correct itself. The ceiling is about trusting the reading rather than
+# reaching it — past ~2 m the beam has spread wide enough that the nearest
+# thing it hears is often not the thing the planner meant.
+FU_MIN_CM = 5
+FU_MAX_CM = 200
+
+# What the firmware calls "arrived" (§4.1). Anything tighter would have the
+# robot chasing the sensor's own quantisation noise.
+FU_TOL_CM = 2
+
+# PROTOCOL.md §4.1 — this HC-SR04 reads about this much LONG, measured against
+# a tape over 10-100 cm. FU removes the scatter but not the offset, because
+# every pass reads through it, so FU20 settles ~18.7 cm from the obstacle.
+# Kept on this side because it is a property of the sensor on the day and
+# changing it must not need a reflash. Re-measure before relying on it; see
+# stm_tokens.fwd_until(compensate=True) for the correction.
+US_BIAS_CM = 1.3
+
+# Minimum firmware protocol version each optional feature needs (§7, §4.1).
+# Checked against ?VER so a capability gap is reported as one, rather than
+# discovered as a mysterious RESEND halfway through a run.
+CAL_MIN_PROTOCOL = 2
+FU_MIN_PROTOCOL = 3
+
 # PROTOCOL.md §5 — every tag the firmware can answer a query with.
 # CAL is protocol 2. It must appear here twice over: once so validate_token()
 # will let "?CAL" be sent at all, and once so classify_reply() routes the
@@ -103,10 +166,13 @@ MAX_PRIMITIVES = 16
 QUERY_TAGS = {"US", "IR", "IRR", "POSE", "DIST", "TURN", "STAT", "IMU", "XCHK",
               "VER", "CAL"}
 
-# This client implements protocol 2. Compared against the ?VER reply at startup.
-PROTOCOL_VERSION = 2
+# This client implements protocol 3. Compared against the ?VER reply at startup.
+PROTOCOL_VERSION = 3
 
-_MOVE_RE = re.compile(r"^(FR|FL|RR|RL|F|R)(\d+)$", re.IGNORECASE)
+# FU before F, exactly as the firmware's own parser orders its prefixes: "fu"
+# would otherwise be eaten by "f" and FU20 read as F with an argument of
+# "U20", which does not parse at all.
+_MOVE_RE = re.compile(r"^(FR|FL|FU|RR|RL|F|R)(\d+)$", re.IGNORECASE)
 _QUERY_RE = re.compile(r"^\?([A-Z]+)$", re.IGNORECASE)
 _CONFIG_RE = re.compile(r"^!(PROF[012]|ZERO)$", re.IGNORECASE)
 
@@ -132,7 +198,11 @@ CAL_LIMITS = {
 # PROTOCOL.md §9 — the parser returns a parse failure for these, so a line
 # containing one gets RESEND. Matched explicitly so the validator can say *why*
 # rather than just "unrecognised".
-_RESERVED_RE = re.compile(r"^(FU|FIRO|FILO|FIR|FIL|SR|SL)(\d*)$", re.IGNORECASE)
+# FU is NOT in this list any more — it is implemented as of protocol 3 (§4.1)
+# and is matched by _MOVE_RE above. Leaving it here would have this client
+# refuse to send a token the firmware now understands, which is precisely the
+# failure this validator exists to prevent, only inverted.
+_RESERVED_RE = re.compile(r"^(FIRO|FILO|FIR|FIL|SR|SL)(\d*)$", re.IGNORECASE)
 
 # The superseded 4-character dialect (W050/S050/D100/A100). Worth naming
 # explicitly: S050 used to mean reverse, and S now means STOP.
@@ -166,6 +236,23 @@ def validate_token(token: str) -> Tuple[bool, str]:
     if m:
         op, digits = m.group(1).upper(), m.group(2)
         value = int(digits)
+
+        # PROTOCOL.md §4.1: FU's argument is a standoff to HOLD, not a distance
+        # to travel, and it is the one movement argument with a meaningful
+        # floor as well as a ceiling. Tested before the zero rule below so
+        # "FU0" is told the real reason rather than a misleading one.
+        if op == "FU":
+            if not (FU_MIN_CM <= value <= FU_MAX_CM):
+                return False, (
+                    f"'{tok}': {value} cm is outside {FU_MIN_CM}..{FU_MAX_CM} "
+                    "(PROTOCOL.md §4.1). Below the floor the approach has no "
+                    "room left to correct itself; above it the beam has spread "
+                    "too wide to trust what it hears — send F<n> for the bulk "
+                    "of the travel and FU<n> for the last stretch. Out of "
+                    "range is a parse failure, not a clamp"
+                )
+            return True, ""
+
         # PROTOCOL.md §4: a zero argument is valid ONLY for F, where it means
         # "forward until obstacle". R0 / FR0 / RL0 are parse failures.
         if value == 0 and op != "F":
@@ -572,7 +659,17 @@ class STM:
 
     def is_busy(self, timeout: float = 2.0) -> Optional[bool]:
         """
-        The `busy` field of ?STAT: True while a primitive is running.
+        The `busy` field of ?STAT: True while the LINE you sent is unfinished.
+
+        The meaning changed in protocol 3. It used to track the motion layer
+        alone, which was indistinguishable from the line for ordinary movement
+        but wrong for FU<n>: that command spends most of its life deliberately
+        stopped, settling between passes, and the old field read 0 in those
+        windows. A caller polling this to decide the robot had arrived would
+        have carried on mid-approach.
+
+        For watching, not for sequencing — the reply to the line is still the
+        only real completion signal. Use wait_reply() for that.
 
         Returns None if the query timed out or the reply was malformed —
         deliberately tri-state, because "I could not find out" and "it is idle"
