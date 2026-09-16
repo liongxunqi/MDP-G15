@@ -244,6 +244,8 @@ fun ControllerScreen(
     onTurnLeft: () -> Unit,
     onTurnRight: () -> Unit,
     onStop: () -> Unit,
+    forwardEnabled: Boolean = true,
+    reverseEnabled: Boolean = true,
     modifier: Modifier = Modifier,
 ) {
     Column(
@@ -291,12 +293,22 @@ fun ControllerScreen(
         Spacer(Modifier.height(8.dp))
         DPad(
             enabled = isConnected,
+            forwardEnabled = forwardEnabled,
+            reverseEnabled = reverseEnabled,
             onForward = onForward,
             onReverse = onReverse,
             onTurnLeft = onTurnLeft,
             onTurnRight = onTurnRight,
             onStop = onStop,
         )
+        if (isConnected && (!forwardEnabled || !reverseEnabled)) {
+            Spacer(Modifier.height(8.dp))
+            Text(
+                text = "Blocked: obstacle or arena edge ahead",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.error,
+            )
+        }
 
         // --- Debug readout — handy while testing C.1. Not the C.4 deliverable. ---
         if (latestMessage.isNotEmpty()) {
@@ -322,9 +334,11 @@ fun DPad(
     onTurnLeft: () -> Unit,
     onTurnRight: () -> Unit,
     onStop: () -> Unit,
+    forwardEnabled: Boolean = true,
+    reverseEnabled: Boolean = true,
 ) {
     Column(horizontalAlignment = Alignment.CenterHorizontally) {
-        Button(onClick = onForward, enabled = enabled) { Text("▲") }
+        Button(onClick = onForward, enabled = enabled && forwardEnabled) { Text("▲") }
         Spacer(Modifier.height(8.dp))
         Row {
             Button(onClick = onTurnLeft, enabled = enabled) { Text("◀") }
@@ -334,7 +348,7 @@ fun DPad(
             Button(onClick = onTurnRight, enabled = enabled) { Text("▶") }
         }
         Spacer(Modifier.height(8.dp))
-        Button(onClick = onReverse, enabled = enabled) { Text("▼") }
+        Button(onClick = onReverse, enabled = enabled && reverseEnabled) { Text("▼") }
     }
 }
 

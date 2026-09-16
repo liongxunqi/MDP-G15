@@ -115,6 +115,10 @@ class ArenaReducer {
         return ArenaReduction.Success(state.copy(robot = pose))
     }
 
+    /** Read-only check: would moving the robot to [destination] succeed, without applying it. */
+    fun canMoveRobot(state: ArenaState, destination: GridCoordinate): Boolean =
+        moveRobot(state, destination) is ArenaReduction.Success
+
     private fun moveRobot(state: ArenaState, destination: GridCoordinate): ArenaReduction {
         val robot = state.robot ?: return ArenaReduction.Failure("Robot position is not set.")
         if (!state.config.contains(destination)) {

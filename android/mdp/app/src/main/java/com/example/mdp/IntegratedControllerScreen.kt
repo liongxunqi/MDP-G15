@@ -9,6 +9,7 @@ import androidx.compose.material3.Tab
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.remember
@@ -17,6 +18,8 @@ import androidx.compose.runtime.setValue
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Modifier
 import androidx.lifecycle.viewmodel.compose.viewModel
+import com.mdp.g15.arena.domain.ArenaReducer
+import com.mdp.g15.arena.domain.step
 import com.mdp.g15.arena.integration.ArenaOutboundSink
 import com.mdp.g15.arena.presentation.ArenaScreen
 import com.mdp.g15.arena.presentation.ArenaViewModel
@@ -58,6 +61,18 @@ fun IntegratedControllerScreen(
         incomingMessages.collect(arenaViewModel::accept)
     }
 
+    // Guard only — this does NOT move the robot locally. It just disables Forward/Reverse
+    // when the arena data we already have (from the last ROBOT report + placed obstacles)
+    // shows the next cell is off-grid or occupied, reusing ArenaReducer's own validation
+    // so there's exactly one place that knows what a "valid move" is.
+    val arenaState by arenaViewModel.uiState.collectAsState()
+    val arenaReducer = remember { ArenaReducer() }
+    val robot = arenaState.arena.robot
+    val forwardAllowed = robot == null ||
+        arenaReducer.canMoveRobot(arenaState.arena, robot.position.step(robot.direction))
+    val reverseAllowed = robot == null ||
+        arenaReducer.canMoveRobot(arenaState.arena, robot.position.step(robot.direction.opposite()))
+
     Column(modifier = modifier.fillMaxSize()) {
         PrimaryTabRow(selectedTabIndex = selectedTab) {
             ControllerTab.entries.forEach { tab ->
@@ -82,6 +97,8 @@ fun IntegratedControllerScreen(
                     isBusy = isBusy,
                     permissionsGranted = permissionsGranted,
                     latestMessage = latestMessage,
+                    forwardEnabled = forwardAllowed,
+                    reverseEnabled = reverseAllowed,
                     onConnectClick = onConnectClick,
                     onDisconnectClick = onDisconnectClick,
                     onForward = onForward,

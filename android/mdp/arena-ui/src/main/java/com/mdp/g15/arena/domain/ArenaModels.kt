@@ -17,11 +17,26 @@ data class ArenaConfig(
 
 data class GridCoordinate(val x: Int, val y: Int)
 
+/** The adjacent cell one step in [direction] (NORTH = +y, per the grid's bottom-left origin). */
+fun GridCoordinate.step(direction: Direction): GridCoordinate = when (direction) {
+    Direction.NORTH -> copy(y = y + 1)
+    Direction.EAST -> copy(x = x + 1)
+    Direction.SOUTH -> copy(y = y - 1)
+    Direction.WEST -> copy(x = x - 1)
+}
+
 enum class Direction(val wireValue: String) {
     NORTH("N"),
     EAST("E"),
     SOUTH("S"),
     WEST("W");
+
+    fun opposite(): Direction = when (this) {
+        NORTH -> SOUTH
+        EAST -> WEST
+        SOUTH -> NORTH
+        WEST -> EAST
+    }
 
     companion object {
         fun fromWire(value: String): Direction? = when (value.trim().uppercase()) {
