@@ -14,7 +14,7 @@ class ArenaReducer {
     }
 
     private fun addObstacle(state: ArenaState, position: GridCoordinate): ArenaReduction {
-        validateFreeCell(state, position)?.let { return ArenaReduction.Failure(it) }
+        validateFreeCell(state, position, ignoreObstacleId = null)?.let { return ArenaReduction.Failure(it) }
 
         val obstacle = Obstacle(id = state.nextObstacleId, position = position)
         return ArenaReduction.Success(
@@ -34,11 +34,8 @@ class ArenaReducer {
     ): ArenaReduction {
         val obstacle = state.obstacles[obstacleId]
             ?: return ArenaReduction.Failure("Obstacle $obstacleId does not exist.")
-        if (!state.config.contains(destination)) {
-            return ArenaReduction.Failure("Destination is outside the arena.")
-        }
-        if (state.obstacles.values.any { it.id != obstacleId && it.position == destination }) {
-            return ArenaReduction.Failure("Another obstacle already occupies that cell.")
+        validateFreeCell(state, destination, ignoreObstacleId = obstacleId)?.let {
+            return ArenaReduction.Failure(it)
         }
         if (obstacle.position == destination) {
             return ArenaReduction.Success(state.copy(selectedObstacleId = obstacleId))
@@ -107,9 +104,10 @@ class ArenaReducer {
     }
 
     private fun applyRobotPose(state: ArenaState, pose: RobotPose): ArenaReduction {
-        if (!state.config.contains(pose.position)) {
+        val cells = pose.position.footprint(state.config.robotFootprintCells)
+        if (cells.any { !state.config.contains(it) }) {
             return ArenaReduction.Failure(
-                "Robot coordinate (${pose.position.x}, ${pose.position.y}) is outside the arena.",
+                "Robot footprint at (${pose.position.x}, ${pose.position.y}) doesn't fit inside the arena.",
             )
         }
         return ArenaReduction.Success(state.copy(robot = pose))
@@ -121,10 +119,11 @@ class ArenaReducer {
 
     private fun moveRobot(state: ArenaState, destination: GridCoordinate): ArenaReduction {
         val robot = state.robot ?: return ArenaReduction.Failure("Robot position is not set.")
-        if (!state.config.contains(destination)) {
+        val cells = destination.footprint(state.config.robotFootprintCells)
+        if (cells.any { !state.config.contains(it) }) {
             return ArenaReduction.Failure("Destination is outside the arena.")
         }
-        if (state.obstacles.values.any { it.position == destination }) {
+        if (state.obstacles.values.any { obstacle -> cells.any { it == obstacle.position } }) {
             return ArenaReduction.Failure("An obstacle already occupies that cell.")
         }
         if (robot.position == destination) {
@@ -133,10 +132,16 @@ class ArenaReducer {
         return ArenaReduction.Success(state.copy(robot = robot.copy(position = destination)))
     }
 
-    private fun validateFreeCell(state: ArenaState, position: GridCoordinate): String? = when {
+    private fun validateFreeCell(
+        state: ArenaState,
+        position: GridCoordinate,
+        ignoreObstacleId: Int?,
+    ): String? = when {
         !state.config.contains(position) -> "Selected cell is outside the arena."
-        state.obstacles.values.any { it.position == position } ->
+        state.obstacles.values.any { it.id != ignoreObstacleId && it.position == position } ->
             "Another obstacle already occupies that cell."
+        state.robot != null && position in state.robot.position.footprint(state.config.robotFootprintCells) ->
+            "The robot occupies that cell."
         else -> null
     }
 }

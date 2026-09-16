@@ -20,6 +20,7 @@ import com.mdp.g15.arena.domain.ArenaState
 import com.mdp.g15.arena.domain.Direction
 import com.mdp.g15.arena.domain.GridCoordinate
 import com.mdp.g15.arena.domain.Obstacle
+import com.mdp.g15.arena.domain.footprint
 import kotlin.math.hypot
 import kotlin.math.min
 
@@ -98,6 +99,9 @@ class ArenaGridView @JvmOverloads constructor(
     private var draggingObstacleId: Int? = null
     private var robotPressed = false
     private var draggingRobot = false
+    /** Offset, in cells, of the pressed point from the robot's footprint anchor (bottom-left). */
+    private var robotGrabOffsetX = 0
+    private var robotGrabOffsetY = 0
     private var longPressTriggered = false
     private var multiTouchOccurred = false
 
@@ -172,9 +176,15 @@ class ArenaGridView @JvmOverloads constructor(
                 longPressTriggered = false
                 multiTouchOccurred = false
                 val coordinate = geometry.coordinateAt(toContentX(event.x), toContentY(event.y))
-                val robotHere = coordinate != null && coordinate == state.robot?.position
+                val robot = state.robot
+                val robotHere = coordinate != null && robot != null &&
+                    coordinate in robot.position.footprint(state.config.robotFootprintCells)
                 pressedObstacleId = if (robotHere) null else coordinate?.let(::obstacleAt)?.id
                 robotPressed = robotHere
+                if (robotHere) {
+                    robotGrabOffsetX = coordinate!!.x - robot!!.position.x
+                    robotGrabOffsetY = coordinate.y - robot.position.y
+                }
                 if (pressedObstacleId != null || robotPressed) {
                     handler.postDelayed(longPressRunnable, ViewConfiguration.getLongPressTimeout().toLong())
                 }
@@ -224,7 +234,10 @@ class ArenaGridView @JvmOverloads constructor(
                         }
                     }
                     draggingRobot -> {
-                        val destination = geometry.coordinateAt(toContentX(event.x), toContentY(event.y))
+                        val underFinger = geometry.coordinateAt(toContentX(event.x), toContentY(event.y))
+                        val destination = underFinger?.let {
+                            GridCoordinate(it.x - robotGrabOffsetX, it.y - robotGrabOffsetY)
+                        }
                         if (destination != null) {
                             interactionListener?.onMoveRobot(destination)
                         }
@@ -351,9 +364,10 @@ class ArenaGridView @JvmOverloads constructor(
         }
     }
 
-    private fun drawRobot(canvas: Canvas, coordinate: GridCoordinate, direction: Direction) {
-        val bounds = geometry.cellBounds(coordinate)
-        val radius = geometry.cellSize * 0.38f
+    /** [anchor] is the robot footprint's bottom-left cell (see [ArenaConfig.robotFootprintCells]). */
+    private fun drawRobot(canvas: Canvas, anchor: GridCoordinate, direction: Direction) {
+        val bounds = geometry.footprintBounds(anchor, state.config.robotFootprintCells) ?: return
+        val radius = (bounds.right - bounds.left) * 0.38f
         canvas.drawCircle(bounds.centerX, bounds.centerY, radius, robotPaint)
 
         val nose = Path()
@@ -417,12 +431,14 @@ class ArenaGridView @JvmOverloads constructor(
         val direction = state.robot?.direction ?: return
         val contentX = toContentX(dragX)
         val contentY = toContentY(dragY)
-        val destination = geometry.coordinateAt(contentX, contentY)
-        if (destination == null) {
+        val underFinger = geometry.coordinateAt(contentX, contentY)
+        val anchor = underFinger?.let { GridCoordinate(it.x - robotGrabOffsetX, it.y - robotGrabOffsetY) }
+        val bounds = anchor?.let { geometry.footprintBounds(it, state.config.robotFootprintCells) }
+        if (anchor == null || bounds == null) {
             drawInvalidDropIndicator(canvas, contentX, contentY)
             return
         }
-        drawRobot(canvas, destination, direction)
+        drawRobot(canvas, anchor, direction)
     }
 
     private fun drawInvalidDropIndicator(canvas: Canvas, x: Float, y: Float) {

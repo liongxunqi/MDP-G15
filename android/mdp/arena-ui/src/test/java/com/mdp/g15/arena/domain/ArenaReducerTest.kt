@@ -74,7 +74,8 @@ class ArenaReducerTest {
 
     @Test
     fun `robot accepts only in-bounds pose`() {
-        val valid = RobotPose(GridCoordinate(19, 0), Direction.SOUTH)
+        // Default footprint is 2x2 anchored bottom-left, so (18,0) is the last column that fits.
+        val valid = RobotPose(GridCoordinate(18, 0), Direction.SOUTH)
         val validState = reducer.success(ArenaState(), ArenaAction.ApplyRobotPose(valid))
         assertEquals(valid, validState.robot)
 
@@ -84,6 +85,37 @@ class ArenaReducerTest {
         )
         assertTrue(invalid is ArenaReduction.Failure)
         assertFalse((invalid as ArenaReduction.Failure).reason.isBlank())
+    }
+
+    @Test
+    fun `obstacle cannot be placed or moved onto a cell the robot occupies`() {
+        // Robot at (5,5) with the default 2x2 footprint occupies (5,5) (6,5) (5,6) (6,6).
+        val withRobot = reducer.success(
+            ArenaState(),
+            ArenaAction.ApplyRobotPose(RobotPose(GridCoordinate(5, 5), Direction.NORTH)),
+        )
+
+        assertTrue(
+            reducer.reduce(withRobot, ArenaAction.AddObstacle(GridCoordinate(6, 6)))
+                is ArenaReduction.Failure,
+        )
+
+        val withObstacle = reducer.success(withRobot, ArenaAction.AddObstacle(GridCoordinate(0, 0)))
+        assertTrue(
+            reducer.reduce(withObstacle, ArenaAction.MoveObstacle(1, GridCoordinate(6, 5)))
+                is ArenaReduction.Failure,
+        )
+    }
+
+    @Test
+    fun `robot pose rejected when its footprint would stick out past the edge`() {
+        // (19,0) is itself a valid single cell, but a 2x2 footprint anchored there needs
+        // column 20, which doesn't exist.
+        val result = reducer.reduce(
+            ArenaState(),
+            ArenaAction.ApplyRobotPose(RobotPose(GridCoordinate(19, 0), Direction.SOUTH)),
+        )
+        assertTrue(result is ArenaReduction.Failure)
     }
 
     private fun ArenaReducer.success(state: ArenaState, action: ArenaAction): ArenaState =

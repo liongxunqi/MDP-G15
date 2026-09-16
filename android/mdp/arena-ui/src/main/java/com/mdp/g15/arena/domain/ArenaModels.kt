@@ -3,12 +3,12 @@ package com.mdp.g15.arena.domain
 data class ArenaConfig(
     val columns: Int = 20,
     val rows: Int = 20,
-    val robotFootprintCells: Int = 1,
+    val robotFootprintCells: Int = 3,
 ) {
     init {
         require(columns > 0) { "Arena columns must be positive." }
         require(rows > 0) { "Arena rows must be positive." }
-        require(robotFootprintCells > 0) { "Robot footprint must be positive." }
+        require(robotFootprintCells in 1..3) { "Robot footprint must be between 1 and 3 cells." }
     }
 
     fun contains(coordinate: GridCoordinate): Boolean =
@@ -24,6 +24,10 @@ fun GridCoordinate.step(direction: Direction): GridCoordinate = when (direction)
     Direction.SOUTH -> copy(y = y - 1)
     Direction.WEST -> copy(x = x - 1)
 }
+
+/** All cells of a [size] x [size] square footprint anchored at this coordinate's bottom-left corner. */
+fun GridCoordinate.footprint(size: Int): List<GridCoordinate> =
+    (0 until size).flatMap { dx -> (0 until size).map { dy -> GridCoordinate(x + dx, y + dy) } }
 
 enum class Direction(val wireValue: String) {
     NORTH("N"),
