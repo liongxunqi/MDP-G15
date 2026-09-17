@@ -15,4 +15,9 @@ enum class RobotCommand(val wire: String) {
     TURN_LEFT("tl"),
     TURN_RIGHT("tr"),
     STOP("s"),
+    FORWARD_LEFT("fl"),
+    FORWARD_RIGHT("fr"),
+    BACK_LEFT("bl"),
+    BACK_RIGHT("br"),
+    BEGIN("BEGIN"),
 }

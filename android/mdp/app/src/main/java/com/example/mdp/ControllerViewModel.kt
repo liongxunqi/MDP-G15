@@ -71,6 +71,11 @@ class ControllerViewModel(app: Application) : AndroidViewModel(app) {
     fun turnLeft() = bt.sendCommand(RobotCommand.TURN_LEFT)
     fun turnRight() = bt.sendCommand(RobotCommand.TURN_RIGHT)
     fun stop() = bt.sendCommand(RobotCommand.STOP)
+    fun forwardLeft() = bt.sendCommand(RobotCommand.FORWARD_LEFT)
+    fun forwardRight() = bt.sendCommand(RobotCommand.FORWARD_RIGHT)
+    fun backLeft() = bt.sendCommand(RobotCommand.BACK_LEFT)
+    fun backRight() = bt.sendCommand(RobotCommand.BACK_RIGHT)
+    fun begin() = bt.sendCommand(RobotCommand.BEGIN)
 
     /** Hands a complete arena application message to the existing Bluetooth send queue. */
     fun sendArenaMessage(message: String) = bt.send(message)

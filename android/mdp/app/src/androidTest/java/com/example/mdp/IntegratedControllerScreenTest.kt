@@ -99,6 +99,11 @@ class IntegratedControllerScreenTest {
                 onTurnLeft = {},
                 onTurnRight = {},
                 onStop = {},
+                onForwardLeft = {},
+                onForwardRight = {},
+                onBackLeft = {},
+                onBackRight = {},
+                onBegin = {},
                 incomingMessages = incoming,
                 onArenaOutbound = outbound::add,
             )

@@ -17,6 +17,7 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.IntrinsicSize
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -144,6 +145,11 @@ class MainActivity : ComponentActivity() {
                         onTurnLeft = viewModel::turnLeft,
                         onTurnRight = viewModel::turnRight,
                         onStop = viewModel::stop,
+                        onForwardLeft = viewModel::forwardLeft,
+                        onForwardRight = viewModel::forwardRight,
+                        onBackLeft = viewModel::backLeft,
+                        onBackRight = viewModel::backRight,
+                        onBegin = viewModel::begin,
                         incomingMessages = viewModel.incoming,
                         onArenaOutbound = viewModel::sendArenaMessage,
                         modifier = Modifier.padding(innerPadding),
@@ -244,6 +250,11 @@ fun ControllerScreen(
     onTurnLeft: () -> Unit,
     onTurnRight: () -> Unit,
     onStop: () -> Unit,
+    onForwardLeft: () -> Unit,
+    onForwardRight: () -> Unit,
+    onBackLeft: () -> Unit,
+    onBackRight: () -> Unit,
+    onBegin: () -> Unit,
     forwardEnabled: Boolean = true,
     reverseEnabled: Boolean = true,
     modifier: Modifier = Modifier,
@@ -291,16 +302,33 @@ fun ControllerScreen(
         // --- C.3: manual control D-pad ---
         Text(text = "Manual control", style = MaterialTheme.typography.labelMedium)
         Spacer(Modifier.height(8.dp))
-        DPad(
-            enabled = isConnected,
-            forwardEnabled = forwardEnabled,
-            reverseEnabled = reverseEnabled,
-            onForward = onForward,
-            onReverse = onReverse,
-            onTurnLeft = onTurnLeft,
-            onTurnRight = onTurnRight,
-            onStop = onStop,
-        )
+        // IntrinsicSize.Min sizes this Column to its widest child (the DPad), so the
+        // Begin button's fillMaxWidth() below stretches to match the DPad's width.
+        Column(
+            modifier = Modifier.width(IntrinsicSize.Min),
+            horizontalAlignment = Alignment.CenterHorizontally,
+        ) {
+            Button(
+                onClick = onBegin,
+                enabled = isConnected,
+                modifier = Modifier.fillMaxWidth(),
+            ) { Text("Begin") }
+            Spacer(Modifier.height(8.dp))
+            DPad(
+                enabled = isConnected,
+                forwardEnabled = forwardEnabled,
+                reverseEnabled = reverseEnabled,
+                onForward = onForward,
+                onReverse = onReverse,
+                onTurnLeft = onTurnLeft,
+                onTurnRight = onTurnRight,
+                onStop = onStop,
+                onForwardLeft = onForwardLeft,
+                onForwardRight = onForwardRight,
+                onBackLeft = onBackLeft,
+                onBackRight = onBackRight,
+            )
+        }
         if (isConnected && (!forwardEnabled || !reverseEnabled)) {
             Spacer(Modifier.height(8.dp))
             Text(
@@ -334,11 +362,21 @@ fun DPad(
     onTurnLeft: () -> Unit,
     onTurnRight: () -> Unit,
     onStop: () -> Unit,
+    onForwardLeft: () -> Unit,
+    onForwardRight: () -> Unit,
+    onBackLeft: () -> Unit,
+    onBackRight: () -> Unit,
     forwardEnabled: Boolean = true,
     reverseEnabled: Boolean = true,
 ) {
     Column(horizontalAlignment = Alignment.CenterHorizontally) {
-        Button(onClick = onForward, enabled = enabled && forwardEnabled) { Text("▲") }
+        Row {
+            Button(onClick = onForwardLeft, enabled = enabled) { Text("↖") }
+            Spacer(Modifier.width(8.dp))
+            Button(onClick = onForward, enabled = enabled && forwardEnabled) { Text("▲") }
+            Spacer(Modifier.width(8.dp))
+            Button(onClick = onForwardRight, enabled = enabled) { Text("↗") }
+        }
         Spacer(Modifier.height(8.dp))
         Row {
             Button(onClick = onTurnLeft, enabled = enabled) { Text("◀") }
@@ -348,7 +386,13 @@ fun DPad(
             Button(onClick = onTurnRight, enabled = enabled) { Text("▶") }
         }
         Spacer(Modifier.height(8.dp))
-        Button(onClick = onReverse, enabled = enabled && reverseEnabled) { Text("▼") }
+        Row {
+            Button(onClick = onBackLeft, enabled = enabled) { Text("↙") }
+            Spacer(Modifier.width(8.dp))
+            Button(onClick = onReverse, enabled = enabled && reverseEnabled) { Text("▼") }
+            Spacer(Modifier.width(8.dp))
+            Button(onClick = onBackRight, enabled = enabled) { Text("↘") }
+        }
     }
 }
 
@@ -414,6 +458,11 @@ fun ControllerScreenPreview() {
             onTurnLeft = {},
             onTurnRight = {},
             onStop = {},
+            onForwardLeft = {},
+            onForwardRight = {},
+            onBackLeft = {},
+            onBackRight = {},
+            onBegin = {},
         )
     }
 }

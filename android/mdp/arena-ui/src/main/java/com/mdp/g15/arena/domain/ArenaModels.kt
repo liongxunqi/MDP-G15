@@ -3,7 +3,7 @@ package com.mdp.g15.arena.domain
 data class ArenaConfig(
     val columns: Int = 20,
     val rows: Int = 20,
-    val robotFootprintCells: Int = 3,
+    val robotFootprintCells: Int = 2,
 ) {
     init {
         require(columns > 0) { "Arena columns must be positive." }

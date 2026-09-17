@@ -45,6 +45,11 @@ fun IntegratedControllerScreen(
     onTurnLeft: () -> Unit,
     onTurnRight: () -> Unit,
     onStop: () -> Unit,
+    onForwardLeft: () -> Unit,
+    onForwardRight: () -> Unit,
+    onBackLeft: () -> Unit,
+    onBackRight: () -> Unit,
+    onBegin: () -> Unit,
     incomingMessages: Flow<String>,
     onArenaOutbound: (String) -> Unit,
     modifier: Modifier = Modifier,
@@ -106,6 +111,11 @@ fun IntegratedControllerScreen(
                     onTurnLeft = onTurnLeft,
                     onTurnRight = onTurnRight,
                     onStop = onStop,
+                    onForwardLeft = onForwardLeft,
+                    onForwardRight = onForwardRight,
+                    onBackLeft = onBackLeft,
+                    onBackRight = onBackRight,
+                    onBegin = onBegin,
                     modifier = Modifier.fillMaxSize(),
                 )
 
