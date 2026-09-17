@@ -856,7 +856,7 @@ class UIState:
                                     edgecolor="#0077ff", linewidth=2)
         self.ax.add_patch(self.robot_rect)
 
-        cx, cy = pose.x + 0.0, pose.y + 0.0
+        cx, cy = pose.x + 0.5, pose.y + 0.5
         dx, dy = {
             Heading.E: (0.8, 0.0),
             Heading.N: (0.0, 0.8),
@@ -878,7 +878,7 @@ class UIState:
         self.approach_markers.clear()
 
         for ap in approaches:
-            px, py = ap.pose.x, ap.pose.y
+            px, py = ap.pose.x + 0.5, ap.pose.y + 0.5
             m = self.ax.plot(px, py, marker="o", markersize=6, linestyle="None",
                              markeredgecolor="black", markerfacecolor="#33cc66")[0]
             self.approach_markers.append(m)
@@ -892,8 +892,8 @@ class UIState:
             self.fig.canvas.draw_idle()
             return
 
-        xs = [p.x for p in states]
-        ys = [p.y for p in states]
+        xs = [p.x + 0.5 for p in states]
+        ys = [p.y + 0.5 for p in states]
         self.path_line, = self.ax.plot(xs, ys, linewidth=2.0)
         self.fig.canvas.draw_idle()
 
