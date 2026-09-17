@@ -589,6 +589,18 @@ class Task1:
                         logging.warning("OK received but mission is halted — ignoring.")
                         continue
 
+                    # Update Android with robot's expected grid position
+                    with self._idx_lock:
+                        if 0 <= just_finished < len(self.directions):
+                            robot_pose = self.directions[just_finished]
+                        else:
+                            robot_pose = None
+
+                    if robot_pose:
+                        self.android.send(
+                            f"ROBOT,{robot_pose['x']},{robot_pose['y']},{robot_pose['dir']}"
+                        )
+
                     # ── Capture + detect for the obstacle we just reached ──────
                     obstacle_id = self._obstacle_for_segment(just_finished)
                     if obstacle_id is not None:
