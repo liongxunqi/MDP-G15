@@ -490,9 +490,13 @@ def plan_tour(scn: Scenario) -> TourPlan:
     """Top-level planner: derive approaches, A* between all stops, TSP order, stitch into a TourPlan."""
     total_obstacles = len(scn.obstacles)
 
-    # Standoffs capped at 2-5 cells (20-50cm) per checklist A.2 recognition-distance spec.
+    # Standoffs capped at 2-5 cells (20-50cm) per checklist A.2 recognition-distance
+    # spec ("midpoint of the robot"). Tried widest-first (3,4,5) so the robot keeps
+    # real physical clearance from the obstacle by default; only falls back to the
+    # tightest legal option (2 cells = 20cm midpoint, but ZERO body clearance, since
+    # the 30cm-wide robot's own footprint consumes the rest) if nothing wider fits.
     approaches_all, skipped = derive_approaches(
-        scn.obstacles, scn.grid, standoffs=(2, 3, 4, 5)
+        scn.obstacles, scn.grid, standoffs=(3, 4, 5, 2)
     )
     if not approaches_all:
         return TourPlan([], [], [], [], [], 0.0, total_obstacles, skipped)
@@ -667,6 +671,8 @@ class UIState:
         self.rects: Dict[Tuple[int, int], Rectangle] = {}
         self.side_labels: Dict[Tuple[int, int], plt.Text] = {}
         self.side_edges: Dict[Tuple[int, int], "plt.Line2D"] = {}
+        self.coord_flash_text = None
+        self.coord_flash_timer = None
 
         self.robot_rect: Optional[Rectangle] = None
         self.robot_heading_patch: Optional[FancyArrowPatch] = None
@@ -688,7 +694,7 @@ class UIState:
         self.radio_mode = None
         self.radio_side = None
         self.btn_plan = None
-        self.btn_clear = None
+        self.btn_reset = None
         self.btn_play = None
         self.btn_stop = None
 
@@ -702,14 +708,40 @@ class UIState:
             self.obstacles[key] = self.side
             self.grid.set_occ(x, y, True)
             self._add_obstacle_patch(key, self.side)
+            self._flash_coords(x, y)
         self.redraw()
 
-    def set_obstacle_side(self, x: int, y: int):
-        key = (x, y)
-        if key in self.obstacles:
-            self.obstacles[key] = self.side
-            self._update_side_label(key, self.side)
+    def _flash_coords(self, x: int, y: int, duration_ms: int = 900):
+        """Briefly show the (x,y) cell coordinates above a just-placed obstacle,
+        then remove it automatically -- a quick visual confirmation of exactly
+        where the click landed."""
+        if self.coord_flash_timer is not None:
+            self.coord_flash_timer.stop()
+            self.coord_flash_timer = None
+        if self.coord_flash_text is not None:
+            self.coord_flash_text.remove()
+            self.coord_flash_text = None
+
+        label_y = min(y + 1.3, GRID_H - 0.3)  # keep it on-screen near the top edge
+        self.coord_flash_text = self.ax.text(
+            x + 0.5, label_y, f"({x},{y})", ha="center", va="bottom",
+            fontsize=9, color="#1a56db", fontweight="bold", zorder=10,
+        )
+        self.redraw()
+
+        timer = self.fig.canvas.new_timer(interval=duration_ms)
+        timer.single_shot = True
+
+        def _clear():
+            if self.coord_flash_text is not None:
+                self.coord_flash_text.remove()
+                self.coord_flash_text = None
+            self.coord_flash_timer = None
             self.redraw()
+
+        timer.add_callback(_clear)
+        timer.start()
+        self.coord_flash_timer = timer
 
     def set_start(self, x: int, y: int):
         # keep the 3x3 footprint fully inside the arena even at the edges
@@ -769,8 +801,8 @@ class UIState:
         plt.show()
 
     def _add_widgets(self):
-        ax_mode = plt.axes([0.82, 0.55, 0.16, 0.2])
-        self.radio_mode = RadioButtons(ax_mode, ("obstacle", "start", "side"), active=0)
+        ax_mode = plt.axes([0.82, 0.62, 0.16, 0.13])
+        self.radio_mode = RadioButtons(ax_mode, ("obstacle", "start"), active=0)
         self.radio_mode.on_clicked(self._on_mode_change)
 
         ax_side = plt.axes([0.82, 0.35, 0.16, 0.17])
@@ -790,8 +822,8 @@ class UIState:
         self.btn_stop.on_clicked(self._on_stop)
 
         ax_clear = plt.axes([0.82, 0.04, 0.16, 0.06])
-        self.btn_clear = Button(ax_clear, "Clear all")
-        self.btn_clear.on_clicked(self._on_clear)
+        self.btn_reset = Button(ax_clear, "Reset")
+        self.btn_reset.on_clicked(self._on_reset)
 
     def _on_mode_change(self, label):
         self.mode = label
@@ -833,14 +865,6 @@ class UIState:
             self.side_edges[key].remove()
             del self.side_edges[key]
 
-    def _update_side_label(self, key: Tuple[int, int], side: Side):
-        if key in self.side_labels:
-            self.side_labels[key].set_text(side.value)
-        if key in self.side_edges:
-            x, y = key
-            xs, ys = self._side_edge_xy(x, y, side)
-            self.side_edges[key].set_data(xs, ys)
-
     def _draw_robot(self, pose: Pose):
         if self.robot_rect is not None:
             self.robot_rect.remove()
@@ -852,24 +876,28 @@ class UIState:
         footprint = 2 * ROBOT_HALF + 1
         x0 = pose.x - ROBOT_HALF
         y0 = pose.y - ROBOT_HALF
-        self.robot_rect = Rectangle((x0, y0), footprint, footprint, facecolor="none",
-                                    edgecolor="#0077ff", linewidth=2)
+        self.robot_rect = Rectangle((x0, y0), footprint, footprint, facecolor="white",
+                                    edgecolor="black", linewidth=2)
         self.ax.add_patch(self.robot_rect)
 
-        cx, cy = pose.x + 0.5, pose.y + 0.5
-        dx, dy = {
-            Heading.E: (0.8, 0.0),
-            Heading.N: (0.0, 0.8),
-            Heading.W: (-0.8, 0.0),
-            Heading.S: (0.0, -0.8),
+        # Front-heading indicator: a solid black square filling the front-center
+        # cell of the 3x3 footprint, instead of an arrow.
+        front_dx, front_dy = {
+            Heading.E: (1, 0),
+            Heading.N: (0, 1),
+            Heading.W: (-1, 0),
+            Heading.S: (0, -1),
         }[pose.h]
-        arr = FancyArrowPatch(
-            (cx, cy), (cx + dx, cy + dy),
-            arrowstyle=ArrowStyle("Simple,tail_width=0.5,head_width=6,head_length=8"),
-            linewidth=1.5, color="#0077ff"
+        front_x = pose.x + front_dx
+        front_y = pose.y + front_dy
+        margin = 0.1
+        indicator = Rectangle(
+            (front_x + margin, front_y + margin),
+            1 - 2 * margin, 1 - 2 * margin,
+            facecolor="black", edgecolor="black", zorder=5,
         )
-        self.ax.add_patch(arr)
-        self.robot_heading_patch = arr
+        self.ax.add_patch(indicator)
+        self.robot_heading_patch = indicator
         self.fig.canvas.draw_idle()
 
     def _draw_approach_markers(self, approaches):
@@ -912,8 +940,6 @@ class UIState:
             self.toggle_obstacle(x, y)
         elif self.mode == "start":
             self.set_start(x, y)
-        elif self.mode == "side":
-            self.set_obstacle_side(x, y)
 
     def on_key(self, event):
         if event.key in ("left", "right"):
@@ -922,11 +948,18 @@ class UIState:
             self.start_pose = Pose(self.start_pose.x, self.start_pose.y, h)
             self._draw_robot(self.start_pose)
 
-    def _on_clear(self, _):
+    def _on_reset(self, _):
         for k in list(self.obstacles.keys()):
             self._remove_obstacle_patch(k)
         self.obstacles.clear()
         self.grid.clear()
+
+        if self.coord_flash_timer is not None:
+            self.coord_flash_timer.stop()
+            self.coord_flash_timer = None
+        if self.coord_flash_text is not None:
+            self.coord_flash_text.remove()
+            self.coord_flash_text = None
 
         if self.path_line is not None:
             self.path_line.remove()
@@ -943,6 +976,9 @@ class UIState:
         self._update_unreachable_text([])
         if self.cost_text is not None:
             self.cost_text.set_text("")
+        # Reset the robot itself, not just its drawings -- back to the
+        # original default start pose, same as when the app first opens.
+        self.start_pose = Pose(1, 1, Heading.N)
         self._draw_robot(self.start_pose)
         self.redraw()
 
@@ -1009,8 +1045,8 @@ class UIState:
         else:
             n_moves = len(tour.prims_all)
             self.cost_text.set_text(
-                f"Path cost: {tour.total_cost:.0f} units over {n_moves} moves "
-                f"(F1=1, B1=2, turn=3 -- relative units, not seconds)"
+                f"Path cost: {tour.total_cost:.0f} relative units over {n_moves} moves "
+                f"(F1=1, B1=2, turn=3)"
             )
         self.redraw()
 
@@ -1034,7 +1070,7 @@ class UIState:
             self.timer.stop()
             self.timer = None
 
-        self.timer = self.fig.canvas.new_timer(interval=200)  # ms
+        self.timer = self.fig.canvas.new_timer(interval=700)  # ms (slowed down for testing -- was 200)
         self.timer.add_callback(self._step_anim)
         self.timer.start()
 
