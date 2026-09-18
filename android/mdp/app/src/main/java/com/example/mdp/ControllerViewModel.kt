@@ -84,6 +84,9 @@ class ControllerViewModel(app: Application) : AndroidViewModel(app) {
     /** Hands a complete arena application message to the existing Bluetooth send queue. */
     fun sendArenaMessage(message: String) = bt.send(message)
 
+    /** Freeform text box on the Controls tab — same raw send path as [sendArenaMessage]. */
+    fun sendCustomMessage(message: String) = bt.send(message)
+
     override fun onCleared() {
         bt.shutdown()
     }

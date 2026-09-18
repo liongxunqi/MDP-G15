@@ -38,6 +38,7 @@ import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -45,6 +46,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -160,6 +162,7 @@ class MainActivity : ComponentActivity() {
                         onBackRight = viewModel::backRight,
                         onBegin = viewModel::begin,
                         onPath = viewModel::path,
+                        onSendCustomMessage = viewModel::sendCustomMessage,
                         incomingMessages = viewModel.incoming,
                         onArenaOutbound = viewModel::sendArenaMessage,
                         modifier = Modifier.padding(innerPadding),
@@ -266,6 +269,7 @@ fun ControllerScreen(
     onBackRight: () -> Unit,
     onBegin: () -> Unit,
     onPath: () -> Unit,
+    onSendCustomMessage: (String) -> Unit,
     forwardEnabled: Boolean = true,
     reverseEnabled: Boolean = true,
     modifier: Modifier = Modifier,
@@ -317,6 +321,22 @@ fun ControllerScreen(
                     verticalArrangement = Arrangement.spacedBy(16.dp),
                 ) {
                     Text("Manual control", style = MaterialTheme.typography.titleMedium)
+                    var customMessage by rememberSaveable { mutableStateOf("") }
+                    OutlinedTextField(
+                        value = customMessage,
+                        onValueChange = { if (it.length <= 50) customMessage = it },
+                        modifier = Modifier.fillMaxWidth(),
+                        singleLine = true,
+                        label = { Text("Custom message (${customMessage.length}/50)") },
+                    )
+                    Button(
+                        onClick = {
+                            onSendCustomMessage(customMessage)
+                            customMessage = ""
+                        },
+                        enabled = isConnected && customMessage.isNotBlank(),
+                        modifier = Modifier.fillMaxWidth(),
+                    ) { Text("Send") }
                     Button(onClick = onBegin, enabled = isConnected, modifier = Modifier.fillMaxWidth()) {
                         Text("Begin")
                     }
@@ -475,6 +495,7 @@ fun ControllerScreenPreview() {
             onBackRight = {},
             onBegin = {},
             onPath = {},
+            onSendCustomMessage = {},
         )
     }
 }

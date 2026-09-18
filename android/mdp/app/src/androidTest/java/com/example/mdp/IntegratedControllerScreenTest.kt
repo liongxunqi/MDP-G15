@@ -266,6 +266,7 @@ class IntegratedControllerScreenTest {
                 onBackRight = { movement.add("br") },
                 onBegin = { movement.add("BEGIN") },
                 onPath = { movement.add("PATH") },
+                onSendCustomMessage = { movement.add("CUSTOM:$it") },
                 incomingMessages = incoming,
                 onArenaOutbound = outbound::add,
             )
