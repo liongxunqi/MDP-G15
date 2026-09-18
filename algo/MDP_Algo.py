@@ -682,13 +682,18 @@ class UIState:
         self.timer = None
         self.anim_index = 0
         self.anim_states: List[Pose] = []
+        self._prims_all_cache: List[Primitive] = []
 
         # anim_states index (where a leg ends) -> Obstacle recognized there
         self.recognized_at_index: Dict[int, Obstacle] = {}
         self.recognized_reported: set = set()
         self.total_targets = 0
         self.recognized_text = None
+        self.runtime_text = None
         self.cost_text = None
+        self.current_pos_text = None
+        self.next_pos_text = None
+        self.direction_text = None
         self.unreachable_text = None
 
         self.radio_mode = None
@@ -751,9 +756,9 @@ class UIState:
         self._draw_robot(self.start_pose)
 
     def init_plot(self):
-        self.fig, self.ax = plt.subplots(figsize=(9.5, 8.6))
-        # leave room on the right for the widget panel, and below for the status panel
-        self.ax.set_position([0.06, 0.22, 0.68, 0.72])
+        self.fig, self.ax = plt.subplots(figsize=(9.5, 9.8))
+        # leave room on the right for the widget panel, and below for the (now larger) status panel
+        self.ax.set_position([0.06, 0.32, 0.68, 0.62])
         self.ax.set_aspect("equal")
         self.ax.set_xlim(0, GRID_W)
         self.ax.set_ylim(0, GRID_H)
@@ -781,13 +786,25 @@ class UIState:
 
         # Status panel below the plot (matches the browser version's layout),
         # rather than overlaid text inside the axes.
-        self.fig.text(0.06, 0.13, "", fontsize=9, color="#227722",
+        self.fig.text(0.06, 0.29, "", fontsize=9, color="#227722",
                        fontweight="bold", va="top")
         self.recognized_text = self.fig.texts[-1]
-        self.fig.text(0.06, 0.095, "", fontsize=9, color="#333333",
+        self.fig.text(0.06, 0.255, "", fontsize=9, color="#333333",
+                       fontweight="bold", va="top")
+        self.runtime_text = self.fig.texts[-1]
+        self.fig.text(0.06, 0.22, "", fontsize=9, color="#333333",
                        fontweight="bold", va="top")
         self.cost_text = self.fig.texts[-1]
-        self.fig.text(0.06, 0.045, "", fontsize=8, color="#cc3333",
+        self.fig.text(0.06, 0.175, "", fontsize=9, color="#0077ff",
+                       fontweight="bold", va="top")
+        self.current_pos_text = self.fig.texts[-1]
+        self.fig.text(0.06, 0.14, "", fontsize=9, color="#0077ff",
+                       fontweight="bold", va="top")
+        self.next_pos_text = self.fig.texts[-1]
+        self.fig.text(0.06, 0.105, "", fontsize=9, color="#0077ff",
+                       fontweight="bold", va="top")
+        self.direction_text = self.fig.texts[-1]
+        self.fig.text(0.06, 0.055, "", fontsize=8, color="#cc3333",
                        fontweight="bold", va="top", wrap=True)
         self.unreachable_text = self.fig.texts[-1]
 
@@ -969,6 +986,7 @@ class UIState:
         self.approach_markers.clear()
         self.anim_states = []
         self.anim_index = 0
+        self._prims_all_cache = []
         self.recognized_at_index = {}
         self.recognized_reported = set()
         self.total_targets = 0
@@ -976,6 +994,9 @@ class UIState:
         self._update_unreachable_text([])
         if self.cost_text is not None:
             self.cost_text.set_text("")
+        if self.runtime_text is not None:
+            self.runtime_text.set_text("")
+        self._update_position_texts()
         # Reset the robot itself, not just its drawings -- back to the
         # original default start pose, same as when the app first opens.
         self.start_pose = Pose(1, 1, Heading.N)
@@ -1004,18 +1025,28 @@ class UIState:
             primitive_lib=PRIM_LIB
         )
 
+        # Real wall-clock time the search actually took -- not the simulated
+        # path cost. "Exhaustive" matches choose_order()'s own <=8 threshold
+        # for brute-force permutation search; above that it falls back to
+        # greedy nearest-neighbour, so the label reflects which one ran.
+        t0 = time.perf_counter()
         tour = plan_tour(scn)
+        elapsed = time.perf_counter() - t0
+        search_kind = "Exhaustive A*" if len(obs_list) <= 8 else "Greedy A*"
+        self._update_runtime_text(elapsed, search_kind)
 
         print("-" * 80, "\n", tour.approaches)
         print("-" * 80, "\n", tour.states_all)
         print(f"[plan] total_cost = {tour.total_cost:.2f} "
               f"(relative time units; F1=1, B1=2, turn=3 -- not measured seconds)")
+        print(f"[plan] runtime = {elapsed:.4f}s ({search_kind})")
 
         self._draw_approach_markers(tour.approaches)
         self._draw_path(tour.states_all)
 
         self.anim_states = tour.states_all
         self.anim_index = 0
+        self._prims_all_cache = tour.prims_all
 
         # anim_states index where each leg ends -> the Obstacle recognized there
         self.recognized_at_index = {}
@@ -1031,11 +1062,65 @@ class UIState:
         self._update_recognized_text()
         self._update_unreachable_text(tour.unreachable)
         self._update_cost_text(tour)
+        self._update_position_texts()
 
         if self.anim_states:
             self._draw_robot(self.anim_states[0])
         elif not tour.order:
             print("No tour found (no valid approaches or no reachable targets).")
+
+    def _update_runtime_text(self, elapsed_seconds: float, search_kind: str):
+        if self.runtime_text is None:
+            return
+        self.runtime_text.set_text(
+            f"Algorithm Runtime: {elapsed_seconds:.4f} seconds ({search_kind})"
+        )
+        self.redraw()
+
+    _DIRECTION_LABELS = {
+        "F1": "Forward",
+        "B1": "Reverse",
+        "L(1,1)": "Turn Left",
+        "R(1,1)": "Turn Right",
+    }
+
+    def _update_position_texts(self):
+        """Refresh Current Position / Next Position / Direction from the
+        current point in the planned animation (self.anim_index)."""
+        if self.current_pos_text is None:
+            return
+
+        if not self.anim_states:
+            self.current_pos_text.set_text("Current Position: --")
+            self.next_pos_text.set_text("Next Position: --")
+            self.direction_text.set_text("Direction: --")
+            self.redraw()
+            return
+
+        cur = self.anim_states[self.anim_index]
+        self.current_pos_text.set_text(
+            f"Current Position: ({cur.x}, {cur.y}, Facing: {cur.h.name})"
+        )
+
+        if self.anim_index < len(self.anim_states) - 1:
+            nxt = self.anim_states[self.anim_index + 1]
+            self.next_pos_text.set_text(f"Next Position: ({nxt.x}, {nxt.y})")
+        else:
+            self.next_pos_text.set_text("Next Position: End")
+
+        if self.anim_index < len(self.prims_used_all()):
+            prim = self.prims_used_all()[self.anim_index]
+            label = self._DIRECTION_LABELS.get(prim.name, prim.name)
+            self.direction_text.set_text(f"Direction: {label}")
+        else:
+            self.direction_text.set_text("Direction: End")
+
+        self.redraw()
+
+    def prims_used_all(self):
+        """The primitive sequence for the currently planned path, aligned so
+        prims_used_all()[i] is the move taken FROM anim_states[i]."""
+        return getattr(self, "_prims_all_cache", [])
 
     def _update_cost_text(self, tour):
         if self.cost_text is None:
@@ -1088,8 +1173,10 @@ class UIState:
             if self.timer is not None:
                 self.timer.stop()
                 self.timer = None
+            self._update_position_texts()
             return
         self._draw_robot(self.anim_states[self.anim_index])
+        self._update_position_texts()
 
         ob = self.recognized_at_index.get(self.anim_index)
         if ob is not None and self.anim_index not in self.recognized_reported:
