@@ -45,7 +45,13 @@ load_dotenv()
 
 from communications.android import Android
 from communications.pc import PC
-from communications.stm import STM
+from communications.stm import (
+    CAL_MIN_PROTOCOL,
+    FU_MIN_PROTOCOL,
+    PROTOCOL_VERSION,
+    STM,
+    validate_line,
+)
 from image_capture.camera import Camera
 
 logging.basicConfig(
@@ -80,8 +86,20 @@ class Task1:
         self.directions: list = []          # direction info per segment (for Android map)
         self.direction_index: int = 0
 
+        # Per-segment obstacle mapping. A segment is NOT 1:1 with an obstacle any
+        # more: PROTOCOL.md §2 caps a line at 16 primitives / 128 bytes, so one
+        # obstacle approach may be split across several segments, and some
+        # segments are pure travel with no photo at the end. Entry is an
+        # obstacle id, or None for "no detection after this segment".
+        self.segment_obstacles: list = []
+
         self.started: bool = False          # True after Android sends BEGIN
         self.path_requested: bool = False   # True while OBSTACLES request is in-flight
+        self.halted: bool = False           # True after FAIL,* or exhausted RESENDs
+
+        # PROTOCOL.md §3: cap RESEND retries. A permanently malformed segment
+        # retried forever is an infinite loop in which the robot never moves.
+        self._resend_counts: dict = {}
 
         # ── Synchronisation primitives ────────────────────────────────────────
         # Mutex for all mutable index / segment state
@@ -100,13 +118,24 @@ class Task1:
         self.detect_retries = int(os.getenv("DETECT_RETRY_COUNT", "1"))
         self.detect_retry_delay = float(os.getenv("DETECT_RETRY_DELAY_S", "0.2"))
         self.detect_timeout = float(os.getenv("DETECT_TIMEOUT_S", "0.5"))
+        # PROTOCOL.md §3 recommends at most three retransmissions.
+        self.max_resends = int(os.getenv("STM_MAX_RESENDS", "3"))
+        # PROTOCOL.md §6: 0 TIGHT (r=291mm), 1 CLEAN (r=318mm), 2 SLOW (r=306mm).
+        # The firmware's own default is TIGHT, and that choice belongs to the
+        # firmware — this client does not override it. Unset (the default here)
+        # means send no !PROF at all and run whatever the STM already selected.
+        # Set STM_ARC_PROFILE only to deliberately ask for a different one.
+        _profile_env = os.getenv("STM_ARC_PROFILE")
+        self.arc_profile = int(_profile_env) if _profile_env not in (None, "") else None
 
         logging.info(
             f"Config — segment_delay={self.segment_delay}s  "
             f"detect_retries={self.detect_retries}  "
             f"detect_retry_delay={self.detect_retry_delay}s  "
             f"detect_timeout={self.detect_timeout}s  "
-            f"debounce_delay={self._debounce_delay}s"
+            f"debounce_delay={self._debounce_delay}s  "
+            f"max_resends={self.max_resends}  "
+            f"arc_profile={self.arc_profile}"
         )
 
     # ── Path calculation helpers ───────────────────────────────────────────────
@@ -138,23 +167,105 @@ class Task1:
 
     # ── STM segment helpers ────────────────────────────────────────────────────
 
+    def _obstacle_for_segment(self, seg_index: int):
+        """
+        Which obstacle (if any) we should photograph after segment `seg_index`.
+
+        Prefers the explicit per-segment map. Falls back to the old positional
+        convention (segment i <-> obstacle_order[i]) so a PC still sending the
+        original PATH shape keeps working.
+        """
+        if self.segment_obstacles:
+            if 0 <= seg_index < len(self.segment_obstacles):
+                value = self.segment_obstacles[seg_index]
+                return None if value is None else str(value)
+            return None
+        if 0 <= seg_index < len(self.obstacle_order):
+            return str(self.obstacle_order[seg_index])
+        return None
+
     def _send_next_segment(self) -> bool:
         """
         Atomically read-and-advance segments_index, then send the segment to STM.
-        Returns True if a segment was sent, False if we are past the end.
+        Returns True if a segment was sent, False if we are past the end or the
+        mission is halted.
+
+        Uses stm.send_line(), which validates against PROTOCOL.md §2/§4 and
+        sends nothing if the segment is malformed — catching it here costs
+        nothing, catching it on the wire costs a RESEND round trip.
         """
+        if self.halted:
+            logging.warning("Segment pump is halted — not sending.")
+            return False
+
+        malformed = None
+
+        # The index advances ONLY on a successful write. Advancing first and
+        # rolling back on failure would race: three threads can reach this
+        # (Android on BEGIN, PC on PATH, STM on OK/RESEND), and a rolled-back
+        # index could silently skip a segment.
         with self._idx_lock:
             if self.segments_index < 0 or self.segments_index >= len(self.segments):
                 return False
             seg = self.segments[self.segments_index]
-            self.segments_index += 1
+            sent_index = self.segments_index
 
-        cmd = ",".join(seg) + "\n"
-        self.stm.send(cmd)
+            ok, reason = validate_line(list(seg))
+            if ok:
+                if not self.stm.send_line(seg):
+                    # Refused by the §2 in-flight guard: a previous line has not
+                    # been answered yet. NOT a halt — the outstanding reply will
+                    # drive the pump forward on its own. Dropping this attempt is
+                    # exactly the right outcome.
+                    logging.warning(
+                        f"Segment {sent_index} not sent — previous line still "
+                        "awaiting its reply (PROTOCOL.md §2). Ignoring this trigger."
+                    )
+                    return False
+                self.segments_index += 1
+            else:
+                malformed = reason
+
+        if malformed is not None:
+            # A segment the firmware could never parse. Retrying it would just
+            # burn the RESEND budget, so stop here instead.
+            self._halt_mission(
+                f"segment {sent_index} is malformed: {seg} — {malformed}"
+            )
+            return False
+
         logging.info(
             f"STM segment {self.segments_index}/{len(self.segments)} sent: {seg}"
         )
         return True
+
+    # ── Failure handling ───────────────────────────────────────────────────────
+
+    def _halt_mission(self, reason: str) -> None:
+        """
+        Stop the segment pump and report.
+
+        PROTOCOL.md §3: FAIL,* means "the robot is not where you think it is".
+        Continuing to feed segments to a robot whose pose is unknown drives it
+        into obstacles, so the pump stops here and waits for a human or a
+        re-plan rather than pressing on.
+        """
+        if self.halted:
+            return
+        self.halted = True
+        logging.error(f"MISSION HALTED — {reason}")
+
+        # Where does the robot actually think it is? Queries bypass the movement
+        # queue (§5) so this is safe even if a move is still running, and the
+        # answer is exactly what a re-plan needs.
+        pose = self.stm.query("?POSE")
+        stat = self.stm.query("?STAT")
+        logging.error(f"Halt diagnostics — {pose or 'POSE unavailable'} | {stat or 'STAT unavailable'}")
+
+        try:
+            self.android.send("STATUS,FAILED")
+        except OSError as exc:
+            logging.error(f"Could not notify Android of halt: {exc}")
 
     # ── Image detection with retry ────────────────────────────────────────────
 
@@ -278,6 +389,10 @@ class Task1:
 
                     with self._idx_lock:
                         self.segments_index = 0
+                        # A fresh BEGIN clears a previous halt: the operator has
+                        # seen the failure and is restarting deliberately.
+                        self.halted = False
+                        self._resend_counts.clear()
 
                     if not self.path_ready.is_set():
                         logging.info(
@@ -319,6 +434,10 @@ class Task1:
                     with self._idx_lock:
                         self.segments = payload.get("segments", [])
                         self.obstacle_order = payload.get("obstacle_ids", [])
+                        # Optional per-segment map; see _obstacle_for_segment().
+                        # Present when the planner had to split an approach
+                        # across several lines to respect the §2 caps.
+                        self.segment_obstacles = payload.get("segment_obstacles", [])
                         self.directions = payload.get("dirs", [])
                         self.direction_index = 0
 
@@ -384,33 +503,95 @@ class Task1:
         """
         while True:
             try:
-                # wait_receive() blocks — this is fine because stm_thread is dedicated
-                stm_msg = self.stm.wait_receive()
+                # wait_reply() blocks — fine, stm_thread is dedicated to this.
+                # It returns only line-level replies (OK / RESEND / FAIL,*);
+                # query answers are routed separately by the STM reader thread,
+                # so they can never be mistaken for a movement reply here.
+                stm_msg = self.stm.wait_reply()
                 if not stm_msg:
+                    # PROTOCOL.md §11: past the 15s watchdog this is a lost
+                    # link, not a slow move.
+                    if self.started and not self.halted:
+                        self._halt_mission("no reply from STM — link presumed lost")
                     continue
 
+                reply = stm_msg.strip().upper()
                 logging.info(f"STM received: '{stm_msg}'")
 
-                if "RESEND" in stm_msg:
-                    # ── STM detected an error — resend last segment ────────────
+                if reply.startswith("FAIL"):
+                    # ── Move did not complete (§3) ─────────────────────────────
+                    # FAIL,TIMEOUT  → wheel stalled or encoder dead
+                    # FAIL,WRONGWAY → arc rotated away from target, aborted
+                    # FAIL,NOECHO   → FU<n> had no reading; NOTHING MOVED (§4.1)
+                    detail = stm_msg.strip().split(",", 1)[1] if "," in stm_msg else "UNKNOWN"
+
+                    if detail == "NOECHO":
+                        # Worth its own message. The other two mean the pose is
+                        # unknown; this one means the pose is exactly what it
+                        # was, because FU refuses to drive at something it
+                        # cannot see. The firmware dropped the rest of the line
+                        # rather than run it from the wrong place, so the plan
+                        # is still stale and the mission still stops — but the
+                        # thing to go and look at is the ultrasound, not the
+                        # wheels, and a recovery can start from the last known
+                        # pose instead of re-localising.
+                        self._halt_mission(
+                            "STM reported FAIL,NOECHO — FU had no usable ultrasound "
+                            "reading, so nothing moved and the rest of the line was "
+                            "dropped (PROTOCOL.md §4.1). The pose is unchanged. "
+                            "Check the sensor wiring and that something is actually "
+                            "in front of the robot, then resend from here."
+                        )
+                        continue
+
+                    self._halt_mission(
+                        f"STM reported {stm_msg.strip()} — the move did not complete "
+                        f"({detail}). Re-plan from the robot's actual pose."
+                    )
+                    continue
+
+                if reply == "RESEND":
+                    # ── Parse failure: nothing executed, safe to retransmit ────
                     with self._idx_lock:
                         if not self.segments:
                             logging.warning("STM RESEND but no segments loaded yet.")
                             continue
                         last_idx = max(self.segments_index - 1, 0)
                         seg = self.segments[last_idx]
-                    cmd = ",".join(seg) + "\n"
-                    self.stm.send(cmd)
-                    logging.info(f"STM RESEND: retransmitting segment {last_idx}: {seg}.")
 
-                elif "OK" in stm_msg:
+                    count = self._resend_counts.get(last_idx, 0) + 1
+                    self._resend_counts[last_idx] = count
+
+                    if count > self.max_resends:
+                        # PROTOCOL.md §3 — give up and report rather than loop.
+                        self._halt_mission(
+                            f"segment {last_idx} {seg} was RESENDed "
+                            f"{self.max_resends} times and never parsed. The "
+                            "tokens are wrong, not the transmission."
+                        )
+                        continue
+
+                    logging.warning(
+                        f"STM RESEND: retransmitting segment {last_idx} "
+                        f"(attempt {count}/{self.max_resends}): {seg}."
+                    )
+                    self.stm.send_line(seg)
+
+                elif reply == "OK":
                     with self._idx_lock:
                         just_finished = self.segments_index - 1
                         more_to_send = self.segments_index < len(self.segments)
+                        # Cleared on success so a later genuine RESEND on this
+                        # index starts counting from zero again.
+                        self._resend_counts.pop(just_finished, None)
+
+                    if self.halted:
+                        logging.warning("OK received but mission is halted — ignoring.")
+                        continue
 
                     # ── Capture + detect for the obstacle we just reached ──────
-                    if 0 <= just_finished < len(self.obstacle_order):
-                        obstacle_id = str(self.obstacle_order[just_finished])
+                    obstacle_id = self._obstacle_for_segment(just_finished)
+                    if obstacle_id is not None:
                         self._detect_and_send_image(obstacle_id)
 
                     # ── Send next movement segment (or finish) ─────────────────
@@ -422,20 +603,117 @@ class Task1:
                                 "STM OK: expected more segments but none available."
                             )
                     else:
-                        # All done — tell PC to stitch the result images
-                        total = len(self.segments)
-                        self.pc.send(f"STITCH,{total - 1}\n")
+                        # All done — tell PC to stitch the result images.
+                        # Counts IMAGES, not segments: with §2 chunking one
+                        # obstacle can span several segments, so len(segments)
+                        # would over-count.
+                        if self.segment_obstacles:
+                            shots = sum(1 for o in self.segment_obstacles if o is not None)
+                        else:
+                            shots = len(self.obstacle_order) or len(self.segments)
+                        self.pc.send(f"STITCH,{max(shots - 1, 0)}\n")
                         self.android.send("STATUS,DONE")
                         logging.info("All segments complete — STITCH sent to PC.")
 
                 else:
-                    # Some boards send intermediate status strings — log and ignore
-                    logging.debug(f"STM: unhandled message '{stm_msg}'.")
+                    # classify_reply() only routes OK / RESEND / FAIL,* here, so
+                    # anything else means the firmware and PROTOCOL.md have
+                    # drifted apart. Worth a warning, not a silent debug line.
+                    logging.warning(
+                        f"STM: unexpected line-level reply '{stm_msg}' — not one of "
+                        "OK / RESEND / FAIL,* (PROTOCOL.md §3)."
+                    )
 
             except OSError as exc:
                 logging.error(f"STM thread OSError: {exc}")
 
     # ══ Entry point ═══════════════════════════════════════════════════════════
+
+    def _stm_startup_check(self) -> None:
+        """
+        PROTOCOL.md §10 stage 5 — prove the link before trusting it with motion.
+
+        ?VER costs one round trip and distinguishes "the firmware is alive and
+        talking a protocol version we know" from "the port opened but nothing
+        is listening", which otherwise only shows up as a mysteriously silent
+        first move. It is also the only way to find out whether FU<n> exists
+        before a segment containing one earns a RESEND.
+
+        Runs BEFORE the segment pump starts, so sending !PROF here cannot
+        collide with a movement OK (see STM.set_profile).
+        """
+        ver = self.stm.query("?VER")
+        if ver is None:
+            logging.warning(
+                "STM: no answer to ?VER. The link may be dead, or the board may be "
+                "on USB Port 1 (UART1, download only — the firmware never transmits "
+                "there). See PROTOCOL.md §1."
+            )
+        else:
+            logging.info(f"STM: {ver}")
+            fields = ver.split(",")
+            proto = fields[2].strip() if len(fields) >= 3 else ""
+            # This client implements protocol 3. Every version is a pure
+            # SUPERSET of the one before — the movement tokens are byte-for-byte
+            # identical back to v1 — so an older firmware is a CAPABILITY gap,
+            # not an incompatibility, and saying so is more useful than a flat
+            # version-mismatch warning that would cry wolf on a board that runs
+            # Task 1 perfectly well.
+            #
+            # The gap that can actually bite is FU<n>: on v1 or v2 it is still a
+            # reserved token, so a segment containing one is a parse failure and
+            # the WHOLE line RESENDs. That is a silent planning bug if nobody is
+            # told, hence the explicit warning rather than an info line.
+            try:
+                proto_num = int(proto)
+            except ValueError:
+                proto_num = -1
+
+            if proto_num < 0:
+                logging.warning(
+                    f"STM: could not read a protocol version out of {ver!r} — "
+                    "re-read PROTOCOL.md §5."
+                )
+            elif proto_num < CAL_MIN_PROTOCOL:
+                logging.info(
+                    f"STM: firmware is protocol {proto_num}. Movement is "
+                    "unaffected, but ?CAL and the !CAL* setters will RESEND "
+                    "(PROTOCOL.md §7)."
+                )
+            elif proto_num < FU_MIN_PROTOCOL:
+                logging.warning(
+                    f"STM: firmware is protocol {proto_num}. Movement and "
+                    "calibration are fine, but FU<n> is still RESERVED there — "
+                    "any segment containing one will RESEND the entire line "
+                    "(PROTOCOL.md §9). Plan with F0 or flash a v"
+                    f"{FU_MIN_PROTOCOL} build."
+                )
+            elif proto_num > PROTOCOL_VERSION:
+                logging.warning(
+                    f"STM: firmware reports protocol {proto_num}, newer than "
+                    f"the {PROTOCOL_VERSION} this client implements. Anything "
+                    "it added is unused here — re-read PROTOCOL.md."
+                )
+
+        if self.arc_profile is None:
+            # No !PROF sent: the firmware's selected profile stands. Ask what it
+            # is rather than assume, so the planner's radius can be checked
+            # against reality instead of against a guess.
+            stat = self.stm.query("?STAT")
+            if stat:
+                logging.info(f"STM: {stat} (arc profile is the last field — §5).")
+            logging.info(
+                "STM: no !PROF sent — running the firmware's own profile "
+                "(default TIGHT, radius 291mm)."
+            )
+        elif self.stm.set_profile(self.arc_profile):
+            logging.info(f"STM: arc profile set to {self.arc_profile}.")
+        else:
+            logging.warning(
+                f"STM: could not set arc profile {self.arc_profile} — the firmware "
+                "keeps whatever it had. If the planner assumed a different radius, "
+                "its turns will land short or long."
+            )
 
     def start(self) -> None:
         """
@@ -448,6 +726,7 @@ class Task1:
         # ── Connections (order matters: BT can take time) ──────────────────
         logging.info("Connecting to STM32…")
         self.stm.connect()
+        self._stm_startup_check()
 
         logging.info("Starting Bluetooth server (waiting for Android)…")
         self.android.start()          # non-blocking; background accept loop starts
