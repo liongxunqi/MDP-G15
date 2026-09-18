@@ -257,3 +257,75 @@ authoritative wherever it disagrees with this table.
 | `DETECT_RETRY_DELAY_S` | 0.2 | Wait between retries |
 | `DETECT_TIMEOUT_S` | 0.5 | How long to wait for OBJECT reply per attempt |
 | `DEBOUNCE_DELAY_S` | 1.0 | How long after last obstacle before auto-sending to PC |
+
+---
+
+## Checklist A.5 — navigate around the obstacle
+
+**RPi only.** No PC, no Android, no pathfinding — `compute_path()` is never
+called. A.5 is one obstacle and a reactive loop, so it has its own entry point
+rather than a special case inside Task 1.
+
+```bash
+python3 task_a5.py              # full run
+python3 task_a5.py --dry-run    # no motion: proves link + camera + YOLO
+python3 task_a5.py --faces 2    # give up after 2 faces
+```
+
+Exit codes: `0` found a valid image, `1` went round every face without one,
+`2` something broke (link, camera, or a `FAIL,*` from the STM).
+
+### The loop
+
+| Step | What happens |
+|---|---|
+| APPROACH | `?US` to confirm something is there, then `FU` to the camera standoff |
+| LOOK | Capture a still, run YOLO on the Pi (`vision.py`) |
+| DECIDE | A **bullseye** is the marker, not a target — it means right obstacle, wrong face. So does nothing at all, and so does a detection under `A5_MIN_CONFIDENCE` |
+| ORBIT | Drive round to the next face, re-acquire the standoff, look again |
+
+### One-time setup
+
+YOLO runs on the Pi for this task, which `requirements_rpi.txt` does not cover:
+
+```bash
+pip install ultralytics
+```
+
+That pulls in torch and is a large, slow install on a Pi. Weights default to
+`pc_side/weights/best.pt`; point `A5_WEIGHTS` elsewhere if yours moved.
+
+### Tuning — read this before the first run
+
+Everything is in `.env` (`A5_*`). The one that matters is **`A5_ORBIT`**, the
+face-to-face manoeuvre. The default
+
+```
+R20,FR90,FL90,R37,FL90
+```
+
+is derived on paper from a 291 mm arc radius, a 25 cm standoff and a 10 cm
+block — the geometry is traced step by step in the comment above `ORBIT_LINE`
+in `task_a5.py`. It is a **starting point, not a measured value.**
+
+Two things make tuning easier than it looks:
+
+* **`FU` re-acquires the standoff at every face**, so distance error does not
+  accumulate across the orbit. Only the **lateral** alignment does — that is
+  the number to chase with a tape measure.
+* The orbit is one line of five primitives, so it is one round trip, and you
+  can try a new manoeuvre by editing `.env` alone — no code change.
+
+The default deliberately uses a straight reverse (`R`) rather than a reverse
+**arc** (`RR`/`RL`). Reverse arcs are implemented in the firmware but have
+never been run on the floor, and the sign convention is still marked *"VERIFY
+THIS ON THE ROBOT"*. A tighter segmented orbit becomes available once they are
+trusted — note the trap that to *continue* a right turn after `FR` you want
+`RL`, not `RR`.
+
+### Before you trust any of it
+
+`task_a5.py` checks `?VER` at startup and refuses to run against firmware older
+than protocol v3, because `FU` is what the whole approach rests on. If the STM
+link has never been proven on the wire, run `python3 test_stm.py --bringup`
+first — it fails faster and tells you more.
