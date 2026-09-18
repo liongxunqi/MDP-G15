@@ -236,7 +236,12 @@ class Task1:
 
         logging.info(
             f"STM segment {self.segments_index}/{len(self.segments)} sent: {seg}"
-        )
+        ) 
+        # for individual segments when they start running
+        try:
+            self.android.send(f"STATUS,RUNNING,{self.segments_index},{len(self.segments)}")
+        except OSError as exc:
+            logging.warning(f"Could not notify Android of running status: {exc}")
         return True
 
     # ── Failure handling ───────────────────────────────────────────────────────
@@ -401,6 +406,16 @@ class Task1:
                         )
                         continue
 
+                    with self._idx_lock:
+                        if self.directions:
+                            start_pose = self.directions[0]
+                            try:
+                                self.android.send(
+                                    f"STATUS,START,{start_pose['x']},{start_pose['y']},{start_pose['dir']}"
+                                )
+                            except OSError as exc:
+                                logging.warning(f"Could not notify Android of start position: {exc}")
+
                     if not self._send_next_segment():
                         logging.warning("Android: BEGIN received but no segments to send.")
 
@@ -451,6 +466,15 @@ class Task1:
                     # If Android already sent BEGIN but PATH hadn't arrived yet,
                     # kick off the first segment now
                     if self.started and self.segments_index == 0:
+                        with self._idx_lock:
+                            if self.directions:
+                                start_pose = self.directions[0]
+                                try:
+                                    self.android.send(
+                                        f"STATUS,START,{start_pose['x']},{start_pose['y']},{start_pose['dir']}"
+                                    )
+                                except OSError as exc:
+                                    logging.warning(f"Could not notify Android of start position: {exc}")
                         if not self._send_next_segment():
                             logging.warning("PC: PATH arrived but no segments to send.")
 
