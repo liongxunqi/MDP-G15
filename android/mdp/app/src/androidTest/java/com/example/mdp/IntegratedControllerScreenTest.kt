@@ -39,6 +39,7 @@ class IntegratedControllerScreenTest {
     private var connectClicks = 0
     private lateinit var commandLog: CommandLog
     private var connected by mutableStateOf(false)
+    private var robotStatusText by mutableStateOf("Awaiting robot status")
     private val movement = mutableListOf<String>()
 
     @Before
@@ -48,6 +49,7 @@ class IntegratedControllerScreenTest {
         connectClicks = 0
         commandLog = CommandLog()
         connected = false
+        robotStatusText = "Awaiting robot status"
         movement.clear()
     }
 
@@ -57,7 +59,8 @@ class IntegratedControllerScreenTest {
 
         composeRule.onNodeWithText("Bluetooth").assertIsDisplayed()
         composeRule.onNodeWithText("▲ Forward").assertIsNotEnabled()
-        composeRule.onNodeWithText("Stop robot").assertIsNotEnabled()
+        composeRule.onNodeWithText("■ Stop").assertIsNotEnabled()
+        composeRule.onNodeWithText("Stop robot").assertDoesNotExist()
         capture("controls")
         composeRule.onNodeWithText("Connect").performClick()
 
@@ -77,15 +80,16 @@ class IntegratedControllerScreenTest {
     }
 
     @Test
-    fun arenaCollectsMessagesWhileControlsAreVisible() {
+    fun robotStatusIsSharedByControlsAndArena() {
         setScreen()
-        composeRule.waitForIdle()
-
-        assertTrue(incoming.tryEmit("STATUS,Exploring"))
-        composeRule.waitForIdle()
+        composeRule.onNodeWithText("Awaiting robot status").assertIsDisplayed()
+        composeRule.runOnIdle { robotStatusText = "Exploring" }
+        composeRule.onNodeWithText("Exploring").assertIsDisplayed()
         composeRule.onNodeWithText("Arena").performClick()
 
         composeRule.onNodeWithText("Exploring").assertIsDisplayed()
+        composeRule.onNodeWithText("20 × 20", substring = true).assertDoesNotExist()
+        composeRule.onNodeWithText("Latest action").assertIsDisplayed()
     }
 
     @Test
@@ -155,10 +159,9 @@ class IntegratedControllerScreenTest {
         composeRule.onNodeWithText("▼ Reverse").assertIsEnabled()
         for (tab in listOf("Arena", "Logs")) {
             composeRule.onNodeWithText(tab).performClick()
-            composeRule.onNodeWithText("Pose: (5, 18) N · 0 obstacles").assertIsDisplayed()
-            composeRule.onNodeWithText("Stop robot").assertIsEnabled().performClick()
+            composeRule.onNodeWithText("Stop robot").assertDoesNotExist()
         }
-        assertEquals(listOf("s", "s"), movement.takeLast(2))
+        assertEquals(1, movement.count { it == "s" })
     }
 
     @Test
@@ -191,7 +194,7 @@ class IntegratedControllerScreenTest {
         composeRule.waitForIdle()
         assertEquals(1, outbound.size)
         assertTrue(outbound.single().startsWith("CLEAR\nOBSTACLE,1,"))
-        composeRule.onNodeWithText("Map delivery unconfirmed", substring = true).assertIsDisplayed()
+        composeRule.onNodeWithText("Map delivery unconfirmed", substring = true).assertDoesNotExist()
         composeRule.runOnIdle { connected = false }
         composeRule.waitForIdle()
         composeRule.onNodeWithText("N").performClick()
@@ -243,7 +246,7 @@ class IntegratedControllerScreenTest {
             val logs by commandLog.entries.collectAsState()
             IntegratedControllerScreen(
                 status = if (connected) "Connected to test robot" else "Disconnected",
-                robotStatus = "—",
+                robotStatus = robotStatusText,
                 isConnected = connected,
                 isBusy = false,
                 permissionsGranted = true,

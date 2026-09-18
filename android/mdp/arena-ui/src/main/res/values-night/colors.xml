@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Axis labels sit outside the light arena surface, directly on the dark card. -->
+    <color name="arena_axis_text">#D7E7F0</color>
+</resources>

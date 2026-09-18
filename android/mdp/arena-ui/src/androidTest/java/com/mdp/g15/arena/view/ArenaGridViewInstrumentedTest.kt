@@ -192,6 +192,33 @@ class ArenaGridViewInstrumentedTest {
     }
 
     @Test
+    fun viewportResizeReturnsToCenteredFit() {
+        val context = ApplicationProvider.getApplicationContext<android.content.Context>()
+        val view = createView(context)
+        val added = AtomicReference<GridCoordinate?>()
+        view.interactionListener = object : ArenaInteractionListener {
+            override fun onAddObstacle(position: GridCoordinate) = added.set(position)
+            override fun onSelectObstacle(obstacleId: Int?) = Unit
+            override fun onMoveObstacle(obstacleId: Int, destination: GridCoordinate) = Unit
+            override fun onRemoveObstacle(obstacleId: Int) = Unit
+            override fun onMoveRobot(destination: GridCoordinate) = Unit
+        }
+
+        onMain {
+            prepare(view, ArenaState(), placementMode = true)
+            view.zoomIn()
+            view.measure(
+                android.view.View.MeasureSpec.makeMeasureSpec(1000, android.view.View.MeasureSpec.EXACTLY),
+                android.view.View.MeasureSpec.makeMeasureSpec(800, android.view.View.MeasureSpec.EXACTLY),
+            )
+            view.layout(0, 0, 1000, 800)
+            dispatchTap(view, 500f, 400f)
+        }
+
+        assertTrue(added.get() == GridCoordinate(10, 9))
+    }
+
+    @Test
     fun draggedObstacleKeepsItsTargetFaceEdge() {
         val context = ApplicationProvider.getApplicationContext<android.content.Context>()
         val view = createView(context)
@@ -258,11 +285,10 @@ class ArenaGridViewInstrumentedTest {
     ): Pair<Float, Float> {
         val density = context.resources.displayMetrics.density
         val axisPadding = 30f * density
-        val outerPadding = 8f * density
-        val cellSize = (VIEW_SIZE - axisPadding - outerPadding) / 20f
+        val cellSize = (VIEW_SIZE - axisPadding * 2f) / 20f
         val x = axisPadding + (coordinate.x + 0.5f) * cellSize
         val displayRow = 19 - coordinate.y
-        val y = outerPadding + (displayRow + 0.5f) * cellSize
+        val y = axisPadding + (displayRow + 0.5f) * cellSize
         return x to y
     }
 

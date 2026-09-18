@@ -68,7 +68,7 @@ class ArenaGridView @JvmOverloads constructor(
                 panY = detector.focusY - contentY * scale
                 lastFocusX = detector.focusX
                 lastFocusY = detector.focusY
-                clampPan()
+                if (scale == MIN_SCALE) resetToFit() else clampPan()
                 invalidate()
                 return true
             }
@@ -155,7 +155,7 @@ class ArenaGridView @JvmOverloads constructor(
     override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
         super.onSizeChanged(w, h, oldw, oldh)
         updateGeometry(w, h)
-        clampPan()
+        resetToFit()
     }
 
     override fun onDraw(canvas: Canvas) {
@@ -527,10 +527,21 @@ class ArenaGridView @JvmOverloads constructor(
         val contentX = toContentX(centerX)
         val contentY = toContentY(centerY)
         scale = newScale.coerceIn(MIN_SCALE, MAX_SCALE)
+        if (scale == MIN_SCALE) {
+            resetToFit()
+            invalidate()
+            return
+        }
         panX = centerX - contentX * scale
         panY = centerY - contentY * scale
         clampPan()
         invalidate()
+    }
+
+    private fun resetToFit() {
+        scale = MIN_SCALE
+        panX = 0f
+        panY = 0f
     }
 
     private fun buildContentDescription(state: ArenaState): String {

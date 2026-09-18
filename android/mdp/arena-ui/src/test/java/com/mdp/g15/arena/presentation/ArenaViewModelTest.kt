@@ -50,11 +50,25 @@ class ArenaViewModelTest {
     fun `selective status ignores unrelated message`() = runTest(dispatcher) {
         viewModel.accept("MOVE,10,FORWARD")
         advanceUntilIdle()
-        assertEquals("Ready to start", viewModel.uiState.value.status)
+        assertEquals("Awaiting robot status", viewModel.uiState.value.status)
 
         viewModel.accept("STATUS,Looking for target 2")
         advanceUntilIdle()
         assertEquals("Looking for target 2", viewModel.uiState.value.status)
+    }
+
+    @Test
+    fun `routine status and robot telemetry preserve latest editing feedback`() = runTest(dispatcher) {
+        viewModel.setPlacementMode(true)
+        val feedback = viewModel.uiState.value.feedback
+
+        viewModel.accept("STATUS,Moving")
+        viewModel.accept("ROBOT,7,2,W")
+        advanceUntilIdle()
+
+        assertEquals("Moving", viewModel.uiState.value.status)
+        assertEquals(feedback, viewModel.uiState.value.feedback)
+        assertEquals(GridCoordinate(7, 2), viewModel.uiState.value.arena.robot?.position)
     }
 
     @Test

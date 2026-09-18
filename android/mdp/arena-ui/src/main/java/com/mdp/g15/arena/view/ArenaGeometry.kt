@@ -4,6 +4,7 @@ import com.mdp.g15.arena.domain.ArenaConfig
 import com.mdp.g15.arena.domain.GridCoordinate
 import com.mdp.g15.arena.domain.footprint
 import kotlin.math.floor
+import kotlin.math.max
 import kotlin.math.min
 
 data class CellBounds(
@@ -38,13 +39,16 @@ class ArenaGeometry {
         outerPadding: Float,
     ) {
         this.config = config
-        val availableWidth = (viewWidth - axisPadding - outerPadding).coerceAtLeast(0f)
-        val availableHeight = (viewHeight - axisPadding - outerPadding).coerceAtLeast(0f)
+        // Reserve the same label-safe inset on every side. This keeps the square
+        // arena visually centred even though labels are drawn only left/bottom.
+        val contentPadding = max(axisPadding, outerPadding)
+        val availableWidth = (viewWidth - contentPadding * 2f).coerceAtLeast(0f)
+        val availableHeight = (viewHeight - contentPadding * 2f).coerceAtLeast(0f)
         cellSize = min(availableWidth / config.columns, availableHeight / config.rows)
         arenaWidth = cellSize * config.columns
         arenaHeight = cellSize * config.rows
-        arenaLeft = axisPadding + ((availableWidth - arenaWidth) / 2f)
-        arenaTop = outerPadding + ((availableHeight - arenaHeight) / 2f)
+        arenaLeft = contentPadding + ((availableWidth - arenaWidth) / 2f)
+        arenaTop = contentPadding + ((availableHeight - arenaHeight) / 2f)
     }
 
     fun coordinateAt(x: Float, y: Float): GridCoordinate? {

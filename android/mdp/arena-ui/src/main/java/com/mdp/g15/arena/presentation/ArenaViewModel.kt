@@ -192,8 +192,6 @@ class ArenaViewModel(
                 _uiState.value = _uiState.value.copy(
                     status = event.text,
                     statusHistory = history,
-                    feedback = "Status updated.",
-                    feedbackIsError = false,
                 )
                 persist()
             }
@@ -218,8 +216,6 @@ class ArenaViewModel(
                 ) { state ->
                     _uiState.value = _uiState.value.copy(
                         arena = state,
-                        feedback = "Robot pose updated.",
-                        feedbackIsError = false,
                     )
                     persist()
                 }
@@ -281,7 +277,7 @@ class ArenaViewModel(
             ?.coerceAtLeast((obstacles.keys.maxOrNull() ?: 0) + 1)
             ?: ((obstacles.keys.maxOrNull() ?: 0) + 1)
         val selected = savedStateHandle.get<Int>(KEY_SELECTED)?.takeIf(obstacles::containsKey)
-        val status = savedStateHandle.get<String>(KEY_STATUS).orEmpty().ifBlank { "Ready to start" }
+        val status = savedStateHandle.get<String>(KEY_STATUS).orEmpty().ifBlank { "Awaiting robot status" }
         return ArenaUiState(
             arena = ArenaState(
                 robot = robot,

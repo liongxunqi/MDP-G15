@@ -1,17 +1,10 @@
 package com.example.mdp
 
-import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.padding
-import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Surface
-import androidx.compose.material3.Button
-import androidx.compose.material3.ButtonDefaults
-import androidx.compose.ui.unit.dp
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.PrimaryTabRow
 import androidx.compose.material3.Tab
 import androidx.compose.material3.Text
@@ -93,28 +86,6 @@ fun IntegratedControllerScreen(
         arenaReducer.canMoveRobot(arenaState.arena, robot.position.step(robot.direction.opposite()))
 
     Column(modifier = modifier.fillMaxSize()) {
-        Surface(color = MaterialTheme.colorScheme.primaryContainer) {
-            Row(
-                Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
-                horizontalArrangement = Arrangement.spacedBy(12.dp),
-                verticalAlignment = androidx.compose.ui.Alignment.CenterVertically,
-            ) {
-                Column(Modifier.weight(1f)) {
-                    Text(status, style = MaterialTheme.typography.labelLarge)
-                    Text("Robot: $robotStatus", style = MaterialTheme.typography.bodySmall)
-                    Text(arenaState.obstacleSyncStatus, style = MaterialTheme.typography.bodySmall)
-                    Text(
-                        robot?.let { "Pose: (${it.position.x}, ${it.position.y}) ${it.direction.wireValue} · ${arenaState.arena.obstacles.size} obstacles" }
-                            ?: "Pose: awaiting telemetry · ${arenaState.arena.obstacles.size} obstacles",
-                        style = MaterialTheme.typography.bodySmall,
-                    )
-                }
-                Button(
-                    onClick = onStop, enabled = isConnected,
-                    colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error),
-                ) { Text("Stop robot") }
-            }
-        }
         PrimaryTabRow(selectedTabIndex = selectedTab) {
             ControllerTab.entries.forEach { tab ->
                 Tab(
@@ -171,6 +142,7 @@ fun IntegratedControllerScreen(
 
                 ControllerTab.ARENA -> ArenaScreen(
                     viewModel = arenaViewModel,
+                    robotStatus = robotStatus,
                     modifier = Modifier.fillMaxSize(),
                 )
             }
