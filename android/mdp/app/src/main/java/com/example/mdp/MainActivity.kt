@@ -159,6 +159,7 @@ class MainActivity : ComponentActivity() {
                         onBackLeft = viewModel::backLeft,
                         onBackRight = viewModel::backRight,
                         onBegin = viewModel::begin,
+                        onPath = viewModel::path,
                         incomingMessages = viewModel.incoming,
                         onArenaOutbound = viewModel::sendArenaMessage,
                         modifier = Modifier.padding(innerPadding),
@@ -264,6 +265,7 @@ fun ControllerScreen(
     onBackLeft: () -> Unit,
     onBackRight: () -> Unit,
     onBegin: () -> Unit,
+    onPath: () -> Unit,
     forwardEnabled: Boolean = true,
     reverseEnabled: Boolean = true,
     modifier: Modifier = Modifier,
@@ -317,6 +319,9 @@ fun ControllerScreen(
                     Text("Manual control", style = MaterialTheme.typography.titleMedium)
                     Button(onClick = onBegin, enabled = isConnected, modifier = Modifier.fillMaxWidth()) {
                         Text("Begin")
+                    }
+                    Button(onClick = onPath, enabled = isConnected, modifier = Modifier.fillMaxWidth()) {
+                        Text("Send Path")
                     }
                     DPad(
                         enabled = isConnected,
@@ -469,6 +474,7 @@ fun ControllerScreenPreview() {
             onBackLeft = {},
             onBackRight = {},
             onBegin = {},
+            onPath = {},
         )
     }
 }

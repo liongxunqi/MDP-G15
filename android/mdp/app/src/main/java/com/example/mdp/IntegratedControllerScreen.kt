@@ -52,6 +52,7 @@ fun IntegratedControllerScreen(
     onBackLeft: () -> Unit,
     onBackRight: () -> Unit,
     onBegin: () -> Unit,
+    onPath: () -> Unit,
     incomingMessages: Flow<String>,
     onArenaOutbound: (String) -> Unit,
     modifier: Modifier = Modifier,
@@ -135,6 +136,7 @@ fun IntegratedControllerScreen(
                     onBackLeft = onBackLeft,
                     onBackRight = onBackRight,
                     onBegin = onBegin,
+                    onPath = onPath,
                     modifier = Modifier.fillMaxSize(),
                 )
 

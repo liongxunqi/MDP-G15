@@ -6,7 +6,7 @@ import org.junit.Test
 class ChecklistProtocolTest {
     @Test fun `every command is delimited for the RPi stream reader`() {
         assertEquals("\n", bluetoothPayload(""))
-        assertEquals(listOf("f\n", "r\n", "tl\n", "tr\n", "s\n", "fl\n", "fr\n", "bl\n", "br\n", "BEGIN\n"), RobotCommand.entries.map { bluetoothPayload(it.wire) })
+        assertEquals(listOf("f\n", "r\n", "tl\n", "tr\n", "s\n", "fl\n", "fr\n", "bl\n", "br\n", "BEGIN\n", "PATH\n"), RobotCommand.entries.map { bluetoothPayload(it.wire) })
         assertEquals("CLEAR\nOBSTACLE,1,30,40,NORTH\n", bluetoothPayload("CLEAR\nOBSTACLE,1,30,40,NORTH"))
         assertEquals("BEGIN\n", bluetoothPayload("BEGIN\n"))
     }

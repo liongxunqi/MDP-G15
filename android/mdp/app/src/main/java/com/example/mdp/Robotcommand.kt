@@ -20,4 +20,5 @@ enum class RobotCommand(val wire: String) {
     BACK_LEFT("bl"),
     BACK_RIGHT("br"),
     BEGIN("BEGIN"),
+    PATH("PATH"),
 }

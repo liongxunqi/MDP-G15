@@ -148,10 +148,10 @@ class IntegratedControllerScreenTest {
             composeRule.onNodeWithText(label).performScrollTo().performClick()
         }
         assertEquals(listOf("f", "tl", "tr", "r", "s"), movement)
-        for (label in listOf("↖ Forward left", "Forward right ↗", "↙ Back left", "Back right ↘", "Begin")) {
+        for (label in listOf("↖ Forward left", "Forward right ↗", "↙ Back left", "Back right ↘", "Begin", "Send Path")) {
             composeRule.onNodeWithText(label).performScrollTo().performClick()
         }
-        assertEquals(listOf("fl", "fr", "bl", "br", "BEGIN"), movement.takeLast(5))
+        assertEquals(listOf("fl", "fr", "bl", "br", "BEGIN", "PATH"), movement.takeLast(6))
         capture("checklist-connected-controls")
         assertTrue(incoming.tryEmit("ROBOT,5,18,N"))
         composeRule.waitForIdle()
@@ -265,6 +265,7 @@ class IntegratedControllerScreenTest {
                 onBackLeft = { movement.add("bl") },
                 onBackRight = { movement.add("br") },
                 onBegin = { movement.add("BEGIN") },
+                onPath = { movement.add("PATH") },
                 incomingMessages = incoming,
                 onArenaOutbound = outbound::add,
             )
