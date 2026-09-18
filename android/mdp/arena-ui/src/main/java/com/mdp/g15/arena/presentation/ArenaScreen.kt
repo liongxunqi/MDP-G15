@@ -1,13 +1,13 @@
 package com.mdp.g15.arena.presentation
 
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.material3.CardDefaults
 import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -31,6 +31,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.testTag
@@ -92,6 +93,7 @@ fun ArenaScreen(
                 )
             }
         } else {
+            val arenaHeight = minOf(maxWidth - 24.dp, (maxHeight * 0.52f).coerceAtLeast(300.dp))
             Column(
                 modifier = Modifier
                     .fillMaxSize()
@@ -102,9 +104,7 @@ fun ArenaScreen(
                 ArenaCanvas(
                     state = state,
                     interactions = interactions,
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .aspectRatio(1f),
+                    modifier = Modifier.fillMaxWidth().height(arenaHeight),
                 )
                 ArenaStatusPanel(
                     state = state,
@@ -144,40 +144,46 @@ private fun ArenaCanvas(
 ) {
     var gridView by remember { mutableStateOf<ArenaGridView?>(null) }
 
-    Box(modifier = modifier) {
-        AndroidView(
-            factory = { context ->
-                ArenaGridView(context).apply {
-                    interactionListener = interactions
-                    gridView = this
-                }
-            },
-            update = { view ->
-                view.interactionListener = interactions
-                view.render(state.arena, state.placementMode)
-            },
-            onRelease = { view ->
-                view.interactionListener = null
-                gridView = null
-            },
-            modifier = Modifier.fillMaxSize().testTag("arena_grid"),
-        )
-        Row(
-            modifier = Modifier
-                .align(Alignment.BottomEnd)
-                .padding(8.dp),
-            horizontalArrangement = Arrangement.spacedBy(4.dp),
-        ) {
-            OutlinedButton(
-                onClick = { gridView?.zoomOut() },
-                modifier = Modifier.size(40.dp),
-                contentPadding = PaddingValues(0.dp),
-            ) { Text("−") }
-            OutlinedButton(
-                onClick = { gridView?.zoomIn() },
-                modifier = Modifier.size(40.dp),
-                contentPadding = PaddingValues(0.dp),
-            ) { Text("+") }
+    Card(
+        modifier = modifier.testTag("arena_grid_card"),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+    ) {
+        Column(modifier = Modifier.fillMaxSize().clipToBounds()) {
+            AndroidView(
+                factory = { context ->
+                    ArenaGridView(context).apply {
+                        interactionListener = interactions
+                        gridView = this
+                    }
+                },
+                update = { view ->
+                    view.interactionListener = interactions
+                    view.render(state.arena, state.placementMode)
+                },
+                onRelease = { view ->
+                    view.interactionListener = null
+                    gridView = null
+                },
+                modifier = Modifier.fillMaxWidth().weight(1f).testTag("arena_grid"),
+            )
+            Row(
+                modifier = Modifier
+                    .align(Alignment.End)
+                    .padding(horizontal = 8.dp, vertical = 4.dp),
+                horizontalArrangement = Arrangement.spacedBy(4.dp),
+            ) {
+                OutlinedButton(
+                    onClick = { gridView?.zoomOut() },
+                    modifier = Modifier.height(40.dp),
+                    contentPadding = PaddingValues(horizontal = 12.dp),
+                ) { Text("− Zoom out") }
+                OutlinedButton(
+                    onClick = { gridView?.zoomIn() },
+                    modifier = Modifier.height(40.dp),
+                    contentPadding = PaddingValues(horizontal = 12.dp),
+                ) { Text("+ Zoom in") }
+            }
         }
     }
 }
@@ -190,20 +196,32 @@ private fun ArenaStatusPanel(
     modifier: Modifier = Modifier,
 ) {
     val selected = state.arena.selectedObstacle
-    Card(modifier = modifier) {
+    Card(
+        modifier = modifier,
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+    ) {
         Column(
             modifier = Modifier.padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
             Text("Arena status", style = MaterialTheme.typography.titleLarge)
-            StatusValue("Robot status", state.status)
-            StatusValue(
-                "Robot pose",
-                state.arena.robot?.let {
-                    "(${it.position.x}, ${it.position.y}) • ${it.direction.name}"
-                } ?: "Not available",
+            Text(
+                "20 × 20 grid · 2 × 2 robot. Hold and drag to move; drag obstacles outside the map to remove. Invalid robot drops keep its pose.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
-            StatusValue("Obstacles", state.arena.obstacles.size.toString())
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                StatusValue("Robot status", state.status, Modifier.weight(1f))
+                StatusValue(
+                    "Robot pose",
+                    state.arena.robot?.let {
+                        "(${it.position.x}, ${it.position.y}) • ${it.direction.name}"
+                    } ?: "Not available",
+                    Modifier.weight(1f),
+                )
+                StatusValue("Obstacles", state.arena.obstacles.size.toString(), Modifier.weight(0.6f))
+            }
             StatusValue(
                 "Selected obstacle",
                 selected?.let {
@@ -273,9 +291,9 @@ private fun ArenaStatusPanel(
 }
 
 @Composable
-private fun StatusValue(label: String, value: String) {
-    Column {
-        Text(label, style = MaterialTheme.typography.labelMedium)
+private fun StatusValue(label: String, value: String, modifier: Modifier = Modifier) {
+    Column(modifier) {
+        Text(label, style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
         Text(value, style = MaterialTheme.typography.bodyLarge)
     }
 }

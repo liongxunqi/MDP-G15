@@ -110,6 +110,9 @@ class ArenaReducer {
                 "Robot footprint at (${pose.position.x}, ${pose.position.y}) doesn't fit inside the arena.",
             )
         }
+        if (state.obstacles.values.any { it.position in cells }) {
+            return ArenaReduction.Failure("Robot footprint overlaps an obstacle.")
+        }
         return ArenaReduction.Success(state.copy(robot = pose))
     }
 

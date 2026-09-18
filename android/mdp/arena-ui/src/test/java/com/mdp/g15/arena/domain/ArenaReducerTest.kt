@@ -118,6 +118,32 @@ class ArenaReducerTest {
         assertTrue(result is ArenaReduction.Failure)
     }
 
+    @Test
+    fun `all four robot cells reject obstacles and received poses reject collisions`() {
+        val pose = RobotPose(GridCoordinate(5, 5), Direction.NORTH)
+        val state = ArenaState(robot = pose, obstacles = mapOf(1 to Obstacle(1, GridCoordinate(0, 0))))
+        assertEquals(2, state.config.robotFootprintCells)
+        for (cell in pose.position.footprint(2)) {
+            assertTrue(reducer.reduce(state, ArenaAction.AddObstacle(cell)) is ArenaReduction.Failure)
+            assertTrue(reducer.reduce(state, ArenaAction.MoveObstacle(1, cell)) is ArenaReduction.Failure)
+            val occupied = ArenaState(obstacles = mapOf(1 to Obstacle(1, cell)))
+            assertTrue(reducer.reduce(occupied, ArenaAction.ApplyRobotPose(pose)) is ArenaReduction.Failure)
+            assertFalse(reducer.canMoveRobot(occupied.copy(robot = RobotPose(GridCoordinate(0, 0), Direction.NORTH)), pose.position))
+        }
+        assertTrue(reducer.reduce(state, ArenaAction.AddObstacle(GridCoordinate(7, 5))) is ArenaReduction.Success)
+    }
+
+    @Test
+    fun `invalid robot moves preserve the last valid pose at every edge`() {
+        val pose = RobotPose(GridCoordinate(5, 5), Direction.EAST)
+        val state = ArenaState(robot = pose)
+        for (destination in listOf(GridCoordinate(-1, 5), GridCoordinate(5, -1), GridCoordinate(19, 5), GridCoordinate(5, 19))) {
+            assertTrue(reducer.reduce(state, ArenaAction.MoveRobot(destination)) is ArenaReduction.Failure)
+            assertEquals(pose, state.robot)
+        }
+        assertTrue(reducer.canMoveRobot(state, GridCoordinate(18, 18)))
+    }
+
     private fun ArenaReducer.success(state: ArenaState, action: ArenaAction): ArenaState =
         (reduce(state, action) as ArenaReduction.Success).state
 }

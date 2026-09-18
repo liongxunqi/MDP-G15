@@ -11,8 +11,10 @@ or manual movement commands.
 - Coordinates use a bottom-left origin: `x` increases left-to-right and `y` increases
   bottom-to-top.
 - An obstacle occupies one cell and keeps a stable positive ID for the arena session.
-- The robot is rendered as a directional pose at one received coordinate; this module
-  does not simulate movement or enforce a robot collision footprint.
+- The robot occupies 2×2 cells anchored at its bottom-left coordinate. Placement,
+  dragging and received poses enforce this footprint's bounds and obstacle collisions.
+  Display-only interpolation smooths clear straight segments and turns; it does not
+  predict movement or issue commands.
 
 ## Messages
 
@@ -26,11 +28,13 @@ TARGET,<obstacleId>,<targetId>,<N|E|S|W>
 ROBOT,<x>,<y>,<N|E|S|W>
 ```
 
+Target messages also accept the briefing's `B`-prefixed obstacle labels (e.g. `B2`).
+
 Unrelated messages are ignored. Malformed relevant messages leave arena state unchanged
 and appear only as local arena feedback. Unknown target obstacle IDs do not create phantom
 obstacles.
 
-Completed local edits are submitted through `ArenaOutboundSink`:
+By default, completed local edits are submitted through `ArenaOutboundSink`:
 
 ```text
 OBSTACLE,UPSERT,<id>,<x>,<y>,<N|E|S|W>
@@ -39,6 +43,12 @@ OBSTACLE,REMOVE,<id>
 
 Creation, movement, and face changes use a complete upsert. Drag previews never send;
 the final valid edit is submitted after release.
+
+The integrated controller enables `ArenaViewModel.Factory(..., useRpiMapSync = true)`
+and calls `connectionChanged(isConnected)`. This adapter replaces the full RPi map
+with a `CLEAR` + obstacle batch after local edits and reconnects, using the existing
+RPi units and full direction names. It does not claim acknowledged delivery.
+See [Android/RPi delivery](../ANDROID_RPI_DELIVERY.md) for the protocol and limits.
 
 ## Host integration
 

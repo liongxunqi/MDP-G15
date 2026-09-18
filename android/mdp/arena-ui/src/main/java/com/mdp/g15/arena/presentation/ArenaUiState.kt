@@ -11,4 +11,5 @@ data class ArenaUiState(
     val placementMode: Boolean = false,
     val canUndo: Boolean = false,
     val canRedo: Boolean = false,
+    val obstacleSyncStatus: String = "Map offline — edits saved locally",
 )

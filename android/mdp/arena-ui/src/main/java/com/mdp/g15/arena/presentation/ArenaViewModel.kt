@@ -22,6 +22,7 @@ import com.mdp.g15.arena.protocol.ArenaDecodeResult
 import com.mdp.g15.arena.protocol.ArenaInboundEvent
 import com.mdp.g15.arena.protocol.ArenaMessageCodec
 import com.mdp.g15.arena.protocol.CsvArenaMessageCodec
+import com.mdp.g15.arena.protocol.ObstacleSync
 import java.util.ArrayDeque
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -33,12 +34,28 @@ class ArenaViewModel(
     private val outboundSink: ArenaOutboundSink,
     private val reducer: ArenaReducer = ArenaReducer(),
     private val codec: ArenaMessageCodec = CsvArenaMessageCodec(),
+    private val useRpiMapSync: Boolean = false,
 ) : ViewModel(), ArenaInboundConsumer {
     private val undoHistory = ArrayDeque<ArenaEditSnapshot>()
     private val redoHistory = ArrayDeque<ArenaEditSnapshot>()
 
     private val _uiState = MutableStateFlow(restoreUiState())
     val uiState: StateFlow<ArenaUiState> = _uiState.asStateFlow()
+    private val obstacleSync = ObstacleSync(outboundSink::submit).also {
+        it.update(_uiState.value.arena.obstacles)
+    }
+
+    fun connectionChanged(connected: Boolean) {
+        if (!useRpiMapSync) return
+        obstacleSync.connectionChanged(connected)
+        updateSyncStatus()
+    }
+
+    private fun updateSyncStatus() {
+        _uiState.value = _uiState.value.copy(
+            obstacleSyncStatus = obstacleSync.status,
+        )
+    }
 
     override fun accept(message: String) {
         viewModelScope.launch {
@@ -118,7 +135,7 @@ class ArenaViewModel(
             feedback = "Arena reset.",
             feedbackIsError = false,
         )
-        before.obstacles.keys.sorted().forEach {
+        if (!useRpiMapSync) before.obstacles.keys.sorted().forEach {
             outboundSink.submit(codec.encode(ArenaOutboundEvent.RemoveObstacle(it)))
         }
         persist()
@@ -154,7 +171,7 @@ class ArenaViewModel(
             is ArenaReduction.Failure -> setFeedback(reduction.reason, isError = true)
             is ArenaReduction.Success -> {
                 if (reduction.state != before) pushUndo(before)
-                reduction.outboundEvent?.let { outboundSink.submit(codec.encode(it)) }
+                if (!useRpiMapSync) reduction.outboundEvent?.let { outboundSink.submit(codec.encode(it)) }
                 _uiState.value = _uiState.value.copy(
                     arena = reduction.state,
                     placementMode = if (leavePlacementMode) false else _uiState.value.placementMode,
@@ -192,7 +209,7 @@ class ArenaViewModel(
                         feedback = "Target ${event.targetId} applied to obstacle ${event.obstacleId}.",
                         feedbackIsError = false,
                     )
-                    persist()
+                    persist(transmitMap = false) // Received data is not a new Android edit.
                 }
             }
             is ArenaInboundEvent.Robot -> {
@@ -239,6 +256,7 @@ class ArenaViewModel(
     }
 
     private fun syncObstacleDiff(before: ArenaState, after: ArenaState) {
+        if (useRpiMapSync) return // persist() sends the full map, including undo/redo/reset.
         (before.obstacles.keys - after.obstacles.keys).sorted().forEach {
             outboundSink.submit(codec.encode(ArenaOutboundEvent.RemoveObstacle(it)))
         }
@@ -276,8 +294,12 @@ class ArenaViewModel(
         )
     }
 
-    private fun persist() {
+    private fun persist(transmitMap: Boolean = true) {
         val state = _uiState.value
+        if (useRpiMapSync) {
+            obstacleSync.update(state.arena.obstacles, transmit = transmitMap)
+            updateSyncStatus()
+        }
         savedStateHandle[KEY_OBSTACLES] = ArrayList(
             state.arena.obstacles.toSortedMap().values.map(::encodeObstacle),
         )
@@ -323,6 +345,7 @@ class ArenaViewModel(
 
     class Factory(
         private val outboundSink: ArenaOutboundSink,
+        private val useRpiMapSync: Boolean = false,
     ) : ViewModelProvider.Factory {
         @Suppress("UNCHECKED_CAST")
         override fun <T : ViewModel> create(
@@ -330,7 +353,7 @@ class ArenaViewModel(
             extras: CreationExtras,
         ): T {
             require(modelClass.isAssignableFrom(ArenaViewModel::class.java))
-            return ArenaViewModel(extras.createSavedStateHandle(), outboundSink) as T
+            return ArenaViewModel(extras.createSavedStateHandle(), outboundSink, useRpiMapSync = useRpiMapSync) as T
         }
     }
 

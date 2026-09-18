@@ -1,5 +1,13 @@
 package com.example.mdp
 
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.padding
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
+import androidx.compose.ui.unit.dp
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
@@ -28,6 +36,7 @@ import kotlinx.coroutines.flow.Flow
 private enum class ControllerTab(val title: String) {
     CONTROLS("Controls"),
     ARENA("Arena"),
+    LOGS("Logs"),
 }
 
 @Composable
@@ -53,17 +62,22 @@ fun IntegratedControllerScreen(
     incomingMessages: Flow<String>,
     onArenaOutbound: (String) -> Unit,
     modifier: Modifier = Modifier,
+    commandLogs: List<CommandLog.Entry> = emptyList(),
+    onClearLogs: () -> Unit = {},
 ) {
     var selectedTab by rememberSaveable { mutableIntStateOf(ControllerTab.CONTROLS.ordinal) }
     val currentOutbound = rememberUpdatedState(onArenaOutbound)
     val outboundSink = remember {
         ArenaOutboundSink { message -> currentOutbound.value(message) }
     }
-    val arenaFactory = remember(outboundSink) { ArenaViewModel.Factory(outboundSink) }
+    val arenaFactory = remember(outboundSink) { ArenaViewModel.Factory(outboundSink, useRpiMapSync = true) }
     val arenaViewModel: ArenaViewModel = viewModel(factory = arenaFactory)
 
     LaunchedEffect(incomingMessages, arenaViewModel) {
         incomingMessages.collect(arenaViewModel::accept)
+    }
+    LaunchedEffect(isConnected, arenaViewModel) {
+        arenaViewModel.connectionChanged(isConnected)
     }
 
     // Guard only — this does NOT move the robot locally. It just disables Forward/Reverse
@@ -79,12 +93,46 @@ fun IntegratedControllerScreen(
         arenaReducer.canMoveRobot(arenaState.arena, robot.position.step(robot.direction.opposite()))
 
     Column(modifier = modifier.fillMaxSize()) {
+        Surface(color = MaterialTheme.colorScheme.primaryContainer) {
+            Row(
+                Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
+                verticalAlignment = androidx.compose.ui.Alignment.CenterVertically,
+            ) {
+                Column(Modifier.weight(1f)) {
+                    Text(status, style = MaterialTheme.typography.labelLarge)
+                    Text("Robot: $robotStatus", style = MaterialTheme.typography.bodySmall)
+                    Text(arenaState.obstacleSyncStatus, style = MaterialTheme.typography.bodySmall)
+                    Text(
+                        robot?.let { "Pose: (${it.position.x}, ${it.position.y}) ${it.direction.wireValue} · ${arenaState.arena.obstacles.size} obstacles" }
+                            ?: "Pose: awaiting telemetry · ${arenaState.arena.obstacles.size} obstacles",
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                }
+                Button(
+                    onClick = onStop, enabled = isConnected,
+                    colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error),
+                ) { Text("Stop robot") }
+            }
+        }
         PrimaryTabRow(selectedTabIndex = selectedTab) {
             ControllerTab.entries.forEach { tab ->
                 Tab(
                     selected = selectedTab == tab.ordinal,
                     onClick = { selectedTab = tab.ordinal },
-                    text = { Text(tab.title) },
+                    text = {
+                        Column(horizontalAlignment = androidx.compose.ui.Alignment.CenterHorizontally) {
+                            Text(tab.title)
+                            Text(
+                                when (tab) {
+                                    ControllerTab.CONTROLS -> "Bluetooth & driving"
+                                    ControllerTab.ARENA -> "Map & targets"
+                                    ControllerTab.LOGS -> "TX / RX history"
+                                },
+                                style = MaterialTheme.typography.labelSmall,
+                            )
+                        }
+                    },
                 )
             }
         }
@@ -118,6 +166,8 @@ fun IntegratedControllerScreen(
                     onBegin = onBegin,
                     modifier = Modifier.fillMaxSize(),
                 )
+
+                ControllerTab.LOGS -> CommandLogScreen(commandLogs, onClearLogs)
 
                 ControllerTab.ARENA -> ArenaScreen(
                     viewModel = arenaViewModel,

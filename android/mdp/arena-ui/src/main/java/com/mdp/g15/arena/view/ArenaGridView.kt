@@ -6,6 +6,7 @@ import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.Path
 import android.graphics.RectF
+import android.os.SystemClock
 import android.os.Handler
 import android.os.Looper
 import android.util.AttributeSet
@@ -16,6 +17,9 @@ import android.view.View
 import android.view.ViewConfiguration
 import androidx.core.content.ContextCompat
 import com.mdp.g15.arena.R
+import com.mdp.g15.arena.domain.ArenaReducer
+import com.mdp.g15.arena.domain.ArenaAction
+import com.mdp.g15.arena.domain.ArenaReduction
 import com.mdp.g15.arena.domain.ArenaState
 import com.mdp.g15.arena.domain.Direction
 import com.mdp.g15.arena.domain.GridCoordinate
@@ -33,6 +37,7 @@ class ArenaGridView @JvmOverloads constructor(
 
     private var state = ArenaState()
     private var placementMode = false
+    private val robotMotion = RobotMotion()
     private val geometry = ArenaGeometry()
     private val density = resources.displayMetrics.density
     private val axisPadding = 30f * density
@@ -129,10 +134,14 @@ class ArenaGridView @JvmOverloads constructor(
     }
 
     fun render(state: ArenaState, placementMode: Boolean) {
+        if (draggingRobot || this.state.config != state.config || this.state.obstacles != state.obstacles) {
+            robotMotion.snap(state.robot)
+        } else if (this.state.robot != state.robot) {
+            robotMotion.retarget(state, SystemClock.uptimeMillis())
+        }
         this.state = state
         this.placementMode = placementMode
         contentDescription = buildContentDescription(state)
-        requestLayout()
         invalidate()
     }
 
@@ -153,12 +162,13 @@ class ArenaGridView @JvmOverloads constructor(
         super.onDraw(canvas)
         updateGeometry(width, height)
         val saveCount = canvas.save()
+        canvas.clipRect(0f, 0f, width.toFloat(), height.toFloat())
         canvas.translate(panX, panY)
         canvas.scale(scale, scale)
         drawArena(canvas)
         drawObstacles(canvas)
         if (!draggingRobot) {
-            state.robot?.let { drawRobot(canvas, it.position, it.direction) }
+            drawAnimatedRobot(canvas)
         }
         drawDragPreview(canvas)
         canvas.restoreToCount(saveCount)
@@ -175,7 +185,7 @@ class ArenaGridView @JvmOverloads constructor(
                 dragY = event.y
                 longPressTriggered = false
                 multiTouchOccurred = false
-                val coordinate = geometry.coordinateAt(toContentX(event.x), toContentY(event.y))
+                val coordinate = coordinateAtTouch(event.x, event.y)
                 val robot = state.robot
                 val robotHere = coordinate != null && robot != null &&
                     coordinate in robot.position.footprint(state.config.robotFootprintCells)
@@ -225,7 +235,7 @@ class ArenaGridView @JvmOverloads constructor(
                 val draggedId = draggingObstacleId
                 when {
                     draggedId != null -> {
-                        val destination = geometry.coordinateAt(toContentX(event.x), toContentY(event.y))
+                        val destination = coordinateAtTouch(event.x, event.y)
                         if (destination == null) {
                             interactionListener?.onRemoveObstacle(draggedId)
                             announceForAccessibility("Obstacle $draggedId removed")
@@ -234,18 +244,18 @@ class ArenaGridView @JvmOverloads constructor(
                         }
                     }
                     draggingRobot -> {
-                        val underFinger = geometry.coordinateAt(toContentX(event.x), toContentY(event.y))
+                        val underFinger = coordinateAtTouch(event.x, event.y)
                         val destination = underFinger?.let {
                             GridCoordinate(it.x - robotGrabOffsetX, it.y - robotGrabOffsetY)
                         }
-                        if (destination != null) {
+                        if (destination != null && ArenaReducer().canMoveRobot(state, destination)) {
                             interactionListener?.onMoveRobot(destination)
                         }
                     }
                     multiTouchOccurred -> Unit
                     else -> {
                         performClick()
-                        val coordinate = geometry.coordinateAt(toContentX(event.x), toContentY(event.y))
+                        val coordinate = coordinateAtTouch(event.x, event.y)
                         if (coordinate != null) {
                             val obstacle = obstacleAt(coordinate)
                             when {
@@ -278,7 +288,25 @@ class ArenaGridView @JvmOverloads constructor(
 
     override fun onDetachedFromWindow() {
         handler.removeCallbacks(longPressRunnable)
+        robotMotion.snap(state.robot)
+        clearGesture()
         super.onDetachedFromWindow()
+    }
+
+    private fun drawAnimatedRobot(canvas: Canvas) {
+        val robot = state.robot ?: return
+        val now = SystemClock.uptimeMillis()
+        val visual = robotMotion.sample(now) ?: return
+        val bounds = geometry.footprintBounds(robot.position, state.config.robotFootprintCells) ?: return
+        val checkpoint = canvas.save()
+        canvas.translate(
+            (visual.x - robot.position.x) * geometry.cellSize,
+            -(visual.y - robot.position.y) * geometry.cellSize,
+        )
+        canvas.rotate(visual.angle - robot.direction.ordinal * 90f, bounds.centerX, bounds.centerY)
+        drawRobot(canvas, robot.position, robot.direction)
+        canvas.restoreToCount(checkpoint)
+        if (robotMotion.isRunning(now)) postInvalidateOnAnimation()
     }
 
     private fun drawArena(canvas: Canvas) {
@@ -351,8 +379,8 @@ class ArenaGridView @JvmOverloads constructor(
             obstacleTextPaint,
         )
 
-        obstacle.targetFace?.let { drawFace(canvas, rect, it) }
         if (state.selectedObstacleId == obstacle.id) canvas.drawRect(rect, selectedPaint)
+        obstacle.targetFace?.let { drawFace(canvas, rect, it) }
     }
 
     private fun drawFace(canvas: Canvas, rect: RectF, direction: Direction) {
@@ -409,8 +437,13 @@ class ArenaGridView @JvmOverloads constructor(
     private fun drawObstacleDragPreview(canvas: Canvas, obstacleId: Int) {
         val contentX = toContentX(dragX)
         val contentY = toContentY(dragY)
-        val destination = geometry.coordinateAt(contentX, contentY)
+        val destination = coordinateAtTouch(dragX, dragY)
         if (destination == null) {
+            drawInvalidDropIndicator(canvas, contentX, contentY)
+            return
+        }
+        if (ArenaReducer().reduce(state, ArenaAction.MoveObstacle(obstacleId, destination)) is ArenaReduction.Failure) {
+            state.obstacles[obstacleId]?.let { drawObstacle(canvas, it) }
             drawInvalidDropIndicator(canvas, contentX, contentY)
             return
         }
@@ -418,9 +451,11 @@ class ArenaGridView @JvmOverloads constructor(
         val inset = geometry.cellSize * 0.08f
         val rect = RectF(bounds.left + inset, bounds.top + inset, bounds.right - inset, bounds.bottom - inset)
         canvas.drawRect(rect, dragPaint)
-        obstacleTextPaint.textSize = geometry.cellSize * 0.38f
+        val obstacle = state.obstacles[obstacleId] ?: return
+        obstacleTextPaint.textSize = geometry.cellSize * 0.48f
+        obstacle.targetFace?.let { drawFace(canvas, rect, it) }
         canvas.drawText(
-            obstacleId.toString(),
+            obstacle.targetId ?: obstacle.targetFace?.wireValue ?: "?",
             rect.centerX(),
             rect.centerY() - (obstacleTextPaint.ascent() + obstacleTextPaint.descent()) / 2f,
             obstacleTextPaint,
@@ -431,10 +466,11 @@ class ArenaGridView @JvmOverloads constructor(
         val direction = state.robot?.direction ?: return
         val contentX = toContentX(dragX)
         val contentY = toContentY(dragY)
-        val underFinger = geometry.coordinateAt(contentX, contentY)
+        val underFinger = coordinateAtTouch(dragX, dragY)
         val anchor = underFinger?.let { GridCoordinate(it.x - robotGrabOffsetX, it.y - robotGrabOffsetY) }
         val bounds = anchor?.let { geometry.footprintBounds(it, state.config.robotFootprintCells) }
-        if (anchor == null || bounds == null) {
+        if (anchor == null || bounds == null || !ArenaReducer().canMoveRobot(state, anchor)) {
+            state.robot?.let { drawRobot(canvas, it.position, it.direction) }
             drawInvalidDropIndicator(canvas, contentX, contentY)
             return
         }
@@ -467,6 +503,12 @@ class ArenaGridView @JvmOverloads constructor(
     /** Converts a raw touch/screen coordinate into the unscaled grid space [ArenaGeometry] expects. */
     private fun toContentX(x: Float): Float = (x - panX) / scale
     private fun toContentY(y: Float): Float = (y - panY) / scale
+
+    // The visible card is the interaction boundary even when zoom exposes only
+    // part of the underlying map. Dropping outside must not select a hidden cell.
+    private fun coordinateAtTouch(x: Float, y: Float): GridCoordinate? =
+        if (x < 0f || y < 0f || x >= width || y >= height) null
+        else geometry.coordinateAt(toContentX(x), toContentY(y))
 
     private fun clampPan() {
         val minPanX = (width - width * scale).coerceAtMost(0f)

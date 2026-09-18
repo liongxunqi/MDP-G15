@@ -32,6 +32,8 @@ class ControllerViewModel(app: Application) : AndroidViewModel(app) {
 
     // Raw incoming stream: debug readout now, Person B's arena parser later.
     val incoming = bt.incoming
+    val commandLogs = bt.commandLog.entries
+    fun clearCommandLogs() = bt.commandLog.clear()
 
     // C.4: curated, human-readable robot status — NOT the raw firehose.
     private val _robotStatus = MutableStateFlow("—")

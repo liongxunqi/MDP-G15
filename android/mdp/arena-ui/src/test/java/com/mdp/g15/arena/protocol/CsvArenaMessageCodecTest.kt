@@ -25,6 +25,7 @@ class CsvArenaMessageCodecTest {
 
     @Test
     fun `target supports checklist format and optional face`() {
+        assertEquals(codec.decode("TARGET,2,11,N"), codec.decode("TARGET,B2,11,N"))
         assertEquals(
             ArenaDecodeResult.Decoded(ArenaInboundEvent.Target(2, "11", null)),
             codec.decode("TARGET,2,11"),

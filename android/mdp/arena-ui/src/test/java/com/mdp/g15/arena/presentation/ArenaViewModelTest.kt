@@ -88,4 +88,40 @@ class ArenaViewModelTest {
         assertTrue(viewModel.uiState.value.arena.obstacles.containsKey(1))
         assertEquals(listOf("OBSTACLE,UPSERT,1,3,4,"), sent)
     }
+
+    @Test
+    fun `RPi mode resends full map for every local edit reset and history operation`() = runTest(dispatcher) {
+        val handle = SavedStateHandle()
+        viewModel = ArenaViewModel(handle, ArenaOutboundSink(sent::add), useRpiMapSync = true)
+        viewModel.addObstacle(GridCoordinate(3, 4))
+        assertTrue(sent.isEmpty())
+        viewModel.connectionChanged(true)
+        assertEquals("CLEAR\nOBSTACLE,1,30,40,SKIP", sent.last())
+        viewModel.moveObstacle(1, GridCoordinate(5, 6))
+        assertEquals("CLEAR\nOBSTACLE,1,50,60,SKIP", sent.last())
+        viewModel.selectObstacle(1)
+        viewModel.setTargetFace(Direction.SOUTH)
+        assertEquals("CLEAR\nOBSTACLE,1,50,60,SOUTH", sent.last())
+        viewModel.addObstacle(GridCoordinate(7, 8))
+        viewModel.removeObstacle(1)
+        assertEquals("CLEAR\nOBSTACLE,2,70,80,SKIP", sent.last())
+        viewModel.undo()
+        assertEquals("CLEAR\nOBSTACLE,1,50,60,SOUTH\nOBSTACLE,2,70,80,SKIP", sent.last())
+        viewModel.redo()
+        assertEquals("CLEAR\nOBSTACLE,2,70,80,SKIP", sent.last())
+        viewModel.resetArena()
+        assertEquals("CLEAR", sent.last())
+        viewModel.undo()
+        val beforeReports = sent.size
+        viewModel.accept("TARGET,2,11,W")
+        viewModel.accept("ROBOT,0,0,N")
+        advanceUntilIdle()
+        assertEquals(beforeReports, sent.size)
+        viewModel.connectionChanged(false)
+        viewModel.moveObstacle(2, GridCoordinate(8, 9))
+        assertEquals(beforeReports, sent.size)
+        val restored = ArenaViewModel(handle, ArenaOutboundSink(sent::add), useRpiMapSync = true)
+        restored.connectionChanged(true)
+        assertEquals("CLEAR\nOBSTACLE,2,80,90,WEST", sent.last())
+    }
 }

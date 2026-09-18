@@ -35,7 +35,7 @@ object RobotMessageParser {
             }
 
             "TARGET" -> {
-                val obstacle = parts.getOrNull(1)?.toIntOrNull()
+                val obstacle = parts.getOrNull(1)?.replaceFirst(Regex("^[bB]"), "")?.toIntOrNull()
                 val id = parts.getOrNull(2)
                 if (obstacle != null && !id.isNullOrEmpty()) {
                     RobotMessage.Target(obstacle, id)
@@ -43,6 +43,9 @@ object RobotMessageParser {
                     RobotMessage.Unknown(line)
                 }
             }
+
+            "MSG" -> parts.drop(1).joinToString(", ").removeSurrounding("[", "]")
+                .takeIf { it.isNotBlank() }?.let(RobotMessage::Status) ?: RobotMessage.Unknown(line)
 
             "STATUS" -> RobotMessage.Status(
                 parts.drop(1).joinToString(", ").ifEmpty { line }

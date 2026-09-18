@@ -15,9 +15,13 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.layout.sizeIn
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.IntrinsicSize
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -29,6 +33,8 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
+import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
@@ -127,6 +133,7 @@ class MainActivity : ComponentActivity() {
             MdpTheme {
                 val state by viewModel.state.collectAsStateWithLifecycle()
                 val latest by viewModel.incoming.collectAsStateWithLifecycle(initialValue = "")
+                val commandLogs by viewModel.commandLogs.collectAsStateWithLifecycle()
                 val robotStatus by viewModel.robotStatus.collectAsStateWithLifecycle()
 
                 Scaffold(modifier = Modifier.fillMaxSize()) { innerPadding ->
@@ -138,6 +145,8 @@ class MainActivity : ComponentActivity() {
                             state is ConnectionState.Reconnecting,
                         permissionsGranted = isBluetoothEnabled,
                         latestMessage = latest,
+                        commandLogs = commandLogs,
+                        onClearLogs = viewModel::clearCommandLogs,
                         onConnectClick = ::openPicker,
                         onDisconnectClick = viewModel::disconnect,
                         onForward = viewModel::forward,
@@ -259,92 +268,84 @@ fun ControllerScreen(
     reverseEnabled: Boolean = true,
     modifier: Modifier = Modifier,
 ) {
-    Column(
-        modifier = modifier
-            .fillMaxSize()
-            .verticalScroll(rememberScrollState())
-            .padding(24.dp),
-        horizontalAlignment = Alignment.CenterHorizontally,
-    ) {
-        // --- Connection status + Connect/Disconnect ---
-        Text(text = "Bluetooth", style = MaterialTheme.typography.titleMedium)
-        Spacer(Modifier.height(8.dp))
-        Text(text = status, style = MaterialTheme.typography.bodyLarge)
-        Spacer(Modifier.height(16.dp))
-
-        when {
-            isConnected -> Button(onClick = onDisconnectClick) { Text("Disconnect") }
-            isBusy -> OutlinedButton(onClick = onDisconnectClick) { Text("Cancel") }
-            else -> Button(onClick = onConnectClick, enabled = permissionsGranted) {
-                Text(if (permissionsGranted) "Connect" else "Permissions required")
-            }
-        }
-
-        Spacer(Modifier.height(24.dp))
-
-        // --- C.4: curated robot status (selective, not the raw stream) ---
-        Card(modifier = Modifier.fillMaxWidth()) {
-            Column(modifier = Modifier.padding(16.dp)) {
-                Text(
-                    text = "Robot status",
-                    style = MaterialTheme.typography.labelMedium,
-                )
-                Spacer(Modifier.height(4.dp))
-                Text(
-                    text = robotStatus,
-                    style = MaterialTheme.typography.titleMedium,
-                )
-            }
-        }
-
-        Spacer(Modifier.height(24.dp))
-
-        // --- C.3: manual control D-pad ---
-        Text(text = "Manual control", style = MaterialTheme.typography.labelMedium)
-        Spacer(Modifier.height(8.dp))
-        // IntrinsicSize.Min sizes this Column to its widest child (the DPad), so the
-        // Begin button's fillMaxWidth() below stretches to match the DPad's width.
+    Box(modifier = modifier.fillMaxSize(), contentAlignment = Alignment.TopCenter) {
         Column(
-            modifier = Modifier.width(IntrinsicSize.Min),
+            modifier = Modifier
+                .widthIn(max = 720.dp)
+                .fillMaxWidth()
+                .verticalScroll(rememberScrollState())
+                .padding(20.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(16.dp),
         ) {
-            Button(
-                onClick = onBegin,
-                enabled = isConnected,
+            Card(
                 modifier = Modifier.fillMaxWidth(),
-            ) { Text("Begin") }
-            Spacer(Modifier.height(8.dp))
-            DPad(
-                enabled = isConnected,
-                forwardEnabled = forwardEnabled,
-                reverseEnabled = reverseEnabled,
-                onForward = onForward,
-                onReverse = onReverse,
-                onTurnLeft = onTurnLeft,
-                onTurnRight = onTurnRight,
-                onStop = onStop,
-                onForwardLeft = onForwardLeft,
-                onForwardRight = onForwardRight,
-                onBackLeft = onBackLeft,
-                onBackRight = onBackRight,
-            )
-        }
-        if (isConnected && (!forwardEnabled || !reverseEnabled)) {
-            Spacer(Modifier.height(8.dp))
-            Text(
-                text = "Blocked: obstacle or arena edge ahead",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.error,
-            )
-        }
-
-        // --- Debug readout — handy while testing C.1. Not the C.4 deliverable. ---
-        if (latestMessage.isNotEmpty()) {
-            Spacer(Modifier.height(24.dp))
-            Text(
-                text = "Last message: $latestMessage",
-                style = MaterialTheme.typography.bodySmall,
-            )
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+                border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+            ) {
+                Column(Modifier.padding(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    Text("Bluetooth", style = MaterialTheme.typography.headlineSmall)
+                    Text(status, style = MaterialTheme.typography.bodyLarge, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    when {
+                        isConnected -> Button(onClick = onDisconnectClick) { Text("Disconnect") }
+                        isBusy -> OutlinedButton(onClick = onDisconnectClick) { Text("Cancel") }
+                        else -> Button(onClick = onConnectClick, enabled = permissionsGranted) {
+                            Text(if (permissionsGranted) "Connect" else "Permissions required")
+                        }
+                    }
+                }
+            }
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer),
+            ) {
+                Column(Modifier.padding(20.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Text("Robot status", style = MaterialTheme.typography.labelLarge)
+                    Text(robotStatus, style = MaterialTheme.typography.titleLarge)
+                }
+            }
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+                border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+            ) {
+                Column(
+                    Modifier.fillMaxWidth().padding(20.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.spacedBy(16.dp),
+                ) {
+                    Text("Manual control", style = MaterialTheme.typography.titleMedium)
+                    Button(onClick = onBegin, enabled = isConnected, modifier = Modifier.fillMaxWidth()) {
+                        Text("Begin")
+                    }
+                    DPad(
+                        enabled = isConnected,
+                        forwardEnabled = forwardEnabled,
+                        reverseEnabled = reverseEnabled,
+                        onForward = onForward,
+                        onReverse = onReverse,
+                        onTurnLeft = onTurnLeft,
+                        onTurnRight = onTurnRight,
+                        onStop = onStop,
+                        onForwardLeft = onForwardLeft,
+                        onForwardRight = onForwardRight,
+                        onBackLeft = onBackLeft,
+                        onBackRight = onBackRight,
+                    )
+                    if (isConnected && (!forwardEnabled || !reverseEnabled)) {
+                        Text(
+                            "Blocked: obstacle or arena edge ahead",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.error,
+                        )
+                    }
+                }
+            }
+            if (latestMessage.isNotEmpty()) {
+                Card(Modifier.fillMaxWidth()) {
+                    Text("Last message: $latestMessage", Modifier.padding(16.dp), style = MaterialTheme.typography.bodySmall)
+                }
+            }
         }
     }
 }
@@ -371,27 +372,32 @@ fun DPad(
 ) {
     Column(horizontalAlignment = Alignment.CenterHorizontally) {
         Row {
-            Button(onClick = onForwardLeft, enabled = enabled) { Text("↖") }
+            Button(onClick = onForwardLeft, enabled = enabled, modifier = Modifier.sizeIn(minWidth = 72.dp, minHeight = 56.dp)) { Text("↖ Forward left") }
             Spacer(Modifier.width(8.dp))
-            Button(onClick = onForward, enabled = enabled && forwardEnabled) { Text("▲") }
+            Button(onClick = onForward, enabled = enabled && forwardEnabled, modifier = Modifier.sizeIn(minWidth = 72.dp, minHeight = 56.dp)) { Text("▲ Forward") }
             Spacer(Modifier.width(8.dp))
-            Button(onClick = onForwardRight, enabled = enabled) { Text("↗") }
+            Button(onClick = onForwardRight, enabled = enabled, modifier = Modifier.sizeIn(minWidth = 72.dp, minHeight = 56.dp)) { Text("Forward right ↗") }
         }
         Spacer(Modifier.height(8.dp))
         Row {
-            Button(onClick = onTurnLeft, enabled = enabled) { Text("◀") }
+            Button(onClick = onTurnLeft, enabled = enabled, modifier = Modifier.sizeIn(minWidth = 72.dp, minHeight = 56.dp)) { Text("◀ Left") }
             Spacer(Modifier.width(8.dp))
-            OutlinedButton(onClick = onStop, enabled = enabled) { Text("■") }
+            OutlinedButton(
+                onClick = onStop, enabled = enabled,
+                modifier = Modifier.sizeIn(minWidth = 72.dp, minHeight = 56.dp),
+                colors = ButtonDefaults.outlinedButtonColors(contentColor = MaterialTheme.colorScheme.error),
+                border = BorderStroke(1.dp, if (enabled) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.outlineVariant),
+            ) { Text("■ Stop") }
             Spacer(Modifier.width(8.dp))
-            Button(onClick = onTurnRight, enabled = enabled) { Text("▶") }
+            Button(onClick = onTurnRight, enabled = enabled, modifier = Modifier.sizeIn(minWidth = 72.dp, minHeight = 56.dp)) { Text("Right ▶") }
         }
         Spacer(Modifier.height(8.dp))
         Row {
-            Button(onClick = onBackLeft, enabled = enabled) { Text("↙") }
+            Button(onClick = onBackLeft, enabled = enabled, modifier = Modifier.sizeIn(minWidth = 72.dp, minHeight = 56.dp)) { Text("↙ Back left") }
             Spacer(Modifier.width(8.dp))
-            Button(onClick = onReverse, enabled = enabled && reverseEnabled) { Text("▼") }
+            Button(onClick = onReverse, enabled = enabled && reverseEnabled, modifier = Modifier.sizeIn(minWidth = 72.dp, minHeight = 56.dp)) { Text("▼ Reverse") }
             Spacer(Modifier.width(8.dp))
-            Button(onClick = onBackRight, enabled = enabled) { Text("↘") }
+            Button(onClick = onBackRight, enabled = enabled, modifier = Modifier.sizeIn(minWidth = 72.dp, minHeight = 56.dp)) { Text("Back right ↘") }
         }
     }
 }

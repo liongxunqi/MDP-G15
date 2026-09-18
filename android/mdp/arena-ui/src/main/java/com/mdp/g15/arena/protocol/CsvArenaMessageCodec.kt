@@ -51,7 +51,7 @@ class CsvArenaMessageCodec : ArenaMessageCodec {
                 "TARGET must be TARGET,<obstacleId>,<targetId>[,<face>].",
             )
         }
-        val obstacleId = parts[1].toIntOrNull()?.takeIf { it > 0 }
+        val obstacleId = parts[1].replaceFirst(Regex("^[bB]"), "").toIntOrNull()?.takeIf { it > 0 }
             ?: return ArenaDecodeResult.Malformed("TARGET obstacle ID must be positive.")
         val targetId = parts[2]
         if (targetId.isBlank()) return ArenaDecodeResult.Malformed("TARGET ID cannot be blank.")

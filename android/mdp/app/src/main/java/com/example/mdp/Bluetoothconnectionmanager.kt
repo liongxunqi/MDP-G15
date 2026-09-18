@@ -9,9 +9,8 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.channels.Channel
-import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -61,6 +60,8 @@ class BluetoothConnectionManager(
         private const val HEARTBEAT_INTERVAL_MS = 1_000L
     }
 
+    val commandLog = CommandLog()
+
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     private val _state = MutableStateFlow<ConnectionState>(ConnectionState.Disconnected)
@@ -70,11 +71,8 @@ class BluetoothConnectionManager(
     private val _incoming = MutableSharedFlow<String>(extraBufferCapacity = 256)
     val incoming: SharedFlow<String> = _incoming.asSharedFlow()
 
-    /**
-     * Outgoing queue. UNLIMITED capacity means send() never blocks the caller and
-     * messages queued during a brief drop are flushed by the next session's writer.
-     */
-    private val outgoing = Channel<String>(Channel.UNLIMITED)
+    /** Never replay queued movement/Begin commands on a replacement socket. */
+    private val outgoing = SessionOutbox()
 
     private var connectionJob: Job? = null
 
@@ -83,21 +81,34 @@ class BluetoothConnectionManager(
 
     /** Start connecting to [device] and keep the link alive until [disconnect]. */
     fun connect(device: BluetoothDevice) {
-        connectionJob?.cancel()                       // drop any previous attempt
-        connectionJob = scope.launch { maintainConnection(device) }
+        commandLog.record(CommandLog.Kind.CONNECTION, "Connect requested: ${safeName(device) ?: "device"}")
+        val previous = connectionJob
+        clearPending()
+        previous?.cancel()
+        closeSocketQuietly()
+        connectionJob = scope.launch {
+            previous?.join()
+            maintainConnection(device)
+        }
     }
 
     /** Stop maintaining the link and close the socket. */
     fun disconnect() {
+        commandLog.record(CommandLog.Kind.CONNECTION, "Disconnected by client")
         connectionJob?.cancel()
-        connectionJob = null
+        // Retain the cancelled job so a rapid Connect waits for its cleanup.
         closeSocketQuietly()                          // unblocks a blocked read()
         _state.value = ConnectionState.Disconnected
+        clearPending()
     }
 
-    /** Queue a raw string. Non-blocking; the frame delimiter is added automatically. */
+    /** The arena republishes its map after reconnect; individual commands never replay. */
     fun send(message: String) {
-        outgoing.trySend(message)                     // never suspends with UNLIMITED
+        if (outgoing.submit(message)) {
+            commandLog.record(CommandLog.Kind.QUEUED, message)
+        } else {
+            commandLog.record(CommandLog.Kind.ERROR, "Not connected; not queued: $message")
+        }
     }
 
     /** Convenience for the D-pad buttons (C.3). */
@@ -127,13 +138,15 @@ class BluetoothConnectionManager(
             val socket = try {
                 openSocket(device)
             } catch (e: IOException) {
+                commandLog.record(CommandLog.Kind.ERROR, "Connection failed: ${e.message}")
                 attempt++
                 delay(RECONNECT_DELAY_MS)
                 continue
             }
 
-            currentSocket = socket
+            commandLog.record(CommandLog.Kind.CONNECTION, "Connected: ${safeName(device) ?: "device"}")
             attempt = 0
+            outgoing.open()
             _state.value = ConnectionState.Connected(safeName(device))
 
             try {
@@ -141,23 +154,35 @@ class BluetoothConnectionManager(
             } catch (e: CancellationException) {
                 throw e                               // user disconnected — exit loop
             } catch (e: IOException) {
+                commandLog.record(CommandLog.Kind.ERROR, "Link dropped; reconnecting: ${e.message}")
                 // link dropped — fall through and reconnect
             } finally {
-                closeSocketQuietly()
+                closeSocketQuietly(socket)
+                clearPending()
             }
 
             if (!currentCoroutineContext().isActive) break
             attempt++
+            _state.value = ConnectionState.Reconnecting(safeName(device), attempt)
             delay(RECONNECT_DELAY_MS)
         }
     }
 
     @SuppressLint("MissingPermission")
-    private fun openSocket(device: BluetoothDevice): BluetoothSocket {
+    private suspend fun openSocket(device: BluetoothDevice): BluetoothSocket {
         // Discovery cripples the connect handshake — always cancel it first.
         if (adapter.isDiscovering) adapter.cancelDiscovery()
         val socket = device.createRfcommSocketToServiceRecord(SPP_UUID)
-        socket.connect()                              // blocks; throws IOException on failure
+        // Allow Disconnect to cancel a blocking connect as well as a read.
+        synchronized(this) { currentSocket = socket }
+        try {
+            currentCoroutineContext().ensureActive()
+            socket.connect()
+            currentCoroutineContext().ensureActive()
+        } catch (error: Exception) {
+            closeSocketQuietly(socket)
+            throw error
+        }
         return socket
     }
 
@@ -166,18 +191,16 @@ class BluetoothConnectionManager(
      * ends (socket closed/dropped) we cancel the writer and return, and the
      * exception (if any) propagates up to trigger a reconnect.
      */
-    private suspend fun runSession(socket: BluetoothSocket) = coroutineScope {
+    private suspend fun runSession(socket: BluetoothSocket) {
         val input: InputStream = socket.inputStream
         val output: OutputStream = socket.outputStream
 
-        val writer = launch { writeLoop(output) }
-        val heartbeat = launch { heartbeatLoop() }
-        try {
-            readLoop(input)
-        } finally {
-            writer.cancel()
-            heartbeat.cancel()
-        }
+        runBluetoothSession(
+            close = { runCatching { socket.close() } },
+            read = { readLoop(input) },
+            write = { writeLoop(output) },
+            heartbeat = { heartbeatLoop() },
+        )
     }
 
     /**
@@ -190,7 +213,7 @@ class BluetoothConnectionManager(
     private suspend fun heartbeatLoop() {
         while (currentCoroutineContext().isActive) {
             delay(HEARTBEAT_INTERVAL_MS)
-            outgoing.trySend("")   // writeLoop appends the delimiter -> just "\n"
+            outgoing.submit("")   // writeLoop appends the delimiter -> just "\n"
         }
     }
 
@@ -210,7 +233,10 @@ class BluetoothConnectionManager(
             while (idx >= 0) {
                 val line = assembled.substring(0, idx).trim()
                 assembled.delete(0, idx + 1)
-                if (line.isNotEmpty()) _incoming.emit(line)
+                if (line.isNotEmpty()) {
+                    commandLog.record(CommandLog.Kind.RX, line)
+                    _incoming.emit(line)
+                }
                 idx = assembled.indexOf(DELIMITER)
             }
         }
@@ -218,13 +244,15 @@ class BluetoothConnectionManager(
 
     /** Drain the outgoing queue to the socket, framing each message. */
     private suspend fun writeLoop(output: OutputStream) {
-        for (message in outgoing) {                   // suspends until something is queued
-            // val framed = message + DELIMITER
-            val framed = message
+        while (currentCoroutineContext().isActive) {
+            val message = outgoing.receive()
+            val framed = bluetoothPayload(message)
             try {
                 output.write(framed.toByteArray(Charsets.UTF_8))
                 output.flush()
+                if (message.isNotEmpty()) commandLog.record(CommandLog.Kind.TX, message)
             } catch (e: IOException) {
+                commandLog.record(CommandLog.Kind.ERROR, "Write failed (${e.message}): $message")
                 // Deliberately NOT requeued: a control command that failed to send
                 // should not replay late after a reconnect. Let the session tear down.
                 throw e
@@ -232,12 +260,19 @@ class BluetoothConnectionManager(
         }
     }
 
-    private fun closeSocketQuietly() {
+    private fun clearPending() {
+        val dropped = outgoing.close()
+        if (dropped > 0) commandLog.record(CommandLog.Kind.ERROR, "Discarded $dropped pending messages after connection change; commands will not replay.")
+    }
+
+    private fun closeSocketQuietly(socket: BluetoothSocket? = currentSocket) {
+        synchronized(this) {
+            if (currentSocket === socket) currentSocket = null
+        }
         try {
-            currentSocket?.close()
+            socket?.close()
         } catch (_: IOException) {
         }
-        currentSocket = null
     }
 
     @SuppressLint("MissingPermission")
