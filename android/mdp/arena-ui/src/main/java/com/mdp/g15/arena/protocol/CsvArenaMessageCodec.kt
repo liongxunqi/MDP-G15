@@ -10,9 +10,11 @@ class CsvArenaMessageCodec : ArenaMessageCodec {
         val clean = message.trim().trimEnd('\r', '\n')
         if (clean.isBlank()) return ArenaDecodeResult.Ignored
 
+        if (StatusMessage.isStatus(clean)) return decodeStrictStatus(clean)
+
         val command = clean.substringBefore(',').trim().uppercase()
         return when (command) {
-            "STATUS", "MSG" -> decodeStatus(clean)
+            "MSG" -> decodeStatus(clean)
             "TARGET" -> decodeTarget(clean)
             "ROBOT" -> decodeRobot(clean)
             else -> ArenaDecodeResult.Ignored
@@ -33,6 +35,13 @@ class CsvArenaMessageCodec : ArenaMessageCodec {
         is ArenaOutboundEvent.RemoveObstacle ->
             "OBSTACLE,REMOVE,${event.obstacleId}"
     }
+
+    private fun decodeStrictStatus(message: String): ArenaDecodeResult =
+        if (StatusMessage.isValid(message)) {
+            ArenaDecodeResult.Decoded(ArenaInboundEvent.Status(StatusMessage.text(message)))
+        } else {
+            ArenaDecodeResult.Malformed(StatusMessage.MALFORMED_FEEDBACK)
+        }
 
     private fun decodeStatus(message: String): ArenaDecodeResult {
         val separator = message.indexOf(',')

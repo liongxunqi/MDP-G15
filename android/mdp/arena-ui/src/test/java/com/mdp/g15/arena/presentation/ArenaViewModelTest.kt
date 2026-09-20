@@ -52,9 +52,22 @@ class ArenaViewModelTest {
         advanceUntilIdle()
         assertEquals("Awaiting robot status", viewModel.uiState.value.status)
 
-        viewModel.accept("STATUS,Looking for target 2")
+        viewModel.accept("STATUS,RUNNING,2,5")
         advanceUntilIdle()
-        assertEquals("Looking for target 2", viewModel.uiState.value.status)
+        assertEquals("RUNNING,2,5", viewModel.uiState.value.status)
+    }
+
+    @Test
+    fun `malformed status is surfaced and not acted on`() = runTest(dispatcher) {
+        viewModel.accept("STATUS,DONE")
+        advanceUntilIdle()
+
+        viewModel.accept("STATUS,START,1,2,X")
+        advanceUntilIdle()
+
+        assertEquals("DONE", viewModel.uiState.value.status)
+        assertEquals("Malformed status received", viewModel.uiState.value.feedback)
+        assertTrue(viewModel.uiState.value.feedbackIsError)
     }
 
     @Test
@@ -62,11 +75,11 @@ class ArenaViewModelTest {
         viewModel.setPlacementMode(true)
         val feedback = viewModel.uiState.value.feedback
 
-        viewModel.accept("STATUS,Moving")
+        viewModel.accept("STATUS,RUNNING,1,4")
         viewModel.accept("ROBOT,7,2,W")
         advanceUntilIdle()
 
-        assertEquals("Moving", viewModel.uiState.value.status)
+        assertEquals("RUNNING,1,4", viewModel.uiState.value.status)
         assertEquals(feedback, viewModel.uiState.value.feedback)
         assertEquals(GridCoordinate(7, 2), viewModel.uiState.value.arena.robot?.position)
     }

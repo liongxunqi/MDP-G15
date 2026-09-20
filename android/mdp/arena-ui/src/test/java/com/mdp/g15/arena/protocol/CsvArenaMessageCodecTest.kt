@@ -12,11 +12,33 @@ class CsvArenaMessageCodecTest {
     private val codec = CsvArenaMessageCodec()
 
     @Test
-    fun `status keeps commas and MSG removes briefing brackets`() {
-        assertEquals(
-            ArenaDecodeResult.Decoded(ArenaInboundEvent.Status("Moving, slowly")),
-            codec.decode("STATUS,Moving, slowly"),
-        )
+    fun `status accepts exactly the five forms`() {
+        listOf(
+            "CONNECTED TO RPI", "RUNNING,3,12", "START,0,19,N", "FAILED", "DONE",
+        ).forEach {
+            assertEquals(
+                ArenaDecodeResult.Decoded(ArenaInboundEvent.Status(it)),
+                codec.decode("STATUS,$it"),
+            )
+        }
+    }
+
+    @Test
+    fun `status rejects everything else as malformed`() {
+        listOf(
+            "STATUS", "STATUS,", "STATUS,Exploring", "STATUS,DONE,extra", "STATUS,FAILED,1",
+            "STATUS,RUNNING,3", "STATUS,RUNNING,3,12,4", "STATUS,RUNNING,-1,12",
+            "STATUS,RUNNING,+3,12", "STATUS,RUNNING,3.0,12", "STATUS,RUNNING,a,12",
+            "STATUS,START,1,2", "STATUS,START,1,2,X", "STATUS,START,1,2,n",
+            "STATUS,START,1,2,NORTH", "STATUS,START,-1,2,N", "STATUS,START,1,2,N,extra",
+            "STATUS,done", "STATUS,CONNECTED  TO RPI", "STATUS, DONE",
+        ).forEach {
+            assertEquals(it, ArenaDecodeResult.Malformed("Malformed status received"), codec.decode(it))
+        }
+    }
+
+    @Test
+    fun `MSG removes briefing brackets`() {
         assertEquals(
             ArenaDecodeResult.Decoded(ArenaInboundEvent.Status("Moving")),
             codec.decode("MSG,[Moving]"),
