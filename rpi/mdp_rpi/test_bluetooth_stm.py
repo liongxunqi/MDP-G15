@@ -95,45 +95,50 @@ class ManualControl:
     # ── Android receive thread ─────────────────────────────────────────────────
 
     def android_receive(self) -> None:
-        """
-        Runs in android_thread.
-        Translates Android wire strings to STM token lists and queues them.
-        """
+        while self.android.client_socket is None:
+            sleep(0.1)
         while True:
             try:
-                msg = self.android.receive()
+                while self.android.client_socket is None:
+                    sleep(0.1)
+                raw = self.android.client_socket.recv(1024)
+                if not raw:
+                    continue
+
+                self._rx_buffer = getattr(self, "_rx_buffer", "")
+                self._rx_buffer += raw.decode("utf-8")
+
+                if "\n" in self._rx_buffer:
+                    line, self._rx_buffer = self._rx_buffer.split("\n", 1)
+                else:
+                    line, self._rx_buffer = self._rx_buffer, ""
+
+                msg = line.strip()
                 if not msg:
                     continue
 
-                cmd = msg.strip().lower()
+                logging.info(f"Android ← tablet: {msg}")
+                cmd = msg.lower()
                 tokens = self.command_map.get(cmd)
 
                 if tokens is None:
                     logging.warning(f"Android: unknown manual command '{msg}' — ignoring.")
                     continue
 
-                # Validate before queuing so a bad token surfaces immediately
-                # rather than after a silent RESEND round-trip.
                 ok, reason = validate_line(list(tokens))
                 if not ok:
-                    logging.error(
-                        f"Android: token list {tokens} for command '{cmd}' is "
-                        f"invalid — {reason}. Fix MANUAL_MOVE_CM / MANUAL_TURN_DEG."
-                    )
+                    logging.error(f"Android: token list {tokens} invalid — {reason}.")
                     continue
 
-                # Stop is time-sensitive: clear the queue and send immediately
-                # so it is never delayed behind a queued move.
                 if cmd == "s":
                     self._pending.clear()
-                    self._pending.append(tokens)
-                else:
-                    self._pending.append(tokens)
-
+                self._pending.append(tokens)
                 self._pending_event.set()
                 logging.info(f"Android: queued {tokens} for '{cmd}'.")
 
             except OSError as exc:
+                if "timed out" in str(exc):
+                    continue #no button has been pressed so dont throw error message
                 logging.error(f"Android thread OSError: {exc}")
 
     # ── STM receive / dispatch thread ──────────────────────────────────────────
