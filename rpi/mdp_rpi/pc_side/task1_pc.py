@@ -8,11 +8,11 @@ What it does
 1. Connects to the RPi's TCP socket server.
 2. Waits for OBSTACLES,<json>  →  runs pathfinding  →  sends back PATH,<json>.
 3. Enters detection loop:
-     RPi sends:  DETECT,<obstacle_id>\n
-                 4-byte big-endian image size (struct.pack(">I", size))
-                 raw JPEG bytes (exactly <size> bytes)
-     PC saves the JPEG, runs YOLO, sends back:
-                 OBJECT,<obstacle_id>,<confidence>,<class_id>\n
+    RPi sends:  DETECT,<obstacle_id>\n
+                4-byte big-endian image size
+                raw JPEG bytes
+    PC saves the JPEG, runs YOLO, sends back:
+                OBJECT,<obstacle_id>,<confidence>,<class_id>\n
 4. On STITCH,<n>  →  stitches the annotated images side-by-side and saves.
 
 Setup
@@ -38,7 +38,7 @@ from typing import Optional
 import cv2
 
 # ── Config — edit these ────────────────────────────────────────────────────────
-RPI_IP   = "192.168.20.1"   # RPi's IP on the hotspot — must match RPI_HOST in .env
+RPI_IP   = "192.168.15.15"   # RPi's IP on the hotspot — must match RPI_HOST in .env
 RPI_PORT = 5000              # must match RPI_PORT in .env
 
 RECEIVED_DIR    = "received_images"   # incoming JPEGs saved here
@@ -78,16 +78,11 @@ def run_detection(image_path: str):
 #                         stm_tokens.chunk_tokens.
 #   "dirs"              — optional robot direction dicts for the Android map
 
-from stm_tokens import (  # noqa: E402
-    PROFILE_NAMES,
-    TURN_RADIUS_MM,
-    TokenError,
-    arc,
-    chunk_tokens,
-    fwd,
-    rev,
-    stop,
-)
+PC_SIDE_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(PC_SIDE_DIR))
+
+from path_planner import plan_mission  # noqa: E402
+from stm_tokens import PROFILE_NAMES, TURN_RADIUS_MM  # noqa: E402
 
 # Must match the profile the robot is actually running. The Pi does not send
 # !PROF unless STM_ARC_PROFILE is set, so the default here is the FIRMWARE's
@@ -95,97 +90,15 @@ from stm_tokens import (  # noqa: E402
 # puts every turn wide, and the error compounds across turns.
 ARC_PROFILE = int(os.getenv("STM_ARC_PROFILE", "0"))
 
-
-def _visit_order(obstacles: list) -> list:
-    """
-    Nearest-neighbour visit order from the start corner (0,0).
-
-    Real, but greedy — it is a reasonable seed, not an optimal tour. Swap in a
-    proper TSP/Dubins ordering when the planner lands.
-    """
-    remaining = list(obstacles)
-    ordered = []
-    cx, cy = 0.0, 0.0
-    while remaining:
-        nearest = min(
-            remaining,
-            key=lambda o: (o.get("x", 0) - cx) ** 2 + (o.get("y", 0) - cy) ** 2,
-        )
-        remaining.remove(nearest)
-        ordered.append(nearest)
-        cx, cy = nearest.get("x", 0), nearest.get("y", 0)
-    return ordered
-
-
 def compute_path(obstacles: list) -> dict:
-    """
-    STUB — the visit ORDER is real, the MOTION is not.
-
-    What is real here: the token vocabulary, the §2 line chunking, the visit
-    ordering, and the segment/obstacle mapping. All of that is tested and the
-    RPi side depends on it.
-
-    What is NOT real: the actual motion between obstacles. Each approach emits a
-    single "S" — a legal token that replies OK and moves the robot zero
-    centimetres. That is the deliberate analogue of the old ["W000"] no-op: the
-    pipeline runs end to end, every message is well-formed, and the robot stays
-    still.
-
-    It emits S rather than a guess because the chassis is Ackermann (PROTOCOL.md
-    §8) — it cannot turn on the spot, every turn is an arc of radius 291-318mm,
-    and a 90 degree turn consumes ~291mm in BOTH axes of a 2000mm arena. A
-    plausible-looking guess at that geometry would not be a harmless placeholder;
-    it would drive the robot into things. Emitting a no-op is the honest stub.
-
-    To write the real thing, use the helpers in stm_tokens: fwd/rev/arc/stop to
-    build tokens, arc_displacement() for where an arc actually lands the robot,
-    arc_fits_in_arena() as a clearance guard, and chunk_tokens() at the end so
-    the §2 caps are respected automatically.
-    """
-    logging.warning(
-        "compute_path() is using the STUB — visit order is real, motion is a "
-        "no-op (each approach emits 'S'). Replace the marked block below."
-    )
+    """Run the physical-motion planner and return the RPi PATH payload."""
     logging.info(
         f"Planning against arc profile {ARC_PROFILE} "
         f"({PROFILE_NAMES.get(ARC_PROFILE, '?')}, radius "
-        f"{TURN_RADIUS_MM.get(ARC_PROFILE, '?')}mm) — this MUST match the profile "
-        f"the robot is actually running. Confirm with ?STAT (last field)."
+        f"{TURN_RADIUS_MM.get(ARC_PROFILE, '?')}mm). This MUST match the STM "
+        "profile; confirm with ?STAT."
     )
-
-    ordered = _visit_order(obstacles)
-
-    segments: list = []
-    segment_obstacles: list = []
-
-    for obstacle in ordered:
-        # ── REPLACE THIS BLOCK ────────────────────────────────────────────────
-        # Build the real token stream that drives from the current pose to a
-        # viewing pose for `obstacle`, e.g.:
-        #     tokens = [arc(True, True, 90), fwd(20), stop()]
-        try:
-            tokens = [stop()]
-        except TokenError as exc:
-            logging.error(f"Token build failed for obstacle {obstacle.get('id')}: {exc}")
-            continue
-        # ── END REPLACE ───────────────────────────────────────────────────────
-
-        # chunk_tokens enforces the §2 caps. One approach may become several
-        # lines; only the last of them gets the obstacle id, because the photo
-        # is taken when the whole approach finishes, not partway through it.
-        lines = chunk_tokens(tokens)
-        for i, line in enumerate(lines):
-            segments.append(line)
-            segment_obstacles.append(
-                obstacle.get("id") if i == len(lines) - 1 else None
-            )
-
-    return {
-        "segments":          segments,
-        "obstacle_ids":      [o.get("id") for o in ordered],
-        "segment_obstacles": segment_obstacles,
-        "dirs":              [],
-    }
+    return plan_mission(obstacles, arc_profile=ARC_PROFILE)
 
 
 # ── Image stitching ────────────────────────────────────────────────────────────
@@ -214,7 +127,7 @@ class RPiConnection:
         self.ip   = ip
         self.port = port
         self.sock: Optional[socket.socket] = None
-        self._rx_buf = ""   # text line buffer
+        self._rx_buf = b""   # socket receive buffer
 
     def connect(self) -> None:
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -232,13 +145,13 @@ class RPiConnection:
         Blocking — accumulates data until a newline is found, then returns
         one complete line. Returns None if the connection is closed.
         """
-        while "\n" not in self._rx_buf:
+        while b"\n" not in self._rx_buf:
             chunk = self.sock.recv(4096)
             if not chunk:
                 return None
-            self._rx_buf += chunk.decode("utf-8")
-        line, self._rx_buf = self._rx_buf.split("\n", 1)
-        msg = line.strip()
+            self._rx_buf += chunk
+        line, self._rx_buf = self._rx_buf.split(b"\n", 1)
+        msg = line.decode("utf-8", errors="replace").strip()
         logging.info(f"← RPi: {msg}")
         return msg
 
@@ -260,47 +173,30 @@ class RPiConnection:
         return data
 
     def receive_image(self, save_path: str) -> bool:
-        """
-        Receive one image using the length-prefix protocol (matches pc.py send_image):
-          1. Read 4 bytes → big-endian uint32 = image size in bytes.
-          2. Read exactly that many bytes → raw JPEG data.
-          3. Save to save_path.
-
-        Any leftover bytes in the text buffer from the previous receive_line()
-        call are used first — the RPi sends the header immediately after the
-        DETECT text line with no gap between them.
-
-        Returns True on success, False on any error.
-        """
+        """Receive one image using the test_camera length-prefix protocol."""
         os.makedirs(os.path.dirname(os.path.abspath(save_path)), exist_ok=True)
         try:
-            # Drain any leftover bytes from the text receive buffer.
-            # Use latin-1 so every byte value round-trips without corruption.
-            leftover = self._rx_buf.encode("latin-1") if self._rx_buf else b""
-            self._rx_buf = ""  # now in binary mode
-
-            # ── Step 1: 4-byte size header ────────────────────────────────────
-            header_buf = leftover
-            while len(header_buf) < 4:
-                chunk = self.sock.recv(4 - len(header_buf))
+            while len(self._rx_buf) < 4:
+                chunk = self.sock.recv(4096)
                 if not chunk:
-                    raise ConnectionError("Connection closed reading size header.")
-                header_buf += chunk
+                    raise ConnectionError("Connection closed reading image size.")
+                self._rx_buf += chunk
 
-            image_size = struct.unpack(">I", header_buf[:4])[0]
-            # Bytes beyond the 4-byte header are the start of the image payload
-            payload = header_buf[4:]
+            image_size = struct.unpack(">I", self._rx_buf[:4])[0]
+            self._rx_buf = self._rx_buf[4:]
             logging.info(f"Receiving image: {image_size} bytes.")
 
-            # ── Step 2: image payload ─────────────────────────────────────────
-            remaining = image_size - len(payload)
-            if remaining > 0:
-                payload += self._recv_exact(remaining)
+            while len(self._rx_buf) < image_size:
+                chunk = self.sock.recv(image_size - len(self._rx_buf))
+                if not chunk:
+                    raise ConnectionError("Connection closed reading image bytes.")
+                self._rx_buf += chunk
+            image_bytes = self._rx_buf[:image_size]
+            self._rx_buf = self._rx_buf[image_size:]
 
-            # ── Step 3: save ──────────────────────────────────────────────────
             with open(save_path, "wb") as fh:
-                fh.write(payload)
-            logging.info(f"Image saved → {save_path}.")
+                fh.write(image_bytes)
+            logging.info(f"Image saved → {save_path} ({len(image_bytes)} bytes).")
             return True
 
         except Exception as exc:
@@ -354,7 +250,7 @@ def main() -> None:
             filename = f"obstacle_{obstacle_id}_{int(time.time())}.jpg"
             save_path = os.path.join(RECEIVED_DIR, filename)
 
-            # Receive the JPEG (4-byte length header + raw bytes)
+            # Receive the JPEG (4-byte length prefix + raw bytes)
             ok = rpi.receive_image(save_path)
             if not ok:
                 logging.error(f"Image receive failed for obstacle {obstacle_id}.")

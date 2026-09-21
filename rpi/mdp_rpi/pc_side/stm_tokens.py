@@ -9,8 +9,8 @@ deployed to the algorithm PC, a different machine from the Pi. The §2 caps are
 therefore restated here rather than imported. If PROTOCOL.md changes, both
 copies must change.
 
-Everything here is real and tested. The path *selection* that consumes it (in
-task1_pc.compute_path) is still a stub — see the note there.
+Everything here is real and tested. The live path selection in
+task1_pc.compute_path is supplied by path_planner.py and uses these builders.
 
 Protocol 3 adds fwd_until() (FU<n>, §4.1). It is the token to reach for when a
 photo has to be taken from a known standoff: F0 trips on a stale reading and

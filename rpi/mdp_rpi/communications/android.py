@@ -16,9 +16,7 @@ Key behaviours:
 
 import os
 import errno
-import fcntl
 import logging
-import sys
 from socket import timeout as SocketTimeout
 from threading import Event, Thread
 from time import sleep
@@ -35,18 +33,6 @@ from bluetooth import (
 from dotenv import load_dotenv
 
 load_dotenv()
-
-# ── Process-level lock so only one instance of the script runs at a time ──────
-_LOCK_PATH = "/var/run/mdp-task1.lock"
-os.makedirs(os.path.dirname(_LOCK_PATH), exist_ok=True)
-_lock_fd = open(_LOCK_PATH, "w")
-try:
-    fcntl.flock(_lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    _lock_fd.write(str(os.getpid()))
-    _lock_fd.flush()
-except BlockingIOError:
-    print("Another instance of this script is already running — exiting.")
-    sys.exit(0)
 
 
 class Android:
@@ -174,16 +160,12 @@ class Android:
             raise
 
     def receive(self) -> Optional[str]:
-        """
-        Non-blocking receive.
-        Returns one complete newline-delimited message, or None if nothing
-        is available yet (timeout, no connection, partial packet).
-        """
         if not self.connected or not self.client_socket:
             return None
 
         try:
-            # Return a buffered complete line immediately if available
+            # If a previous recv contained multiple commands,
+            # return the next buffered command first.
             if "\n" in self._rx_buffer:
                 line, self._rx_buffer = self._rx_buffer.split("\n", 1)
                 msg = line.strip()
@@ -191,23 +173,46 @@ class Android:
                     logging.info(f"Android ← tablet: {msg}")
                     return msg
 
+            # If exactly one complete command remains buffered, return it.
+            if self._rx_buffer.strip():
+                msg = self._rx_buffer.strip()
+                self._rx_buffer = ""
+                logging.info(f"Android ← tablet: {msg}")
+                return msg
+
             raw = self.client_socket.recv(1024)
+
             if not raw:
                 logging.info("Android: tablet disconnected (0 bytes).")
                 self._close_client()
                 return None
-            self._rx_buffer += raw.decode("utf-8")
 
-            if "\n" in self._rx_buffer:
-                line, self._rx_buffer = self._rx_buffer.split("\n", 1)
-                msg = line.strip()
+            logging.info(f"ANDROID RAW BYTES: {raw!r}")
+
+            decoded = raw.decode("utf-8")
+
+            # Multiple commands may arrive in one recv().
+            if "\n" in decoded:
+                first, rest = decoded.split("\n", 1)
+                self._rx_buffer = rest
+
+                msg = first.strip()
                 if msg:
                     logging.info(f"Android ← tablet: {msg}")
                     return msg
+
+                return None
+
+            # Current tablet build also sends commands without '\n'.
+            msg = decoded.strip()
+            if msg:
+                logging.info(f"Android ← tablet: {msg}")
+                return msg
+
             return None
 
         except SocketTimeout:
-            return None  # normal — no data this tick
+            return None
 
         except BluetoothError as exc:
             if exc.args and "timed out" in str(exc.args[0]).lower():
@@ -217,10 +222,15 @@ class Android:
             return None
 
         except OSError as exc:
-            if getattr(exc, "errno", None) in (errno.ECONNRESET, errno.ENOTCONN, errno.EPIPE):
+            if getattr(exc, "errno", None) in (
+                errno.ECONNRESET,
+                errno.ENOTCONN,
+                errno.EPIPE,
+            ):
                 logging.warning(f"Android: connection reset ({exc}).")
                 self._close_client()
                 return None
+
             logging.error(f"Android: unexpected OSError in receive: {exc}")
             self._close_client()
             return None

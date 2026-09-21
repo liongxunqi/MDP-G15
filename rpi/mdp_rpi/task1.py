@@ -34,6 +34,7 @@ Thread-safety notes
 """
 
 import json
+import fcntl
 import logging
 import os
 from threading import Event, Lock, Thread, Timer
@@ -279,9 +280,9 @@ class Task1:
         Full image capture + transfer + wait-for-result cycle with retry.
 
         Steps per attempt:
-          1. Capture image from camera.
+          1. Capture JPEG bytes from camera.
           2. Tell PC a DETECT is coming: DETECT,<id>
-          3. Send image filename then raw bytes.
+          3. Send a 4-byte size header then raw bytes.
           4. Wait up to detect_timeout seconds for pc_thread to set image_done.
           5. Retry up to detect_retries times if no response.
 
@@ -291,8 +292,8 @@ class Task1:
 
         for attempt in range(1, total_attempts + 1):
             # ── Capture ──────────────────────────────────────────────────────
-            image_path = self.camera.capture_image()
-            if not image_path:
+            image_bytes = self.camera.capture_image()
+            if not image_bytes:
                 logging.error(f"DETECT attempt {attempt}: camera capture failed — skipping.")
                 continue
 
@@ -305,7 +306,7 @@ class Task1:
             )
 
             # Send actual image bytes
-            self.pc.send_image(image_path)
+            self.pc.send_image(image_bytes)
 
             # ── Wait for result ───────────────────────────────────────────────
             if self.image_done.wait(timeout=self.detect_timeout):
@@ -346,13 +347,39 @@ class Task1:
 
                 if tag == "OBSTACLE" and len(parts) >= 5:
                     # ── New obstacle from Android ─────────────────────────────
-                    facing_map = {"NORTH": 0, "EAST": 2, "SOUTH": 4, "WEST": 6, "SKIP": 8}
-                    obstacle = {
-                        "id":  int(parts[1]),
-                        "x":   int(parts[2]) / 10,
-                        "y":   int(parts[3]) / 10,
-                        "d":   facing_map.get(parts[4].strip().upper(), 0),
+                    facing_map = {
+                        "N": 0, "NORTH": 0,
+                        "E": 2, "EAST": 2,
+                        "S": 4, "SOUTH": 4,
+                        "W": 6, "WEST": 6,
+                        "SKIP": 8,
                     }
+                    offset = 1
+                    if parts[1].strip().upper() == "UPSERT" and len(parts) >= 6:
+                        offset = 2
+                    elif parts[1].strip().upper() == "REMOVE":
+                        obstacle_id = int(parts[2])
+                        before = len(self.obstacles)
+                        self.obstacles = [
+                            ob for ob in self.obstacles if ob.get("id") != obstacle_id
+                        ]
+                        self.path_ready.clear()
+                        self.path_requested = False
+                        logging.info(
+                            f"Android: removed obstacle {obstacle_id} "
+                            f"({before - len(self.obstacles)} entr{'y' if before - len(self.obstacles) == 1 else 'ies'})."
+                        )
+                        continue
+
+                    obstacle = {
+                        "id":  int(parts[offset]),
+                        "x":   int(parts[offset + 1]) / 10,
+                        "y":   int(parts[offset + 2]) / 10,
+                        "d":   facing_map.get(parts[offset + 3].strip().upper(), 0),
+                    }
+                    self.obstacles = [
+                        ob for ob in self.obstacles if ob.get("id") != obstacle["id"]
+                    ]
                     self.obstacles.append(obstacle)
                     self.path_ready.clear()
                     self.path_requested = False
@@ -424,6 +451,8 @@ class Task1:
 
             except OSError as exc:
                 logging.error(f"Android thread OSError: {exc}")
+            except Exception as exc:
+                logging.exception(f"Android thread error while handling message: {exc}")
 
     # ══ Thread: PC receive ════════════════════════════════════════════════════
 
@@ -527,7 +556,13 @@ class Task1:
         """
         while True:
             try:
-                # wait_reply() blocks — fine, stm_thread is dedicated to this.
+                # Do not start a reply timeout while idle. A line may be sent by
+                # Android between loop iterations; this check ensures the 20 s
+                # deadline begins only after that specific line is in flight.
+                if not self.stm.awaiting_reply:
+                    sleep(0.02)
+                    continue
+
                 # It returns only line-level replies (OK / RESEND / FAIL,*);
                 # query answers are routed separately by the STM reader thread,
                 # so they can never be mistaken for a movement reply here.
@@ -807,6 +842,29 @@ class Task1:
 
 # ── Run ────────────────────────────────────────────────────────────────────────
 
+_LOCK_PATH = "/var/run/mdp-task1.lock"
+
+
+def _acquire_task_lock():
+    """Prevent concurrent Task 1 orchestrators without affecting test scripts."""
+    os.makedirs(os.path.dirname(_LOCK_PATH), exist_ok=True)
+    lock_file = open(_LOCK_PATH, "w")
+    try:
+        fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        lock_file.close()
+        logging.error("Another Task 1 instance is already running — exiting.")
+        return None
+
+    lock_file.write(str(os.getpid()))
+    lock_file.flush()
+    return lock_file
+
 if __name__ == "__main__":
-    task = Task1()
-    task.start()
+    task_lock = _acquire_task_lock()
+    if task_lock is not None:
+        try:
+            Task1().start()
+        finally:
+            fcntl.flock(task_lock, fcntl.LOCK_UN)
+            task_lock.close()

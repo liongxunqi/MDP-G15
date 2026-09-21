@@ -16,6 +16,7 @@ Release/
 
 # Generated/received images
 rpi/mdp_rpi/pc_side/received/
+rpi/mdp_rpi/pc_side/received_images/
 rpi/mdp_rpi/pc_side/runs/
 
 # ===== Eclipse / CubeIDE workspace metadata =====

@@ -8,15 +8,14 @@ Why RPi is the server:
   The PC's IP can change depending on which laptop connects.
 
 Image transfer protocol (send_image):
-  1. RPi sends the filename as a UTF-8 string followed by "\\n"         → PC knows what to name the saved file
-  2. RPi sends raw JPEG bytes in 1 KB chunks
-  3. RPi sends the sentinel b"END_IMAGE" to signal end of file
-  PC must handle these three steps in order.
+  1. RPi sends a 4-byte big-endian image size.
+  2. RPi sends exactly that many raw JPEG bytes.
 """
 
 import logging
 import os
 import socket
+import struct
 import sys
 from typing import Optional
 
@@ -115,39 +114,29 @@ class PC:
 
     # ── Image transfer ────────────────────────────────────────────────────────
 
-    def send_image(self, image_path: str) -> None:
+    def send_image(self, image_or_path) -> None:
         """
-        Transfer a JPEG to the PC.
+        Transfer a JPEG to the PC using the test_camera length-prefix protocol.
 
-        Protocol:
-          1. Send filename (basename only) + "\\n" so PC can name the saved file.
-          2. Send raw bytes in 1 KB chunks.
-          3. Send sentinel b"END_IMAGE".
-
-        The PC side must call receive_image() which mirrors this exactly.
+        `image_or_path` may be in-memory JPEG bytes from Camera.capture_image()
+        or a file path for older tests.
         """
         if not self.client_socket:
             logging.warning("PC: send_image called but not connected — skipping.")
             return
 
-        filename = os.path.basename(image_path)
         try:
-            # Step 1 — filename header
-            self.client_socket.sendall((filename + "\n").encode("utf-8"))
-            logging.info(f"PC: sending image '{filename}'…")
+            if isinstance(image_or_path, (bytes, bytearray)):
+                image_bytes = bytes(image_or_path)
+            else:
+                with open(os.fspath(image_or_path), "rb") as fh:
+                    image_bytes = fh.read()
 
-            # Step 2 — raw bytes
-            with open(image_path, "rb") as fh:
-                chunk = fh.read(1024)
-                while chunk:
-                    self.client_socket.sendall(chunk)
-                    chunk = fh.read(1024)
-
-            # Step 3 — sentinel
-            self.client_socket.sendall(b"END_IMAGE")
-            logging.info(f"PC: image '{filename}' sent successfully.")
+            self.client_socket.sendall(struct.pack(">I", len(image_bytes)))
+            self.client_socket.sendall(image_bytes)
+            logging.info(f"PC: image sent successfully ({len(image_bytes)} bytes).")
         except FileNotFoundError:
-            logging.error(f"PC: image file not found — {image_path}")
+            logging.error(f"PC: image file not found — {image_or_path}")
         except socket.error as exc:
             logging.error(f"PC: error sending image — {exc}")
             self.disconnect()

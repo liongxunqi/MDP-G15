@@ -382,6 +382,12 @@ class STM:
         self._inflight = False
         self._inflight_lock = threading.Lock()
 
+    @property
+    def awaiting_reply(self) -> bool:
+        """Whether a movement line has been sent and still needs its reply."""
+        with self._inflight_lock:
+            return self._inflight
+
     # ── Connection ────────────────────────────────────────────────────────────
 
     def connect(self) -> None:
