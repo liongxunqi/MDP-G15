@@ -1,0 +1,38 @@
+# ---- STM32CubeIDE build output ----
+Debug/
+Release/
+*.o
+*.d
+*.su
+*.elf
+*.bin
+*.map
+*.list
+*.cyclo
+
+# The .hex IS the flashing artefact for FlyMcu.
+# Keep it out of git anyway - regenerate it, don't merge it.
+*.hex
+
+# ---- CubeIDE / Eclipse workspace state ----
+.metadata/
+RemoteSystemsTempFiles/
+*.launch
+
+# The repo root ignores .settings/ everywhere; re-include it here so teammates
+# can reimport this project in CubeIDE. Only the machine-specific file is dropped.
+!.settings/
+.settings/language.settings.xml
+
+# ---- CubeMX backups ----
+*.ioc.bak
+*.bak
+
+# .mxproject is tracked on purpose: CubeMX needs it to regenerate code
+# consistently after an .ioc change, so teammates must have the same copy.
+!.mxproject
+
+# ---- OS noise ----
+.DS_Store
+Thumbs.db
+desktop.ini
