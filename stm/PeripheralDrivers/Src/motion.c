@@ -65,9 +65,20 @@ static uint8_t s_profileIdx = 0U;
 
 /* Learned angular deceleration and the state needed to measure it. */
 static float s_arcDecel   = MOTION_ARC_DECEL_DPS2;
+
+/* Has anything better than the compiled constant been put into s_arcDecel /
+ * s_arcLag yet this power-on? Until it has, the first valid measurement is
+ * taken OUTRIGHT rather than filtered toward - see the learner at the end of
+ * an arc. Set by the !CAL* setters too: a restored value is a real prior and
+ * must not be thrown away by the next arc.
+ *
+ * Declared here rather than beside the learner so they sit with the values
+ * whose provenance they describe. */
+static uint8_t s_decelSeeded = 0U;
 static float s_brakeRate  = 0.0f;   /* |yaw rate| when braking started */
 static float s_brakeAngle = 0.0f;   /* |heading| when braking started  */
 static float s_arcLag     = MOTION_ARC_LAG_S;
+static uint8_t s_lagSeeded   = 0U;
 
 /* Cross-check results for the last arc. */
 static float   s_xcheckDeg    = 0.0f;
@@ -93,7 +104,8 @@ uint8_t Motion_SetArcDecel(float dps2)
         return 0U;
     }
 
-    s_arcDecel = dps2;
+    s_arcDecel    = dps2;
+    s_decelSeeded = 1U;   /* a restored value is a prior worth keeping */
     return 1U;
 }
 
@@ -101,7 +113,8 @@ uint8_t Motion_SetArcLag(float secs)
 {
     if ((secs < 0.0f) || (secs > MOTION_ARC_LAG_MAX_S)) { return 0U; }
 
-    s_arcLag = secs;
+    s_arcLag    = secs;
+    s_lagSeeded = 1U;
     return 1U;
 }
 
@@ -290,6 +303,8 @@ void Motion_Init(void)
     s_recentreTick = 0U;
     s_arcTargetDeg = 0.0f;
     s_arcCommandDeg = 0;
+    s_decelSeeded   = 0U;
+    s_lagSeeded     = 0U;
 }
 
 void Motion_DriveDistance(int32_t mm)
@@ -662,8 +677,29 @@ void Motion_Tick(void)
                     if ((meas > MOTION_ARC_DECEL_MIN) &&
                         (meas < MOTION_ARC_DECEL_MAX))
                     {
-                        s_arcDecel += MOTION_ARC_LEARN_GAIN
-                                    * (meas - s_arcDecel);
+#if MOTION_ARC_SEED_FIRST
+                        /* The first valid arc of a power-on is a direct
+                         * measurement of THIS floor. What it is being
+                         * filtered toward is a constant from a different day,
+                         * so there is no prior here worth defending - take
+                         * the measurement outright and spend the remaining
+                         * arcs rejecting noise instead of catching up.
+                         *
+                         * At gain 0.25 the old rule needed about ten arcs to
+                         * arrive, which meant the cold first run - the one
+                         * A.3 and A.4 are graded on - was always driven on
+                         * numbers nobody had measured here. */
+                        if (!s_decelSeeded)
+                        {
+                            s_arcDecel    = meas;
+                            s_decelSeeded = 1U;
+                        }
+                        else
+#endif
+                        {
+                            s_arcDecel += MOTION_ARC_LEARN_GAIN
+                                        * (meas - s_arcDecel);
+                        }
                     }
 
                     /* Whatever error survives alpha is latency. Positive
@@ -677,7 +713,24 @@ void Motion_Tick(void)
                                    : (float)s_arcCommandDeg;
                         float over = ended - want;
 
-                        s_arcLag += MOTION_ARC_LAG_GAIN * (over / s_brakeRate);
+                        /* over / rate IS the lag error in seconds, not a
+                         * proxy for it: braking Dt too late over-rotates by
+                         * rate * Dt. So gain 1.0 is the deadbeat correction
+                         * and MOTION_ARC_LAG_GAIN is pure damping. Same
+                         * argument as the decel above - on the first arc
+                         * there is nothing to damp against. */
+#if MOTION_ARC_SEED_FIRST
+                        if (!s_lagSeeded)
+                        {
+                            s_arcLag  += (over / s_brakeRate);
+                            s_lagSeeded = 1U;
+                        }
+                        else
+#endif
+                        {
+                            s_arcLag += MOTION_ARC_LAG_GAIN
+                                      * (over / s_brakeRate);
+                        }
 
                         if (s_arcLag < 0.0f)                { s_arcLag = 0.0f; }
                         if (s_arcLag > MOTION_ARC_LAG_MAX_S) { s_arcLag = MOTION_ARC_LAG_MAX_S; }

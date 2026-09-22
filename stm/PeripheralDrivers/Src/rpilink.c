@@ -47,6 +47,13 @@ static volatile uint8_t s_quiet;
  * RpiLink_Poll(). Should stay at zero; anything else is line trouble. */
 static volatile uint32_t s_rearms;
 
+/* What the !CAL* setters have done. Written only from answer_immediate(),
+ * which runs in RpiLink_Poll() on the main loop; read from Display() on the
+ * same loop, so no guard is needed. See the note in rpilink.h. */
+static uint32_t s_calOk;
+static uint32_t s_calBusy;
+static uint32_t s_calRange;
+
 /* 0 none, 1 watchdog timeout, 2 wrong-way abort, 3 FU had no echo to aim at.
  * Latched when a primitive ends badly and held until the whole line has been
  * answered. */
@@ -107,6 +114,17 @@ void RpiLink_Log(const char *s)
 
 uint8_t  RpiLink_IsQuiet(void)      { return s_quiet; }
 uint32_t RpiLink_GetRearmCount(void) { return s_rearms; }
+
+uint32_t RpiLink_GetCalOkCount(void)    { return s_calOk; }
+uint32_t RpiLink_GetCalBusyCount(void)  { return s_calBusy; }
+uint32_t RpiLink_GetCalRangeCount(void) { return s_calRange; }
+
+void RpiLink_ClearCalCounts(void)
+{
+    s_calOk    = 0U;
+    s_calBusy  = 0U;
+    s_calRange = 0U;
+}
 
 /* ------------------------------------------------------------------ */
 /* Receive                                                             */
@@ -319,6 +337,7 @@ static void answer_immediate(const Command_t *c)
          * sender retries once ?STAT reports idle. */
         if (Motion_IsBusy())
         {
+            s_calBusy++;
             snprintf(b, sizeof(b), "%s", CMD_REPLY_RESEND);
         }
         else
@@ -337,6 +356,11 @@ static void answer_immediate(const Command_t *c)
             {
                 ok = Odom_SetHeadingTrim((float)c->arg);
             }
+
+            /* Counted apart from the busy refusal above. Both answer RESEND,
+               and which one it was is the difference between "retry when the
+               robot stops" and "the number you sent is wrong". */
+            if (ok) { s_calOk++; } else { s_calRange++; }
 
             snprintf(b, sizeof(b), "%s",
                      ok ? CMD_REPLY_OK : CMD_REPLY_RESEND);

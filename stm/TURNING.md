@@ -458,11 +458,11 @@ Ordered by what blocks the most downstream work.
 |---|---|---|---|
 | 1 | **Reverse-arc radius**, floor chord | Retrace accuracy (§5) — on the critical path | Mark under rear axle, `RR90`, mark again, `R = chord / 1.414` |
 | 2 | **Reverse arcs run at all**, correct sign | Everything in §5 | Bench `RR90` / `RL90`, watch for `WRONGWAY` abort |
-| 3 | **Servo lock-to-lock time** vs the 100 ms align window | All multi-segment turns (§2) | Mode 6, or watch the wheels during `FR45,RL45` |
+| 3 | **Servo lock-to-lock time** vs the 100 ms align window | All multi-segment turns (§2) | Mode 7, or watch the wheels during `FR45,RL45` |
 | 4 | **Short-segment radius** (30° arc, never leaves approach speed) | Segmented-turn predictions (§2) | Floor chord on a 30° arc |
 | 5 | `FR45,RL45` net displacement vs the predicted 170 mm | Validates the whole §2 model | Chord method, compare against `FR90` |
 | 6 | **Motion constants, one at a time** with a tape measure | 40% time saving (§6) | A.3 distance run after each change |
-| 7 | **Side IR response** as an obstacle passes at arc speed | Reactive avoidance (§7) | Mode 7 live, drive an arc past a block |
+| 7 | **Side IR response** as an obstacle passes at arc speed | Reactive avoidance (§7) | Mode 8 live, drive an arc past a block |
 | 8 | **Outbound path length ÷ straight-line distance home** | Decides retrace vs direct (§6) | Free from the first full run |
 
 ---

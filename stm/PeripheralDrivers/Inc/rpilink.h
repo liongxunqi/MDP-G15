@@ -149,6 +149,24 @@ uint32_t RpiLink_GetRearmCount(void);
 /* 1 while a line is being executed. For the OLED. */
 uint8_t RpiLink_IsBusy(void);
 
+/* Tally of what the three calibration setters (!CALD/!CALL/!CALT, PROTOCOL.md
+ * §7) have done since boot or since the last clear. For the OLED, and the
+ * reason it exists is that the board is otherwise silent about them: the
+ * console latches off the moment the host speaks, so during a calibrate.py run
+ * there is nothing to watch.
+ *
+ * The split matters more than the total. A setter earns RESEND for two
+ * completely different reasons - the value was out of range, or a move was in
+ * flight and the firmware refused to change the model underneath it - and on
+ * the wire they are the same three bytes. The host has to disambiguate with
+ * ?STAT; these counters just say which it was. */
+uint32_t RpiLink_GetCalOkCount(void);     /* applied                          */
+uint32_t RpiLink_GetCalBusyCount(void);   /* refused: a move was in flight    */
+uint32_t RpiLink_GetCalRangeCount(void);  /* refused: value out of range      */
+
+/* Zero all three. Lets one phase of a calibration run be read on its own. */
+void RpiLink_ClearCalCounts(void);
+
 /* Last command the executor started. For the OLED. */
 CmdOpcode_t RpiLink_LastOpcode(void);
 

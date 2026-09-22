@@ -245,9 +245,15 @@ it traces a truer circle. Pick **TIGHT** when floor space is the constraint.
 
 The firmware learns three things while it drives: arc deceleration, brake
 engagement lag, and the steering centre trim. **All three live in RAM and are
-lost at power-off**, so a cold robot spends its first three or four arcs
-converging — the difference between a 9° error and a 1° one on the first turn
-of a session.
+lost at power-off**, so a cold robot has to converge them again every session
+— the difference between a 9° error and a 1° one on the first turn.
+
+How fast it converges changed. The decel and lag now take the **first** valid
+arc of a power-on outright instead of filtering toward it from a compiled
+constant, and the trim is measured from the steering loop's own output rather
+than searched for. One arc and one straight now do what used to take about ten
+of each. Restoring saved values with the setters below still beats both, and a
+restored value is not overwritten by the next arc.
 
 `?CAL` reads them. The setters write them back.
 
@@ -265,8 +271,15 @@ every movement argument is a magnitude with its direction in the opcode.
 
 **1. The sequence lives on the RPi.** There is no "run calibration" command
 and there will not be one. Calibration is a script you send, built from
-ordinary primitives. The firmware never drives itself, so there is no mode
-that could still be running when a task starts.
+ordinary primitives. Nothing the host can say makes the firmware drive itself,
+so no wire command can leave a sequence running when a task starts.
+
+> **Amended.** OLED **mode 1 (CALIB)** does drive this sequence, from the
+> button. That is a bench tool with a human standing over it, not a protocol
+> feature — there is still no token for it, and a sender cannot start it. It
+> also cancels itself the moment a command line arrives, so the hazard this
+> rule guards against (a firmware-driven sequence still running when a task
+> starts) cannot happen: the task's first line ends the cycle.
 
 **2. The setters are refused while a move is running.** `Motion_Tick()` reads
 the braking model on every tick of a turn, so a restore landing mid-arc would
@@ -277,11 +290,19 @@ have the robot finish braking on numbers that changed underneath it. Reply is
 throw out is a sender bug, and clamping would hide it behind an `OK`. Limits
 are 50–3000 dps², 0–250 ms, and ±80 µs.
 
+> Rules 2 and 3 both answer `RESEND`, and the wire cannot tell you which. The
+> sender disambiguates with `?STAT`; on the robot, **OLED mode 11 (CAL)** keeps
+> them as separate counters and shows the three live values in these same
+> scaled integers. Worth watching during a calibration run — the console
+> latches off the moment the host speaks, so there is nothing else to look at.
+
 ### A sequence that works
 
 ```
 !PROF0            pick the profile the tasks will actually use
-F600              a straight ≥ 500 mm — the trim needs 50 samples to update
+F80               a straight ≥ 800 mm — the trim discards the first 0.5 s as
+                  launch transient, then wants 0.5 s of steady driving, so it
+                  needs ~1.0 s of HOLDING. F<n> is CENTIMETRES (§4)
 FR90              four arcs, alternating so the robot returns to its
 RR90              start heading and stays on the same patch of floor
 FR90
@@ -292,6 +313,15 @@ RR90
 Then store the `CAL` reply against the surface, battery and weight it was
 taken on, and push it back with the three setters after the next power-on to
 skip the warm-up entirely.
+
+> **A short straight fails silently.** Below ~1.0 s of holding the firmware
+> leaves the trim exactly as it was and says nothing, and a trim that did not
+> move is indistinguishable over the wire from one that has converged — so a
+> too-short run gets stored in a profile as though it had been measured. The
+> firmware knows which it was, but `?CAL` has no field to carry it and adding
+> one is a protocol bump; for now the robot reports it on **OLED mode 1**,
+> which prints `SKIP` in place of the trim delta. Give the straight margin
+> rather than relying on spotting it.
 
 ### Two health checks, free
 
@@ -378,7 +408,7 @@ meaningless if stage 3 was never proven.
 | 9 | `?US` with a box ~50 cm ahead | `US,50`-ish. Proves the sensor before trusting `FU` |
 | 10 | Send `FU20`, box ~1 m ahead | Approaches in stages, `OK` after ~4 s, `?US` reads 18-22 |
 | 11 | Send `FU20` with the sensor unplugged | `FAIL,NOECHO`. **Nothing moves** |
-| 12 | Loop a realistic sequence 20× | `rx` on OLED mode 7 stays **0** |
+| 12 | Loop a realistic sequence 20× | `rx` on OLED mode 8 stays **0** |
 
 **Do stage 2 before anything else.** The firmware prints a banner and run
 reports on this port while no host is connected; the first valid command

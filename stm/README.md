@@ -17,7 +17,7 @@ anything else in this document — see [What other teams need to know](#what-oth
 | **A.3** Straight line, 80–120 cm, ±6%, no visible deviation | **Passing** — 0.0–0.3% error at 1000 and 1200 mm |
 | **A.4** Rotation, 90–360° | **Passing** — within ±1° on the first turn of a cold session |
 | **A.1** RPi ↔ STM over USB→Serial | STM side complete and unit-tested, **never tested on the wire** |
-| **A.5** Navigate around obstacle | Sensor drivers done and calibrated; navigation logic not written |
+| **A.5** Navigate around obstacle | Firmware side complete — the navigation lives on the Pi in `rpi/mdp_rpi/task_a5.py` and drives `?US` + `FU<n>` + arcs. **Never run on the floor** |
 
 Sensors: IR calibrated per channel, ultrasonic verified against a tape. Motors
 C and D are not implemented.
@@ -86,22 +86,104 @@ moving. **Short press** acts within the current mode.
 
 | Mode | Name | Short press does |
 |---|---|---|
-| 1 | **DRIVE** | Runs the A.3 distance. Holds the result: target, odometry, error %, B/A encoder agreement |
-| 2 | **SETDIST** | Steps target 800→1200 mm in 100 mm steps |
-| 3 | **TURN** | Runs the A.4 turn. Holds the result: commanded, measured, error, radius, cross-check |
-| 4 | **SETANGLE** | Steps angle 90/180/270/360, then direction (R/L, fwd/rev) |
-| 5 | **PROFILE** | Cycles arc profiles. Shows learned decel and brake lag |
-| 6 | **SERVO** | End-stop sweep, +25 µs per press. Auto-centres 2 s after the last press |
-| 7 | **SENSE** | Live IR and ultrasonic distances, echo count, UART re-arm count |
-| 8 | **IRCAL** | Median-filtered raw ADC counts, for fitting the IR curve |
-| 9 | **IMU** | Gyro diagnostics: heading, rate, poll rate, stalls, peak raw |
+| 1 | **CALIB** | Drives one PROTOCOL.md §7 calibration cycle — a straight, then four arcs — and shows what it changed. Press again to stop it, or to run another |
+| 2 | **DRIVE** | Runs the A.3 distance. Holds the result: target, odometry, error %, B/A encoder agreement |
+| 3 | **SETDIST** | Steps target 800→1200 mm in 100 mm steps |
+| 4 | **TURN** | Runs the A.4 turn. Holds the result: commanded, measured, error, radius, cross-check |
+| 5 | **SETANGLE** | Steps angle 90/180/270/360, then direction (R/L, fwd/rev) |
+| 6 | **PROFILE** | Cycles arc profiles. Shows learned decel and brake lag |
+| 7 | **SERVO** | End-stop sweep, +25 µs per press. Auto-centres 2 s after the last press |
+| 8 | **SENSE** | Live IR and ultrasonic distances, echo count, UART re-arm count |
+| 9 | **IRCAL** | Median-filtered raw ADC counts, for fitting the IR curve |
+| 10 | **IMU** | Gyro diagnostics: heading, rate, poll rate, stalls, peak raw |
+| 11 | **CAL** | What `?CAL` would answer right now, in the integers the wire carries, plus a tally of what the `!CAL*` setters have done. Short press zeroes the tally |
 
-Modes 7 and 8: short press also dumps a sample to USART3.
+**The board powers up in mode 2, not mode 1.** A stray press after power-on
+should cost one straight run, not a five-move sequence nobody is standing next
+to. Long-press once to reach CALIB.
 
-Mode 6 warning: the sweep pushes the steering past its normal limits to find
+Modes 8 and 9: short press also dumps a sample to USART3.
+
+### Mode 1 — the calibration cycle
+
+One press drives the `PROTOCOL.md` §7 sequence: an 800 mm straight, then four
+90° arcs alternating forward and reverse on the same steering side, so the
+robot retraces its own arc and stays on one patch of floor.
+
+The straight is 800 mm because the trim learner discards the first 0.5 s as
+launch transient and then wants 0.5 s of steady driving — about a second of
+holding once the ramps are paid for. A shorter one teaches it nothing **and
+says nothing**, which is why the screen prints `SKIP` rather than a trim that
+merely did not move.
+
+**It does not learn anything.** The learning already happens at the end of
+every move inside `motion.c` — `Odom_LearnTrim()` after a straight, the decel
+and lag update after an arc — and it does not care whether the move came from
+this button or off the wire. The mode only drives §7's moves in §7's order.
+That is why this is a sequencer and not a calibration routine, and why it was
+about eighty lines rather than a rewrite.
+
+```
+1 CALIB TIGHT        <- the profile you are calibrating. It is NOT set here
+done  run 2          <- or "step 3/5 arc", or "READY  run 0"
+dec  12340   +40     <- value, then what THIS cycle changed it by
+lag  1500    -10
+trm   +12     +3     <- the delta that matters most, or SKIP
+```
+
+**One press is one cycle, not the whole convergence.** Press, read the right-
+hand column, press again, and stop when it stops moving — that is what
+converged means, and a delta answers it without you having to remember the
+previous numbers. Press again while it is running to stop it; a long press
+aborts and leaves the mode.
+
+With the current learning rules that should take **two cycles, not ten**: the
+decel and lag take the first arc's measurement outright, and the trim is
+measured from the steering loop's own output rather than searched for. If
+`trm`'s delta is still the same size on the fourth cycle as the first,
+something is wrong — see *How the learning works* below.
+
+Three things worth knowing before you use it:
+
+- **It does not select a profile.** The learned values belong to whichever
+  profile was active when they were learned, so set mode 6 first if TIGHT is
+  not what you will drive.
+- **The reverse legs are unverified.** `motion.c` still marks the reverse-arc
+  sign convention "VERIFY THIS ON THE ROBOT". Watch the first cycle. If the
+  reverse legs go the wrong way, flip `g_calArcFwd` in `main.c` to all `1U` —
+  `FR90/FL90` also returns the heading, it just walks the robot forward in an
+  S and needs more floor.
+- **The host always wins.** A command line arriving mid-cycle cancels the
+  cycle. See the amendment under §7 rule 1 in `PROTOCOL.md`.
+
+Useful right now for the open steering-centre question: run four or five
+cycles and watch `trm` on the bottom two lines. Settling within a few µs of
+zero means `SERVO_CENTER_US` is right; settling at a consistent non-zero value
+means it is off by about that much, at 7.5 µs per cm over a metre.
+
+Mode 7 warning: the sweep pushes the steering past its normal limits to find
 where the linkage binds. **Watch the wheels, not the numbers** — the moment
 they stop moving is the mechanical stop, and further steps only stall the
 servo.
+
+Mode 11 is the one to sit on while the Pi runs `calibrate.py`. Four lines:
+
+```
+11 CAL wire
+dec  12340          <- decel_x10, exactly as ?CAL sends it
+lag 1500 trm +12    <- lag_ms_x10, trim in whole us
+ok 3 bsy 0 rg 0     <- what the !CAL* setters did
+short = zero
+```
+
+`bsy` and `rg` are the reason it exists. A setter answers `RESEND` both when
+the value was out of range and when a move was in flight and the firmware
+refused to change the braking model underneath it — identical on the wire, and
+the host has to disambiguate with `?STAT`. Here they are separate columns.
+
+Values are shown **scaled as the wire carries them**, not converted, so they
+can be compared against the host's log without arithmetic. Mode 6 has the same
+decel and lag in real units; mode 2 has the trim after a run.
 
 ---
 
@@ -386,6 +468,64 @@ I²C2: 400 kHz. USART3: 115200 8N1.
 **Everything here was measured on this robot. Do not replace with catalogue
 figures.**
 
+### How the learning works
+
+Three values are learned while driving — arc decel, brake lag, steering trim —
+and all three are RAM-only, so every power-on starts over. They used to be
+fixed-gain integrators at ~0.25–0.3, which is about ten iterations each. They
+are not any more, and the reason is worth keeping:
+
+**Decel and lag take the first valid arc outright** (`MOTION_ARC_SEED_FIRST`).
+What the old rule filtered *toward* was a constant measured on another day and
+another floor; the first arc is a measurement of this one. There was no prior
+worth defending, and the cold first run — the one A.3 and A.4 are graded on —
+was always driven on numbers nobody had checked here. Later arcs still filter
+at the old gains, which is where noise rejection belongs. A value restored with
+`!CALD`/`!CALL` counts as seeded and is *not* overwritten by the next arc: that
+one is a real prior.
+
+For the lag specifically, `over / rate` **is** the lag error in seconds, not a
+proxy for it — braking Δt late over-rotates by rate × Δt — so gain 1.0 is the
+deadbeat correction and `MOTION_ARC_LAG_GAIN` was only ever damping.
+
+**The trim is measured, not searched for** (`TRIM_LEARN_FROM_OUTPUT`). If the
+robot is being held straight, the mean of what the steering loop *put out* is
+the bias the centre is missing, already in servo µs:
+
+```
+s_servoUs = SERVO_CENTER_US + correction + s_headingTrim
+```
+
+so `trim += mean(correction)` is the answer rather than a fraction of it.
+Damped to 0.7 with a 25 µs step clamp so one bumped or wheel-slipped run
+cannot own the trim.
+
+That change also gives the trim **somewhere to stop**, which is the part that
+actually mattered. The old rule chased mean heading *error*, and the loop
+ignores any error inside `HEADING_DEADBAND_DEG` — so a robot sitting steadily
+at 0.2° contributed nothing the servo would act on and 0.8 µs of trim every
+single run, forever. It was chasing something the controller had already ruled
+close enough. Mean *correction* is zero exactly when the steering is doing
+nothing, which is the real definition of a correct centre.
+
+Both estimators are still accumulated every run, and both learners keep their
+old rule behind a `#if`, so either can be A/B'd on the floor with a one-line
+rebuild. Both also now discard the first 0.5 s of a straight
+(`TRIM_WARMUP_TICKS`): the servo slams from centre at launch and that stretch
+is transient, not evidence. Throwing it away is a better estimate from the same
+run, which is cheaper than driving further.
+
+A straight too short to clear `TRIM_WARMUP_TICKS + TRIM_MIN_SAMPLES` leaves
+the trim untouched, and an untouched trim reads exactly like a converged one.
+`Odom_TrimWasUpdated()` is how you tell them apart; mode 1 shows it as `SKIP`.
+This is the one failure here that could quietly poison a saved calibration
+profile, which is why it is visible rather than merely correct.
+
+**None of this has been run on a robot.** Watch `trm`'s delta on mode 1: it
+should shrink hard after the first cycle and sit near zero. If it oscillates —
+same size, alternating sign — lower `TRIM_LEARN_GAIN`; the backlash push
+inside `correction` is the thing most likely to cause it.
+
 ### Geometry
 
 | Constant | Value | Source |
@@ -588,18 +728,18 @@ Ten turns because the start/end alignment error is fixed, so spreading it over
 ten divides it by ten. **Turn slowly** — fast hand-rolling back-drives the 30:1
 gearbox and can slip the hub, which looks exactly like a counting fault.
 
-**Servo end stops.** Mode 6. Step up watching the **wheels**, not the numbers.
+**Servo end stops.** Mode 7. Step up watching the **wheels**, not the numbers.
 
 **Turn radius, without trusting the gyro.** Mark the floor under the rear axle,
 run a 90, mark again, measure the chord. `R = chord / 1.414`. This is the only
 measurement in the system that does not pass through the gyro.
 
-**Gyro sanity.** Mode 9, robot flat on the floor, slide it through 180° both
+**Gyro sanity.** Mode 10, robot flat on the floor, slide it through 180° both
 slowly and fast. Both must read 180 — a fast reading that comes up short means
 clipping. Rotate the whole robot on the ground; lifting and twisting mixes in
 roll and pitch.
 
-**IR calibration.** Mode 8, sensors mounted in their final positions, matt black
+**IR calibration.** Mode 9, sensors mounted in their final positions, matt black
 obstacle as the target (the arena obstacles are matt black, and a white card
 gives a different answer). Record `IR_LeftFiltered()`, not the raw sample. Fit
 `ln(cm)` against `ln(volts)` — the slope is B, the intercept is `ln(A)`.
@@ -641,7 +781,7 @@ why the cross-check exists.
 - **Once the gyro goes stale it stays stale until reboot.** `IMU_Poll()` returns
   early when not ready. Deliberate — a flapping sensor switching heading
   sources mid-run is worse than a consistently degraded one. Watch `st` on
-  mode 9.
+  mode 10.
 - **Cross-track uses dead-reckoned `y_mm`.** It returns the robot to where it
   *believes* the line was, not to an absolute position.
 - **`Sensors_ObstacleAhead()` treats "no reading" as "obstacle".** Fail-safe,
@@ -671,7 +811,7 @@ why the cross-check exists.
 - Strong definitions for the two heading hooks, if the RPi ever wants heading
 
 **Watch on the bench**
-- `rx` on mode 7 should stay at **0**. Anything else means the link is glitching
+- `rx` on mode 8 should stay at **0**. Anything else means the link is glitching
   and being silently recovered — check the wiring before it bites in a run.
-- `pk` on mode 9 should stay well under 32767. Near the rail means the gyro is
+- `pk` on mode 10 should stay well under 32767. Near the rail means the gyro is
   clipping and every angle is under-read.

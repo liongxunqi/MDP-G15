@@ -234,6 +234,60 @@
 
 #define HEADING_TRIM_GAIN   4.0f    /* us of trim per degree of mean error */
 #define HEADING_TRIM_MAX_US 80.0f
+
+/* ---------------------------------------------------------------------------
+ * HOW THE TRIM IS LEARNED
+ *
+ * 1 - from the mean CORRECTION the steering loop put out, in servo us.
+ * 0 - from the mean heading ERROR, the original rule, via HEADING_TRIM_GAIN.
+ *
+ * Output space is a measurement; error space is a search. When the robot is
+ * being held straight, the average of what the servo had to do IS the bias
+ * the centre is missing, already in the right units - so the update is the
+ * answer rather than a fraction of it, and two runs get there where the old
+ * rule took about ten.
+ *
+ * The bigger difference is that output space has somewhere to STOP. The
+ * heading loop ignores any error inside HEADING_DEADBAND_DEG, but the old
+ * rule integrated those errors anyway: a robot sitting steadily at 0.2
+ * degrees moved the trim 0.8 us every run and never converged, because it was
+ * chasing something the controller had already ruled close enough. A
+ * deadband tick contributes a correction of exactly zero, and zero is the
+ * right evidence - no steering needed means no trim needed.
+ *
+ * Both estimators are accumulated on every run, so flipping this is a
+ * one-line rebuild and an honest A/B on the same robot. */
+#define TRIM_LEARN_FROM_OUTPUT  1
+
+/* Fraction of the measured bias folded in per run. 1.0 is deadbeat and lands
+ * in a single run; it also hands the whole trim to one bumped or wheel-slipped
+ * run. 0.7 costs about one extra run and does not. */
+#define TRIM_LEARN_GAIN      0.7f
+
+/* Ceiling on one run's step, us. Same argument as the gain, for the single
+ * wild run that the gain alone would still let through. Generous enough that
+ * a genuine cold start still converges in two runs. */
+#define TRIM_MAX_STEP_US     25.0f
+
+/* Ticks of a straight discarded before the accumulators start, at 100 Hz.
+ * The servo slams from centre at launch and the first stretch is transient,
+ * not evidence. Throwing it away is a better estimate from the SAME run -
+ * cheaper than driving further. */
+#define TRIM_WARMUP_TICKS    50U    /* 0.5 s */
+
+/* Samples required AFTER the warm-up window before the trim is touched at
+ * all. Aborted and very short moves teach nothing. */
+#define TRIM_MIN_SAMPLES     50U    /* 0.5 s */
+
+/* TRIM_WARMUP_TICKS + TRIM_MIN_SAMPLES is the real minimum: 100 ticks, one
+ * second of HOLDING, which needs a straight of roughly 800 mm once the accel
+ * and brake ramps are paid for. It used to be half that, which is where
+ * PROTOCOL.md §7's old "a straight >= 500 mm" came from - that figure moved
+ * with this one.
+ *
+ * A straight that falls short does not fail: Odom_LearnTrim() returns having
+ * changed nothing, and a trim that did not move looks exactly like a trim
+ * that has converged. Odom_TrimWasUpdated() below is how you tell. */
 #define ODOM_DT_S           0.01f
 
 /* Sign convention: which way a positive heading error should steer.
@@ -408,10 +462,19 @@ uint8_t Odom_SetHeadingTrim(float us);
  * the quantity the cross-track term drives to zero. */
 float Odom_GetCrossTrack(void);
 
-/* Fold this run's mean heading error into the trim. Call ONCE when a straight
- * move finishes, from the motion layer. Does nothing if the run was too short
- * to have collected a meaningful average. */
+/* Fold this run's measured steering bias into the trim. Call ONCE when a
+ * straight move finishes, from the motion layer. Does nothing if the run was
+ * too short to have collected a meaningful average - see the note on
+ * TRIM_MIN_SAMPLES. */
 void Odom_LearnTrim(void);
+
+/* 1 if the last straight was long enough to actually move the trim.
+ *
+ * Read it after a straight, before the next one starts. Exists because "did
+ * not learn" and "has converged" produce the identical trim value, and a run
+ * that silently taught nothing can otherwise be saved into a calibration
+ * profile as though it had been measured. */
+uint8_t Odom_TrimWasUpdated(void);
 
 /* ------------------------------------------------------------------ */
 /* Calibration helper                                                  */

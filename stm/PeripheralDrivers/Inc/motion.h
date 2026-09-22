@@ -200,6 +200,21 @@
  * odd run cannot throw it. */
 #define MOTION_ARC_LEARN_GAIN       0.25f
 
+/* 1 - the FIRST valid arc of a power-on replaces the compiled seed outright,
+ *     and MOTION_ARC_LEARN_GAIN / MOTION_ARC_LAG_GAIN only damp the arcs
+ *     after it. One arc to arrive instead of about ten.
+ * 0 - every arc filters, including the first. The original behaviour.
+ *
+ * The seed is a number measured on another day and another floor. The first
+ * arc is a measurement of THIS one, so filtering it toward the seed is
+ * defending a prior that has nothing behind it - and it left the cold first
+ * run, which is the run A.3 and A.4 are graded on, driving on constants
+ * nobody had checked here.
+ *
+ * A value restored with !CALD / !CALL counts as seeded: that one IS a real
+ * prior, and the next arc must not throw it away. See Motion_SetArcDecel(). */
+#define MOTION_ARC_SEED_FIRST       1
+
 /* Brake engagement lag, seconds. LEARNED, like alpha.
  *
  * The w^2/2a term describes the coast once the brakes are actually working.

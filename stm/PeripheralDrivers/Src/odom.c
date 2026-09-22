@@ -46,6 +46,22 @@ static float    s_error;
 static float    s_headingTrim;   /* learned centre offset, us */
 static float    s_errSum;        /* mean-error accumulator, this run */
 static uint32_t s_errCount;
+
+/* Mean-CORRECTION accumulator, this run: what the steering loop actually had
+ * to put out to hold the line, in servo microseconds. This is what the trim
+ * is learned from - see Odom_LearnTrim(). s_ticksHeld counts every tick of
+ * the run so the launch transient can be skipped. */
+static float    s_corrSum;
+static uint32_t s_corrCount;
+static uint32_t s_ticksHeld;
+
+/* Did the last straight actually teach the trim anything? Cleared when a
+ * straight starts, set only if Odom_LearnTrim() got far enough to apply a
+ * step. A straight too short to clear TRIM_WARMUP_TICKS + TRIM_MIN_SAMPLES
+ * leaves the trim untouched, and an untouched trim is indistinguishable from
+ * a converged one by looking at the value - which is how a short run gets
+ * saved into a calibration profile as though it had been measured. */
+static uint8_t  s_trimUpdated;
 static uint16_t s_servoUs;
 
 /* Spin calibration state */
@@ -260,12 +276,6 @@ void Odom_Update(void)
         }
 
         /* Deadband. Below this the servo would only hunt and buzz. */
-        /* Collect the error for the between-runs trim update. Accumulating
-         * is safe; ACTING on it inside the run is what destabilised the loop
-         * against the linkage backlash. */
-        s_errSum += s_error * ((s_holdRpm < 0) ? -1.0f : 1.0f);
-        s_errCount++;
-
         if ((s_error < HEADING_DEADBAND_DEG) && (s_error > -HEADING_DEADBAND_DEG))
         {
             correction = 0.0f;
@@ -285,6 +295,34 @@ void Odom_Update(void)
             else if (correction < 0.0f) { correction -= SERVO_BACKLASH_US; }
 
             correction = clampf(correction, -HEADING_MAX_US, HEADING_MAX_US);
+        }
+
+        /* Collect what the CONTROLLER IS PUTTING OUT, for the between-runs
+         * trim update. See the note above Odom_LearnTrim().
+         *
+         * Taken here, after the direction flip and the backlash push, because
+         * this is servo space - the same space the trim lives in. No sign
+         * flip for reverse: a mechanical offset is the same servo offset
+         * whichever way the robot is travelling, which is the whole reason
+         * the trim sits outside the flip below.
+         *
+         * A deadband tick contributes a real 0, not a skipped sample. Zero
+         * steering IS the correct evidence when the robot is holding line -
+         * and that is exactly what the old error-space version could not
+         * express, because it went on integrating errors the loop had
+         * already decided were close enough. */
+        s_ticksHeld++;
+        if (s_ticksHeld > TRIM_WARMUP_TICKS)
+        {
+            s_corrSum += correction;
+            s_corrCount++;
+
+            /* The old error-space estimator, kept accumulating so the two
+               can be compared on the floor without a rebuild - see
+               TRIM_LEARN_FROM_OUTPUT in odom.h. Error space DOES need the
+               reverse flip; servo space does not. */
+            s_errSum += s_error * ((s_holdRpm < 0) ? -1.0f : 1.0f);
+            s_errCount++;
         }
 
         /* Trim added AFTER the direction flip - it is a servo-space constant,
@@ -313,6 +351,7 @@ float    Odom_GetDistance(void)     { return s_pose.distance_mm; }
 uint16_t Odom_GetServoUs(void)      { return s_servoUs; }
 float    Odom_GetHeadingError(void) { return s_error; }
 float    Odom_GetHeadingTrim(void)  { return s_headingTrim; }
+uint8_t  Odom_TrimWasUpdated(void)   { return s_trimUpdated; }
 float    Odom_GetCrossTrack(void)   { return s_pose.y_mm; }
 
 /* ------------------------------------------------------------------ */
@@ -356,29 +395,68 @@ uint8_t Odom_SetHeadingTrim(float us)
 
 void Odom_LearnTrim(void)
 {
-    float mean;
+    float step;
 
     /* Too few samples to mean anything - a very short move, or one that was
-     * aborted before the heading loop had settled. */
-    if (s_errCount < 50U) { return; }
+     * aborted before the heading loop had settled. Counted AFTER the warm-up
+     * window, so this is 50 samples of steady driving rather than 50 samples
+     * that might all be launch transient. */
+    if (s_corrCount < TRIM_MIN_SAMPLES) { return; }
 
-    mean = s_errSum / (float)s_errCount;
+    s_trimUpdated = 1U;
 
-    /* A positive mean error means the robot sat to one side for the whole
-     * run, which is exactly a centre offset. HEADING_SIGN converts heading
-     * degrees into the servo direction that cancels them. */
-    s_headingTrim += mean * HEADING_TRIM_GAIN * (float)HEADING_SIGN;
+#if TRIM_LEARN_FROM_OUTPUT
+    /* MEASURE THE ANSWER, DO NOT SEARCH FOR IT.
+     *
+     * If the robot is being held straight, the mean of what the steering loop
+     * put out IS the bias the centre is missing - in the same units, already
+     * in servo space. So the update is the measurement, not a fraction of an
+     * error, and one run gets there instead of ten.
+     *
+     * It also gives the trim somewhere to stop. The old rule chased mean
+     * HEADING error, and the loop ignores any error inside HEADING_DEADBAND_
+     * DEG - so the robot would sit happily at 0.2 degrees, contributing
+     * nothing the servo would act on and 0.8 us of trim every single run,
+     * forever. Mean CORRECTION is zero exactly when the steering is doing
+     * nothing, which is the real definition of a correct centre.
+     *
+     * Damped rather than deadbeat: TRIM_LEARN_GAIN below 1 costs about one
+     * extra run and stops a single bumped or slipping run from owning the
+     * trim outright. The step clamp is the same argument for a single wild
+     * one. */
+    step = (s_corrSum / (float)s_corrCount) * TRIM_LEARN_GAIN;
+    step = clampf(step, -TRIM_MAX_STEP_US, TRIM_MAX_STEP_US);
+    s_headingTrim += step;
+#else
+    /* The original error-space rule, kept for an A/B on the floor. Converges
+     * in roughly ten runs where the rule above takes two, and cannot settle
+     * for the deadband reason described there.
+     *
+     * Note this is the original ESTIMATOR, not the original code: it reads
+     * the same warm-up-trimmed window as the rule above. That is deliberate.
+     * An A/B that changed the estimator and the sampling window at once would
+     * not tell you which one moved the result. */
+    step = (s_errSum / (float)s_errCount) * HEADING_TRIM_GAIN * (float)HEADING_SIGN;
+    s_headingTrim += step;
+#endif
+
     s_headingTrim  = clampf(s_headingTrim,
                             -HEADING_TRIM_MAX_US, HEADING_TRIM_MAX_US);
 
-    s_errSum   = 0.0f;
-    s_errCount = 0U;
+    s_errSum    = 0.0f;
+    s_errCount  = 0U;
+    s_corrSum   = 0.0f;
+    s_corrCount = 0U;
 }
 
 void Odom_DriveHeading(int16_t rpm, float heading_deg)
 {
     s_errSum      = 0.0f;
     s_errCount    = 0U;
+    s_corrSum     = 0.0f;
+    s_corrCount   = 0U;
+    s_ticksHeld   = 0U;          /* restart the warm-up window */
+    s_trimUpdated = 0U;          /* until this straight earns it */
     s_holdHeading = wrap180(heading_deg);
     s_holdRpm     = rpm;
     s_error       = 0.0f;

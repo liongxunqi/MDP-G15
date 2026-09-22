@@ -19,22 +19,32 @@
   *  MODES - LONG press the user button (PE0) to cycle, SHORT press to act.
   *  A long press also aborts whatever is moving.
   *
-  *    1 DRIVE    A.3 run. SHORT drives the selected distance and holds the
+  *    1 CALIB    SHORT drives one PROTOCOL.md §7 calibration cycle - a
+  *               straight, then four arcs - and the learning that already
+  *               happens at the end of every move does the rest. Shows what
+  *               the cycle CHANGED. Press again until that stops moving.
+  *               Boots into mode 2, not this one, on purpose.
+  *    2 DRIVE    A.3 run. SHORT drives the selected distance and holds the
   *               result on screen: target, odometry, error %, and B/A
   *               encoder agreement for that run.
-  *    2 SETDIST  SHORT steps the target 800..1200 mm in 100 mm steps.
-  *    3 TURN     A.4 run. SHORT turns the selected angle and holds the
+  *    3 SETDIST  SHORT steps the target 800..1200 mm in 100 mm steps.
+  *    4 TURN     A.4 run. SHORT turns the selected angle and holds the
   *               result: commanded, measured, error, radius, cross-check.
-  *    4 SETANGLE SHORT steps angle 90/180/270/360 and the direction.
-  *    5 PROFILE  SHORT cycles the arc profiles. Shows the learned decel and
+  *    5 SETANGLE SHORT steps angle 90/180/270/360 and the direction.
+  *    6 PROFILE  SHORT cycles the arc profiles. Shows the learned decel and
   *               brake lag, which is where converged seed values come from.
-  *    6 SERVO    End-stop sweep. Auto-centres 2 s after the last press.
-  *    7 SENSE    Live calibrated distances from both IRs and the ultrasonic,
+  *    7 SERVO    End-stop sweep. Auto-centres 2 s after the last press.
+  *    8 SENSE    Live calibrated distances from both IRs and the ultrasonic,
   *               plus the echo counter. SHORT streams a sample to USART3.
-  *    8 IRCAL    Median-filtered ADC counts, for fitting the IR curve in
+  *    9 IRCAL    Median-filtered ADC counts, for fitting the IR curve in
   *               ir.h. SHORT streams a sample to USART3.
-  *    9 IMU      Gyro diagnostics: heading, rate, poll rate, stalls, and the
+  *   10 IMU      Gyro diagnostics: heading, rate, poll rate, stalls, and the
   *               peak raw value against the full-scale rail.
+  *   11 CAL      What ?CAL would answer right now, in the EXACT integers the
+  *               wire carries, plus a tally of what the !CAL* setters have
+  *               done. The console latches off the moment the host speaks, so
+  *               during a calibrate.py run this is the only window. SHORT
+  *               zeroes the tally.
   *
   *  CONTROL TICK - TIM6, 100 Hz, priority 6. Order is not negotiable:
   *      Encoders_Update() -> IR_Update() -> Ultrasonic_Tick() -> IMU_Tick()
@@ -87,9 +97,67 @@
 #define DIST_MAX_MM          1200
 #define DIST_STEP_MM         100
 
-typedef enum { MODE_DRIVE = 0, MODE_SETDIST, MODE_TURN, MODE_SETANGLE,
-               MODE_PROFILE, MODE_SERVO, MODE_SENSE, MODE_IRCAL, MODE_IMU,
-               MODE_COUNT } uimode_t;
+typedef enum { MODE_CALIB = 0, MODE_DRIVE, MODE_SETDIST, MODE_TURN,
+               MODE_SETANGLE, MODE_PROFILE, MODE_SERVO, MODE_SENSE,
+               MODE_IRCAL, MODE_IMU, MODE_CAL, MODE_COUNT } uimode_t;
+
+/* ---------------------------------------------------------------------------
+ * MODE 1: THE CALIBRATION CYCLE
+ *
+ * PROTOCOL.md §7 gives the sequence that converges the three learned values:
+ * a straight long enough to teach the trim, then four arcs. This drives it
+ * from the button so the whole thing can be done without the Pi.
+ *
+ * Nothing here learns anything. The learning already happens at the end of
+ * every move inside motion.c - Odom_LearnTrim() after a straight, the decel
+ * and lag update after an arc - and it does not care whether the move came
+ * from this button or off the wire. This mode only drives §7's moves in
+ * §7's order. That is the whole trick, and it is why this is a sequencer and
+ * not a calibration routine.
+ *
+ * ONE PRESS IS ONE CYCLE, NOT THE WHOLE CONVERGENCE. Convergence is
+ * iterative by nature: press, watch dec and lag on mode 11, press again,
+ * stop when they stop moving. Doing it in one press would mean a firmware-
+ * driven sequence running for minutes, which is exactly what PROTOCOL.md §7
+ * rule 1 exists to prevent.
+ *
+ * THE HOST ALWAYS WINS. If a command line arrives while a cycle is running,
+ * the cycle cancels itself - see Calib_Tick(). §7 rule 1 says the firmware
+ * never drives itself so that no mode can still be running when a task
+ * starts; a button sequence is not a wire command, but it creates the same
+ * hazard, and yielding to the host is how this mode stays inside the spirit
+ * of that rule.
+ * ------------------------------------------------------------------------- */
+
+/* The trim needs TRIM_WARMUP_TICKS + TRIM_MIN_SAMPLES of HOLDING - one second
+   - and the accel and brake ramps are not free. 800 mm leaves real margin on
+   a low battery; 600 cleared the bar on paper and not much else. A straight
+   that falls short teaches nothing AND says nothing, which is why the screen
+   below calls it out rather than showing a trim that merely did not move. */
+#define CALIB_STRAIGHT_MM    800
+#define CALIB_ARC_DEG        90
+
+/* Between steps. Each move should start from a robot that has stopped
+   rocking, and the gap is also what makes the step advance unambiguous -
+   see Calib_Tick(). */
+#define CALIB_SETTLE_MS      400U
+
+/* The §7 sequence: one straight, then four arcs ALTERNATING FORWARD AND
+   REVERSE ON THE SAME STEERING SIDE. FR90 then RR90 retraces the same arc
+   backwards, so the robot returns to its start pose instead of walking
+   across the room - four arcs fit on one patch of floor.
+
+   CAVEAT: reverse arcs are implemented but motion.c:346 still marks their
+   sign convention "VERIFY THIS ON THE ROBOT". If the reverse legs go the
+   wrong way, change the two 0s below to 1s: FR90/FL90 also returns the
+   heading, it just needs more floor because the robot walks forward in an S.
+   Watch the first cycle before walking away from it. */
+static const uint8_t g_calArcFwd[]   = { 1U, 0U, 1U, 0U };
+static const uint8_t g_calArcRight[] = { 1U, 1U, 1U, 1U };
+#define CALIB_ARCS      (sizeof(g_calArcFwd) / sizeof(g_calArcFwd[0]))
+#define CALIB_STEPS     (1U + CALIB_ARCS)   /* the straight, then the arcs */
+
+typedef enum { CALIB_IDLE = 0, CALIB_RUNNING, CALIB_DONE } calibstate_t;
 
 /* Private variables ---------------------------------------------------------*/
 TIM_HandleTypeDef  htim2;    /* encoder A  PA15 / PB3      */
@@ -105,7 +173,33 @@ I2C_HandleTypeDef  hi2c2;    /* ICM-20948  PB10/PB11       */
 DMA_HandleTypeDef  hdma_adc1;
 
 static volatile uint8_t  g_evtShort = 0, g_evtLong = 0;
+
+/* Boots into DRIVE, not CALIB, deliberately. A stray short press after
+   power-on should cost one straight run, not a five-move sequence nobody is
+   standing next to. Long press once to reach CALIB. */
 static volatile uimode_t g_mode = MODE_DRIVE;
+
+/* Calibration cycle state. Touched only from the main loop - the button ISR
+   sets g_evtShort and nothing else - so none of it is volatile. */
+static calibstate_t g_calState = CALIB_IDLE;
+static uint8_t      g_calStep  = 0U;    /* 0 = straight, 1..4 = the arcs   */
+static uint32_t     g_calMark  = 0U;    /* HAL_GetTick() of the last motion */
+static uint16_t     g_calRuns  = 0U;    /* cycles completed since power-on  */
+
+/* How the current step ended, latched before anything clears it. MOTION_IDLE
+   means "not latched yet" - see Calib_Tick(). */
+static MotionState_t g_calOutcome = MOTION_IDLE;
+
+/* Learned values as they stood when the cycle STARTED, so the screen can
+   show what the cycle changed. "Have they stopped moving?" is the only
+   question this mode exists to answer, and a delta answers it directly
+   while two absolute numbers make you remember the previous one. */
+static int32_t g_calPrevDecel10 = 0;
+static int32_t g_calPrevLag10   = 0;
+static int32_t g_calPrevTrim    = 0;
+static int32_t g_calDeltaDecel  = 0;
+static int32_t g_calDeltaLag    = 0;
+static int32_t g_calDeltaTrim   = 0;
 
 /* Commanded distance for the next run. Changed in MODE_SETDIST. */
 static volatile int32_t  g_targetMm = DIST_TARGET_MM;
@@ -293,6 +387,153 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 }
 
 /* ==========================================================================
+ *  Calibration cycle (mode 1). See the block comment above the mode enum.
+ * ========================================================================== */
+
+/* The learned values in the units ?CAL puts on the wire, so the screens and
+   the protocol agree without anyone doing arithmetic in their head. */
+static int32_t CalDecel10(void)
+{
+    return (int32_t)((Motion_GetArcDecel() * 10.0f) + 0.5f);
+}
+
+static int32_t CalLag10(void)
+{
+    return (int32_t)((Motion_GetArcLag() * 10000.0f) + 0.5f);
+}
+
+/* Kick off step g_calStep. Step 0 is the straight; 1..CALIB_ARCS are arcs. */
+static void Calib_StartStep(void)
+{
+    g_calMark    = HAL_GetTick();
+    g_calOutcome = MOTION_IDLE;   /* nothing latched for this step yet */
+
+    if (g_calStep == 0U)
+    {
+        Motion_DriveDistance(CALIB_STRAIGHT_MM);
+    }
+    else
+    {
+        uint8_t i = (uint8_t)(g_calStep - 1U);
+        Motion_DriveArc(CALIB_ARC_DEG, g_calArcFwd[i], g_calArcRight[i]);
+    }
+}
+
+static void Calib_Start(void)
+{
+    g_calPrevDecel10 = CalDecel10();
+    g_calPrevLag10   = CalLag10();
+    g_calPrevTrim    = (int32_t)Odom_GetHeadingTrim();
+    g_calStep        = 0U;
+    g_calState       = CALIB_RUNNING;
+    RpiLink_Log("\r\ncalib cycle starting\r\n");
+    Calib_StartStep();
+}
+
+/* Stop the SEQUENCE. Does not touch the motors - every caller has either
+   just stopped them or is about to. Separated for exactly that reason: a
+   cancel that also braked would hide which of the two actually happened. */
+static void Calib_Cancel(void)
+{
+    if (g_calState == CALIB_RUNNING)
+    {
+        g_calState = CALIB_IDLE;
+        RpiLink_Log("calib cycle cancelled\r\n");
+    }
+}
+
+static void Calib_Tick(void)
+{
+    uint32_t now;
+
+    if (g_calState != CALIB_RUNNING) { return; }
+
+    /* The host outranks the button. A line arriving mid-cycle will start its
+       own move, and from here that is indistinguishable from this cycle's
+       move finishing - so the next step would be launched underneath the
+       host's command. Yield instead. See §7 rule 1 in the mode comment. */
+    if (RpiLink_IsBusy())
+    {
+        Calib_Cancel();
+        return;
+    }
+
+    now = HAL_GetTick();
+
+    /* While anything is moving, keep the mark fresh. The settle timer then
+       only starts counting once the move has actually ended, and the same
+       gap covers the first few ticks after Motion_DriveX() is called, when
+       the motion layer has not reported busy yet. Without that, a step would
+       be declared finished the instant it was started. */
+    if (Motion_IsBusy())
+    {
+        g_calMark = now;
+        return;
+    }
+
+    /* Latch HOW the step ended, on the first tick after it ended.
+     *
+     * It cannot be read later: the g_reportReady block further down this
+     * same loop calls Motion_ClearState(), which drops TIMEOUT back to IDLE,
+     * so by the time the settle expires every move looks like a success.
+     * Same trap the line executor documents in rpilink.c, same answer.
+     *
+     * MOTION_IDLE doubles as "nothing latched": it is also what the state
+     * reads for the tick or two between Motion_DriveX() being called and the
+     * control tick picking the move up, and latching that would be wrong. */
+    if (g_calOutcome == MOTION_IDLE) { g_calOutcome = Motion_GetState(); }
+
+    if ((now - g_calMark) < CALIB_SETTLE_MS) { return; }
+
+    if (g_calOutcome == MOTION_TIMEOUT)
+    {
+        /* A stalled wheel or a dead encoder. Launching the next arc from a
+           pose the odometry has lost is how a bench test becomes a repair. */
+        g_calState = CALIB_IDLE;
+        RpiLink_Log("calib cycle ABORTED: a move timed out\r\n");
+        return;
+    }
+
+    /* Step finished and the robot has settled. */
+    g_calStep++;
+
+    if (g_calStep < (uint8_t)CALIB_STEPS)
+    {
+        Calib_StartStep();
+        return;
+    }
+
+    g_calDeltaDecel = CalDecel10() - g_calPrevDecel10;
+    g_calDeltaLag   = CalLag10()   - g_calPrevLag10;
+    g_calDeltaTrim  = (int32_t)Odom_GetHeadingTrim() - g_calPrevTrim;
+    g_calRuns++;
+    g_calState = CALIB_DONE;
+
+    {
+        char msg[112];
+        char trimNote[40];
+
+        if (Odom_TrimWasUpdated())
+        {
+            snprintf(trimNote, sizeof(trimNote), "%+ld", (long)g_calDeltaTrim);
+        }
+        else
+        {
+            snprintf(trimNote, sizeof(trimNote), "SKIPPED, straight too short");
+        }
+
+        snprintf(msg, sizeof(msg),
+                 "calib cycle %u done: dec %ld (%+ld) lag %ld (%+ld) "
+                 "trim %ld (%s)\r\n",
+                 (unsigned)g_calRuns,
+                 (long)CalDecel10(), (long)g_calDeltaDecel,
+                 (long)CalLag10(),   (long)g_calDeltaLag,
+                 (long)Odom_GetHeadingTrim(), trimNote);
+        RpiLink_Log(msg);
+    }
+}
+
+/* ==========================================================================
  *  Display
  * ========================================================================== */
 
@@ -324,8 +565,81 @@ static void Display(void)
 
     switch (g_mode)
     {
+    case MODE_CALIB:
+        {
+            /* The profile is on the title line because it is what you are
+               calibrating. The learned values belong to whichever profile
+               was active when they were learned, and this mode does not set
+               one - use mode 6 first if it is not the one you will drive. */
+            const ArcProfile_t *pr =
+                Motion_GetArcProfileInfo(Motion_GetArcProfile());
+
+            snprintf(line, sizeof(line), "1 CALIB %s", pr->name);
+            ShowLine(0, line);
+
+            if (g_calState == CALIB_RUNNING)
+            {
+                snprintf(line, sizeof(line), "step %u/%u %s",
+                         (unsigned)(g_calStep + 1U), (unsigned)CALIB_STEPS,
+                         (g_calStep == 0U) ? "str" : "arc");
+            }
+            else if (g_calState == CALIB_DONE)
+            {
+                snprintf(line, sizeof(line), "done  run %u",
+                         (unsigned)g_calRuns);
+            }
+            else
+            {
+                snprintf(line, sizeof(line), "READY  run %u",
+                         (unsigned)g_calRuns);
+            }
+            ShowLine(12, line);
+
+            /* One line per learned value, each carrying what the last
+               finished cycle CHANGED it by. The delta is the whole point: a
+               cycle that moved nothing is a converged robot, and putting it
+               beside the value beats making you remember the previous one.
+               trm's delta is the one to watch — it is the value that used to
+               walk every run and never settle. */
+            if (g_calState == CALIB_DONE)
+            {
+                snprintf(line, sizeof(line), "dec %5ld %+5ld",
+                         (long)CalDecel10(), (long)g_calDeltaDecel);
+                ShowLine(24, line);
+                snprintf(line, sizeof(line), "lag %4ld %+4ld",
+                         (long)CalLag10(), (long)g_calDeltaLag);
+                ShowLine(36, line);
+                /* SKIP, not a delta of zero. The straight was too short to
+                   teach the trim anything, and an untouched trim reads
+                   exactly like a converged one - so say which it was. */
+                if (Odom_TrimWasUpdated())
+                {
+                    snprintf(line, sizeof(line), "trm %+4ld %+4ld",
+                             (long)Odom_GetHeadingTrim(), (long)g_calDeltaTrim);
+                }
+                else
+                {
+                    snprintf(line, sizeof(line), "trm %+4ld SKIP",
+                             (long)Odom_GetHeadingTrim());
+                }
+                ShowLine(48, line);
+            }
+            else
+            {
+                snprintf(line, sizeof(line), "dec %5ld", (long)CalDecel10());
+                ShowLine(24, line);
+                snprintf(line, sizeof(line), "lag %4ld", (long)CalLag10());
+                ShowLine(36, line);
+                snprintf(line, sizeof(line), "trm %+4ld  %s",
+                         (long)Odom_GetHeadingTrim(),
+                         (g_calState == CALIB_RUNNING) ? "STOP" : "GO");
+                ShowLine(48, line);
+            }
+        }
+        break;
+
     case MODE_SETANGLE:
-        ShowLine(0,  "4 SET ANGLE");
+        ShowLine(0,  "5 SET ANGLE");
         snprintf(line, sizeof(line), "%s%d  %s",
                  g_turnRight ? "R" : "L",
                  (int)g_angleList[g_angleIdx],
@@ -337,7 +651,7 @@ static void Display(void)
         break;
 
     case MODE_TURN:
-        snprintf(line, sizeof(line), "3 TURN %s%s",
+        snprintf(line, sizeof(line), "4 TURN %s%s",
                  Motion_IsBusy() ? st[(int)Motion_GetState()] : "",
                  IMU_IsReady() ? "" : " !NOGYRO");
         ShowLine(0, line);
@@ -419,7 +733,7 @@ static void Display(void)
             const ArcProfile_t *pr = Motion_GetArcProfileInfo(Motion_GetArcProfile());
             uint16_t steer = Motion_GetArcSteerUs();
 
-            snprintf(line, sizeof(line), "5 PROFILE %s", pr->name);
+            snprintf(line, sizeof(line), "6 PROFILE %s", pr->name);
             ShowLine(0, line);
             snprintf(line, sizeof(line), "steer %u us%s", (unsigned)steer,
                      (steer < pr->steer_us) ? " CLMP" : "");
@@ -435,7 +749,7 @@ static void Display(void)
         break;
 
     case MODE_SERVO:
-        ShowLine(0,  "6 SERVO SWEEP");
+        ShowLine(0,  "7 SERVO SWEEP");
         snprintf(line, sizeof(line), "us  %u", (unsigned)g_sweepUs);
         ShowLine(12, line);
         snprintf(line, sizeof(line), "off %+d",
@@ -463,7 +777,7 @@ static void Display(void)
         break;
 
     case MODE_SENSE:
-        ShowLine(0, "7 SENSE");
+        ShowLine(0, "8 SENSE");
         FmtCm(line, sizeof(line), "IRL", IR_LeftCm());       ShowLine(12, line);
         FmtCm(line, sizeof(line), "IRR", IR_RightCm());      ShowLine(24, line);
         FmtCm(line, sizeof(line), "US ", Ultrasonic_GetCm()); ShowLine(36, line);
@@ -482,7 +796,7 @@ static void Display(void)
            copied off it at a known distance, and a raw Sharp reading moves
            too much to read. Title says so - a screen labelled "raw" showing
            a filtered value would be its own trap. */
-        ShowLine(0, "8 IRCAL median");
+        ShowLine(0, "9 IRCAL median");
         snprintf(line, sizeof(line), "L %4u cnt", IR_LeftFiltered());
         ShowLine(12, line);
         snprintf(line, sizeof(line), "R %4u cnt", IR_RightFiltered());
@@ -493,7 +807,7 @@ static void Display(void)
         break;
 
     case MODE_IMU:
-        ShowLine(0, "9 IMU gyro");
+        ShowLine(0, "10 IMU gyro");
         if (!IMU_IsReady())
         {
             ShowLine(12, "NOT READY");
@@ -533,8 +847,49 @@ static void Display(void)
         }
         break;
 
+    case MODE_CAL:
+        {
+            /* The three numbers ?CAL puts on the wire, in the units it puts
+               them there in: decel and lag scaled x10, trim in whole us. NOT
+               converted to something friendlier, because the point of this
+               screen is to be compared against what the host printed. A
+               screen showing 1234 dps^2 next to a log line reading 12340
+               costs you the comparison it exists to make.
+
+               Mode 6 already shows decel and lag in real units, and mode 2
+               shows the trim after a run. This is the only place all three
+               appear together, and the only place they appear as sent. */
+            long decel10 = (long)CalDecel10();
+            long lag10   = (long)CalLag10();
+            long trim    = (long)Odom_GetHeadingTrim();
+
+            /* Clamped for the display only. Four columns of counter would not
+               fit beside their labels, and the counts that matter here are
+               small - a calibrate.py restore sends exactly three setters. */
+            unsigned okN  = (unsigned)RpiLink_GetCalOkCount();
+            unsigned bsyN = (unsigned)RpiLink_GetCalBusyCount();
+            unsigned rgN  = (unsigned)RpiLink_GetCalRangeCount();
+            if (okN  > 99U) { okN  = 99U; }
+            if (bsyN > 99U) { bsyN = 99U; }
+            if (rgN  > 99U) { rgN  = 99U; }
+
+            ShowLine(0, "11 CAL wire");
+            snprintf(line, sizeof(line), "dec %6ld", decel10);
+            ShowLine(12, line);
+            /* Both on one line so the tally can have its own. Exactly 16
+               characters at the widest, which is what ShowLine fits. */
+            snprintf(line, sizeof(line), "lag%5ld trm%+4ld", lag10, trim);
+            ShowLine(24, line);
+            /* bsy and rg are both RESEND on the wire. Telling them apart is
+               the whole reason this screen exists - see rpilink.h. */
+            snprintf(line, sizeof(line), "ok%2u bsy%2u rg%2u", okN, bsyN, rgN);
+            ShowLine(36, line);
+            ShowLine(48, "short = zero");
+        }
+        break;
+
     case MODE_SETDIST:
-        ShowLine(0,  "2 SET DISTANCE");
+        ShowLine(0,  "3 SET DISTANCE");
         snprintf(line, sizeof(line), "tgt %4ld mm", (long)g_targetMm);
         ShowLine(12, line);
         ShowLine(24, "short = +100");
@@ -560,7 +915,7 @@ static void Display(void)
                back to the encoder difference. Accuracy drops, and the fact
                that it is silent is exactly how a 90 degree turn once ran to
                369 - so say so on the screen the run is being watched on. */
-            snprintf(line, sizeof(line), "1 DRIVE %s%s",
+            snprintf(line, sizeof(line), "2 DRIVE %s%s",
                      st[(int)Motion_GetState()],
                      IMU_IsReady() ? "" : " !");
             ShowLine(0, line);
@@ -591,7 +946,7 @@ static void Display(void)
             long ef  = e10 % 10;
             if (ef < 0) { ef = -ef; }
 
-            ShowLine(0, g_repTimeout ? "1 DRIVE TIMEOUT" : "1 DRIVE DONE");
+            ShowLine(0, g_repTimeout ? "2 DRIVE TIMEOUT" : "2 DRIVE DONE");
             /* Target and result share a line so the learned steering trim
                can have one. Exactly 16 characters, which is what ShowLine
                fits. */
@@ -636,7 +991,7 @@ static void Display(void)
         }
         else
         {
-            ShowLine(0,  "1 DRIVE READY");
+            ShowLine(0,  "2 DRIVE READY");
             snprintf(line, sizeof(line), "tgt %4ld mm", (long)g_targetMm);
             ShowLine(12, line);
             ShowLine(24, "short = GO");
@@ -848,8 +1203,8 @@ int main(void)
 
     RpiLink_Log("\r\n=== C30D FUNCTIONAL TEST BUILD ===\r\n");
     RpiLink_Log("LONG press = mode, SHORT = action\r\n");
-    RpiLink_Log("1 DRIVE 2 SETDIST 3 TURN 4 SETANGLE\r\n");
-    RpiLink_Log("5 PROFILE 6 SERVO 7 SENSE 8 IRCAL 9 IMU\r\n\r\n");
+    RpiLink_Log("1 CALIB 2 DRIVE 3 SETDIST 4 TURN 5 SETANGLE\r\n");
+    RpiLink_Log("6 PROFILE 7 SERVO 8 SENSE 9 IRCAL 10 IMU 11 CAL\r\n\r\n");
 
     /* Tick LAST - nothing fires against an uninitialised module. */
     MX_TIM6_Init();
@@ -861,6 +1216,7 @@ int main(void)
 
         IMU_Poll();
         RpiLink_Poll();
+        Calib_Tick();   /* after RpiLink_Poll(): the host's line wins */
 
         if (g_reportReady)
         {
@@ -884,6 +1240,11 @@ int main(void)
             Motion_ClearState();
             Motors_Coast();
 
+            /* Stopping the motors is not enough: the cycle would see an idle
+               robot a moment later and launch its next step into a mode the
+               operator has already walked away from. */
+            Calib_Cancel();
+
             /* Leaving the sweep, put the steering back to centre. Walking
                away with the servo held against a mechanical stop stalls it
                and it will get hot. */
@@ -905,7 +1266,27 @@ int main(void)
                 Motion_Stop();
                 Motion_ClearState();
                 Motors_Coast();
+                Calib_Cancel();   /* same reason as the long press */
                 RpiLink_Log("STOP\r\n");
+            }
+            else if (g_mode == MODE_CALIB)
+            {
+                if (g_calState == CALIB_RUNNING)
+                {
+                    /* Press again to stop. This branch has to handle it
+                       because a press lands in the 400 ms gap between steps
+                       as often as not, and Motion_IsBusy() is false there -
+                       so the STOP branch above never sees it and the cycle
+                       would silently restart from step 1. */
+                    Calib_Cancel();
+                }
+                else
+                {
+                    /* Re-pressing after DONE runs another cycle, which is the
+                       intended way to use it: press, read the deltas, press
+                       again, stop when they stop moving. */
+                    Calib_Start();
+                }
             }
             else if (g_mode == MODE_SETANGLE)
             {
@@ -962,6 +1343,16 @@ int main(void)
                 IMU_ResetHeading();
                 IMU_ResetStats();
                 RpiLink_Log("IMU heading + stats zeroed\r\n");
+            }
+            else if (g_mode == MODE_CAL)
+            {
+                /* Zero the tally so one phase of a calibration run can be
+                   read on its own. The learned values themselves are NOT
+                   touched: they are what the host is in the middle of
+                   setting, and clearing them from the button would be a way
+                   to silently ruin a run while watching it. */
+                RpiLink_ClearCalCounts();
+                RpiLink_Log("CAL counters zeroed\r\n");
             }
             else if (g_mode == MODE_SETDIST)
             {

@@ -145,18 +145,26 @@
  * before this the first run of a session went 3 cm right. That is the run
  * A.3 and A.4 are graded on.
  *
- * What it does NOT fix: Odom_LearnTrim() converges to about -34, not -26,
- * because it minimises mean HEADING error (cross-track term included) and
- * that is a different target from zero lateral offset. So warm runs still
- * settle roughly 1 cm left. To test whether cross-track is what drags the
- * fixed point past zero, set CROSS_TRACK_ENABLE to 0 and see where the trim
- * lands.
+ * The -26 above is where ZERO LATERAL OFFSET sits, and the seven runs are
+ * still the evidence for it. What has changed is the learner underneath.
+ *
+ * It used to minimise mean HEADING error, which is a different target, and it
+ * converged to about -34 rather than -26 - so warm runs settled roughly 1 cm
+ * left while cold ones landed on zero. It now minimises mean CORRECTION: the
+ * average of what the steering loop actually had to put out, whose zero is
+ * "the robot needs no steering", which is much closer to zero lateral offset.
+ * See TRIM_LEARN_FROM_OUTPUT in odom.h.
+ *
+ * WHERE IT NOW LANDS HAS NOT BEEN MEASURED. The expectation is nearer -26
+ * than -34, but that is reasoning, not a tape measure. Re-run the seven-point
+ * fit before trusting 1474 for warm runs; the cold-run case it was chosen for
+ * is unaffected either way, because a cold trim is 0 whatever learns it.
  *
  * Note the travel is now asymmetric: 626 us of pulse above centre, 574
  * below. arc_steer_us() already takes the smaller side so left and right
  * arcs stay identical, which costs MOTION_ARC_STEER_US 575 exactly 1 us.
  * About 0.05 degrees of steer. Do not "fix" this by moving SERVO_MIN_US or
- * SERVO_MAX_US - those are the mechanical stops from the mode 6 sweep. */
+ * SERVO_MAX_US - those are the mechanical stops from the mode 7 sweep. */
 #define SERVO_CENTER_US     1474U
 
 /* Absolute safety bounds for the end-stop sweep ONLY.
