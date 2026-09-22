@@ -128,8 +128,10 @@ print(class_id, conf)
 
 Order of startup matters:
 
-1. **PC:** `cd pc_side && python3 task1_pc.py`  ← must start first, waits for RPi
-2. **RPi:** `python3 task1.py`
+1. **RPi:** `python3 task1.py`  ← **must start first.** The RPi is the TCP
+   *server*; it binds, listens, and blocks on `accept()`
+2. **PC:** `cd pc_side && python3 task1_pc.py` — it *connects*, with no retry,
+   so starting it first just gets connection refused
 3. **Android:** connect via Bluetooth, send obstacles, press Send Data, press Begin
 
 ---
@@ -153,13 +155,13 @@ each. Planned and collision-checked, rather than dead-reckoned.
 ### Running it
 
 ```bash
-# PC  — start first, same as Task 1
-cd pc_side && python3 task1_pc.py
-
-# RPi
+# 1. RPi — FIRST. It is the TCP server and blocks waiting for the PC.
 python3 task_a5.py
 
-# Android — place ONE obstacle, Send Data, Begin. Exactly as Task 1.
+# 2. PC — connects to the RPi. No retry, so it must come second.
+cd pc_side && python3 task1_pc.py
+
+# 3. Android — place ONE obstacle, Send Data, Begin. Exactly as Task 1.
 ```
 
 The face you tap on Android is **ignored**. Not knowing it is what A.5 tests,

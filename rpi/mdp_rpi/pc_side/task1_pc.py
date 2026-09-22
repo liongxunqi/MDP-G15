@@ -1,7 +1,9 @@
 """
 pc_side/task1_pc.py  —  PC algorithm + image-recognition server for Task 1
 ───────────────────────────────────────────────────────────────────────────
-Run this on the PC BEFORE starting task1.py on the RPi.
+Run this on the PC AFTER task1.py (or task_a5.py) is already running on the
+RPi. The RPi is the server and waits; this connects to it, and connect()
+does not retry - start it first and you get connection refused.
 
 What it does
 ─────────────
