@@ -144,9 +144,15 @@ class Task1:
         # Debounce timer — send OBSTACLES to PC 1 s after last obstacle arrives
         self._debounce_lock = Lock()
         self._calc_timer: Timer | None = None
+        # Watchdog on an outstanding OBSTACLES request. See _arm_path_watchdog().
+        self._path_timer: Timer | None = None
 
         # ── Tunable config from .env ──────────────────────────────────────────
         self._debounce_delay = float(os.getenv("DEBOUNCE_DELAY_S", "1.0"))
+        # How long to wait for PATH before calling it a failure. Generous:
+        # planning is an exhaustive tour search with an A* per edge, and a slow
+        # laptop is not a broken one.
+        self._path_timeout = float(os.getenv("PATH_TIMEOUT_S", "30.0"))
         self.segment_delay = float(os.getenv("SEGMENT_DELAY_S", "0.5"))
         self.detect_retries = int(os.getenv("DETECT_RETRY_COUNT", "1"))
         self.detect_retry_delay = float(os.getenv("DETECT_RETRY_DELAY_S", "0.2"))
@@ -295,8 +301,51 @@ class Task1:
         payload = "OBSTACLES," + json.dumps(outgoing) + "\n"
         self.pc.send(payload)
         self.path_requested = True
+        self._arm_path_watchdog()
         logging.info(f"Sent OBSTACLES to PC ({len(outgoing)} obstacle(s)).")
         return True
+
+    # ── PATH watchdog ─────────────────────────────────────────────────────────
+
+    def _arm_path_watchdog(self) -> None:
+        """
+        Fail loudly if the PC never answers an OBSTACLES request.
+
+        Nothing blocks on PATH — BEGIN checks path_ready and returns, and the
+        arrival of PATH is what kicks off the first segment. So a planner that
+        raises does not deadlock anything. It leaves path_requested True
+        forever, which makes _request_path_from_pc() refuse to try again, and
+        the robot stands still with nothing on screen to say why.
+
+        That silence is the whole problem: a stalled plan and a robot waiting
+        for BEGIN look identical from the outside.
+        """
+        self._cancel_path_watchdog()
+        self._path_timer = Timer(self._path_timeout, self._on_path_timeout)
+        self._path_timer.daemon = True
+        self._path_timer.start()
+
+    def _cancel_path_watchdog(self) -> None:
+        if self._path_timer is not None:
+            self._path_timer.cancel()
+            self._path_timer = None
+
+    def _on_path_timeout(self) -> None:
+        if not self.path_requested:
+            return          # PATH landed while the timer was already firing
+
+        logging.error(
+            f"No PATH from the PC within {self._path_timeout}s. The planner has "
+            f"most likely raised — check the PC's console. Press Send Data "
+            f"again to retry once it is back."
+        )
+        # Cleared so a retry is possible at all: _request_path_from_pc()
+        # refuses to send while a request is in flight.
+        self.path_requested = False
+        try:
+            self.android.send("STATUS,FAILED")
+        except OSError as exc:
+            logging.warning(f"Could not tell Android the planner failed: {exc}")
 
     # ── STM segment helpers ────────────────────────────────────────────────────
 
@@ -618,6 +667,7 @@ class Task1:
                         self.direction_index = 0
 
                     self.path_requested = False
+                    self._cancel_path_watchdog()
                     self.path_ready.set()
                     logging.info(
                         f"PC: PATH received — {len(self.segments)} segment(s), "

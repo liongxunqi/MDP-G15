@@ -207,8 +207,9 @@ python3 task_a5_reactive.py --dry-run     # no motion: prove camera + PC
 ### Offline tests
 
 ```bash
-python3 test_task_a5.py            # 17 tests — fan-out, fold-back, filter
-python3 test_task_a5_reactive.py   # 24 tests — the standalone sequence
+python3 test_task_a5.py                  # 17 tests — fan-out, fold-back, filter
+python3 test_task_a5_reactive.py         # 24 tests — the standalone sequence
+cd pc_side && python3 test_path_planner.py   # 10 tests — the tour search
 ```
 
 Neither needs a robot, a PC, Bluetooth or pyserial. Geometry is not covered by
@@ -345,6 +346,7 @@ authoritative wherever it disagrees with this table.
 | `DETECT_RETRY_DELAY_S` | 0.2 | Wait between retries |
 | `DETECT_TIMEOUT_S` | 0.5 | How long to wait for OBJECT reply per attempt |
 | `DEBOUNCE_DELAY_S` | 1.0 | How long after last obstacle before auto-sending to PC |
+| `PATH_TIMEOUT_S` | 30.0 | Give up waiting for the PC's `PATH` and report `STATUS,FAILED` |
 
 A.5 only (`task_a5.py`):
 

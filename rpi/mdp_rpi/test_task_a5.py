@@ -88,6 +88,10 @@ def bare_task() -> Task1:
     t._a5_face_of = {}
     t._a5_found = None
     t.android = FakeAndroid()
+    # _request_path_from_pc() arms the PATH watchdog, so the two fields it
+    # touches have to exist even though no timer is wanted here.
+    t._path_timer = None
+    t._path_timeout = 30.0
     return t
 
 

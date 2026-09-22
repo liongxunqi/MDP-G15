@@ -181,6 +181,31 @@ def _route_cost(order, cache) -> float:
     return total
 
 
+def _reachable(visitable, cache):
+    """
+    Split the obstacles into those the robot can get to and those it cannot.
+
+    An obstacle with no finite edge INTO it from anywhere — the start or any
+    other obstacle — cannot appear in any tour, and leaving it in makes every
+    permutation cost infinity. That is not a hypothetical: a block within
+    about 65 cm of a wall puts its wall-facing approach outside the arena, and
+    A.5 declares all four faces, so it hits one whenever the obstacle is near
+    an edge.
+
+    Dropping them is the honest outcome. Three faces is still a search; the
+    one pointing into a wall was never photographable.
+    """
+    ids = [o["id"] for o in visitable]
+    ok, dropped = [], []
+    for obs in visitable:
+        sources = ["START"] + [i for i in ids if i != obs["id"]]
+        if any(math.isfinite(_edge_cost(cache, src, obs["id"])) for src in sources):
+            ok.append(obs)
+        else:
+            dropped.append(obs)
+    return ok, dropped
+
+
 def _visit_order(visitable, cache):
     if len(visitable) <= 1:
         return list(visitable)
@@ -191,9 +216,31 @@ def _visit_order(visitable, cache):
             cost = _route_cost(list(perm), cache)
             if cost < best_cost:
                 best_cost, best_order = cost, list(perm)
+
+        if best_order is None:
+            # Every permutation cost infinity, so no complete tour exists.
+            # This used to fall straight through to the log line below and
+            # raise TypeError on None — a crash rather than a plan, which on
+            # the wire means the RPi waits for a PATH that never comes.
+            #
+            # Visiting some obstacles beats visiting none, so fall back to the
+            # greedy order. The per-leg search in plan_mission() catches
+            # NoPathFound and skips, so an unreachable leg is dropped there.
+            logging.warning(
+                "No finite tour over %d obstacle(s) — falling back to nearest-"
+                "neighbour order and skipping whatever cannot be reached.",
+                len(visitable),
+            )
+            return _greedy_order(visitable, cache)
+
         logging.info(f"Visit order (exhaustive): {[o['id'] for o in best_order]}  cost={best_cost:.0f}mm")
         return best_order
 
+    return _greedy_order(visitable, cache)
+
+
+def _greedy_order(visitable, cache):
+    """Nearest-neighbour, then 2-opt. Always returns an order, never None."""
     remaining = list(visitable)
     order = []
     prev_id = "START"
@@ -259,6 +306,26 @@ def plan_mission(obstacles: List[dict], arc_profile: int = PROFILE_TIGHT) -> dic
         visitable.append(obs)
 
     edge_cache = _build_edge_cache(start, visitable, anchor_by_id, radius_mm, obstacles)
+
+    # Drop anything nothing can reach before the tour is searched, rather than
+    # letting it make every permutation infinite. See _reachable().
+    visitable, unreachable = _reachable(visitable, edge_cache)
+    for obs in unreachable:
+        logging.error(
+            f"Obstacle {obs.get('id')}: no approach exists from anywhere — "
+            f"dropped. Its viewing pose is most likely outside the arena, "
+            f"which happens when the obstacle sits within about 65cm of a wall "
+            f"and the image face points at it."
+        )
+
+    if not visitable:
+        logging.error(
+            "No obstacle can be reached — returning an empty path rather than "
+            "no path at all, so the caller gets an answer instead of waiting "
+            "for one."
+        )
+        return {"segments": [], "obstacle_ids": [], "segment_obstacles": [], "dirs": []}
+
     order = _visit_order(visitable, edge_cache)
 
     segments: List[List[str]] = []
