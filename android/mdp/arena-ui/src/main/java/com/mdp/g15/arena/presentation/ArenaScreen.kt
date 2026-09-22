@@ -232,7 +232,11 @@ private fun ArenaStatusPanel(
                     } ?: "Not available",
                     Modifier.weight(1f),
                 )
-                StatusValue("Obstacles", state.arena.obstacles.size.toString(), Modifier.weight(0.6f))
+                StatusValue(
+                    "Obstacles",
+                    "${state.arena.obstacles.size}/${state.arena.config.maxObstacles}",
+                    Modifier.weight(0.6f),
+                )
             }
             StatusValue(
                 "Selected obstacle",
@@ -261,11 +265,19 @@ private fun ArenaStatusPanel(
                 }
             }
 
+            val atObstacleLimit = state.arena.obstacles.size >= state.arena.config.maxObstacles
             Button(
                 onClick = { viewModel.setPlacementMode(!state.placementMode) },
+                enabled = state.placementMode || !atObstacleLimit,
                 modifier = Modifier.fillMaxWidth(),
             ) {
-                Text(if (state.placementMode) "Cancel adding" else "Add obstacle")
+                Text(
+                    when {
+                        state.placementMode -> "Cancel adding"
+                        atObstacleLimit -> "Obstacle limit reached"
+                        else -> "Add obstacle"
+                    },
+                )
             }
             Row(
                 modifier = Modifier.fillMaxWidth(),

@@ -4,11 +4,13 @@ data class ArenaConfig(
     val columns: Int = 20,
     val rows: Int = 20,
     val robotFootprintCells: Int = 2,
+    val maxObstacles: Int = 50,
 ) {
     init {
         require(columns > 0) { "Arena columns must be positive." }
         require(rows > 0) { "Arena rows must be positive." }
         require(robotFootprintCells in 1..3) { "Robot footprint must be between 1 and 3 cells." }
+        require(maxObstacles > 0) { "Arena must allow at least one obstacle." }
     }
 
     fun contains(coordinate: GridCoordinate): Boolean =

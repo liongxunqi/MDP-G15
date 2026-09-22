@@ -27,6 +27,18 @@ class ArenaReducerTest {
     }
 
     @Test
+    fun `add is rejected once the configured obstacle limit is reached`() {
+        val capped = ArenaState(config = ArenaConfig(maxObstacles = 2))
+        val first = reducer.success(capped, ArenaAction.AddObstacle(GridCoordinate(0, 0)))
+        val second = reducer.success(first, ArenaAction.AddObstacle(GridCoordinate(1, 0)))
+        assertEquals(2, second.obstacles.size)
+
+        val result = reducer.reduce(second, ArenaAction.AddObstacle(GridCoordinate(2, 0)))
+        assertTrue(result is ArenaReduction.Failure)
+        assertEquals(2, second.obstacles.size)
+    }
+
+    @Test
     fun `move preserves obstacle metadata and rejects collisions`() {
         var state = reducer.success(ArenaState(), ArenaAction.AddObstacle(GridCoordinate(1, 1)))
         state = reducer.success(state, ArenaAction.SetTargetFace(1, Direction.WEST))

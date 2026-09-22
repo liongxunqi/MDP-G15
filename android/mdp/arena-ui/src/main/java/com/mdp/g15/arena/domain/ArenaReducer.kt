@@ -14,6 +14,9 @@ class ArenaReducer {
     }
 
     private fun addObstacle(state: ArenaState, position: GridCoordinate): ArenaReduction {
+        if (state.obstacles.size >= state.config.maxObstacles) {
+            return ArenaReduction.Failure("Cannot place more than ${state.config.maxObstacles} obstacles.")
+        }
         validateFreeCell(state, position, ignoreObstacleId = null)?.let { return ArenaReduction.Failure(it) }
 
         val obstacle = Obstacle(id = state.nextObstacleId, position = position)
