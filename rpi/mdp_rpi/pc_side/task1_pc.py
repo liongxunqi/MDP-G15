@@ -1,9 +1,7 @@
 """
 pc_side/task1_pc.py  —  PC algorithm + image-recognition server for Task 1
 ───────────────────────────────────────────────────────────────────────────
-Run this on the PC AFTER task1.py (or task_a5.py) is already running on the
-RPi. The RPi is the server and waits; this connects to it, and connect()
-does not retry - start it first and you get connection refused.
+Run this on the PC BEFORE starting task1.py on the RPi.
 
 What it does
 ─────────────
@@ -11,10 +9,10 @@ What it does
 2. Waits for OBSTACLES,<json>  →  runs pathfinding  →  sends back PATH,<json>.
 3. Enters detection loop:
     RPi sends:  DETECT,<obstacle_id>\n
-                4-byte big-endian image size
-                raw JPEG bytes
+    4-byte big-endian image size (struct.pack(">I", size))
+    raw JPEG bytes (exactly <size> bytes)
     PC saves the JPEG, runs YOLO, sends back:
-                OBJECT,<obstacle_id>,<confidence>,<class_id>\n
+    OBJECT,<obstacle_id>,<confidence>,<class_id>\n
 4. On STITCH,<n>  →  stitches the annotated images side-by-side and saves.
 
 Setup
@@ -70,35 +68,25 @@ def run_detection(image_path: str):
 
 
 # ── Pathfinding ────────────────────────────────────────────────────────────────
-# compute_path() must return a dict with these keys:
-#   "segments"          — list of lists of STM tokens, one sublist per LINE
-#                         e.g. [ ["FR90", "F20", "S"], ["F30", "S"] ]
-#   "obstacle_ids"      — obstacle IDs in the order they will be visited
-#   "segment_obstacles" — parallel to "segments": the obstacle to photograph
-#                         after that line finishes, or None for pure travel.
-#                         Segments are NOT 1:1 with obstacles any more — see
-#                         stm_tokens.chunk_tokens.
-#   "dirs"              — optional robot direction dicts for the Android map
+# compute_path() returns:
+#   "segments"          — list of STM token lines, e.g. [["FR90","F20","S"], ["F30","S"]]
+#   "obstacle_ids"      — obstacle IDs in visit order
+#   "segment_obstacles" — parallel to "segments": obstacle to photograph after
+#                         that line, or None for pure travel
+#   "dirs"              — robot pose per line, for the Android map
 
-PC_SIDE_DIR = Path(__file__).resolve().parent
-sys.path.insert(0, str(PC_SIDE_DIR))
-
-from path_planner import plan_mission  # noqa: E402
 from stm_tokens import PROFILE_NAMES, TURN_RADIUS_MM  # noqa: E402
+from path_planner import plan_mission  # noqa: E402
 
-# Must match the profile the robot is actually running. The Pi does not send
-# !PROF unless STM_ARC_PROFILE is set, so the default here is the FIRMWARE's
-# default — TIGHT, radius 291mm. Planning for one radius and driving another
-# puts every turn wide, and the error compounds across turns.
+# Must match whatever profile is actually running on the STM (?STAT).
 ARC_PROFILE = int(os.getenv("STM_ARC_PROFILE", "0"))
 
+
 def compute_path(obstacles: list) -> dict:
-    """Run the physical-motion planner and return the RPi PATH payload."""
     logging.info(
         f"Planning against arc profile {ARC_PROFILE} "
         f"({PROFILE_NAMES.get(ARC_PROFILE, '?')}, radius "
-        f"{TURN_RADIUS_MM.get(ARC_PROFILE, '?')}mm). This MUST match the STM "
-        "profile; confirm with ?STAT."
+        f"{TURN_RADIUS_MM.get(ARC_PROFILE, '?')}mm)."
     )
     return plan_mission(obstacles, arc_profile=ARC_PROFILE)
 
@@ -252,7 +240,7 @@ def main() -> None:
             filename = f"obstacle_{obstacle_id}_{int(time.time())}.jpg"
             save_path = os.path.join(RECEIVED_DIR, filename)
 
-            # Receive the JPEG (4-byte length prefix + raw bytes)
+            # Receive the JPEG (4-byte length header + raw bytes)
             ok = rpi.receive_image(save_path)
             if not ok:
                 logging.error(f"Image receive failed for obstacle {obstacle_id}.")

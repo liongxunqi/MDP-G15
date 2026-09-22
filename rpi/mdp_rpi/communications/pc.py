@@ -4,12 +4,12 @@ communications/pc.py
 TCP socket server — the RPi listens and the PC connects to it.
 
 Why RPi is the server:
-  The RPi has a fixed IP on the hotspot network so the PC can always find it.
-  The PC's IP can change depending on which laptop connects.
+The RPi has a fixed IP on the hotspot network so the PC can always find it.
+The PC's IP can change depending on which laptop connects.
 
 Image transfer protocol (send_image):
-  1. RPi sends a 4-byte big-endian image size.
-  2. RPi sends exactly that many raw JPEG bytes.
+1. RPi sends a 4-byte big-endian image size.
+2. RPi sends exactly that many raw JPEG bytes.
 """
 
 import logging

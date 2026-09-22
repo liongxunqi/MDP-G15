@@ -14,6 +14,7 @@ from image_recognition.detect import detect  # noqa: E402
 
 HOST = "0.0.0.0"
 PORT = 5001
+TEST_OBSTACLE_ID = 1
 
 SAVE_DIR = PC_SIDE_DIR / "received"
 SAVE_DIR.mkdir(parents=True, exist_ok=True)
@@ -72,9 +73,12 @@ def handle_client(conn, addr):
         + (f" ({confidence:.3f})" if confidence is not None else "")
     )
     # ── Send result to RPi ───────────────────────────────────────────
-    conn.sendall(
-        result_label.encode("utf-8")
+    response = (
+        f"OBJECT,{TEST_OBSTACLE_ID},{confidence:.4f},{result_label}"
+        if confidence is not None
+        else f"OBJECT,{TEST_OBSTACLE_ID},0.0,NONE"
     )
+    conn.sendall(response.encode("utf-8"))
 
 
 def main():
