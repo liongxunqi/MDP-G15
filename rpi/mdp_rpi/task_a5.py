@@ -6,8 +6,8 @@ task_a5.py  —  MDP checklist A.5: navigate around the obstacle
      the obstacle in search of face which has a valid image from the image
      list."
 
-    PC:      cd pc_side && python3 task1_pc.py     ← start first
-    RPi:     python3 task_a5.py
+    RPi:     python3 task_a5.py                    ← FIRST: it is the server
+    PC:      cd pc_side && python3 task1_pc.py     ← second: it connects
     Android: place ONE obstacle, Send Data, Begin  ← exactly as Task 1
 
 A.5 IS TASK 1 WITH ONE THING REMOVED

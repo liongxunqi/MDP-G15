@@ -128,8 +128,10 @@ print(class_id, conf)
 
 Order of startup matters:
 
-1. **PC:** `cd pc_side && python3 task1_pc.py`  ← must start first, waits for RPi
-2. **RPi:** `python3 task1.py`
+1. **RPi:** `python3 task1.py`  ← **must start first.** The RPi is the TCP
+   *server*; it binds, listens, and blocks on `accept()`
+2. **PC:** `cd pc_side && python3 task1_pc.py` — it *connects*, with no retry,
+   so starting it first just gets connection refused
 3. **Android:** connect via Bluetooth, send obstacles, press Send Data, press Begin
 
 ---
@@ -153,13 +155,13 @@ each. Planned and collision-checked, rather than dead-reckoned.
 ### Running it
 
 ```bash
-# PC  — start first, same as Task 1
-cd pc_side && python3 task1_pc.py
-
-# RPi
+# 1. RPi — FIRST. It is the TCP server and blocks waiting for the PC.
 python3 task_a5.py
 
-# Android — place ONE obstacle, Send Data, Begin. Exactly as Task 1.
+# 2. PC — connects to the RPi. No retry, so it must come second.
+cd pc_side && python3 task1_pc.py
+
+# 3. Android — place ONE obstacle, Send Data, Begin. Exactly as Task 1.
 ```
 
 The face you tap on Android is **ignored**. Not knowing it is what A.5 tests,
@@ -181,6 +183,38 @@ that is the search working — and every fanned id folds back to the *same*
 obstacle, where `ArenaReducer.applyTarget()` is last-write-wins. Forward them
 all and a bullseye arriving after the real image replaces it on the tablet,
 while the Pi's own log still cheerfully reports the right answer.
+
+### How much room it leaves
+
+`OBSTACLE_SIZE_MM` is **assumed, not measured** — 100 mm from the course spec.
+Nothing on the robot can measure a block, so that number is an input, not an
+observation.
+
+It matters in two places that behave completely differently:
+
+| Use | Self-correcting? |
+|---|---|
+| Where the viewing pose goes | **Yes** — the approach ends on `FU30`, which reads the real gap and drives that, so the robot stops 30 cm from whatever is actually there |
+| How much room the path leaves going past | **No** — open-loop, nothing watching |
+
+`OBSTACLE_CLEARANCE_MM` (20 mm) exists so the second can be tuned without
+moving the first. Before it was split out there was about **2 mm** of margin:
+the virtual box keeps the robot's centre 220 mm from the block centre, and the
+real robot's worst-case half-extent is ~148 mm at a corner, so the whole
+allowance went on the robot's own corners. An obstacle wider than 10 cm was
+clipped by the excess, and the first sign would be a stalled wheel and
+`FAIL,TIMEOUT` fifteen seconds later.
+
+**Sensors cannot cover this gap today.** The ultrasonic is front-facing and
+during an orbit the block is to the *side*. The side IRs point the right way
+but saturate below 10 cm — 5 cm and 8 cm both read ~9 cm (`ir.h`) — which is
+exactly the range a clip happens in, and `FIR`/`FIL`, which would act on them,
+are reserved and unimplemented. So the margin is bought up front rather than
+sensed.
+
+Clearance costs orbit radius one-for-one: +20 mm here is +20 mm of swing per
+face. Nothing on a lone central block, worth re-checking before an
+eight-obstacle arena.
 
 ### What it does not do
 
