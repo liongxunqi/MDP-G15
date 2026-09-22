@@ -62,12 +62,36 @@ logging.basicConfig(
 )
 
 
+# ── Checklist A.5 ─────────────────────────────────────────────────────────────
+# A.5 is Task 1 with ONE thing removed: you do not know which face the image is
+# on. Task 1 is built entirely around knowing it — the operator taps the face in
+# on Android, it arrives as `d`, and path_planner._viewing_pose() turns it into
+# the pose to photograph from.
+#
+# So A.5 reduces to Task 1 exactly: declare the single obstacle FOUR times, once
+# per face, and one unknown-face problem becomes four known-face problems. The
+# planner then does the orbit for you — four viewing poses, a shortest tour
+# between them, and one DETECT at each — instead of the robot dead-reckoning its
+# way around a block.
+#
+# Nothing in the planner or the Android app changes. The fan-out happens here,
+# on the way out to the PC, and is folded back on the way to Android.
+A5_FACE_D = (0, 2, 4, 6)
+A5_FACE_NAME = {0: "N", 2: "E", 4: "S", 6: "W"}
+
+# What does NOT count as "a valid image from the image list". The bullseye is
+# the MARKER — finding it means the right obstacle and the wrong face, which is
+# the situation A.5 asks you to get out of. 'dot' is the filler class, and NONE
+# is what task1_pc.py sends when YOLO found nothing.
+A5_NOT_A_TARGET = {"bullseye", "dot", "none"}
+
+
 class Task1:
     """Orchestrates the three-thread pipeline for Task 1."""
 
     # ── Init ──────────────────────────────────────────────────────────────────
 
-    def __init__(self):
+    def __init__(self, a5_mode: bool = False):
         # Communication objects
         self.android = Android()
         self.pc = PC()
@@ -97,6 +121,14 @@ class Task1:
         self.started: bool = False          # True after Android sends BEGIN
         self.path_requested: bool = False   # True while OBSTACLES request is in-flight
         self.halted: bool = False           # True after FAIL,* or exhausted RESENDs
+
+        # ── A.5 state ─────────────────────────────────────────────────────────
+        # Off unless this was constructed by task_a5.py. Everything it touches
+        # is guarded, so Task 1 behaves exactly as it did.
+        self.a5_mode: bool = a5_mode
+        self._a5_base_id: int | None = None    # the id Android actually knows
+        self._a5_face_of: dict = {}            # fanned-out id (str) -> "N"/"E"/"S"/"W"
+        self._a5_found: tuple | None = None    # (face, class_id, confidence)
 
         # PROTOCOL.md §3: cap RESEND retries. A permanently malformed segment
         # retried forever is an infinite loop in which the robot never moves.
@@ -155,15 +187,115 @@ class Task1:
             self._calc_timer.start()
         logging.info(f"Path calculation scheduled in {self._debounce_delay}s…")
 
+    def _a5_expand(self, obstacles: list) -> list:
+        """
+        One obstacle in, four out — same cell, one per face.
+
+        The face Android sent is DISCARDED on purpose. In A.5 the operator
+        cannot know it; whatever they tapped is a guess, and acting on a guess
+        would photograph one face and call the task done.
+
+        Ids are derived as base*10 + d so the fold-back in pc_receive() is a
+        division. Android is never told about them — it knows one obstacle and
+        must keep knowing one obstacle, or ArenaReducer rejects the TARGET as
+        referencing an obstacle that does not exist.
+        """
+        if len(obstacles) != 1:
+            logging.error(
+                f"A.5 expects exactly one obstacle, got {len(obstacles)}. Sending "
+                f"them unchanged — this will behave like Task 1, not like A.5."
+            )
+            return obstacles
+
+        base = obstacles[0]
+        try:
+            base_id = int(base["id"])
+        except (KeyError, TypeError, ValueError):
+            logging.error(f"A.5: obstacle has no usable integer id: {base!r}.")
+            return obstacles
+
+        self._a5_base_id = base_id
+        self._a5_face_of = {}
+        self._a5_found = None
+
+        expanded = []
+        for d in A5_FACE_D:
+            face_id = base_id * 10 + d
+            expanded.append({**base, "id": face_id, "d": d})
+            self._a5_face_of[str(face_id)] = A5_FACE_NAME[d]
+
+        logging.info(
+            f"A.5: obstacle {base_id} at ({base.get('x')}, {base.get('y')}) "
+            f"expanded to four faces {sorted(self._a5_face_of.values())} — the "
+            f"face Android sent (d={base.get('d')}) is ignored, which is the "
+            f"whole point of A.5."
+        )
+        return expanded
+
+    def _a5_report(self, face_id: str, class_id: str, confidence: float) -> None:
+        """
+        Decide what a detection on one face means, and what Android hears.
+
+        THREE OF THE FOUR REPLIES ARE NOT THE ANSWER, and that is the search
+        working rather than anything going wrong. Task 1 forwards every result
+        because every face it visits genuinely has an image; here three of them
+        are bullseyes or blanks.
+
+        Forwarding them would not merely be noise. Every fanned-out id folds
+        back to the SAME obstacle, and ArenaReducer.applyTarget() overwrites
+        targetId each time — so the last face visited would win, and a bullseye
+        arriving after the real image would replace it on the screen the
+        supervisor is watching. Only a valid image is forwarded, and only the
+        first one.
+        """
+        face = self._a5_face_of.get(str(face_id).strip(), "?")
+        name = class_id.strip()
+
+        if name.lower() in A5_NOT_A_TARGET:
+            logging.info(
+                f"A.5 face {face}: '{name}' — the marker or nothing at all, not "
+                f"a target. Wrong face, keep going."
+            )
+            return
+
+        if self._a5_found is not None:
+            prev_face, prev_name, _ = self._a5_found
+            logging.info(
+                f"A.5 face {face}: '{name}' (conf={confidence:.2f}) — already "
+                f"found '{prev_name}' on face {prev_face}, not overwriting it. "
+                f"The path was planned before the first photo, so the remaining "
+                f"faces get visited either way."
+            )
+            return
+
+        self._a5_found = (face, name, confidence)
+        logging.info("=" * 58)
+        logging.info(
+            f"A.5 COMPLETE — valid image '{name}' (conf={confidence:.2f}) found "
+            f"on the {face} face."
+        )
+        logging.info(
+            f"The annotated still is on the PC under pc_side/runs/predict/, "
+            f"named obstacle_{face_id}_*.jpg."
+        )
+        logging.info("=" * 58)
+
+        # Folded back to the id Android actually knows about.
+        target_id = self._a5_base_id if self._a5_base_id is not None else face_id
+        self.android.send(f"TARGET,{target_id},{name}")
+
     def _request_path_from_pc(self) -> bool:
         """Send current obstacle list to PC for pathfinding.  Idempotent."""
         if self.path_requested:
             logging.info("PATH already in-flight — skipping duplicate OBSTACLES send.")
             return False
-        payload = "OBSTACLES," + json.dumps(self.obstacles) + "\n"
+
+        outgoing = self._a5_expand(self.obstacles) if self.a5_mode else self.obstacles
+
+        payload = "OBSTACLES," + json.dumps(outgoing) + "\n"
         self.pc.send(payload)
         self.path_requested = True
-        logging.info(f"Sent OBSTACLES to PC ({len(self.obstacles)} obstacle(s)).")
+        logging.info(f"Sent OBSTACLES to PC ({len(outgoing)} obstacle(s)).")
         return True
 
     # ── STM segment helpers ────────────────────────────────────────────────────
@@ -529,11 +661,17 @@ class Task1:
                         f"class={class_id}  conf={confidence}."
                     )
 
-                    # Unblock stm_thread which is waiting for this
+                    # Unblock stm_thread which is waiting for this. Must happen
+                    # for EVERY reply, valid image or not, or the segment pump
+                    # waits out its timeout on every wrong face.
                     self.image_done.set()
 
                     # Forward result to Android
-                    if confidence is not None:
+                    if confidence is None:
+                        pass
+                    elif self.a5_mode:
+                        self._a5_report(obstacle_id, class_id, confidence)
+                    else:
                         self.android.send(f"TARGET,{obstacle_id},{class_id}")
 
                 else:
@@ -684,6 +822,22 @@ class Task1:
                             shots = len(self.obstacle_order) or len(self.segments)
                         self.pc.send(f"STITCH,{max(shots - 1, 0)}\n")
                         self.android.send("STATUS,DONE")
+
+                        if self.a5_mode:
+                            if self._a5_found is not None:
+                                face, name, conf = self._a5_found
+                                logging.info(
+                                    f"A.5 finished: '{name}' (conf={conf:.2f}) on "
+                                    f"the {face} face."
+                                )
+                            else:
+                                logging.warning(
+                                    "A.5 finished having seen all four faces "
+                                    "without a valid image. Either the framing is "
+                                    "off at this standoff or the obstacle was not "
+                                    "where Android said — check the stills the PC "
+                                    "saved under pc_side/received_images/."
+                                )
                         logging.info("All segments complete — STITCH sent to PC.")
 
                 else:
