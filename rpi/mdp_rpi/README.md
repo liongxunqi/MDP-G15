@@ -6,6 +6,11 @@
 RPi/
 ├── .env                        ← all config lives here (IPs, ports, baud rate, timings)
 ├── task1.py                    ← main entry point, run this on the RPi
+├── task_a5.py                  ← checklist A.5: runs task1 with one obstacle
+│                                 expanded to all four of its faces
+├── task_a5_reactive.py         ← A.5 fallback: no Android, no planner
+├── test_task_a5.py             ← offline test for A.5 mode (17)
+├── test_task_a5_reactive.py    ← offline test for the fallback (24)
 ├── test_connection.py          ← smoke test: RPi ↔ PC TCP link
 ├── test_camera.py              ← smoke test: picamera2 capture
 ├── test_stm.py                 ← smoke test: interactive STM command sender
@@ -129,6 +134,90 @@ Order of startup matters:
 
 ---
 
+## Checklist A.5 — navigate around the obstacle
+
+> *"Navigate towards a given obstacle having a visual marker… navigate around
+> the obstacle in search of face which has a valid image from the image list."*
+
+**A.5 is Task 1 with one thing removed: you do not know which face the image is
+on.** That is the only difference, and it is the thing Task 1 is built around
+knowing — the operator taps the face in on Android, it arrives as `d`, and
+`path_planner._viewing_pose()` turns it into the pose to photograph from.
+
+So A.5 reduces to Task 1 exactly. Declare the obstacle **four times, once per
+face**, and one unknown-face problem becomes four known-face problems. The
+planner does the orbit: four viewing poses 30 cm off each face, a shortest tour
+between them, an `FU30` to measure the final standoff, and one `DETECT` at
+each. Planned and collision-checked, rather than dead-reckoned.
+
+### Running it
+
+```bash
+# PC  — start first, same as Task 1
+cd pc_side && python3 task1_pc.py
+
+# RPi
+python3 task_a5.py
+
+# Android — place ONE obstacle, Send Data, Begin. Exactly as Task 1.
+```
+
+The face you tap on Android is **ignored**. Not knowing it is what A.5 tests,
+so acting on a guess would photograph one face and call the task done.
+
+### What A.5 mode changes
+
+`task_a5.py` is a thin entry point; the three changes live in `task1.py` behind
+`a5_mode`, so Task 1 itself is untouched.
+
+| | |
+|---|---|
+| **Fan out** | One obstacle becomes four on the way to the PC, ids `base*10 + d`. Android is never told |
+| **Fold back** | The winning `TARGET` is reported under the id Android actually knows |
+| **Filter** | Only a valid image is forwarded, and only the first one |
+
+The filter is not tidiness. Three of the four replies are bullseyes or blanks —
+that is the search working — and every fanned id folds back to the *same*
+obstacle, where `ArenaReducer.applyTarget()` is last-write-wins. Forward them
+all and a bullseye arriving after the real image replaces it on the tablet,
+while the Pi's own log still cheerfully reports the right answer.
+
+### What it does not do
+
+**Stop early.** The path is planned in full before the first photo, so all four
+faces get visited even when the image is on the first one. The answer is
+latched on the first valid image and later faces cannot overwrite it, so this
+costs time, not correctness.
+
+### The standalone fallback
+
+`task_a5_reactive.py` is the earlier version: Pi + STM + PC detection, **no
+Android and no planner**. It approaches on `FU`, and if the face is wrong it
+drives a fixed five-token orbit (`A5_ORBIT` in `.env`) and looks again.
+
+That orbit is dead-reckoned and has never been driven on a floor, which is why
+it is the fallback rather than the primary — but it is the one to reach for
+when Bluetooth will not pair on the day.
+
+```bash
+python3 task_a5_reactive.py --no-detect   # motion only: tune A5_ORBIT
+python3 task_a5_reactive.py --dry-run     # no motion: prove camera + PC
+```
+
+### Offline tests
+
+```bash
+python3 test_task_a5.py                  # 17 tests — fan-out, fold-back, filter
+python3 test_task_a5_reactive.py         # 24 tests — the standalone sequence
+cd pc_side && python3 test_path_planner.py   # 10 tests — the tour search
+```
+
+Neither needs a robot, a PC, Bluetooth or pyserial. Geometry is not covered by
+either: the planner owns it in the primary path, and in the fallback it is what
+`--no-detect` and a tape measure are for.
+
+---
+
 ## Message Protocol Reference
 
 ### Android → RPi (Bluetooth)
@@ -151,8 +240,8 @@ Order of startup matters:
 |---|---|
 | `OBSTACLES,<json>` | List of obstacles for pathfinding |
 | `DETECT,<obstacle_id>` | About to send image for this obstacle |
-| `<filename>\n` | Image filename (sent right after DETECT) |
-| `<raw bytes>END_IMAGE` | JPEG data with sentinel |
+| `<4-byte big-endian length>` | Size of the JPEG that follows, sent right after DETECT |
+| `<raw JPEG bytes>` | Exactly that many bytes. No sentinel, no filename |
 | `STITCH,<n>` | All done, stitch n+1 images |
 
 ### PC → RPi (TCP)
@@ -257,3 +346,16 @@ authoritative wherever it disagrees with this table.
 | `DETECT_RETRY_DELAY_S` | 0.2 | Wait between retries |
 | `DETECT_TIMEOUT_S` | 0.5 | How long to wait for OBJECT reply per attempt |
 | `DEBOUNCE_DELAY_S` | 1.0 | How long after last obstacle before auto-sending to PC |
+| `PATH_TIMEOUT_S` | 30.0 | Give up waiting for the PC's `PATH` and report `STATUS,FAILED` |
+
+A.5 only (`task_a5.py`):
+
+| Variable | Default | Effect |
+|---|---|---|
+| `A5_STANDOFF_CM` | 25 | Camera standoff. Sent as `FU(standoff + 1.3)` |
+| `A5_MAX_APPROACH_CM` | 150 | Further than this is a wall, not the obstacle |
+| `A5_MAX_FACES` | 4 | A block has four; a fifth leg returns you to the first |
+| `A5_MIN_CONFIDENCE` | 0.55 | Second gate, on top of the 0.25 floor in `detect.py` |
+| `A5_SETTLE_S` | 0.3 | Let the chassis stop rocking before `FU` measures |
+| `A5_ARC_PROFILE` | 0 | Profile `A5_ORBIT` was traced for. Checked against `?STAT`, never set |
+| `A5_ORBIT` | `R20,FR90,FL90,R37,FL90` | One face to the next — **the thing you tune** |

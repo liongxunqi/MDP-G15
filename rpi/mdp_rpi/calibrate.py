@@ -3,8 +3,15 @@ calibrate.py  —  Run the PROTOCOL.md §7 calibration sequence and save the res
 ────────────────────────────────────────────────────────────────────────────────
 The firmware learns three things while it drives — arc deceleration, brake
 engagement lag and steering trim — and loses all three at power-off. A cold
-robot spends its first three or four arcs converging, which is the difference
-between a 9 degree error and a 1 degree one on the first turn of a session.
+robot has to converge them again every session, which is the difference between
+a 9 degree error and a 1 degree one on the first turn.
+
+It converges much faster than it used to. The decel and lag take the FIRST
+valid arc outright instead of filtering toward a compiled constant, and the
+trim is measured from the steering loop's own output rather than searched for
+— one arc and one straight now do what took about ten of each. Restoring a
+saved profile still beats both, and the firmware no longer overwrites a
+restored value with the next arc.
 
 This runs the sequence, averages the readings, checks the robot against itself,
 and writes the answer to a named profile you can restore in one command.
@@ -32,10 +39,28 @@ happened to be last, and the noisiest sample is as likely as any other. The
 mean of several arcs is the estimate; the spread tells you how much to trust
 it, which is why both are reported and stored.
 
-THE FIRST ARC IS BURN-IN
-────────────────────────
-Arc 1 is one update away from the compile-time seed and still carries it, so
-it is discarded by default. --keep-first includes it.
+ARC 1 IS NOW THE CLEANEST SAMPLE, NOT THE DIRTIEST
+──────────────────────────────────────────────────
+It used to be burn-in: one update away from the compile-time seed and still
+mostly carrying it, so it was discarded by default. The firmware now takes the
+first valid arc's measurement OUTRIGHT, so arc 1 is the only reading with no
+seed in it at all — it is the noisiest single sample, but it is not biased,
+and neither is any reading after it.
+
+So arc 1 is kept by default now. --drop-first restores the old behaviour, which
+is still reasonable if you would rather average only the smoothed readings.
+
+THE STRAIGHT HAS TO BE LONG ENOUGH
+──────────────────────────────────
+The trim learner now discards the first half second of a straight as launch
+transient and then wants half a second of steady driving, so a straight needs
+about a second of HOLDING — roughly 800mm once the accel and brake ramps are
+paid for. It used to want half that.
+
+A straight that falls short does not fail. The firmware changes the trim by
+nothing and says nothing, and a trim that did not move reads exactly like a
+trim that has converged — so a short run gets saved into a profile as though
+it had been measured. STRAIGHT_CM below is sized with margin for that reason.
 """
 
 import argparse
@@ -72,11 +97,15 @@ def _stdev(vals) -> float:
     m = _mean(vals)
     return (sum((v - m) ** 2 for v in vals) / (len(vals) - 1)) ** 0.5
 
-# PROTOCOL.md §7. NOTE the straight is F50, not the F600 the document prints:
+# PROTOCOL.md §7. NOTE the straight is F80, not the F600 the document prints:
 # F<n> is CENTIMETRES (§4), so F600 is six metres and does not fit a 2.0m arena.
-# What the trim learner actually needs is 50 samples at the 10ms heading tick,
-# i.e. half a second of straight driving, which F50 covers.
-STRAIGHT_CM = 50
+#
+# 80cm, not the 50 this used to be. The trim learner now throws away the first
+# 50 ticks of a straight as launch transient before collecting its 50 samples,
+# so it needs about a second of holding rather than half a second. 50cm still
+# cleared that on paper and had almost no margin left for a low battery or a
+# heavier chassis — and falling short is silent, so margin is the whole point.
+STRAIGHT_CM = 80
 ARC_DEG = 90
 
 # Alternating so the robot returns to its start heading and stays on the same
@@ -192,8 +221,9 @@ def run(stm: STM, arcs: int, profile: int, keep_first: bool
         logging.error(f"!PROF{profile} refused.")
         return None
 
-    # The straight feeds the trim learner its 50 samples.
-    logging.info(f"Straight: F{STRAIGHT_CM} (trim needs ≥0.5s of driving)")
+    # The straight feeds the trim learner. It needs ~1.0s of holding, not the
+    # 0.5s it used to — see STRAIGHT_CM.
+    logging.info(f"Straight: F{STRAIGHT_CM} (trim needs ≥1.0s of holding)")
     if not send_move(stm, f"F{STRAIGHT_CM}"):
         return None
 
@@ -215,7 +245,7 @@ def run(stm: STM, arcs: int, profile: int, keep_first: bool
 
     used = samples if keep_first else samples[1:]
     if not used:
-        logging.error("No samples left after discarding burn-in — run more arcs.")
+        logging.error("No samples left after discarding arc 1 — run more arcs.")
         return None
 
     def summarise(idx: int):
@@ -376,8 +406,10 @@ def main() -> int:
                    help="arcs to drive (default 6)")
     r.add_argument("--profile", type=int, default=0, choices=(0, 1, 2),
                    help="arc profile to calibrate for (default 0 TIGHT)")
-    r.add_argument("--keep-first", action="store_true",
-                   help="include arc 1 in the average (it is burn-in)")
+    r.add_argument("--drop-first", action="store_true",
+                   help="exclude arc 1 from the average. It used to be burn-in; "
+                        "the firmware now takes the first arc outright, so it is "
+                        "the one reading with no compiled seed in it")
     r.add_argument("--no-xchk", action="store_true",
                    help="skip the cross-check arc")
 
@@ -457,7 +489,7 @@ def main() -> int:
         print()
         input("  Enter to start, Ctrl-C to cancel... ")
 
-        out = run(stm, args.arcs, args.profile, args.keep_first)
+        out = run(stm, args.arcs, args.profile, keep_first=not args.drop_first)
         if out is None:
             return 1
         result, _ = out

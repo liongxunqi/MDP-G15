@@ -37,6 +37,7 @@ Desktop.ini
 # ===== Editor/IDE junk (if either of you uses VSCode too) =====
 .vscode/
 
-# ===== Keep these tracked (do NOT ignore) =====
-# .project, .cproject, .mxproject, STM32.ioc, linker scripts (*.ld)
-# — these are needed for teammates to reopen/reimport the project
+# ===== STM32 firmware lives in stm/ =====
+# The CubeIDE project (.project, .cproject, STM32X.ioc, linker scripts) is
+# tracked under stm/ and governed by stm/.gitignore. Keep those files tracked —
+# teammates need them to reopen/reimport the project.
