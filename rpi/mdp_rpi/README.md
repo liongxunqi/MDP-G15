@@ -182,6 +182,38 @@ obstacle, where `ArenaReducer.applyTarget()` is last-write-wins. Forward them
 all and a bullseye arriving after the real image replaces it on the tablet,
 while the Pi's own log still cheerfully reports the right answer.
 
+### How much room it leaves
+
+`OBSTACLE_SIZE_MM` is **assumed, not measured** — 100 mm from the course spec.
+Nothing on the robot can measure a block, so that number is an input, not an
+observation.
+
+It matters in two places that behave completely differently:
+
+| Use | Self-correcting? |
+|---|---|
+| Where the viewing pose goes | **Yes** — the approach ends on `FU30`, which reads the real gap and drives that, so the robot stops 30 cm from whatever is actually there |
+| How much room the path leaves going past | **No** — open-loop, nothing watching |
+
+`OBSTACLE_CLEARANCE_MM` (20 mm) exists so the second can be tuned without
+moving the first. Before it was split out there was about **2 mm** of margin:
+the virtual box keeps the robot's centre 220 mm from the block centre, and the
+real robot's worst-case half-extent is ~148 mm at a corner, so the whole
+allowance went on the robot's own corners. An obstacle wider than 10 cm was
+clipped by the excess, and the first sign would be a stalled wheel and
+`FAIL,TIMEOUT` fifteen seconds later.
+
+**Sensors cannot cover this gap today.** The ultrasonic is front-facing and
+during an orbit the block is to the *side*. The side IRs point the right way
+but saturate below 10 cm — 5 cm and 8 cm both read ~9 cm (`ir.h`) — which is
+exactly the range a clip happens in, and `FIR`/`FIL`, which would act on them,
+are reserved and unimplemented. So the margin is bought up front rather than
+sensed.
+
+Clearance costs orbit radius one-for-one: +20 mm here is +20 mm of swing per
+face. Nothing on a lone central block, worth re-checking before an
+eight-obstacle arena.
+
 ### What it does not do
 
 **Stop early.** The path is planned in full before the first photo, so all four

@@ -45,11 +45,45 @@ from stm_tokens import (
 import grid_search
 
 ARENA_MM = ARENA_CM * 10
+
+# The spec block. NOTHING MEASURES IT — the robot has no way to, so this is an
+# assumption from the course spec, not an observation.
+#
+# It sets where the viewing pose goes, and that use is self-correcting: the
+# approach ends on FU<n>, which stands still, reads the real gap with the
+# ultrasonic and drives that, so the robot stops the right distance from
+# whatever is actually there whatever this says.
 OBSTACLE_SIZE_MM = 100.0
 
 ROBOT_PLANNING_SIZE_MM = 300.0
 ROBOT_PLANNING_HALF_MM = ROBOT_PLANNING_SIZE_MM / 2.0
-VIRTUAL_OBSTACLE_HALF_MM = (OBSTACLE_SIZE_MM + ROBOT_PLANNING_SIZE_MM) / 2.0
+
+# Extra room left around an obstacle when PLANNING A PATH PAST IT. Split out
+# from OBSTACLE_SIZE_MM because the two uses are not the same kind of number
+# and only one of them is checked by a sensor.
+#
+# Going around is open-loop and has nothing watching it. The front ultrasonic
+# points the wrong way — during an orbit the block is to the SIDE — and the
+# side IRs saturate below 10cm (5cm and 8cm both read ~9cm, see ir.h), which
+# is exactly the range a clip happens in. FIR/FIL, which would act on them,
+# are reserved and unimplemented. So there is no sensor answer here and the
+# margin has to be bought up front.
+#
+# Without it there is essentially none. The virtual box keeps the robot's
+# CENTRE 200mm from the block centre; the real robot's worst-case half-extent
+# is ~148mm at a corner (188 x 230 plate) and the block's half-width is 50mm,
+# leaving about 2mm. The whole allowance is consumed by the robot's own
+# corners, so an obstacle wider than 100mm is clipped by the excess — and the
+# first anyone would know is a stalled wheel and FAIL,TIMEOUT 15 seconds later.
+#
+# Costs orbit radius one-for-one: +20mm here is +20mm of swing per face.
+# Nothing on a lone central block; worth re-checking before an 8-obstacle
+# arena, where it eats into what is reachable.
+OBSTACLE_CLEARANCE_MM = 20.0
+
+VIRTUAL_OBSTACLE_HALF_MM = (
+    (OBSTACLE_SIZE_MM + ROBOT_PLANNING_SIZE_MM) / 2.0 + OBSTACLE_CLEARANCE_MM
+)
 
 STANDOFF_MM = 300.0
 REV_AFTER_PHOTO_CM = 15
