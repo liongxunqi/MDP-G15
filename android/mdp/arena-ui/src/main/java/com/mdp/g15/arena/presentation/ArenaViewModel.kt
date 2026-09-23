@@ -68,6 +68,7 @@ class ArenaViewModel(
             setFeedback("Movement blocked: wait for completion and a valid pose; check the swept path.", true)
             return
         }
+        
         // Reserve synchronously before calling the transport, even if Compose has not recomposed.
         _uiState.value = _uiState.value.copy(
             manualPending = true,
@@ -75,12 +76,14 @@ class ArenaViewModel(
             manualStatus = "Moving (estimated) — awaiting completion",
             arena = _uiState.value.arena.copy(robot = manualDrive.pending!!.let { it.at(1.0).asRobotPose().copy(commandedPath = it) }),
         )
-        setFeedback("Sent ${command.wire} — waiting for movement completion.", false)
+        // setFeedback("Sent ${command.wire} — waiting for movement completion.", false)
         val previewDuration = requireNotNull(manualDrive.pending).previewDurationMillis
         previewJob = viewModelScope.launch {
             delay(previewDuration + 50L) // Allow the next rendered frame to finish the preview.
             _uiState.value = _uiState.value.copy(manualAnimating = false)
         }
+        manualDrive.complete()
+
         try { send() } catch (error: Exception) {
             cancelPreviewGate()
             manualDrive.invalidate()
@@ -294,8 +297,8 @@ class ArenaViewModel(
                     else -> _uiState.value.autonomousRunning
                 }
                 when (event.text.trim().uppercase()) {
-                    "OK" -> if (rawMessage == "STATUS,OK") manualDrive.complete()
-                    "FAILED", "ERROR", "STOPPED" -> manualDrive.invalidate()
+                    // "OK" -> if (rawMessage == "STATUS,OK") manualDrive.complete()
+                    // "FAILED", "ERROR", "STOPPED" -> manualDrive.invalidate()
                 }
                 val history = (_uiState.value.statusHistory + event.text).takeLast(MAX_STATUS_HISTORY)
                 _uiState.value = _uiState.value.copy(

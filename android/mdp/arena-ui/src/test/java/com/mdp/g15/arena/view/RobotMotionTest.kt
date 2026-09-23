@@ -5,24 +5,39 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class RobotMotionTest {
-    @Test fun `manual turn follows an arc with intermediate diagonal heading`() {
+    @Test fun `manual arc follows a curve rather than a chord`() {
+        val motion = RobotMotion()
+        val path = DrivePath(DrivePose(8.0, 8.0, 0.0), ManualCommand.FORWARD_RIGHT)
+        val end = path.at(1.0)
+        motion.snap(state(8, 8).robot)
+        motion.retarget(ArenaState(robot = end.asRobotPose().copy(commandedPath = path)), 0)
+        val halfway = motion.sample(500)!!
+        assertEquals(22.5f, halfway.angle, 0.001f)
+        assertEquals(path.at(0.5).x.toFloat(), halfway.x, 0.001f)
+        assertTrue(halfway.x < (8f + end.x.toFloat()) / 2) // curved rather than a straight chord
+        assertEquals(end.x.toFloat(), motion.sample(1000)!!.x, 0.001f)
+        assertEquals(end.y.toFloat(), motion.sample(1000)!!.y, 0.001f)
+    }
+    @Test fun `left and right turn on the spot through intermediate headings`() {
         val motion = RobotMotion()
         val path = DrivePath(DrivePose(8.0, 8.0, 0.0), ManualCommand.RIGHT)
         motion.snap(state(8, 8).robot)
         motion.retarget(ArenaState(robot = path.at(1.0).asRobotPose().copy(commandedPath = path)), 0)
         val halfway = motion.sample(500)!!
         assertEquals(45f, halfway.angle, 0.001f)
-        assertEquals(path.at(0.5).x.toFloat(), halfway.x, 0.001f)
-        assertTrue(halfway.x < (8f + 2.91f / 2)) // curved rather than a diagonal chord
-        assertEquals(10.91f, motion.sample(1000)!!.x, 0.001f)
-        assertEquals(10.91f, motion.sample(1000)!!.y, 0.001f)
+        assertEquals(8f, halfway.x, 0.001f)
+        assertEquals(8f, halfway.y, 0.001f)
+        val done = motion.sample(1000)!!
+        assertEquals(90f, done.angle, 0.001f)
+        assertEquals(8f, done.x, 0.001f)
+        assertEquals(8f, done.y, 0.001f)
     }
     @Test fun `straight preview moves smoothly and snaps cleanly on reset`() {
         val motion = RobotMotion()
         val path = DrivePath(DrivePose(8.0, 8.0, 0.0), ManualCommand.FORWARD)
         motion.snap(state(8, 8).robot)
         motion.retarget(ArenaState(robot = path.at(1.0).asRobotPose().copy(commandedPath = path)), 0)
-        assertEquals(9f, motion.sample(325)!!.y, 0.001f)
+        assertEquals(8.5f, motion.sample(325)!!.y, 0.001f)
         motion.snap(null)
         assertNull(motion.sample(650))
     }

@@ -2,9 +2,19 @@ package com.mdp.g15.arena.domain
 
 import kotlin.math.*
 
-/** Defaults from the RPi manual bridge and STM TIGHT profile. Units are 10 cm cells. */
-enum class ManualCommand(val wire: String, val reverse: Boolean = false, val turn: Double = 0.0) {
-    FORWARD("f"), REVERSE("r", true), LEFT("tl", turn = -90.0), RIGHT("tr", turn = 90.0),
+/**
+ * Distance one Forward/Reverse press travels, in 10 cm cells. Must equal the RPi manual
+ * bridge's MANUAL_MOVE_CM / 10, or the estimated pose drifts from the real robot.
+ */
+const val MANUAL_STEP_CELLS = 1.0
+
+/**
+ * Defaults from the RPi manual bridge and STM TIGHT profile. Units are 10 cm cells.
+ * [pivot] commands (Left/Right) rotate the robot on the spot: same cell, new heading.
+ * Every other turn is an arc that also moves the robot.
+ */
+enum class ManualCommand(val wire: String, val reverse: Boolean = false, val turn: Double = 0.0, val pivot: Boolean = false) {
+    FORWARD("f"), REVERSE("r", true), LEFT("tl", turn = -90.0, pivot = true), RIGHT("tr", turn = 90.0, pivot = true),
     FORWARD_LEFT("fl", turn = -45.0), FORWARD_RIGHT("fr", turn = 45.0),
     BACK_LEFT("bl", true, 45.0), BACK_RIGHT("br", true, -45.0);
 }
@@ -35,14 +45,19 @@ data class DrivePath(val start: DrivePose, val command: ManualCommand, val radiu
         val t = fraction.coerceIn(0.0, 1.0)
         val h = Math.toRadians(start.heading)
         val sign = if (command.reverse) -1.0 else 1.0
-        if (command.turn == 0.0) return DrivePose(start.x + sin(h) * 2.0 * t * sign, start.y + cos(h) * 2.0 * t * sign, start.heading)
+        if (command.pivot) return DrivePose(start.x, start.y, start.heading + command.turn * t)
+        if (command.turn == 0.0) return DrivePose(start.x + sin(h) * MANUAL_STEP_CELLS * t * sign, start.y + cos(h) * MANUAL_STEP_CELLS * t * sign, start.heading)
         val delta = Math.toRadians(command.turn) * t
         val r = radius * sign * command.turn.sign
         return DrivePose(start.x + r * (cos(h) - cos(h + delta)), start.y + r * (sin(h + delta) - sin(h)), start.heading + command.turn * t)
     }
 
-    /** Conservative swept AABBs between closely spaced samples, including a rotating square. */
+    /**
+     * Conservative swept AABBs between closely spaced samples, including a rotating square.
+     * Pivots (Left/Right) never leave their cell, so there is no path to sweep and nothing to check.
+     */
     fun fits(state: ArenaState): Boolean {
+        if (command.pivot) return true
         fun bounds(p: DrivePose) = p.bounds(state.config.robotFootprintCells)
         var previous = bounds(at(0.0))
         for (i in 1..180) {

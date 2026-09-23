@@ -117,7 +117,7 @@ class ArenaViewModelTest {
         viewModel.accept("STATUS,OK")
         advanceUntilIdle()
         viewModel.drive(ManualCommand.FORWARD) {}
-        assertEquals(11.0, viewModel.uiState.value.arena.robot!!.estimate!!.y, 0.0001)
+        assertEquals(10.0, viewModel.uiState.value.arena.robot!!.estimate!!.y, 0.0001)
     }
 
     @Test fun `manual and autonomous commands cannot interleave`() = runTest(dispatcher) {
@@ -165,10 +165,10 @@ class ArenaViewModelTest {
         var transmissions = 0
         repeat(100) { viewModel.drive(ManualCommand.FORWARD) { transmissions++ } }
         assertEquals(1, transmissions)
-        assertEquals(18.0, viewModel.uiState.value.arena.robot!!.estimate!!.y, 0.0001)
+        assertEquals(17.0, viewModel.uiState.value.arena.robot!!.estimate!!.y, 0.0001)
         viewModel.accept("ROBOT,8,16,N")
         advanceUntilIdle()
-        assertEquals(18.0, viewModel.uiState.value.arena.robot!!.estimate!!.y, 0.0001)
+        assertEquals(17.0, viewModel.uiState.value.arena.robot!!.estimate!!.y, 0.0001)
         viewModel.resetArena()
         assertTrue(viewModel.uiState.value.manualPending)
         viewModel.accept("STATUS,OK")
