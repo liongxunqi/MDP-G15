@@ -5,6 +5,27 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class RobotMotionTest {
+    @Test fun `manual turn follows an arc with intermediate diagonal heading`() {
+        val motion = RobotMotion()
+        val path = DrivePath(DrivePose(8.0, 8.0, 0.0), ManualCommand.RIGHT)
+        motion.snap(state(8, 8).robot)
+        motion.retarget(ArenaState(robot = path.at(1.0).asRobotPose().copy(commandedPath = path)), 0)
+        val halfway = motion.sample(500)!!
+        assertEquals(45f, halfway.angle, 0.001f)
+        assertEquals(path.at(0.5).x.toFloat(), halfway.x, 0.001f)
+        assertTrue(halfway.x < (8f + 2.91f / 2)) // curved rather than a diagonal chord
+        assertEquals(10.91f, motion.sample(1000)!!.x, 0.001f)
+        assertEquals(10.91f, motion.sample(1000)!!.y, 0.001f)
+    }
+    @Test fun `straight preview moves smoothly and snaps cleanly on reset`() {
+        val motion = RobotMotion()
+        val path = DrivePath(DrivePose(8.0, 8.0, 0.0), ManualCommand.FORWARD)
+        motion.snap(state(8, 8).robot)
+        motion.retarget(ArenaState(robot = path.at(1.0).asRobotPose().copy(commandedPath = path)), 0)
+        assertEquals(9f, motion.sample(325)!!.y, 0.001f)
+        motion.snap(null)
+        assertNull(motion.sample(650))
+    }
     private fun state(x: Int, y: Int = 2, direction: Direction = Direction.NORTH) =
         ArenaState(robot = RobotPose(GridCoordinate(x, y), direction))
 

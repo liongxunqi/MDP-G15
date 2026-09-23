@@ -36,6 +36,9 @@ Desktop.ini
 
 # ===== Editor/IDE junk (if either of you uses VSCode too) =====
 .vscode/
+local/
+.idea/
+docs/
 
 # ===== STM32 firmware lives in stm/ =====
 # The CubeIDE project (.project, .cproject, STM32X.ioc, linker scripts) is

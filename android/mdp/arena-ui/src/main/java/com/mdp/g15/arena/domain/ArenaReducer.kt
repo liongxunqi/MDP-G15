@@ -93,9 +93,7 @@ class ArenaReducer {
     private fun applyTarget(state: ArenaState, action: ArenaAction.ApplyTarget): ArenaReduction {
         val obstacle = state.obstacles[action.obstacleId]
             ?: return ArenaReduction.Failure("Target references unknown obstacle ${action.obstacleId}.")
-        if (action.targetId.isBlank()) {
-            return ArenaReduction.Failure("Target ID cannot be blank.")
-        }
+        TargetId.error(action.targetId)?.let { return ArenaReduction.Failure(it) }
         val updated = obstacle.copy(
             targetId = action.targetId,
             targetFace = action.face ?: obstacle.targetFace,
@@ -134,7 +132,7 @@ class ArenaReducer {
         if (robot.position == destination) {
             return ArenaReduction.Success(state)
         }
-        return ArenaReduction.Success(state.copy(robot = robot.copy(position = destination)))
+        return ArenaReduction.Success(state.copy(robot = robot.copy(position = destination, estimate = null, commandedPath = null)))
     }
 
     private fun validateFreeCell(
@@ -145,7 +143,7 @@ class ArenaReducer {
         !state.config.contains(position) -> "Selected cell is outside the arena."
         state.obstacles.values.any { it.id != ignoreObstacleId && it.position == position } ->
             "Another obstacle already occupies that cell."
-        state.robot != null && position in state.robot.position.footprint(state.config.robotFootprintCells) ->
+        state.robot != null && DrivePose.from(state.robot).overlaps(position, state.config.robotFootprintCells) ->
             "The robot occupies that cell."
         else -> null
     }

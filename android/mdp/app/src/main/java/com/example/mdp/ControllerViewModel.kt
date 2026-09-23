@@ -40,13 +40,11 @@ class ControllerViewModel(app: Application) : AndroidViewModel(app) {
     private val _robotStatus = MutableStateFlow("Awaiting robot status")
     val robotStatus: StateFlow<String> = _robotStatus.asStateFlow()
 
-    // Obstacle IDs currently on the arena, kept in sync from outside (see
-    // updateKnownObstacleIds) so a TARGET for an unknown obstacle can be rejected
-    // the same way ArenaReducer.applyTarget rejects it.
-    private val knownObstacleIds = MutableStateFlow<Set<Int>>(emptySet())
+    // Query the authoritative arena when a message arrives; never cache a second ID set.
+    private var obstacleExists: (Int) -> Boolean = { false }
 
-    fun updateKnownObstacleIds(ids: Set<Int>) {
-        knownObstacleIds.value = ids
+    fun bindObstacleLookup(lookup: (Int) -> Boolean) {
+        obstacleExists = lookup
     }
 
     init {
@@ -56,7 +54,7 @@ class ControllerViewModel(app: Application) : AndroidViewModel(app) {
         // unrecognised deliberately do NOT.
         viewModelScope.launch {
             bt.incoming.collect { line ->
-                val msg = RobotMessageParser.parse(line) { id -> id in knownObstacleIds.value }
+                val msg = RobotMessageParser.parse(line, obstacleExists)
                 when (msg) {
                     is RobotMessage.Status ->
                         _robotStatus.value = msg.text

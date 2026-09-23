@@ -40,14 +40,47 @@ rejected and failed messages are logged alongside QUEUED, TX and RX events.
 - The protocol-v3-fu task1.py handles BEGIN but does not handle the tablet's D-pad
   strings. Android retains them; matching deployed RPi/STM support must be verified
   by their owner. No alternate movement mapping is guessed.
-- There are no command IDs, acknowledgements, map readback, or execution IDs in
-  the current RPi interface. Guaranteed convergence and exactly-once execution
+- There are no command IDs, map acknowledgements/readback, or execution IDs in
+  the task1 interface. Guaranteed convergence and exactly-once execution
   require those receiver capabilities and cannot be provided by Android alone.
 - Protocol v3 sends `ROBOT,x,y,dir` after STM OK only if the completed segment has
   a planner `dirs` entry. Android accepts integer cell coordinates and N/E/S/W (or
   full direction names). This reports expected segment-end pose, not measured
   continuous movement. The branch's PC stub currently returns `dirs: []`, so it
   produces no robot-position updates until a planner supplies those entries.
+
+## Manual driving checklist repair
+
+The current checked-in `rpi/mdp_rpi/test_bluetooth_stm.py` is a separate manual
+bridge. Its defaults are 20 cm straight moves, 90-degree left/right arcs and
+45-degree diagonal arcs. Android models those defaults with the documented
+TIGHT radius of 29.1 cm. Verify the bridge's environment overrides and active
+STM profile before hardware use; the app cannot discover calibration values.
+
+Android reserves one movement before transmission and checks the complete swept
+2x2 footprint against arena edges and obstacles. The grid immediately shows a
+labelled estimate, retaining fractional coordinates and animated arc headings.
+Preview durations (650 ms straight, 1000 ms turning) are visual estimates, not
+measured velocity. The preview must finish before another tap is accepted, and
+the timer alone never authorizes the next physical command.
+
+The manual bridge sends `STATUS,OK` after STM completion; this releases the
+movement reservation (ordinary `MSG,[OK]` text does not). With a test tool, send `ROBOT,8,8,N` to establish a pose,
+then `STATUS,OK` after each simulated completed movement. Without completion
+feedback, further movement stays locked. Genuine incoming poses correct the
+estimate without releasing the outstanding-command lock; repeated starting-pose
+reports while pending do not roll back the preview. Stop, failure, disconnection,
+and invalid telemetry pause driving until a valid fresh pose is received.
+
+There is still no sequence identifier to distinguish arbitrary delayed or
+duplicated reports/acknowledgements from new ones. This is not guaranteed physical
+synchronization. The separate task1 receiver still lacks these D-pad handlers.
+
+Arena now contains the grid, D-pad, status and Stop. Only editing details scroll;
+the grid and driving pad stay visible in portrait and landscape. Custom messages
+matching movement tokens pass through the same guard. Manual and autonomous
+commands cannot interleave. Raw latest RX is displayed separately from parsed
+feedback, and later valid messages clear stale parsing errors.
 
 ## Verification
 

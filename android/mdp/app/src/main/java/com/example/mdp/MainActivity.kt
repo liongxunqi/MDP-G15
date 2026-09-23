@@ -163,7 +163,7 @@ class MainActivity : ComponentActivity() {
                         onBegin = viewModel::begin,
                         onPath = viewModel::path,
                         onSendCustomMessage = viewModel::sendCustomMessage,
-                        onKnownObstacleIdsChanged = viewModel::updateKnownObstacleIds,
+                        onObstacleLookupAvailable = viewModel::bindObstacleLookup,
                         incomingMessages = viewModel.incoming,
                         onArenaOutbound = viewModel::sendArenaMessage,
                         modifier = Modifier.padding(innerPadding),
@@ -274,6 +274,7 @@ fun ControllerScreen(
     forwardEnabled: Boolean = true,
     reverseEnabled: Boolean = true,
     modifier: Modifier = Modifier,
+    showManualPad: Boolean = true,
 ) {
     Box(modifier = modifier.fillMaxSize(), contentAlignment = Alignment.TopCenter) {
         Column(
@@ -344,7 +345,7 @@ fun ControllerScreen(
                     Button(onClick = onPath, enabled = isConnected, modifier = Modifier.fillMaxWidth()) {
                         Text("Send Path")
                     }
-                    DPad(
+                    if (showManualPad) DPad(
                         enabled = isConnected,
                         forwardEnabled = forwardEnabled,
                         reverseEnabled = reverseEnabled,
@@ -358,7 +359,7 @@ fun ControllerScreen(
                         onBackLeft = onBackLeft,
                         onBackRight = onBackRight,
                     )
-                    if (isConnected && (!forwardEnabled || !reverseEnabled)) {
+                    if (showManualPad && isConnected && (!forwardEnabled || !reverseEnabled)) {
                         Text(
                             "Blocked: obstacle or arena edge ahead",
                             style = MaterialTheme.typography.bodySmall,

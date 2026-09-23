@@ -41,6 +41,8 @@ class IntegratedControllerScreenTest {
     private var connected by mutableStateOf(false)
     private var robotStatusText by mutableStateOf("Awaiting robot status")
     private val movement = mutableListOf<String>()
+    private var targetLookup: (Int) -> Boolean = { false }
+    private val targetChecksAtMapWrite = mutableListOf<RobotMessage>()
 
     @Before
     fun setUp() {
@@ -51,6 +53,23 @@ class IntegratedControllerScreenTest {
         connected = false
         robotStatusText = "Awaiting robot status"
         movement.clear()
+        targetLookup = { false }
+        targetChecksAtMapWrite.clear()
+    }
+
+    @Test
+    fun targetLookupSeesEditsImmediatelyBeforeAnotherComposition() {
+        connected = true
+        setScreen()
+        composeRule.onNodeWithText("Arena").performClick()
+        composeRule.onNodeWithText("Add obstacle").performScrollTo().performClick()
+        composeRule.onNodeWithTag("arena_grid").performTouchInput { click(center) }
+        // Captured synchronously inside the outgoing map callback, not after recomposition.
+        assertEquals(RobotMessage.Target(1, "11"), targetChecksAtMapWrite.last())
+        composeRule.onNodeWithText("Undo").performScrollTo().performClick()
+        assertEquals(RobotMessage.TargetRejected("Target references unknown obstacle 1."), targetChecksAtMapWrite.last())
+        composeRule.onNodeWithText("Redo").performScrollTo().performClick()
+        assertEquals(RobotMessage.Target(1, "11"), targetChecksAtMapWrite.last())
     }
 
     @Test
@@ -58,8 +77,8 @@ class IntegratedControllerScreenTest {
         setScreen()
 
         composeRule.onNodeWithText("Bluetooth").assertIsDisplayed()
-        composeRule.onNodeWithText("▲ Forward").assertIsNotEnabled()
-        composeRule.onNodeWithText("■ Stop").assertIsNotEnabled()
+        composeRule.onNodeWithText("▲ Forward").assertDoesNotExist()
+        composeRule.onNodeWithText("■ Stop").assertDoesNotExist()
         composeRule.onNodeWithText("Stop robot").assertDoesNotExist()
         capture("controls")
         composeRule.onNodeWithText("Connect").performClick()
@@ -97,7 +116,7 @@ class IntegratedControllerScreenTest {
         connected = true
         setScreen()
         composeRule.onNodeWithText("Arena").performClick()
-        composeRule.onNodeWithText("Add obstacle").performClick()
+        composeRule.onNodeWithText("Add obstacle").performScrollTo().performClick()
 
         composeRule.onNodeWithTag("arena_grid").performTouchInput { click(center) }
         composeRule.waitForIdle()
@@ -141,22 +160,53 @@ class IntegratedControllerScreenTest {
     }
 
     @Test
+    fun longStatusAndScrollingDetailsKeepGridAndStopVisible() {
+        connected = true
+        setScreen()
+        assertTrue(incoming.tryEmit("ROBOT,8,8,N"))
+        composeRule.waitForIdle()
+        composeRule.runOnIdle { robotStatusText = "A detailed status message from the robot. ".repeat(60) }
+        composeRule.onNodeWithText("Arena").performClick()
+        composeRule.onNodeWithText("■ Stop").assertIsDisplayed().assertIsEnabled()
+        composeRule.onNodeWithTag("arena_grid").assertIsDisplayed()
+        composeRule.onNodeWithText("Add obstacle").performScrollTo().assertIsDisplayed()
+        composeRule.onNodeWithText("■ Stop").assertIsDisplayed()
+        composeRule.onNodeWithTag("arena_grid").assertIsDisplayed()
+        capture("checklist-long-status")
+    }
+
+    @Test
     fun labeledMovementAndPersistentStopKeepTheirCallbacksAndBoundaryGuards() {
         connected = true
         setScreen()
-        for (label in listOf("▲ Forward", "◀ Left", "Right ▶", "▼ Reverse", "■ Stop")) {
-            composeRule.onNodeWithText(label).performScrollTo().performClick()
+        composeRule.onNodeWithText("Arena").performClick()
+        composeRule.onNodeWithText("▲ Forward").assertIsNotEnabled()
+        for (label in listOf("▲ Forward", "◀ Left", "Right ▶", "▼ Reverse", "↖ Forward left", "Forward right ↗", "↙ Back left", "Back right ↘")) {
+            assertTrue(incoming.tryEmit("ROBOT,8,8,N"))
+            composeRule.waitForIdle()
+            composeRule.waitUntil(5_000) {
+                runCatching { composeRule.onNodeWithText(label).assertIsEnabled() }.isSuccess
+            }
+            composeRule.onNodeWithText(label).assertIsDisplayed().assertIsEnabled().performClick()
+            composeRule.onNodeWithText("▲ Forward").assertIsNotEnabled()
+            composeRule.onNodeWithText("■ Stop").assertIsEnabled()
+            if (label == "▲ Forward") {
+                composeRule.onNodeWithText("(8.00, 10.00) • N • estimated").performScrollTo().assertIsDisplayed()
+                composeRule.onNodeWithTag("arena_grid").assertIsDisplayed()
+                composeRule.onNodeWithText("▲ Forward").performClick()
+                assertEquals(listOf("f"), movement)
+            }
+            assertTrue(incoming.tryEmit("STATUS,OK"))
+            composeRule.waitForIdle()
         }
-        assertEquals(listOf("f", "tl", "tr", "r", "s"), movement)
-        for (label in listOf("↖ Forward left", "Forward right ↗", "↙ Back left", "Back right ↘", "Begin", "Send Path")) {
-            composeRule.onNodeWithText(label).performScrollTo().performClick()
-        }
-        assertEquals(listOf("fl", "fr", "bl", "br", "BEGIN", "PATH"), movement.takeLast(6))
-        capture("checklist-connected-controls")
+        assertEquals(listOf("f", "tl", "tr", "r", "fl", "fr", "bl", "br"), movement)
+        composeRule.onNodeWithText("■ Stop").performClick()
         assertTrue(incoming.tryEmit("ROBOT,5,18,N"))
         composeRule.waitForIdle()
         composeRule.onNodeWithText("▲ Forward").assertIsNotEnabled()
         composeRule.onNodeWithText("▼ Reverse").assertIsEnabled()
+        composeRule.onNodeWithTag("arena_grid").assertIsDisplayed()
+        capture("checklist-connected-controls")
         for (tab in listOf("Arena", "Logs")) {
             composeRule.onNodeWithText(tab).performClick()
             composeRule.onNodeWithText("Stop robot").assertDoesNotExist()
@@ -169,14 +219,14 @@ class IntegratedControllerScreenTest {
         connected = true
         setScreen()
         composeRule.onNodeWithText("Arena").performClick()
-        composeRule.onNodeWithText("Add obstacle").assertIsDisplayed().performClick()
+        composeRule.onNodeWithText("Add obstacle").performScrollTo().assertIsDisplayed().performClick()
         composeRule.onNodeWithTag("arena_grid").performTouchInput { click(center) }
-        composeRule.onNodeWithText("N").assertIsDisplayed().performClick()
+        composeRule.onNodeWithText("N").performScrollTo().assertIsDisplayed().performClick()
         assertEquals(3, outbound.size)
         assertEquals(outbound[1].replace("SKIP", "NORTH"), outbound[2])
         assertTrue(incoming.tryEmit("TARGET,B1,11,E"))
         composeRule.waitForIdle()
-        composeRule.onNodeWithText(" • face E • target 11", substring = true).assertIsDisplayed()
+        composeRule.onNodeWithText(" • face E • target 11", substring = true).performScrollTo().assertIsDisplayed()
         composeRule.onNodeWithText("+ Zoom in").assertIsDisplayed()
         composeRule.onNodeWithText("− Zoom out").assertIsDisplayed()
         capture("checklist-arena")
@@ -187,7 +237,7 @@ class IntegratedControllerScreenTest {
     fun offlineMapIsSentOnConnectAndResentOnReconnectWithoutMovementReplay() {
         setScreen()
         composeRule.onNodeWithText("Arena").performClick()
-        composeRule.onNodeWithText("Add obstacle").performClick()
+        composeRule.onNodeWithText("Add obstacle").performScrollTo().performClick()
         composeRule.onNodeWithTag("arena_grid").performTouchInput { click(center) }
         assertTrue(outbound.isEmpty())
         composeRule.runOnIdle { connected = true }
@@ -197,7 +247,7 @@ class IntegratedControllerScreenTest {
         composeRule.onNodeWithText("Map delivery unconfirmed", substring = true).assertDoesNotExist()
         composeRule.runOnIdle { connected = false }
         composeRule.waitForIdle()
-        composeRule.onNodeWithText("N").performClick()
+        composeRule.onNodeWithText("N").performScrollTo().performClick()
         assertEquals(1, outbound.size)
         composeRule.runOnIdle { connected = true }
         composeRule.waitForIdle()
@@ -267,9 +317,12 @@ class IntegratedControllerScreenTest {
                 onBegin = { movement.add("BEGIN") },
                 onPath = { movement.add("PATH") },
                 onSendCustomMessage = { movement.add("CUSTOM:$it") },
-                onKnownObstacleIdsChanged = {},
+                onObstacleLookupAvailable = { targetLookup = it },
                 incomingMessages = incoming,
-                onArenaOutbound = outbound::add,
+                onArenaOutbound = {
+                    outbound.add(it)
+                    targetChecksAtMapWrite.add(RobotMessageParser.parse("TARGET,1,11", targetLookup))
+                },
             )
           }
         }

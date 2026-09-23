@@ -7,7 +7,7 @@ object StatusMessage {
     // Regex.matches() requires the WHOLE input to match, so extra or missing fields fail.
     // [0-9] (not \d or toIntOrNull) keeps integers to plain ASCII digits: no "+3", "-3" or " 3".
     private val VALID = Regex(
-        "STATUS,(?:CONNECTED TO RPI|RUNNING,[0-9]+,[0-9]+|START,[0-9]+,[0-9]+,[NSEW]|FAILED|DONE)",
+        "STATUS,(?:CONNECTED TO RPI|RUNNING,[0-9]+,[0-9]+|START,[0-9]+,[0-9]+,[NSEW]|OK|FAILED|DONE)",
     )
 
     /** True when the first comma-separated field is exactly "STATUS". */

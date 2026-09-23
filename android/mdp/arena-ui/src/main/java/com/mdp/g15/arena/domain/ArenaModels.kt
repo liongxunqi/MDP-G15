@@ -58,6 +58,9 @@ enum class Direction(val wireValue: String) {
 data class RobotPose(
     val position: GridCoordinate,
     val direction: Direction,
+    /** Local command estimate; never encoded as measured telemetry. */
+    val estimate: DrivePose? = null,
+    val commandedPath: DrivePath? = null,
 )
 
 data class Obstacle(

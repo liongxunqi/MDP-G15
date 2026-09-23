@@ -7,6 +7,23 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class ArenaReducerTest {
+    @Test fun `default fifty obstacle cap remains enforced after recycling an ID`() {
+        var state = ArenaState()
+        repeat(50) { i -> state = reducer.success(state, ArenaAction.AddObstacle(GridCoordinate(i % 20, i / 20))) }
+        assertTrue(reducer.reduce(state, ArenaAction.AddObstacle(GridCoordinate(10,10))) is ArenaReduction.Failure)
+        state = reducer.success(state, ArenaAction.RemoveObstacle(17))
+        state = reducer.success(state, ArenaAction.AddObstacle(GridCoordinate(10,10)))
+        assertEquals(50, state.obstacles.size)
+        assertEquals(GridCoordinate(10,10), state.obstacles.getValue(17).position)
+        assertTrue(reducer.reduce(state, ArenaAction.AddObstacle(GridCoordinate(11,10))) is ArenaReduction.Failure)
+    }
+    @Test fun `direct target actions cannot bypass wire validation`() {
+        val s = ArenaState(obstacles = mapOf(1 to Obstacle(1, GridCoordinate(4,4))))
+        for (target in listOf("-1", "ABC", "a", "", "A B")) {
+            assertTrue(reducer.reduce(s, ArenaAction.ApplyTarget(1, target, null)) is ArenaReduction.Failure)
+        }
+        assertTrue(reducer.reduce(s, ArenaAction.ApplyTarget(1, "A9", null)) is ArenaReduction.Success)
+    }
     private val reducer = ArenaReducer()
 
     @Test

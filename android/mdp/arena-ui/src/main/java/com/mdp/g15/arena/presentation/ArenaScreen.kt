@@ -46,6 +46,7 @@ fun ArenaScreen(
     viewModel: ArenaViewModel,
     robotStatus: String? = null,
     modifier: Modifier = Modifier,
+    drivingControls: (@Composable () -> Unit)? = null,
 ) {
     val state by viewModel.uiState.collectAsState()
     var confirmReset by remember { mutableStateOf(false) }
@@ -76,37 +77,36 @@ fun ArenaScreen(
                         .weight(2f)
                         .fillMaxHeight(),
                 )
-                ArenaStatusPanel(
-                    state = state,
-                    robotStatus = robotStatus,
-                    viewModel = viewModel,
-                    onReset = { confirmReset = true },
-                    modifier = Modifier
-                        .weight(1f)
-                        .fillMaxHeight()
-                        .verticalScroll(rememberScrollState()),
-                )
+                Column(Modifier.weight(1.25f).fillMaxHeight(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    drivingControls?.invoke()
+                    ArenaStatusPanel(
+                        state = state,
+                        robotStatus = robotStatus,
+                        viewModel = viewModel,
+                        onReset = { confirmReset = true },
+                        modifier = Modifier.fillMaxWidth().fillMaxHeight(),
+                    )
+                }
             }
         } else {
             Column(
                 modifier = Modifier
                     .fillMaxSize()
-                    .verticalScroll(rememberScrollState())
                     .padding(12.dp),
                 verticalArrangement = Arrangement.spacedBy(16.dp),
             ) {
                 ArenaCanvas(
                     state = state,
                     interactions = interactions,
-                    squareViewport = true,
-                    modifier = Modifier.fillMaxWidth(),
+                    modifier = Modifier.fillMaxWidth().weight(1f),
                 )
+                drivingControls?.invoke()
                 ArenaStatusPanel(
                     state = state,
                     robotStatus = robotStatus,
                     viewModel = viewModel,
                     onReset = { confirmReset = true },
-                    modifier = Modifier.fillMaxWidth(),
+                    modifier = Modifier.fillMaxWidth().weight(0.65f),
                 )
             }
         }
@@ -205,7 +205,7 @@ private fun ArenaStatusPanel(
         border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
     ) {
         Column(
-            modifier = Modifier.padding(16.dp),
+            modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
             Text("Arena status", style = MaterialTheme.typography.titleLarge)
@@ -219,6 +219,9 @@ private fun ArenaStatusPanel(
                 },
                 style = MaterialTheme.typography.bodyMedium,
             )
+            if (state.latestReceived.isNotEmpty()) {
+                StatusValue("Last received", state.latestReceived)
+            }
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                 StatusValue(
                     "Robot status",
@@ -228,7 +231,11 @@ private fun ArenaStatusPanel(
                 StatusValue(
                     "Robot pose",
                     state.arena.robot?.let {
-                        "(${it.position.x}, ${it.position.y}) • ${it.direction.name}"
+                        it.estimate?.let { pose ->
+                            val headings = listOf("N", "NE", "E", "SE", "S", "SW", "W", "NW")
+                            val heading = headings[((kotlin.math.round(pose.heading / 45).toInt() % 8) + 8) % 8]
+                            String.format(java.util.Locale.US, "(%.2f, %.2f) • %s • estimated", pose.x, pose.y, heading)
+                        } ?: "(${it.position.x}, ${it.position.y}) • ${it.direction.name}"
                     } ?: "Not available",
                     Modifier.weight(1f),
                 )

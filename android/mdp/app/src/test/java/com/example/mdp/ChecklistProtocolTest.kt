@@ -4,6 +4,14 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class ChecklistProtocolTest {
+    @Test fun `target validation rejects invalid labels and accepts the incoming uppercase rule`() {
+        for (target in listOf("-1", "100", "abc", "a", "+1", "A B", "é", "💡")) {
+            assertTrue(target, RobotMessageParser.parse("TARGET,1,$target") { true } is RobotMessage.TargetRejected)
+        }
+        for (target in listOf("0", "9", "11", "A", "NW", "A9")) {
+            assertEquals(RobotMessage.Target(1, target), RobotMessageParser.parse("TARGET,B1,$target") { true })
+        }
+    }
     @Test fun `every command is delimited for the RPi stream reader`() {
         assertEquals("\n", bluetoothPayload(""))
         assertEquals(listOf("f\n", "r\n", "tl\n", "tr\n", "s\n", "fl\n", "fr\n", "bl\n", "br\n", "BEGIN\n", "PATH\n"), RobotCommand.entries.map { bluetoothPayload(it.wire) })
@@ -12,6 +20,7 @@ class ChecklistProtocolTest {
     }
 
     @Test fun `status target and robot reports remain recognized`() {
+        assertEquals(RobotMessage.Status("OK"), RobotMessageParser.parse("STATUS,OK"))
         assertEquals(RobotMessage.Status("RUNNING,3,12"), RobotMessageParser.parse("STATUS,RUNNING,3,12"))
         assertEquals(RobotMessage.Status("START,1,2,N"), RobotMessageParser.parse("STATUS,START,1,2,N"))
         assertEquals(RobotMessage.MalformedStatus, RobotMessageParser.parse("STATUS,Exploring"))
@@ -31,7 +40,7 @@ class ChecklistProtocolTest {
             RobotMessageParser.parse("TARGET,1"),
         )
         assertEquals(
-            RobotMessage.TargetRejected("TARGET obstacle ID must be positive."),
+            RobotMessage.TargetRejected("TARGET obstacle ID must be a positive integer."),
             RobotMessageParser.parse("TARGET,0,11"),
         )
         assertEquals(

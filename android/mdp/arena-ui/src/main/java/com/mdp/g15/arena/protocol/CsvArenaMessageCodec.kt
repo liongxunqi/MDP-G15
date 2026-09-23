@@ -4,6 +4,7 @@ import com.mdp.g15.arena.domain.ArenaOutboundEvent
 import com.mdp.g15.arena.domain.Direction
 import com.mdp.g15.arena.domain.GridCoordinate
 import com.mdp.g15.arena.domain.RobotPose
+import com.mdp.g15.arena.domain.TargetId
 
 class CsvArenaMessageCodec : ArenaMessageCodec {
     override fun decode(message: String): ArenaDecodeResult {
@@ -63,10 +64,7 @@ class CsvArenaMessageCodec : ArenaMessageCodec {
         val obstacleId = parts[1].replaceFirst(Regex("^[bB]"), "").toIntOrNull()?.takeIf { it > 0 }
             ?: return ArenaDecodeResult.Malformed("TARGET obstacle ID must be a positive integer.")
         val targetId = parts[2]
-        if (targetId.isBlank()) return ArenaDecodeResult.Malformed("TARGET ID cannot be blank.")
-        if (!targetId.matches(Regex("^[A-Z0-9]{1,2}$"))) {
-        return ArenaDecodeResult.Malformed("TARGET ID must be 1-2 alphanumeric, uppercase-only characters.")
-    }
+        TargetId.error(targetId)?.let { return ArenaDecodeResult.Malformed(it) }
         val face = parts.getOrNull(3)?.let {
             Direction.fromWire(it)
                 ?: return ArenaDecodeResult.Malformed("TARGET face must be N, E, S, or W.")
