@@ -40,6 +40,15 @@ class ControllerViewModel(app: Application) : AndroidViewModel(app) {
     private val _robotStatus = MutableStateFlow("Awaiting robot status")
     val robotStatus: StateFlow<String> = _robotStatus.asStateFlow()
 
+    // Obstacle IDs currently on the arena, kept in sync from outside (see
+    // updateKnownObstacleIds) so a TARGET for an unknown obstacle can be rejected
+    // the same way ArenaReducer.applyTarget rejects it.
+    private val knownObstacleIds = MutableStateFlow<Set<Int>>(emptySet())
+
+    fun updateKnownObstacleIds(ids: Set<Int>) {
+        knownObstacleIds.value = ids
+    }
+
     init {
         // Filter the incoming stream down to status-worthy events only. This is
         // the "selective information" the C.4 spec asks for: STATUS messages and
@@ -47,12 +56,15 @@ class ControllerViewModel(app: Application) : AndroidViewModel(app) {
         // unrecognised deliberately do NOT.
         viewModelScope.launch {
             bt.incoming.collect { line ->
-                when (val msg = RobotMessageParser.parse(line)) {
+                val msg = RobotMessageParser.parse(line) { id -> id in knownObstacleIds.value }
+                when (msg) {
                     is RobotMessage.Status ->
                         _robotStatus.value = msg.text
                     is RobotMessage.Target ->
                         _robotStatus.value =
                             "Target ${msg.targetId} found at obstacle ${msg.obstacle}"
+                    is RobotMessage.TargetRejected ->
+                        _robotStatus.value = msg.reason
                     is RobotMessage.MalformedStatus ->
                         _robotStatus.value = StatusMessage.MALFORMED_FEEDBACK
                     is RobotMessage.Position -> Unit   // arena data, not status

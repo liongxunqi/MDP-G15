@@ -267,6 +267,7 @@ class IntegratedControllerScreenTest {
                 onBegin = { movement.add("BEGIN") },
                 onPath = { movement.add("PATH") },
                 onSendCustomMessage = { movement.add("CUSTOM:$it") },
+                onKnownObstacleIdsChanged = {},
                 incomingMessages = incoming,
                 onArenaOutbound = outbound::add,
             )

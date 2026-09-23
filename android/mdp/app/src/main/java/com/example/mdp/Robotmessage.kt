@@ -1,5 +1,8 @@
 package com.example.mdp
 
+import com.mdp.g15.arena.protocol.ArenaDecodeResult
+import com.mdp.g15.arena.protocol.ArenaInboundEvent
+import com.mdp.g15.arena.protocol.CsvArenaMessageCodec
 import com.mdp.g15.arena.protocol.StatusMessage
 
 /**
@@ -8,14 +11,18 @@ import com.mdp.g15.arena.protocol.StatusMessage
  * share this one parser — so there's a single place that knows the wire format.
  *
  * Incoming formats (agree these with the RPi / algorithm team on day one):
- *   ROBOT, <x>, <y>, <dir>      -> Position   (fixed by spec, C.10)
- *   TARGET, <obstacle>, <id>    -> Target     (fixed by spec, C.9)
- *   STATUS,<one of 5 forms>     -> Status     (strict, see StatusMessage); else MalformedStatus
- *   anything else               -> Unknown
+ *   ROBOT, <x>, <y>, <dir>       -> Position   (fixed by spec, C.10)
+ *   TARGET,<obstacleId>,<id>[,<face>] -> Target, or TargetRejected if malformed or the
+ *                                  obstacle is unknown (same rules as CsvArenaMessageCodec
+ *                                  / ArenaReducer.applyTarget)
+ *   STATUS,<one of 5 forms>      -> Status     (strict, see StatusMessage); else MalformedStatus
+ *   anything else                -> Unknown
  */
 sealed interface RobotMessage {
     data class Position(val x: Int, val y: Int, val direction: String) : RobotMessage
     data class Target(val obstacle: Int, val targetId: String) : RobotMessage
+    /** TARGET was malformed, or named an obstacle that doesn't exist on the arena. */
+    data class TargetRejected(val reason: String) : RobotMessage
     data class Status(val text: String) : RobotMessage
     /** Started with STATUS but matched none of the five allowed forms. */
     data object MalformedStatus : RobotMessage
@@ -23,8 +30,14 @@ sealed interface RobotMessage {
 }
 
 object RobotMessageParser {
+    private val arenaCodec = CsvArenaMessageCodec()
 
-    fun parse(line: String): RobotMessage {
+    /**
+     * [obstacleExists] lets the caller reject a TARGET for an obstacle it doesn't know
+     * about, mirroring ArenaReducer.applyTarget. Defaults to "assume it exists" for
+     * callers with no arena data to check against.
+     */
+    fun parse(line: String, obstacleExists: (Int) -> Boolean = { true }): RobotMessage {
         if (StatusMessage.isStatus(line)) {
             return if (StatusMessage.isValid(line)) {
                 RobotMessage.Status(StatusMessage.text(line))
@@ -45,15 +58,7 @@ object RobotMessageParser {
                 }
             }
 
-            "TARGET" -> {
-                val obstacle = parts.getOrNull(1)?.replaceFirst(Regex("^[bB]"), "")?.toIntOrNull()
-                val id = parts.getOrNull(2)
-                if (obstacle != null && !id.isNullOrEmpty()) {
-                    RobotMessage.Target(obstacle, id)
-                } else {
-                    RobotMessage.Unknown(line)
-                }
-            }
+            "TARGET" -> parseTarget(line, obstacleExists)
 
             "MSG" -> parts.drop(1).joinToString(", ").removeSurrounding("[", "]")
                 .takeIf { it.isNotBlank() }?.let(RobotMessage::Status) ?: RobotMessage.Unknown(line)
@@ -61,4 +66,19 @@ object RobotMessageParser {
             else -> RobotMessage.Unknown(line)
         }
     }
+
+    /** Same format checks as CsvArenaMessageCodec.decodeTarget, plus an existence check. */
+    private fun parseTarget(line: String, obstacleExists: (Int) -> Boolean): RobotMessage =
+        when (val result = arenaCodec.decode(line)) {
+            is ArenaDecodeResult.Malformed -> RobotMessage.TargetRejected(result.reason)
+            is ArenaDecodeResult.Decoded -> {
+                val event = result.event as? ArenaInboundEvent.Target ?: return RobotMessage.Unknown(line)
+                if (obstacleExists(event.obstacleId)) {
+                    RobotMessage.Target(event.obstacleId, event.targetId)
+                } else {
+                    RobotMessage.TargetRejected("Target references unknown obstacle ${event.obstacleId}.")
+                }
+            }
+            ArenaDecodeResult.Ignored -> RobotMessage.Unknown(line)
+        }
 }

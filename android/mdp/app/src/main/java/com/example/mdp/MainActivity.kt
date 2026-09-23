@@ -163,6 +163,7 @@ class MainActivity : ComponentActivity() {
                         onBegin = viewModel::begin,
                         onPath = viewModel::path,
                         onSendCustomMessage = viewModel::sendCustomMessage,
+                        onKnownObstacleIdsChanged = viewModel::updateKnownObstacleIds,
                         incomingMessages = viewModel.incoming,
                         onArenaOutbound = viewModel::sendArenaMessage,
                         modifier = Modifier.padding(innerPadding),

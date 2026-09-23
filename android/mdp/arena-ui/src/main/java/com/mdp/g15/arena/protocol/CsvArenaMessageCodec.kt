@@ -61,9 +61,12 @@ class CsvArenaMessageCodec : ArenaMessageCodec {
             )
         }
         val obstacleId = parts[1].replaceFirst(Regex("^[bB]"), "").toIntOrNull()?.takeIf { it > 0 }
-            ?: return ArenaDecodeResult.Malformed("TARGET obstacle ID must be positive.")
+            ?: return ArenaDecodeResult.Malformed("TARGET obstacle ID must be a positive integer.")
         val targetId = parts[2]
         if (targetId.isBlank()) return ArenaDecodeResult.Malformed("TARGET ID cannot be blank.")
+        if (!targetId.matches(Regex("^[A-Z0-9]{1,2}$"))) {
+        return ArenaDecodeResult.Malformed("TARGET ID must be 1-2 alphanumeric, uppercase-only characters.")
+    }
         val face = parts.getOrNull(3)?.let {
             Direction.fromWire(it)
                 ?: return ArenaDecodeResult.Malformed("TARGET face must be N, E, S, or W.")

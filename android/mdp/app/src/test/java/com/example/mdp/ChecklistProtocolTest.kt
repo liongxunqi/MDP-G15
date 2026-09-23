@@ -23,4 +23,37 @@ class ChecklistProtocolTest {
         assertEquals(RobotMessage.Position(7, 2, "W"), RobotMessageParser.parse("ROBOT,7,2,W"))
         assertTrue(RobotMessageParser.parse("ROBOT,bad,2,W") is RobotMessage.Unknown)
     }
+
+    @Test fun `target applies the same format rules as CsvArenaMessageCodec`() {
+        // Malformed — same checks and wording as CsvArenaMessageCodec.decodeTarget.
+        assertEquals(
+            RobotMessage.TargetRejected("TARGET must be TARGET,<obstacleId>,<targetId>[,<face>]."),
+            RobotMessageParser.parse("TARGET,1"),
+        )
+        assertEquals(
+            RobotMessage.TargetRejected("TARGET obstacle ID must be positive."),
+            RobotMessageParser.parse("TARGET,0,11"),
+        )
+        assertEquals(
+            RobotMessage.TargetRejected("TARGET ID cannot be blank."),
+            RobotMessageParser.parse("TARGET,1,"),
+        )
+        assertEquals(
+            RobotMessage.TargetRejected("TARGET face must be N, E, S, or W."),
+            RobotMessageParser.parse("TARGET,1,11,NW"),
+        )
+
+        // Well-formed but references an obstacle the caller says doesn't exist —
+        // same wording as ArenaReducer.applyTarget.
+        assertEquals(
+            RobotMessage.TargetRejected("Target references unknown obstacle 1231."),
+            RobotMessageParser.parse("TARGET,1231,NW") { false },
+        )
+
+        // Well-formed and the obstacle exists.
+        assertEquals(
+            RobotMessage.Target(1231, "NW"),
+            RobotMessageParser.parse("TARGET,1231,NW") { id -> id == 1231 },
+        )
+    }
 }

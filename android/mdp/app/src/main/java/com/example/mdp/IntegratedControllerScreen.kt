@@ -54,6 +54,7 @@ fun IntegratedControllerScreen(
     onBegin: () -> Unit,
     onPath: () -> Unit,
     onSendCustomMessage: (String) -> Unit,
+    onKnownObstacleIdsChanged: (Set<Int>) -> Unit,
     incomingMessages: Flow<String>,
     onArenaOutbound: (String) -> Unit,
     modifier: Modifier = Modifier,
@@ -80,6 +81,10 @@ fun IntegratedControllerScreen(
     // shows the next cell is off-grid or occupied, reusing ArenaReducer's own validation
     // so there's exactly one place that knows what a "valid move" is.
     val arenaState by arenaViewModel.uiState.collectAsState()
+    //update known obstacles id if one is removed or added
+    LaunchedEffect(arenaState.arena.obstacles.keys, onKnownObstacleIdsChanged) {
+        onKnownObstacleIdsChanged(arenaState.arena.obstacles.keys)
+    }
     val arenaReducer = remember { ArenaReducer() }
     val robot = arenaState.arena.robot
     val forwardAllowed = robot == null ||
