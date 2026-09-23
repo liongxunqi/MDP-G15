@@ -455,7 +455,7 @@ class ArenaGridView @JvmOverloads constructor(
         obstacleTextPaint.textSize = geometry.cellSize * 0.48f
         obstacle.targetFace?.let { drawFace(canvas, rect, it) }
         canvas.drawText(
-            obstacle.targetId ?: obstacle.targetFace?.wireValue ?: "?",
+            obstacle.targetId ?: "?",
             rect.centerX(),
             rect.centerY() - (obstacleTextPaint.ascent() + obstacleTextPaint.descent()) / 2f,
             obstacleTextPaint,

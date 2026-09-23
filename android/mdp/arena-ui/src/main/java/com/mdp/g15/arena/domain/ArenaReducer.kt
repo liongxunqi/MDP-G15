@@ -2,6 +2,15 @@ package com.mdp.g15.arena.domain
 
 class ArenaReducer {
     fun reduce(state: ArenaState, action: ArenaAction): ArenaReduction = when (action) {
+        ArenaAction.SpawnObstacle -> {
+            if (state.obstacles.size >= state.config.maxObstacles) {
+                ArenaReduction.Failure("Cannot place more than ${state.config.maxObstacles} obstacles.")
+            } else {
+                val position = firstFreeObstacleCell(state)
+                if (position == null) ArenaReduction.Failure("No free cell is available for an obstacle.")
+                else addObstacle(state, position)
+            }
+        }
         is ArenaAction.AddObstacle -> addObstacle(state, action.position)
         is ArenaAction.MoveObstacle -> moveObstacle(state, action.obstacleId, action.destination)
         is ArenaAction.RemoveObstacle -> removeObstacle(state, action.obstacleId)
@@ -11,6 +20,17 @@ class ArenaReducer {
         is ArenaAction.ApplyRobotPose -> applyRobotPose(state, action.pose)
         is ArenaAction.MoveRobot -> moveRobot(state, action.destination)
         ArenaAction.Reset -> ArenaReduction.Success(ArenaState(config = state.config))
+    }
+
+    /** Deterministic bottom-left-first placement, using the same checks as dragging. */
+    fun firstFreeObstacleCell(state: ArenaState): GridCoordinate? {
+        for (y in 0 until state.config.rows) {
+            for (x in 0 until state.config.columns) {
+                val cell = GridCoordinate(x, y)
+                if (validateFreeCell(state, cell, ignoreObstacleId = null) == null) return cell
+            }
+        }
+        return null
     }
 
     private fun addObstacle(state: ArenaState, position: GridCoordinate): ArenaReduction {

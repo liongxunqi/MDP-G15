@@ -24,6 +24,40 @@ class ArenaReducerTest {
         }
         assertTrue(reducer.reduce(s, ArenaAction.ApplyTarget(1, "A9", null)) is ArenaReduction.Success)
     }
+    @Test fun `automatic placement skips rotated robot footprint and fills only free cells`() {
+        val pose = RobotPose(GridCoordinate(0, 0), Direction.NORTH,
+            estimate = DrivePose(0.5, 0.5, 45.0))
+        var state = ArenaState(config = ArenaConfig(columns = 5, rows = 5), robot = pose)
+        while (reducer.firstFreeObstacleCell(state) != null) {
+            state = reducer.success(state, ArenaAction.SpawnObstacle)
+            val obstacle = state.selectedObstacle!!
+            assertFalse(DrivePose.from(pose).overlaps(obstacle.position, 2))
+            assertTrue(state.config.contains(obstacle.position))
+        }
+        assertEquals(state.obstacles.size, state.obstacles.values.map { it.position }.toSet().size)
+        assertTrue(reducer.reduce(state, ArenaAction.SpawnObstacle) is ArenaReduction.Failure)
+    }
+
+    @Test fun `automatic placement respects cap recycles holes and resets metadata`() {
+        var state = ArenaState()
+        repeat(50) { state = reducer.success(state, ArenaAction.SpawnObstacle) }
+        assertEquals(GridCoordinate(0, 0), state.obstacles.getValue(1).position)
+        assertTrue(reducer.reduce(state, ArenaAction.SpawnObstacle) is ArenaReduction.Failure)
+        state = reducer.success(state, ArenaAction.ApplyTarget(17, "11", Direction.WEST))
+        state = reducer.success(state, ArenaAction.RemoveObstacle(17))
+        state = reducer.success(state, ArenaAction.SpawnObstacle)
+        assertEquals(17, state.selectedObstacleId)
+        assertEquals(GridCoordinate(16, 0), state.selectedObstacle!!.position)
+        assertNull(state.selectedObstacle!!.targetFace)
+        assertNull(state.selectedObstacle!!.targetId)
+    }
+
+    @Test fun `robot occupying entire arena prevents automatic placement`() {
+        val state = ArenaState(config = ArenaConfig(columns = 2, rows = 2),
+            robot = RobotPose(GridCoordinate(0, 0), Direction.NORTH))
+        assertTrue(reducer.reduce(state, ArenaAction.SpawnObstacle) is ArenaReduction.Failure)
+    }
+
     private val reducer = ArenaReducer()
 
     @Test

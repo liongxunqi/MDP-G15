@@ -21,8 +21,6 @@ import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
-import androidx.compose.ui.test.performTouchInput
-import androidx.compose.ui.test.click
 import kotlinx.coroutines.flow.MutableSharedFlow
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
@@ -63,7 +61,6 @@ class IntegratedControllerScreenTest {
         setScreen()
         composeRule.onNodeWithText("Arena").performClick()
         composeRule.onNodeWithText("Add obstacle").performScrollTo().performClick()
-        composeRule.onNodeWithTag("arena_grid").performTouchInput { click(center) }
         // Captured synchronously inside the outgoing map callback, not after recomposition.
         assertEquals(RobotMessage.Target(1, "11"), targetChecksAtMapWrite.last())
         composeRule.onNodeWithText("Undo").performScrollTo().performClick()
@@ -118,12 +115,35 @@ class IntegratedControllerScreenTest {
         composeRule.onNodeWithText("Arena").performClick()
         composeRule.onNodeWithText("Add obstacle").performScrollTo().performClick()
 
-        composeRule.onNodeWithTag("arena_grid").performTouchInput { click(center) }
         composeRule.waitForIdle()
 
         assertEquals(2, outbound.size) // initial map, then completed placement
         assertEquals("CLEAR", outbound.first())
-        assertTrue(outbound.last().startsWith("CLEAR\nOBSTACLE,1,"))
+        assertEquals("CLEAR\nOBSTACLE,1,0,0,SKIP", outbound.last())
+        repeat(2) { composeRule.onNodeWithText("Add obstacle").performScrollTo().performClick() }
+        assertEquals(4, outbound.size)
+        assertEquals("CLEAR\nOBSTACLE,1,0,0,SKIP\nOBSTACLE,2,10,0,SKIP\nOBSTACLE,3,20,0,SKIP", outbound.last())
+        composeRule.onNodeWithText("W").performScrollTo().performClick()
+        assertTrue(outbound.last().endsWith("OBSTACLE,3,20,0,WEST"))
+    }
+
+    @Test
+    fun immediateAddStopsAtLimitAndUndoRedoRestoresAvailability() {
+        connected = true
+        setScreen()
+        composeRule.onNodeWithText("Arena").performClick()
+        repeat(50) {
+            composeRule.onNodeWithText("Add obstacle").performScrollTo().performClick()
+        }
+        composeRule.onNodeWithText("Obstacle limit reached").assertIsNotEnabled()
+        assertEquals(51, outbound.size) // connection snapshot plus 50 additions
+        assertEquals(51, outbound.last().lines().size) // CLEAR plus 50 obstacles
+        composeRule.onNodeWithText("Undo").performScrollTo().performClick()
+        composeRule.onNodeWithText("Add obstacle").assertIsEnabled()
+        assertEquals(50, outbound.last().lines().size)
+        composeRule.onNodeWithText("Redo").performScrollTo().performClick()
+        composeRule.onNodeWithText("Obstacle limit reached").assertIsNotEnabled()
+        assertEquals(51, outbound.last().lines().size)
     }
 
     @Test
@@ -220,7 +240,6 @@ class IntegratedControllerScreenTest {
         setScreen()
         composeRule.onNodeWithText("Arena").performClick()
         composeRule.onNodeWithText("Add obstacle").performScrollTo().assertIsDisplayed().performClick()
-        composeRule.onNodeWithTag("arena_grid").performTouchInput { click(center) }
         composeRule.onNodeWithText("N").performScrollTo().assertIsDisplayed().performClick()
         assertEquals(3, outbound.size)
         assertEquals(outbound[1].replace("SKIP", "NORTH"), outbound[2])
@@ -238,7 +257,6 @@ class IntegratedControllerScreenTest {
         setScreen()
         composeRule.onNodeWithText("Arena").performClick()
         composeRule.onNodeWithText("Add obstacle").performScrollTo().performClick()
-        composeRule.onNodeWithTag("arena_grid").performTouchInput { click(center) }
         assertTrue(outbound.isEmpty())
         composeRule.runOnIdle { connected = true }
         composeRule.waitForIdle()

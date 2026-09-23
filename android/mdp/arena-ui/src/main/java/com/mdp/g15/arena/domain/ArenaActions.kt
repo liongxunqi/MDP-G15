@@ -1,6 +1,7 @@
 package com.mdp.g15.arena.domain
 
 sealed interface ArenaAction {
+    data object SpawnObstacle : ArenaAction
     data class AddObstacle(val position: GridCoordinate) : ArenaAction
     data class MoveObstacle(val obstacleId: Int, val destination: GridCoordinate) : ArenaAction
     data class RemoveObstacle(val obstacleId: Int) : ArenaAction

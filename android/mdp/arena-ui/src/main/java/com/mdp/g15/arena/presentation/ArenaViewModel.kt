@@ -147,6 +147,12 @@ class ArenaViewModel(
         )
     }
 
+    fun spawnObstacle() = dispatchLocal(
+        action = ArenaAction.SpawnObstacle,
+        successMessage = "Obstacle added and selected. Drag it into position and choose its target face.",
+        leavePlacementMode = true,
+    )
+
     fun addObstacle(position: GridCoordinate) = dispatchLocal(
         action = ArenaAction.AddObstacle(position),
         successMessage = "Obstacle placed at (${position.x}, ${position.y}).",

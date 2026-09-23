@@ -200,6 +200,59 @@ class ArenaViewModelTest {
         viewModel.stopManual {}
         assertFalse(viewModel.manualAllowed(ManualCommand.FORWARD))
     }
+    @Test fun `rapid spawn presses stop at cap and preserve history on rejected press`() {
+        repeat(100) { viewModel.spawnObstacle() }
+        assertEquals(50, viewModel.uiState.value.arena.obstacles.size)
+        assertEquals(50, sent.size)
+        assertFalse(viewModel.uiState.value.placementMode)
+        assertTrue(viewModel.uiState.value.feedbackIsError)
+        viewModel.undo()
+        assertEquals(49, viewModel.uiState.value.arena.obstacles.size)
+        viewModel.redo()
+        assertEquals(50, viewModel.uiState.value.arena.obstacles.size)
+        viewModel.removeObstacle(17)
+        viewModel.spawnObstacle()
+        assertEquals(17, viewModel.uiState.value.arena.selectedObstacleId)
+        assertFalse(viewModel.uiState.value.canRedo)
+    }
+
+    @Test fun `automatic additions persist and sync edits and reconnect without extra taps`() {
+        val handle = SavedStateHandle()
+        val vm = ArenaViewModel(handle, ArenaOutboundSink(sent::add), useRpiMapSync = true)
+        repeat(3) { vm.spawnObstacle() }
+        assertTrue(sent.isEmpty())
+        vm.connectionChanged(true)
+        assertEquals("CLEAR\nOBSTACLE,1,0,0,SKIP\nOBSTACLE,2,10,0,SKIP\nOBSTACLE,3,20,0,SKIP", sent.last())
+        vm.moveObstacle(3, GridCoordinate(5, 5))
+        vm.setTargetFace(Direction.WEST)
+        assertTrue(sent.last().endsWith("OBSTACLE,3,50,50,WEST"))
+        val restored = ArenaViewModel(handle, ArenaOutboundSink(sent::add), useRpiMapSync = true)
+        assertEquals(vm.uiState.value.arena.obstacles, restored.uiState.value.arena.obstacles)
+        restored.connectionChanged(true)
+        assertTrue(sent.last().endsWith("OBSTACLE,3,50,50,WEST"))
+    }
+
+    @Test fun `spawn cannot bypass manual pending preview or autonomous locks`() = runTest(dispatcher) {
+        viewModel.connectionChanged(true)
+        viewModel.accept("ROBOT,8,8,N")
+        runCurrent()
+        viewModel.drive(ManualCommand.FORWARD) {}
+        viewModel.spawnObstacle()
+        assertTrue(viewModel.uiState.value.arena.obstacles.isEmpty())
+        viewModel.accept("STATUS,OK")
+        runCurrent()
+        viewModel.spawnObstacle()
+        assertTrue(viewModel.uiState.value.arena.obstacles.isEmpty())
+        advanceUntilIdle()
+        viewModel.startRun {}
+        viewModel.spawnObstacle()
+        assertTrue(viewModel.uiState.value.arena.obstacles.isEmpty())
+        viewModel.accept("STATUS,DONE")
+        advanceUntilIdle()
+        viewModel.spawnObstacle()
+        assertEquals(1, viewModel.uiState.value.arena.obstacles.size)
+    }
+
     private val dispatcher = StandardTestDispatcher()
     private lateinit var sent: MutableList<String>
     private lateinit var viewModel: ArenaViewModel

@@ -1,6 +1,7 @@
 package com.mdp.g15.arena.view
 
 import android.graphics.Bitmap
+import android.graphics.Paint
 import android.graphics.Canvas
 import android.os.SystemClock
 import android.view.MotionEvent
@@ -13,6 +14,7 @@ import com.mdp.g15.arena.domain.Direction
 import com.mdp.g15.arena.domain.GridCoordinate
 import com.mdp.g15.arena.domain.Obstacle
 import com.mdp.g15.arena.domain.RobotPose
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -239,6 +241,48 @@ class ArenaGridViewInstrumentedTest {
             val faceColor = androidx.core.content.ContextCompat.getColor(context, com.mdp.g15.arena.R.color.arena_target_face)
             assertTrue(bitmap.getPixel(destination.first.toInt(), faceY) == faceColor)
             dispatch(view, time, SystemClock.uptimeMillis(), MotionEvent.ACTION_CANCEL, destination.first, destination.second)
+        }
+    }
+
+    @Test
+    fun gridAndDragLabelsDistinguishUnknownTargetsFromSelectedDirections() {
+        val context = ApplicationProvider.getApplicationContext<android.content.Context>()
+        // Include unset/all directions, alphabetic targets and a target identical to its ID.
+        for (face in listOf(null) + Direction.entries) {
+            for (target in listOf(null, "A", "11")) {
+                val view = createView(context)
+                val obstacle = Obstacle(11, GridCoordinate(1, 1), face, target)
+                val state = ArenaState(obstacles = mapOf(11 to obstacle))
+                val start = cellCenter(context, obstacle.position)
+                val destination = cellCenter(context, GridCoordinate(5, 6))
+                val time = SystemClock.uptimeMillis()
+                val bitmap = Bitmap.createBitmap(VIEW_SIZE, VIEW_SIZE, Bitmap.Config.ARGB_8888)
+                val labels = mutableListOf<String>()
+                val canvas = object : Canvas(bitmap) {
+                    override fun drawText(text: String, x: Float, y: Float, paint: Paint) {
+                        labels.add(text)
+                        super.drawText(text, x, y, paint)
+                    }
+                }
+                onMain {
+                    prepare(view, state, false)
+                    view.draw(canvas)
+                    assertEquals("Grid label for face=$face target=$target", target ?: "11", labels.last())
+                    dispatch(view, time, time, MotionEvent.ACTION_DOWN, start.first, start.second)
+                }
+                Thread.sleep(ViewConfiguration.getLongPressTimeout().toLong() + 100L)
+                onMain {
+                    dispatch(view, time, SystemClock.uptimeMillis(), MotionEvent.ACTION_MOVE, destination.first, destination.second)
+                    labels.clear()
+                    view.draw(canvas)
+                    assertEquals("Drag label for face=$face target=$target", target ?: "?", labels.last())
+                    dispatch(view, time, SystemClock.uptimeMillis(), MotionEvent.ACTION_CANCEL, destination.first, destination.second)
+                    labels.clear()
+                    view.draw(canvas)
+                    assertEquals("Cancel restores grid label", target ?: "11", labels.last())
+                }
+                bitmap.recycle()
+            }
         }
     }
 

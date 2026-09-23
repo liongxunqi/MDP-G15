@@ -274,13 +274,12 @@ private fun ArenaStatusPanel(
 
             val atObstacleLimit = state.arena.obstacles.size >= state.arena.config.maxObstacles
             Button(
-                onClick = { viewModel.setPlacementMode(!state.placementMode) },
-                enabled = state.placementMode || !atObstacleLimit,
+                onClick = viewModel::spawnObstacle,
+                enabled = !atObstacleLimit && !state.manualPending && !state.manualAnimating && !state.autonomousRunning,
                 modifier = Modifier.fillMaxWidth(),
             ) {
                 Text(
                     when {
-                        state.placementMode -> "Cancel adding"
                         atObstacleLimit -> "Obstacle limit reached"
                         else -> "Add obstacle"
                     },
