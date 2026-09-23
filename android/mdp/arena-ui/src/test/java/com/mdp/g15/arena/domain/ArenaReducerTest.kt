@@ -10,20 +10,46 @@ class ArenaReducerTest {
     private val reducer = ArenaReducer()
 
     @Test
-    fun `add assigns stable increasing IDs and rejects occupied cell`() {
+    fun `add assigns increasing IDs from an empty arena and rejects occupied cell`() {
         val first = reducer.success(ArenaState(), ArenaAction.AddObstacle(GridCoordinate(4, 5)))
         val second = reducer.success(first, ArenaAction.AddObstacle(GridCoordinate(8, 9)))
 
         assertEquals(setOf(1, 2), second.obstacles.keys)
-        assertEquals(3, second.nextObstacleId)
         assertTrue(
             reducer.reduce(second, ArenaAction.AddObstacle(GridCoordinate(4, 5)))
                 is ArenaReduction.Failure,
         )
+    }
 
-        val removed = reducer.success(second, ArenaAction.RemoveObstacle(1))
-        val third = reducer.success(removed, ArenaAction.AddObstacle(GridCoordinate(1, 1)))
-        assertEquals(setOf(2, 3), third.obstacles.keys)
+    @Test
+    fun `removed IDs are recycled smallest-first before new ones are allocated`() {
+        // 1,2,3 -> remove 3 -> next placement reuses 3.
+        var state = reducer.success(ArenaState(), ArenaAction.AddObstacle(GridCoordinate(0, 0)))
+        state = reducer.success(state, ArenaAction.AddObstacle(GridCoordinate(1, 0)))
+        state = reducer.success(state, ArenaAction.AddObstacle(GridCoordinate(2, 0)))
+        state = reducer.success(state, ArenaAction.RemoveObstacle(3))
+        state = reducer.success(state, ArenaAction.AddObstacle(GridCoordinate(3, 0)))
+        assertEquals(setOf(1, 2, 3), state.obstacles.keys)
+
+        // 1,2,3,4 -> remove the middle ID 3 -> next gets 3, the one after gets 5 (1,2,4 taken).
+        state = reducer.success(state, ArenaAction.AddObstacle(GridCoordinate(4, 0)))
+        assertEquals(setOf(1, 2, 3, 4), state.obstacles.keys)
+        state = reducer.success(state, ArenaAction.RemoveObstacle(3))
+        state = reducer.success(state, ArenaAction.AddObstacle(GridCoordinate(5, 0)))
+        assertEquals(setOf(1, 2, 3, 4), state.obstacles.keys)
+        state = reducer.success(state, ArenaAction.AddObstacle(GridCoordinate(6, 0)))
+        assertEquals(setOf(1, 2, 3, 4, 5), state.obstacles.keys)
+
+        // 1..5 -> remove non-contiguous 2 and 4 -> reused smallest-first (2, then 4), then a new ID (6).
+        state = reducer.success(state, ArenaAction.RemoveObstacle(2))
+        state = reducer.success(state, ArenaAction.RemoveObstacle(4))
+        assertEquals(setOf(1, 3, 5), state.obstacles.keys)
+        state = reducer.success(state, ArenaAction.AddObstacle(GridCoordinate(7, 0)))
+        assertEquals(setOf(1, 2, 3, 5), state.obstacles.keys)
+        state = reducer.success(state, ArenaAction.AddObstacle(GridCoordinate(8, 0)))
+        assertEquals(setOf(1, 2, 3, 4, 5), state.obstacles.keys)
+        state = reducer.success(state, ArenaAction.AddObstacle(GridCoordinate(9, 0)))
+        assertEquals(setOf(1, 2, 3, 4, 5, 6), state.obstacles.keys)
     }
 
     @Test
@@ -64,7 +90,7 @@ class ArenaReducerTest {
 
         assertNull(removed.selectedObstacleId)
         assertEquals(setOf(2), removed.obstacles.keys)
-        assertEquals(3, removed.nextObstacleId)
+        assertEquals(1, removed.nextFreeObstacleId())
     }
 
     @Test

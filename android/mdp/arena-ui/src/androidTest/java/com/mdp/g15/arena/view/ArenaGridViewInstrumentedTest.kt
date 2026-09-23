@@ -30,7 +30,6 @@ class ArenaGridViewInstrumentedTest {
                 1 to Obstacle(1, GridCoordinate(10, 6), Direction.NORTH, "11"),
             ),
             selectedObstacleId = 1,
-            nextObstacleId = 2,
         )
         view.render(state, placementMode = false)
         view.measure(
@@ -83,7 +82,6 @@ class ArenaGridViewInstrumentedTest {
         }
         val state = ArenaState(
             obstacles = mapOf(1 to Obstacle(1, GridCoordinate(1, 1))),
-            nextObstacleId = 2,
         )
         val start = cellCenter(context, GridCoordinate(1, 1))
         val destination = cellCenter(context, GridCoordinate(5, 6))

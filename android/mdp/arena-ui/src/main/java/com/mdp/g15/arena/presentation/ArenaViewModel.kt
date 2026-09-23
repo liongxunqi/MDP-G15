@@ -273,9 +273,6 @@ class ArenaViewModel(
             .mapNotNull(::decodeObstacle)
             .associateBy(Obstacle::id)
         val robot = savedStateHandle.get<String>(KEY_ROBOT)?.let(::decodeRobot)
-        val nextId = savedStateHandle.get<Int>(KEY_NEXT_ID)
-            ?.coerceAtLeast((obstacles.keys.maxOrNull() ?: 0) + 1)
-            ?: ((obstacles.keys.maxOrNull() ?: 0) + 1)
         val selected = savedStateHandle.get<Int>(KEY_SELECTED)?.takeIf(obstacles::containsKey)
         val status = savedStateHandle.get<String>(KEY_STATUS).orEmpty().ifBlank { "Awaiting robot status" }
         return ArenaUiState(
@@ -283,7 +280,6 @@ class ArenaViewModel(
                 robot = robot,
                 obstacles = obstacles,
                 selectedObstacleId = selected,
-                nextObstacleId = nextId,
             ),
             status = status,
             statusHistory = listOf(status),
@@ -300,7 +296,6 @@ class ArenaViewModel(
             state.arena.obstacles.toSortedMap().values.map(::encodeObstacle),
         )
         savedStateHandle[KEY_ROBOT] = state.arena.robot?.let(::encodeRobot)
-        savedStateHandle[KEY_NEXT_ID] = state.arena.nextObstacleId
         savedStateHandle[KEY_SELECTED] = state.arena.selectedObstacleId
         savedStateHandle[KEY_STATUS] = state.status
     }
@@ -358,7 +353,6 @@ class ArenaViewModel(
         private const val MAX_UNDO_HISTORY = 50
         private const val KEY_OBSTACLES = "arena.obstacles"
         private const val KEY_ROBOT = "arena.robot"
-        private const val KEY_NEXT_ID = "arena.nextId"
         private const val KEY_SELECTED = "arena.selected"
         private const val KEY_STATUS = "arena.status"
     }

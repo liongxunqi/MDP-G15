@@ -19,12 +19,11 @@ class ArenaReducer {
         }
         validateFreeCell(state, position, ignoreObstacleId = null)?.let { return ArenaReduction.Failure(it) }
 
-        val obstacle = Obstacle(id = state.nextObstacleId, position = position)
+        val obstacle = Obstacle(id = state.nextFreeObstacleId(), position = position)
         return ArenaReduction.Success(
             state = state.copy(
                 obstacles = state.obstacles + (obstacle.id to obstacle),
                 selectedObstacleId = obstacle.id,
-                nextObstacleId = obstacle.id + 1,
             ),
             outboundEvent = ArenaOutboundEvent.UpsertObstacle(obstacle),
         )

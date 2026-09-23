@@ -76,22 +76,26 @@ data class ArenaState(
     val robot: RobotPose? = null,
     val obstacles: Map<Int, Obstacle> = emptyMap(),
     val selectedObstacleId: Int? = null,
-    val nextObstacleId: Int = 1,
 ) {
     val selectedObstacle: Obstacle?
         get() = selectedObstacleId?.let(obstacles::get)
+
+    /** Smallest positive ID not currently in use — removed IDs are reused before new ones. */
+    fun nextFreeObstacleId(): Int {
+        var candidate = 1
+        while (candidate in obstacles) candidate++
+        return candidate
+    }
 }
 
 data class ArenaEditSnapshot(
     val obstacles: Map<Int, Obstacle>,
     val selectedObstacleId: Int?,
-    val nextObstacleId: Int,
     val robot: RobotPose?,
 ) {
     fun applyTo(state: ArenaState): ArenaState = state.copy(
         obstacles = obstacles,
         selectedObstacleId = selectedObstacleId?.takeIf(obstacles::containsKey),
-        nextObstacleId = nextObstacleId,
         robot = robot,
     )
 
@@ -99,7 +103,6 @@ data class ArenaEditSnapshot(
         fun from(state: ArenaState): ArenaEditSnapshot = ArenaEditSnapshot(
             obstacles = state.obstacles,
             selectedObstacleId = state.selectedObstacleId,
-            nextObstacleId = state.nextObstacleId,
             robot = state.robot,
         )
     }
