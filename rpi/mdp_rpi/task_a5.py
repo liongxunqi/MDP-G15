@@ -42,9 +42,10 @@ logging.basicConfig(
 # bullseye is the "right obstacle, wrong face" marker, not a target. dot is filler.
 NOT_A_TARGET = {"bullseye", "dot"}
 LOOK_ERROR = object()
-MIN_CONFIDENCE = float(os.getenv("A5_MIN_CONFIDENCE", "0.55"))
 
 STANDOFF_CM = int(os.getenv("A5_STANDOFF_CM", "45"))
+ORBIT_INSET_CM = int(os.getenv("A5_ORBIT_INSET_CM", "20"))
+CAPTURE_SETTLE_S = float(os.getenv("A5_CAPTURE_SETTLE_S", "2.0"))
 MAX_APPROACH_CM = int(os.getenv("A5_MAX_APPROACH_CM", "150"))
 MAX_FACES = int(os.getenv("A5_MAX_FACES", "4"))
 ARC_PROFILE = int(os.getenv("A5_ARC_PROFILE", "1"))
@@ -68,14 +69,40 @@ PC_TIMEOUT_S = float(os.getenv("A5_PC_TIMEOUT_S", "30.0"))
 POST_ORBIT_MAX_APPROACH_CM = int(os.getenv("A5_POST_ORBIT_MAX_APPROACH_CM",
                                             str(STANDOFF_CM + 50)))
 
-# Profile 1 CLEAN has a measured 31.8cm radius. The requested arc angles
-# compensate for its measured turn bias; ?TURN verifies the physical result.
+# Profile 1 CLEAN has a measured 31.8cm radius. A5 requests the real geometric
+# angle, then uses ?TURN to verify and correct the completed heading.
 CLEAN_RADIUS_CM = 31.8
-ORBIT_FR_DEG = int(os.getenv("A5_ORBIT_FR_DEG", "88"))
-ORBIT_FL_DEG = int(os.getenv("A5_ORBIT_FL_DEG", "94"))
-ORBIT_TURN_TOLERANCE_DEG = float(os.getenv("A5_ORBIT_TURN_TOLERANCE_DEG", "8"))
+ORBIT_FR_DEG = int(os.getenv("A5_ORBIT_FR_DEG", "90"))
+ORBIT_FL_DEG = int(os.getenv("A5_ORBIT_FL_DEG", "90"))
+ORBIT_FR_COMMAND_OFFSET_DEG = int(
+    os.getenv("A5_ORBIT_FR_COMMAND_OFFSET_DEG", "0")
+)
+ORBIT_FL_COMMAND_OFFSET_DEG = int(
+    os.getenv("A5_ORBIT_FL_COMMAND_OFFSET_DEG", "0")
+)
+ORBIT_RR_COMMAND_OFFSET_DEG = int(
+    os.getenv("A5_ORBIT_RR_COMMAND_OFFSET_DEG", "0")
+)
+ORBIT_RL_COMMAND_OFFSET_DEG = int(
+    os.getenv("A5_ORBIT_RL_COMMAND_OFFSET_DEG", "0")
+)
+ORBIT_HEADING_TOLERANCE_DEG = float(
+    os.getenv("A5_ORBIT_HEADING_TOLERANCE_DEG", "2")
+)
+ORBIT_MAX_CORRECTION_DEG = int(os.getenv("A5_ORBIT_MAX_CORRECTION_DEG", "10"))
+ORBIT_MIN_CORRECTION_DEG = int(os.getenv("A5_ORBIT_MIN_CORRECTION_DEG", "5"))
+ORBIT_MAX_CORRECTIONS = int(os.getenv("A5_ORBIT_MAX_CORRECTIONS", "1"))
+ORBIT_CORRECTION_COAST_DEG = float(
+    os.getenv("A5_ORBIT_CORRECTION_COAST_DEG", "3.5")
+)
 if ARC_PROFILE != 1:
     raise ValueError("Task A5 is configured only for arc profile 1 CLEAN.")
+if not (0 < ORBIT_INSET_CM < STANDOFF_CM):
+    raise ValueError(
+        "A5_ORBIT_INSET_CM must be positive and smaller than A5_STANDOFF_CM."
+    )
+
+ORBIT_GEOMETRY_STANDOFF_CM = STANDOFF_CM - ORBIT_INSET_CM
 
 
 def _profile_one_orbit() -> str:
@@ -83,7 +110,7 @@ def _profile_one_orbit() -> str:
     # measured at the driven rear axle. Include that longitudinal offset when
     # placing the axle around the next face.
     radial_cm = (
-        STANDOFF_CM
+        ORBIT_GEOMETRY_STANDOFF_CM
         + OBSTACLE_SIZE_CM / 2.0
         + REAR_AXLE_TO_SENSOR_CM
     )
@@ -230,6 +257,13 @@ class TaskA5:
     def look(self, face: int):
         logging.info(f"── Looking at face {face} ──")
 
+        # FU and the final reverse may leave the camera mount rocking even
+        # after the STM has replied OK. With automatic exposure near 60 ms,
+        # that vibration visibly smears the target and can defeat YOLO.
+        logging.info("Letting the chassis settle for %.1fs before capture.",
+                     CAPTURE_SETTLE_S)
+        sleep(CAPTURE_SETTLE_S)
+
         image_bytes = self.camera.capture_image()
         if not image_bytes:
             logging.error("Capture failed — stopping instead of orbiting blind.")
@@ -250,45 +284,150 @@ class TaskA5:
             logging.info(f"Found '{name}' (conf={conf:.2f}) — that is the marker, "
                          f"not a target. Wrong face.")
             return None
-        if conf < MIN_CONFIDENCE:
-            logging.info(f"Found '{name}' but only at conf={conf:.2f}, below "
-                         f"{MIN_CONFIDENCE}. Not trusting it.")
-            return None
-
         logging.info(f"Valid image: '{name}' at conf={conf:.2f}.")
         return name, conf
 
     def orbit(self, face: int) -> bool:
         logging.info(f"── Face {face} was not it — going around ──")
 
-        # Send primitives separately so ?TURN can verify each corrected arc.
-        # A heading error is safer to catch here than after FU sees the wall.
+        # Run the geometric segment without injecting corrections between its
+        # primitives. ?TURN is relative to one arc, so add the signed results
+        # and correct the net heading once the complete segment has landed.
+        expected_heading = 0.0
+        actual_heading = 0.0
         for token in ORBIT_LINE.split(","):
             token = token.strip()
             if not token:
                 continue
-            if not self._send(token):
+            if token.startswith(("FR", "FL", "RR", "RL")):
+                measured = self._send_measured_arc(token)
+                if measured is None:
+                    return False
+                expected_heading += self._arc_heading(token)
+                actual_heading += measured
+            elif not self._send(token):
                 return False
-            if token.startswith(("FR", "FL")) and not self.dry_run:
-                fields = self.stm.query_fields("?TURN")
-                if not fields:
-                    logging.error("No ?TURN reading after %s.", token)
-                    return False
-                try:
-                    actual_deg = int(fields[0]) / 10.0
-                except ValueError:
-                    logging.error("Invalid ?TURN reading after %s: %s", token, fields)
-                    return False
-                expected_deg = -90.0 if token.startswith("FR") else 90.0
-                logging.info("Orbit %s produced %.1f° (expected %+.1f°).",
-                             token, actual_deg, expected_deg)
-                if abs(actual_deg - expected_deg) > ORBIT_TURN_TOLERANCE_DEG:
-                    logging.error("%s heading error exceeds %.1f°; stopping.",
-                                  token, ORBIT_TURN_TOLERANCE_DEG)
-                    return False
+
+        corrected_heading = self._correct_segment_heading(
+            expected_heading, actual_heading
+        )
+        if corrected_heading is None:
+            return False
+
+        # The compact orbit lands at its smaller sensor radius. Back away by
+        # the difference, then let FU trim forward odometry error at the next
+        # face and restore the camera's viewing pose.
+        if not self._send(f"R{ORBIT_INSET_CM}"):
+            return False
 
         sleep(0.3)
         return self._stand_off(STANDOFF_CM, max_approach_cm=POST_ORBIT_MAX_APPROACH_CM)
+
+    def _read_turn(self, token: str):
+        fields = self.stm.query_fields("?TURN")
+        if not fields:
+            logging.error("No ?TURN reading after %s.", token)
+            return None
+        try:
+            return int(fields[0]) / 10.0
+        except ValueError:
+            logging.error("Invalid ?TURN reading after %s: %s", token, fields)
+            return None
+
+    @staticmethod
+    def _arc_heading(token: str) -> float:
+        heading_sign = {"FR": -1.0, "FL": 1.0, "RR": 1.0, "RL": -1.0}
+        return float(token[2:]) * heading_sign[token[:2]]
+
+    def _send_measured_arc(self, token: str):
+        arc_type = token[:2]
+        requested_deg = float(token[2:])
+        command_offsets = {
+            "FR": ORBIT_FR_COMMAND_OFFSET_DEG,
+            "FL": ORBIT_FL_COMMAND_OFFSET_DEG,
+            "RR": ORBIT_RR_COMMAND_OFFSET_DEG,
+            "RL": ORBIT_RL_COMMAND_OFFSET_DEG,
+        }
+        if arc_type not in command_offsets:
+            logging.error("Unsupported A5 arc token: %s.", token)
+            return None
+
+        command_offset = command_offsets[arc_type]
+        command_deg = int(round(requested_deg + command_offset))
+        if command_deg <= 0:
+            logging.error("A5 arc compensation produced invalid command for %s.", token)
+            return None
+        command = arc_type + str(command_deg)
+        if command != token:
+            logging.info("A5 turn compensation: %s target uses %s command.",
+                         token, command)
+        if not self._send(command):
+            return None
+        if self.dry_run:
+            return self._arc_heading(token)
+
+        measured_deg = self._read_turn(command)
+        if measured_deg is None:
+            return None
+        logging.info("Orbit %s measured %+.1f°.", command, measured_deg)
+        return measured_deg
+
+    def _correct_segment_heading(
+        self, expected_heading: float, actual_heading: float
+    ):
+        logging.info(
+            "Orbit segment complete: heading %+.1f° "
+            "(target %+.1f°, error %+.1f°).",
+            actual_heading, expected_heading, expected_heading - actual_heading,
+        )
+        for attempt in range(1, ORBIT_MAX_CORRECTIONS + 1):
+            error_deg = expected_heading - actual_heading
+            if abs(error_deg) <= ORBIT_HEADING_TOLERANCE_DEG + 1e-6:
+                return actual_heading
+
+            # Final correction only. This chassis cannot pivot in place, so a
+            # short forward arc is the least disruptive available adjustment.
+            correction_deg = max(
+                ORBIT_MIN_CORRECTION_DEG,
+                int(round(abs(error_deg) - ORBIT_CORRECTION_COAST_DEG)),
+            )
+            correction_deg = min(correction_deg, ORBIT_MAX_CORRECTION_DEG)
+            correction_type = "FL" if error_deg > 0.0 else "FR"
+            correction = correction_type + str(correction_deg)
+            logging.warning(
+                "Final segment correction %d/%d: %s.",
+                attempt, ORBIT_MAX_CORRECTIONS, correction,
+            )
+            if not self._send(correction):
+                return None
+
+            corrected_deg = self._read_turn(correction)
+            if corrected_deg is None:
+                return None
+            previous_error = abs(error_deg)
+            actual_heading += corrected_deg
+            residual_deg = expected_heading - actual_heading
+            logging.info(
+                "Final heading after %s: %+.1f° "
+                "(target %+.1f°, residual %+.1f°).",
+                correction, actual_heading, expected_heading, residual_deg,
+            )
+            if abs(residual_deg) >= previous_error:
+                logging.warning(
+                    "%s did not improve the heading; avoiding correction oscillation.",
+                    correction,
+                )
+                break
+
+        residual_deg = expected_heading - actual_heading
+        if abs(residual_deg) <= ORBIT_HEADING_TOLERANCE_DEG + 1e-6:
+            return actual_heading
+        logging.warning(
+            "Heading remains %+.1f° from target after %d corrections; "
+            "continuing as configured.",
+            residual_deg, ORBIT_MAX_CORRECTIONS,
+        )
+        return actual_heading
 
     def _check_protocol(self) -> bool:
         fields = self.stm.query_fields("?VER")
@@ -335,7 +474,11 @@ class TaskA5:
                 self.stm.disconnect()
                 return 2
             logging.info(f"STM arc profile set to {ARC_PROFILE} for A5.")
-            logging.info(f"A5 orbit at {STANDOFF_CM} cm: {ORBIT_LINE}")
+            logging.info(
+                "A5 compact orbit (equivalent %d cm inset), returning to %d cm "
+                "for images: %s",
+                ORBIT_INSET_CM, STANDOFF_CM, ORBIT_LINE,
+            )
 
         try:
             self.camera = Camera()
