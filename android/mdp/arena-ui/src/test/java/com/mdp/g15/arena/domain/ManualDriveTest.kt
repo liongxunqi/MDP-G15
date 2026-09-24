@@ -23,6 +23,26 @@ class ManualDriveTest {
         assertEquals(45.0, reverseLeft.heading, 0.0001)
         assertEquals(reverseLeft, DrivePose.from(reverseLeft.asRobotPose()))
     }
+    @Test fun `forward left and right end on a cardinal direction a quarter turn away`() {
+        val left = listOf(Direction.NORTH to Direction.WEST, Direction.WEST to Direction.SOUTH,
+            Direction.SOUTH to Direction.EAST, Direction.EAST to Direction.NORTH)
+        val right = listOf(Direction.NORTH to Direction.EAST, Direction.EAST to Direction.SOUTH,
+            Direction.SOUTH to Direction.WEST, Direction.WEST to Direction.NORTH)
+        for ((command, cases) in listOf(ManualCommand.FORWARD_LEFT to left, ManualCommand.FORWARD_RIGHT to right)) {
+            for ((from, to) in cases) {
+                val start = DrivePose(8.0, 8.0, from.ordinal * 90.0)
+                val end = DrivePath(start, command).at(1.0)
+                assertEquals("$command $from", 0.0, end.heading % 90.0, 0.0)
+                assertEquals("$command $from", to, end.asRobotPose().direction)
+                // Chained turns start from the stored cardinal heading, so nothing drifts.
+                assertEquals(0.0, DrivePath(end, command).at(1.0).heading % 90.0, 0.0)
+            }
+        }
+    }
+    @Test fun `forward left sweeps through intermediate headings`() {
+        val path = DrivePath(DrivePose(8.0, 8.0, 0.0), ManualCommand.FORWARD_LEFT)
+        assertEquals(-45.0, path.at(0.5).heading, 0.0001)
+    }
     private fun state(x: Int = 8, y: Int = 8, direction: Direction = Direction.NORTH) = ArenaState(robot = RobotPose(GridCoordinate(x, y), direction))
     @Test fun `all cardinal boundaries account for two cell distance and footprint`() {
         for ((direction, xy) in listOf(Direction.NORTH to GridCoordinate(8,17), Direction.EAST to GridCoordinate(17,8), Direction.SOUTH to GridCoordinate(8,1), Direction.WEST to GridCoordinate(1,8))) {

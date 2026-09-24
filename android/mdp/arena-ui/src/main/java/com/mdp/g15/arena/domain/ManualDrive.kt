@@ -7,6 +7,9 @@ enum class ManualCommand(val wire: String, val reverse: Boolean = false, val tur
     FORWARD("f"), REVERSE("r", true), LEFT("tl", turn = -90.0), RIGHT("tr", turn = 90.0),
     FORWARD_LEFT("fl", turn = -45.0), FORWARD_RIGHT("fr", turn = 45.0),
     BACK_LEFT("bl", true, 45.0), BACK_RIGHT("br", true, -45.0);
+
+    /** Forward-left/right end on a cardinal heading, a 90° step from the starting one. */
+    val snapsToQuarterTurn: Boolean get() = this == FORWARD_LEFT || this == FORWARD_RIGHT
 }
 
 data class DrivePose(val x: Double, val y: Double, val heading: Double) {
@@ -38,7 +41,18 @@ data class DrivePath(val start: DrivePose, val command: ManualCommand, val radiu
         if (command.turn == 0.0) return DrivePose(start.x + sin(h) * 2.0 * t * sign, start.y + cos(h) * 2.0 * t * sign, start.heading)
         val delta = Math.toRadians(command.turn) * t
         val r = radius * sign * command.turn.sign
-        return DrivePose(start.x + r * (cos(h) - cos(h + delta)), start.y + r * (sin(h + delta) - sin(h)), start.heading + command.turn * t)
+        return DrivePose(start.x + r * (cos(h) - cos(h + delta)), start.y + r * (sin(h + delta) - sin(h)), headingAt(t))
+    }
+
+    /**
+     * Forward-left/right: the drawn heading sweeps through intermediate angles, but the
+     * end heading is derived from the starting cardinal direction (±90°), never
+     * accumulated from the animation angle. Position keeps using the arc geometry above.
+     */
+    private fun headingAt(t: Double): Double {
+        if (!command.snapsToQuarterTurn) return start.heading + command.turn * t
+        val end = (start.heading / 90.0).roundToInt() * 90.0 + command.turn.sign * 90.0
+        return if (t >= 1.0) end else start.heading + (end - start.heading) * t
     }
 
     /** Conservative swept AABBs between closely spaced samples, including a rotating square. */
