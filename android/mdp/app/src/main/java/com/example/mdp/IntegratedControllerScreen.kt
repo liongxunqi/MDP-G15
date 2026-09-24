@@ -1,6 +1,10 @@
 package com.example.mdp
 
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Row
+import androidx.compose.material3.Button
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -19,6 +23,7 @@ import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.mdp.g15.arena.domain.ManualCommand
 import com.mdp.g15.arena.integration.ArenaOutboundSink
@@ -60,6 +65,8 @@ fun IntegratedControllerScreen(
     modifier: Modifier = Modifier,
     commandLogs: List<CommandLog.Entry> = emptyList(),
     onClearLogs: () -> Unit = {},
+    appendNewline: Boolean = true,
+    onAppendNewlineChange: (Boolean) -> Unit = {},
 ) {
     var selectedTab by rememberSaveable { mutableIntStateOf(ControllerTab.CONTROLS.ordinal) }
     val currentOutbound = rememberUpdatedState(onArenaOutbound)
@@ -163,6 +170,9 @@ fun IntegratedControllerScreen(
                     viewModel = arenaViewModel,
                     robotStatus = arenaState.manualStatus ?: robotStatus,
                     modifier = Modifier.fillMaxSize(),
+                    belowResetControls = {
+                        NewlineModeButtons(appendNewline = appendNewline, onChange = onAppendNewlineChange)
+                    },
                     drivingControls = {
                         ArenaDrivePad(
                             status = arenaState.manualStatus ?: robotStatus,
@@ -176,6 +186,24 @@ fun IntegratedControllerScreen(
                     },
                 )
             }
+        }
+    }
+}
+
+/**
+ * "Amd tool" sends messages with no trailing newline; "normal" (the default) appends one.
+ * The active mode is filled like "Add obstacle"; the inactive one is outlined like "Reset arena".
+ * Pressing the already-active button is a no-op.
+ */
+@Composable
+private fun NewlineModeButtons(appendNewline: Boolean, onChange: (Boolean) -> Unit) {
+    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        if (!appendNewline) {
+            Button(onClick = { onChange(false) }, modifier = Modifier.weight(1f)) { Text("Amd tool") }
+            OutlinedButton(onClick = { onChange(true) }, modifier = Modifier.weight(1f)) { Text("normal") }
+        } else {
+            OutlinedButton(onClick = { onChange(false) }, modifier = Modifier.weight(1f)) { Text("Amd tool") }
+            Button(onClick = { onChange(true) }, modifier = Modifier.weight(1f)) { Text("normal") }
         }
     }
 }

@@ -74,6 +74,13 @@ class BluetoothConnectionManager(
     /** Never replay queued movement/Begin commands on a replacement socket. */
     private val outgoing = SessionOutbox()
 
+    /** Trailing-newline framing on send. Normal mode (true) is the default; the AMD tool wants none. */
+    private val _appendNewline = MutableStateFlow(true)
+    val appendNewline: StateFlow<Boolean> = _appendNewline.asStateFlow()
+
+    /** Idempotent: setting the mode it is already in changes nothing. */
+    fun setAppendNewline(enabled: Boolean) { _appendNewline.value = enabled }
+
     private var connectionJob: Job? = null
 
     @Volatile
@@ -246,7 +253,7 @@ class BluetoothConnectionManager(
     private suspend fun writeLoop(output: OutputStream) {
         while (currentCoroutineContext().isActive) {
             val message = outgoing.receive()
-            val framed = bluetoothPayload(message)
+            val framed = bluetoothPayload(message, _appendNewline.value)
             try {
                 output.write(framed.toByteArray(Charsets.UTF_8))
                 output.flush()

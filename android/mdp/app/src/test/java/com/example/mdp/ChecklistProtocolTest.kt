@@ -17,6 +17,8 @@ class ChecklistProtocolTest {
         assertEquals(listOf("f\n", "r\n", "tl\n", "tr\n", "s\n", "fl\n", "fr\n", "bl\n", "br\n", "BEGIN\n", "PATH\n"), RobotCommand.entries.map { bluetoothPayload(it.wire) })
         assertEquals("CLEAR\nOBSTACLE,1,30,40,NORTH\n", bluetoothPayload("CLEAR\nOBSTACLE,1,30,40,NORTH"))
         assertEquals("BEGIN\n", bluetoothPayload("BEGIN\n"))
+        assertEquals("BEGIN", bluetoothPayload("BEGIN\n", appendNewline = false))
+        assertEquals("", bluetoothPayload("", appendNewline = false))
     }
 
     @Test fun `status target and robot reports remain recognized`() {

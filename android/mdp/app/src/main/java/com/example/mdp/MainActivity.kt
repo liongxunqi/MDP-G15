@@ -137,6 +137,7 @@ class MainActivity : ComponentActivity() {
                 val latest by viewModel.incoming.collectAsStateWithLifecycle(initialValue = "")
                 val commandLogs by viewModel.commandLogs.collectAsStateWithLifecycle()
                 val robotStatus by viewModel.robotStatus.collectAsStateWithLifecycle()
+                val appendNewline by viewModel.appendNewline.collectAsStateWithLifecycle()
 
                 Scaffold(modifier = Modifier.fillMaxSize()) { innerPadding ->
                     IntegratedControllerScreen(
@@ -166,6 +167,8 @@ class MainActivity : ComponentActivity() {
                         onObstacleLookupAvailable = viewModel::bindObstacleLookup,
                         incomingMessages = viewModel.incoming,
                         onArenaOutbound = viewModel::sendArenaMessage,
+                        appendNewline = appendNewline,
+                        onAppendNewlineChange = viewModel::setAppendNewline,
                         modifier = Modifier.padding(innerPadding),
                     )
 

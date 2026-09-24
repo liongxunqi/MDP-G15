@@ -47,6 +47,7 @@ fun ArenaScreen(
     robotStatus: String? = null,
     modifier: Modifier = Modifier,
     drivingControls: (@Composable () -> Unit)? = null,
+    belowResetControls: (@Composable () -> Unit)? = null,
 ) {
     val state by viewModel.uiState.collectAsState()
     var confirmReset by remember { mutableStateOf(false) }
@@ -84,6 +85,7 @@ fun ArenaScreen(
                         robotStatus = robotStatus,
                         viewModel = viewModel,
                         onReset = { confirmReset = true },
+                        belowResetControls = belowResetControls,
                         modifier = Modifier.fillMaxWidth().fillMaxHeight(),
                     )
                 }
@@ -106,6 +108,7 @@ fun ArenaScreen(
                     robotStatus = robotStatus,
                     viewModel = viewModel,
                     onReset = { confirmReset = true },
+                    belowResetControls = belowResetControls,
                     modifier = Modifier.fillMaxWidth().weight(0.65f),
                 )
             }
@@ -196,6 +199,7 @@ private fun ArenaStatusPanel(
     robotStatus: String?,
     viewModel: ArenaViewModel,
     onReset: () -> Unit,
+    belowResetControls: (@Composable () -> Unit)? = null,
     modifier: Modifier = Modifier,
 ) {
     val selected = state.arena.selectedObstacle
@@ -303,6 +307,7 @@ private fun ArenaStatusPanel(
             OutlinedButton(onClick = onReset, modifier = Modifier.fillMaxWidth()) {
                 Text("Reset arena")
             }
+            belowResetControls?.invoke()
 
         }
     }
