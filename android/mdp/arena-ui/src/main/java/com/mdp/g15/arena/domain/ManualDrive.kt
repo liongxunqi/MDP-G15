@@ -2,6 +2,8 @@ package com.mdp.g15.arena.domain
 
 import kotlin.math.*
 
+
+const val MANUAL_STEP_CELLS = 1.0
 /** Defaults from the RPi manual bridge and STM TIGHT profile. Units are 10 cm cells. */
 enum class ManualCommand(val wire: String, val reverse: Boolean = false, val turn: Double = 0.0) {
     FORWARD("f"), REVERSE("r", true), LEFT("tl", turn = -90.0), RIGHT("tr", turn = 90.0),
@@ -38,7 +40,7 @@ data class DrivePath(val start: DrivePose, val command: ManualCommand, val radiu
         val t = fraction.coerceIn(0.0, 1.0)
         val h = Math.toRadians(start.heading)
         val sign = if (command.reverse) -1.0 else 1.0
-        if (command.turn == 0.0) return DrivePose(start.x + sin(h) * 2.0 * t * sign, start.y + cos(h) * 2.0 * t * sign, start.heading)
+        if (command.turn == 0.0) return DrivePose(start.x + sin(h) * MANUAL_STEP_CELLS * t * sign, start.y + cos(h) * MANUAL_STEP_CELLS * t * sign, start.heading)
         val delta = Math.toRadians(command.turn) * t
         val r = radius * sign * command.turn.sign
         return DrivePose(start.x + r * (cos(h) - cos(h + delta)), start.y + r * (sin(h + delta) - sin(h)), headingAt(t))
