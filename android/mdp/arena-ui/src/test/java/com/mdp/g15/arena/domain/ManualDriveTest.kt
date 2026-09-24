@@ -20,7 +20,7 @@ class ManualDriveTest {
         assertEquals(180.0, uturn.heading, 0.0001)
         val reverseLeft = DrivePath(start, ManualCommand.BACK_LEFT).at(1.0)
         assertTrue(reverseLeft.x < start.x && reverseLeft.y < start.y)
-        assertEquals(45.0, reverseLeft.heading, 0.0001)
+        assertEquals(90.0, reverseLeft.heading, 0.0001)
         assertEquals(reverseLeft, DrivePose.from(reverseLeft.asRobotPose()))
     }
     @Test fun `forward left and right end on a cardinal direction a quarter turn away`() {
@@ -38,6 +38,21 @@ class ManualDriveTest {
                 assertEquals(0.0, DrivePath(end, command).at(1.0).heading % 90.0, 0.0)
             }
         }
+    }
+    @Test fun `back left and right end on a cardinal direction a quarter turn away`() {
+        // Same heading sense as before: back-left rotates clockwise (+), back-right anticlockwise (-).
+        val backLeft = listOf(Direction.NORTH to Direction.EAST, Direction.EAST to Direction.SOUTH,
+            Direction.SOUTH to Direction.WEST, Direction.WEST to Direction.NORTH)
+        val backRight = listOf(Direction.NORTH to Direction.WEST, Direction.WEST to Direction.SOUTH,
+            Direction.SOUTH to Direction.EAST, Direction.EAST to Direction.NORTH)
+        for ((command, cases) in listOf(ManualCommand.BACK_LEFT to backLeft, ManualCommand.BACK_RIGHT to backRight)) {
+            for ((from, to) in cases) {
+                val end = DrivePath(DrivePose(8.0, 8.0, from.ordinal * 90.0), command).at(1.0)
+                assertEquals("$command $from", 0.0, end.heading % 90.0, 0.0)
+                assertEquals("$command $from", to, end.asRobotPose().direction)
+            }
+        }
+        assertEquals(45.0, DrivePath(DrivePose(8.0, 8.0, 0.0), ManualCommand.BACK_LEFT).at(0.5).heading, 0.0001)
     }
     @Test fun `forward left sweeps through intermediate headings`() {
         val path = DrivePath(DrivePose(8.0, 8.0, 0.0), ManualCommand.FORWARD_LEFT)

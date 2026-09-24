@@ -13,8 +13,8 @@ enum class ManualCommand(val wire: String, val reverse: Boolean = false, val tur
     FORWARD_LEFT("fl", turn = -45.0), FORWARD_RIGHT("fr", turn = 45.0),
     BACK_LEFT("bl", true, 45.0), BACK_RIGHT("br", true, -45.0);
 
-    /** Forward-left/right end on a cardinal heading, a 90° step from the starting one. */
-    val snapsToQuarterTurn: Boolean get() = this == FORWARD_LEFT || this == FORWARD_RIGHT
+    /** Every arc command (forward or back, left or right) ends on a cardinal heading, a 90° step from the start. */
+    val snapsToQuarterTurn: Boolean get() = this == FORWARD_LEFT || this == FORWARD_RIGHT || this == BACK_LEFT || this == BACK_RIGHT
 }
 
 data class DrivePose(val x: Double, val y: Double, val heading: Double) {
@@ -50,7 +50,7 @@ data class DrivePath(val start: DrivePose, val command: ManualCommand, val radiu
     }
 
     /**
-     * Forward-left/right: the drawn heading sweeps through intermediate angles, but the
+     * Forward/back left/right arcs: the drawn heading sweeps through intermediate angles, but the
      * end heading is derived from the starting cardinal direction (±90°), never
      * accumulated from the animation angle. Position keeps using the arc geometry above.
      */
