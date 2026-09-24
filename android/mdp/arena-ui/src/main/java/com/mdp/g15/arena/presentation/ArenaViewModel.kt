@@ -82,7 +82,7 @@ class ArenaViewModel(
             _uiState.value = _uiState.value.copy(manualAnimating = false)
         }
         // uncomment below line so we dont have to wait for STATUS,OK
-        // manualDrive.complete()
+        manualDrive.complete()
         try { send() } catch (error: Exception) {
             cancelPreviewGate()
             manualDrive.invalidate()
@@ -299,8 +299,8 @@ class ArenaViewModel(
                 }
                 when (event.text.trim().uppercase()) {
                     //comment out below lines if we are not relying on Status OK
-                    "OK" -> if (rawMessage == "STATUS,OK") manualDrive.complete()
-                    "FAILED", "ERROR", "STOPPED" -> manualDrive.invalidate()
+                    // "OK" -> if (rawMessage == "STATUS,OK") manualDrive.complete()
+                    // "FAILED", "ERROR", "STOPPED" -> manualDrive.invalidate()
                 }
                 val history = (_uiState.value.statusHistory + event.text).takeLast(MAX_STATUS_HISTORY)
                 _uiState.value = _uiState.value.copy(
