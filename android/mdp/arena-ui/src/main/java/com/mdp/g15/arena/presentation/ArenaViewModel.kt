@@ -287,6 +287,19 @@ class ArenaViewModel(
         _uiState.value = _uiState.value.copy(manualAnimating = false)
     }
 
+    private val startStatus = Regex("START,([0-9]+),([0-9]+),([NSEW])")
+
+    /**
+     * STATUS,START,<x>,<y>,<N/E/S/W> also places the robot on the arena. It goes through the same
+     * path as ROBOT,<x>,<y>,<dir>, so the pose gets the same fit/obstacle validation.
+     * The status text and autonomous flag are already handled by the Status branch.
+     */
+    private fun applyStartPose(statusText: String, rawMessage: String) {
+        val (x, y, face) = startStatus.matchEntire(statusText)?.destructured ?: return
+        val direction = Direction.fromWire(face) ?: return
+        handleInbound(ArenaInboundEvent.Robot(RobotPose(GridCoordinate(x.toInt(), y.toInt()), direction)), rawMessage)
+    }
+
     private fun handleInbound(event: ArenaInboundEvent, rawMessage: String) {
         when (event) {
             is ArenaInboundEvent.Status -> {
@@ -318,6 +331,7 @@ class ArenaViewModel(
                     },
                 )
                 persist()
+                applyStartPose(event.text, rawMessage)
             }
             is ArenaInboundEvent.Target -> {
                 val action = ArenaAction.ApplyTarget(event.obstacleId, event.targetId, event.face)

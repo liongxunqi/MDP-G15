@@ -318,6 +318,27 @@ class ArenaViewModelTest {
     }
 
     @Test
+    fun `status start places the robot and marks the run autonomous`() = runTest(dispatcher) {
+        viewModel.accept("STATUS,START,2,3,E")
+        advanceUntilIdle()
+
+        val ui = viewModel.uiState.value
+        assertEquals("START,2,3,E", ui.status)
+        assertTrue(ui.autonomousRunning)
+        assertEquals(GridCoordinate(2, 3), ui.arena.robot?.position)
+        assertEquals(Direction.EAST, ui.arena.robot?.direction)
+    }
+
+    @Test
+    fun `status start that does not fit leaves the robot alone`() = runTest(dispatcher) {
+        viewModel.accept("ROBOT,8,8,N")
+        viewModel.accept("STATUS,START,19,19,N")
+        advanceUntilIdle()
+
+        assertEquals(GridCoordinate(8, 8), viewModel.uiState.value.arena.robot?.position)
+    }
+
+    @Test
     fun `target and robot messages update render state without outbound traffic`() = runTest(dispatcher) {
         viewModel.addObstacle(GridCoordinate(1, 1))
         sent.clear()
