@@ -70,6 +70,28 @@ class ManualDriveTest {
         gate.complete()
         assertNull(gate.reserve(s, ManualCommand.FORWARD))
     }
+    @Test fun `turns into the arena are allowed from an edge cell but straight moves stay strict`() {
+        val left = state(0, 8, Direction.NORTH)
+        for (c in listOf(ManualCommand.RIGHT, ManualCommand.FORWARD_RIGHT)) {
+            assertTrue(c.name, DrivePath(DrivePose.from(left.robot!!), c).fits(left))
+        }
+        val right = state(18, 8, Direction.NORTH)
+        for (c in listOf(ManualCommand.LEFT, ManualCommand.FORWARD_LEFT)) {
+            assertTrue(c.name, DrivePath(DrivePose.from(right.robot!!), c).fits(right))
+        }
+        // Turning out of the arena, or a straight move past the edge, is still rejected.
+        assertFalse(DrivePath(DrivePose.from(left.robot!!), ManualCommand.LEFT).fits(left))
+        assertFalse(DrivePath(DrivePose(0.0, 8.0, 270.0), ManualCommand.FORWARD).fits(left))
+    }
+    @Test fun `seeding after an invalidate re-arms driving from the placed pose`() {
+        val s = state()
+        val gate = ManualDriveGuard()
+        gate.invalidate()
+        assertFalse(gate.allowed(s, ManualCommand.FORWARD))
+        gate.seed(s.robot!!)
+        assertTrue(gate.allowed(s, ManualCommand.FORWARD))
+        assertEquals(8.0, gate.pose!!.x, 0.0)
+    }
     @Test fun `all eight commands have clear paths from arena center`() {
         val s = state()
         ManualCommand.entries.forEach { assertTrue(it.name, DrivePath(DrivePose.from(s.robot!!), it).fits(s)) }

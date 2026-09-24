@@ -4,6 +4,9 @@ import kotlin.math.*
 
 
 const val MANUAL_STEP_CELLS = 1.0
+
+/** How far (cells) a turning robot's bounding box may poke past the arena boundary. */
+const val TURN_EDGE_OVERHANG_CELLS = 0.3
 /** Defaults from the RPi manual bridge and STM TIGHT profile. Units are 10 cm cells. */
 enum class ManualCommand(val wire: String, val reverse: Boolean = false, val turn: Double = 0.0) {
     FORWARD("f"), REVERSE("r", true), LEFT("tl", turn = -90.0), RIGHT("tr", turn = 90.0),
@@ -69,7 +72,10 @@ data class DrivePath(val start: DrivePose, val command: ManualCommand, val radiu
             val b = min(previous[1], next[1]) - margin
             val r = max(previous[2], next[2]) + margin
             val t = max(previous[3], next[3]) + margin
-            if (l < -1e-8 || b < -1e-8 || r > state.config.columns + 1e-8 || t > state.config.rows + 1e-8) return false
+            // The rotating square's bounding box overhangs the arena edge near the start of a turn
+            // from an edge cell; allow that for turns only. Obstacles below stay strict.
+            val edge = 1e-8 + if (command.turn == 0.0) 0.0 else TURN_EDGE_OVERHANG_CELLS
+            if (l < -edge || b < -edge || r > state.config.columns + edge || t > state.config.rows + edge) return false
             if (state.obstacles.values.any { it.position.x < r - 1e-8 && it.position.x + 1 > l + 1e-8 && it.position.y < t - 1e-8 && it.position.y + 1 > b + 1e-8 }) return false
             previous = next
         }
@@ -95,6 +101,11 @@ class ManualDriveGuard {
             reportedDuringMove = robot
         }
         return true
+    }
+    /** Operator-placed pose (drag and drop): trusted as the new known pose. Never mid-move. */
+    fun seed(robot: RobotPose) {
+        check(pending == null) { "Cannot seed the pose while a command is pending" }
+        pose = DrivePose.from(robot); uncertain = false; reportedDuringMove = null
     }
     fun allowed(state: ArenaState, command: ManualCommand): Boolean =
         !uncertain && pending == null && pose?.let { DrivePath(it, command).fits(state) } == true

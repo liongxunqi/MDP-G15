@@ -81,6 +81,8 @@ class ArenaViewModel(
             delay(previewDuration + 50L) // Allow the next rendered frame to finish the preview.
             _uiState.value = _uiState.value.copy(manualAnimating = false)
         }
+        // uncomment below line so we dont have to wait for STATUS,OK
+        // manualDrive.complete()
         try { send() } catch (error: Exception) {
             cancelPreviewGate()
             manualDrive.invalidate()
@@ -251,13 +253,15 @@ class ArenaViewModel(
         leavePlacementMode: Boolean = false,
     ) {
         if (blockWhileDriving()) return
-        if (action is ArenaAction.MoveRobot) manualDrive.invalidate()
         val before = _uiState.value.arena
         when (val reduction = reducer.reduce(before, action)) {
             is ArenaReduction.Failure -> setFeedback(reduction.reason, isError = true)
             is ArenaReduction.Success -> {
                 if (reduction.state != before) pushUndo(before)
                 if (!useRpiMapSync) reduction.outboundEvent?.let { outboundSink.submit(codec.encode(it)) }
+                // A rejected drop leaves the robot (and the guard) untouched. A successful one is
+                // the operator's stated pose, so re-arm the guard instead of leaving it invalidated.
+                if (action is ArenaAction.MoveRobot) reduction.state.robot?.let(manualDrive::seed)
                 _uiState.value = _uiState.value.copy(
                     arena = reduction.state,
                     placementMode = if (leavePlacementMode) false else _uiState.value.placementMode,
@@ -294,6 +298,7 @@ class ArenaViewModel(
                     else -> _uiState.value.autonomousRunning
                 }
                 when (event.text.trim().uppercase()) {
+                    //comment out below lines if we are not relying on Status OK
                     "OK" -> if (rawMessage == "STATUS,OK") manualDrive.complete()
                     "FAILED", "ERROR", "STOPPED" -> manualDrive.invalidate()
                 }
