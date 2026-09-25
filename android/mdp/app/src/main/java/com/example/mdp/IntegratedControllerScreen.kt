@@ -40,7 +40,6 @@ private enum class ControllerTab(val title: String) {
 @Composable
 fun IntegratedControllerScreen(
     status: String,
-    robotStatus: String,
     isConnected: Boolean,
     isBusy: Boolean,
     permissionsGranted: Boolean,
@@ -78,6 +77,9 @@ fun IntegratedControllerScreen(
 
     LaunchedEffect(incomingMessages, arenaViewModel) {
         incomingMessages.collect(arenaViewModel::accept)
+    }
+    LaunchedEffect(appendNewline, arenaViewModel) {
+        arenaViewModel.setAmdToolMode(!appendNewline)
     }
     LaunchedEffect(isConnected, arenaViewModel) {
         arenaViewModel.connectionChanged(isConnected)
@@ -129,7 +131,7 @@ fun IntegratedControllerScreen(
             when (ControllerTab.entries[selectedTab]) {
                 ControllerTab.CONTROLS -> ControllerScreen(
                     status = status,
-                    robotStatus = arenaState.manualStatus ?: robotStatus,
+                    robotStatus = arenaState.manualStatus ?: arenaState.status,
                     isConnected = isConnected,
                     isBusy = isBusy,
                     permissionsGranted = permissionsGranted,
@@ -168,14 +170,20 @@ fun IntegratedControllerScreen(
 
                 ControllerTab.ARENA -> ArenaScreen(
                     viewModel = arenaViewModel,
-                    robotStatus = arenaState.manualStatus ?: robotStatus,
+                    robotStatus = arenaState.manualStatus ?: arenaState.status,
                     modifier = Modifier.fillMaxSize(),
                     belowResetControls = {
-                        NewlineModeButtons(appendNewline = appendNewline, onChange = onAppendNewlineChange)
+                        NewlineModeButtons(
+                            appendNewline = !arenaState.amdToolMode,
+                            enabled = !arenaState.manualPending && !arenaState.manualAnimating && !arenaState.autonomousRunning,
+                            onChange = { value ->
+                                if (arenaViewModel.setAmdToolMode(!value)) onAppendNewlineChange(value)
+                            },
+                        )
                     },
                     drivingControls = {
                         ArenaDrivePad(
-                            status = arenaState.manualStatus ?: robotStatus,
+                            status = arenaState.manualStatus ?: arenaState.status,
                             connected = isConnected,
                             allowed = allowedCommands,
                             onMove = { command ->
@@ -191,19 +199,19 @@ fun IntegratedControllerScreen(
 }
 
 /**
- * "Amd tool" sends messages with no trailing newline; "normal" (the default) appends one.
+ * "Amd tool" uses grid-direction steps and no trailing newline; normal keeps robot arcs and framing.
  * The active mode is filled like "Add obstacle"; the inactive one is outlined like "Reset arena".
  * Pressing the already-active button is a no-op.
  */
 @Composable
-private fun NewlineModeButtons(appendNewline: Boolean, onChange: (Boolean) -> Unit) {
+private fun NewlineModeButtons(appendNewline: Boolean, enabled: Boolean, onChange: (Boolean) -> Unit) {
     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
         if (!appendNewline) {
-            Button(onClick = { onChange(false) }, modifier = Modifier.weight(1f)) { Text("Amd tool") }
-            OutlinedButton(onClick = { onChange(true) }, modifier = Modifier.weight(1f)) { Text("normal") }
+            Button(enabled = enabled, onClick = { onChange(false) }, modifier = Modifier.weight(1f)) { Text("Amd tool") }
+            OutlinedButton(enabled = enabled, onClick = { onChange(true) }, modifier = Modifier.weight(1f)) { Text("normal") }
         } else {
-            OutlinedButton(onClick = { onChange(false) }, modifier = Modifier.weight(1f)) { Text("Amd tool") }
-            Button(onClick = { onChange(true) }, modifier = Modifier.weight(1f)) { Text("normal") }
+            OutlinedButton(enabled = enabled, onClick = { onChange(false) }, modifier = Modifier.weight(1f)) { Text("Amd tool") }
+            Button(enabled = enabled, onClick = { onChange(true) }, modifier = Modifier.weight(1f)) { Text("normal") }
         }
     }
 }

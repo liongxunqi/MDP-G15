@@ -10,7 +10,6 @@ import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.advanceUntilIdle
 import kotlinx.coroutines.test.runCurrent
-import kotlinx.coroutines.test.advanceTimeBy
 import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.test.setMain
@@ -23,6 +22,98 @@ import org.junit.Test
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class ArenaViewModelTest {
+    @Test fun `connection permits all free commands until valid pose enables map checks in both modes`() = runTest(dispatcher) {
+        for (amd in listOf(false, true)) {
+            viewModel.connectionChanged(false)
+            viewModel.setAmdToolMode(amd)
+            assertTrue(ManualCommand.entries.none(viewModel::manualAllowed))
+            viewModel.connectionChanged(true)
+            assertTrue(viewModel.uiState.value.freeMoveMode)
+            assertEquals(null, viewModel.uiState.value.arena.robot)
+            var sends = 0
+            for (command in ManualCommand.entries) {
+                assertTrue(viewModel.manualAllowed(command))
+                viewModel.drive(command) { sends++ }
+                viewModel.drive(command) { sends++ }
+                assertEquals(null, viewModel.uiState.value.arena.robot)
+                advanceUntilIdle()
+            }
+            assertEquals(8, sends)
+            viewModel.stopManual {}
+            assertTrue(ManualCommand.entries.all(viewModel::manualAllowed))
+            viewModel.accept("ROBOT,99,99,N")
+            advanceUntilIdle()
+            assertTrue(ManualCommand.entries.all(viewModel::manualAllowed))
+            viewModel.accept("ROBOT,8,18,N")
+            advanceUntilIdle()
+            assertFalse(viewModel.uiState.value.freeMoveMode)
+            assertFalse(viewModel.manualAllowed(ManualCommand.FORWARD))
+            assertTrue(viewModel.manualAllowed(ManualCommand.REVERSE))
+            viewModel.connectionChanged(false)
+            viewModel.connectionChanged(true)
+            assertTrue(ManualCommand.entries.all(viewModel::manualAllowed))
+            assertEquals(null, viewModel.uiState.value.arena.robot)
+        }
+    }
+
+    @Test fun `rejected telemetry during preview neither cancels movement nor bricks the next tap`() = runTest(dispatcher) {
+        for (amd in listOf(false, true)) {
+            viewModel.setAmdToolMode(amd)
+            viewModel.connectionChanged(true)
+            viewModel.accept("ROBOT,8,8,N")
+            advanceUntilIdle()
+            viewModel.drive(ManualCommand.RIGHT) {}
+            val moving = viewModel.uiState.value
+            viewModel.accept("ROBOT,19,19,N\nSTATUS,START,99,99,N\nSTATUS,FAILED,extra")
+            runCurrent()
+            assertEquals(moving.arena.robot, viewModel.uiState.value.arena.robot)
+            assertEquals(moving.manualStatus, viewModel.uiState.value.manualStatus)
+            assertTrue(viewModel.uiState.value.manualAnimating)
+            assertFalse(viewModel.manualAllowed(ManualCommand.FORWARD))
+            advanceUntilIdle()
+            assertTrue(viewModel.manualAllowed(ManualCommand.FORWARD))
+        }
+    }
+
+    @Test fun `invalid input preserves initial free mode and never unlocks a failed send`() = runTest(dispatcher) {
+        for (amd in listOf(false, true)) {
+            viewModel.setAmdToolMode(amd)
+            viewModel.connectionChanged(true)
+            viewModel.accept("ROBOT,99,99,N")
+            advanceUntilIdle()
+            assertTrue(ManualCommand.entries.all(viewModel::manualAllowed))
+            assertEquals(null, viewModel.uiState.value.arena.robot)
+            viewModel.accept("ROBOT,8,8,N")
+            advanceUntilIdle()
+            viewModel.drive(ManualCommand.RIGHT) { error("transport failed") }
+            assertTrue(ManualCommand.entries.none(viewModel::manualAllowed))
+            viewModel.accept("ROBOT,99,99,N\nSTATUS,OK")
+            advanceUntilIdle()
+            assertTrue(ManualCommand.entries.none(viewModel::manualAllowed))
+            viewModel.connectionChanged(false)
+        }
+    }
+
+    @Test fun `AMD lateral moves update heading and returning to normal restores arc`() = runTest(dispatcher) {
+        viewModel.connectionChanged(true)
+        viewModel.accept("ROBOT,8,8,N")
+        advanceUntilIdle()
+        viewModel.setAmdToolMode(true)
+        viewModel.drive(ManualCommand.LEFT) {}
+        advanceUntilIdle()
+        assertEquals(GridCoordinate(7,8), viewModel.uiState.value.arena.robot!!.position)
+        assertEquals(Direction.WEST, viewModel.uiState.value.arena.robot!!.direction)
+        viewModel.drive(ManualCommand.RIGHT) {}
+        advanceUntilIdle()
+        assertEquals(GridCoordinate(8,8), viewModel.uiState.value.arena.robot!!.position)
+        assertEquals(Direction.EAST, viewModel.uiState.value.arena.robot!!.direction)
+        assertTrue(viewModel.setAmdToolMode(false))
+        viewModel.drive(ManualCommand.RIGHT) {}
+        advanceUntilIdle()
+        assertEquals(10.91, viewModel.uiState.value.arena.robot!!.estimate!!.x, 0.0001)
+        assertEquals(5.09, viewModel.uiState.value.arena.robot!!.estimate!!.y, 0.0001)
+    }
+
     @Test fun `recycled IDs survive legacy restoration undo redo and new obstacle identities`() = runTest(dispatcher) {
         val handle = SavedStateHandle(mapOf(
             "arena.nextId" to 999,
@@ -67,54 +158,74 @@ class ArenaViewModelTest {
         advanceUntilIdle()
         assertEquals("Target references unknown obstacle 2.", viewModel.uiState.value.feedback)
     }
-    @Test fun `fast acknowledgement waits for preview and preview alone never releases a command`() = runTest(dispatcher) {
-        viewModel.connectionChanged(true)
-        viewModel.accept("ROBOT,8,8,N")
-        runCurrent()
-        var sends = 0
-        viewModel.drive(ManualCommand.FORWARD) { sends++ }
-        viewModel.accept("MSG,[OK]")
-        runCurrent()
-        assertTrue(viewModel.uiState.value.manualPending)
-        viewModel.accept("STATUS,OK")
-        runCurrent()
-        assertFalse(viewModel.uiState.value.manualPending)
-        assertTrue(viewModel.uiState.value.manualAnimating)
-        viewModel.drive(ManualCommand.FORWARD) { sends++ }
-        assertEquals(1, sends)
-        advanceTimeBy(701)
-        runCurrent()
-        assertTrue(viewModel.manualAllowed(ManualCommand.FORWARD))
-        viewModel.drive(ManualCommand.FORWARD) { sends++ }
-        advanceUntilIdle()
-        assertEquals(2, sends)
-        assertTrue(viewModel.uiState.value.manualPending)
-        assertFalse(viewModel.uiState.value.manualAnimating)
-        assertFalse(viewModel.manualAllowed(ManualCommand.FORWARD))
-    }
-    @Test fun `bad robot telemetry locks driving while preserving last visible pose`() = runTest(dispatcher) {
-        viewModel.connectionChanged(true)
-        for (bad in listOf("ROBOT,8,9", "ROBOT,19,19,N")) {
+    @Test fun `local completion keeps repeated taps gated by preview in both modes`() = runTest(dispatcher) {
+        for (amd in listOf(false, true)) {
+            viewModel.setAmdToolMode(amd)
+            viewModel.connectionChanged(true)
             viewModel.accept("ROBOT,8,8,N")
+            runCurrent()
+            var sends = 0
+            repeat(100) { viewModel.drive(ManualCommand.FORWARD) { sends++ } }
+            assertEquals(1, sends)
+            assertFalse(viewModel.uiState.value.manualPending)
+            assertTrue(viewModel.uiState.value.manualAnimating)
+            assertFalse(viewModel.setAmdToolMode(!amd))
+            viewModel.accept("STATUS,OK")
+            runCurrent()
+            assertFalse(viewModel.manualAllowed(ManualCommand.FORWARD))
             advanceUntilIdle()
             assertTrue(viewModel.manualAllowed(ManualCommand.FORWARD))
-            viewModel.accept(bad)
+            viewModel.drive(ManualCommand.FORWARD) { sends++ }
             advanceUntilIdle()
-            assertFalse(viewModel.manualAllowed(ManualCommand.FORWARD))
-            assertEquals(GridCoordinate(8,8), viewModel.uiState.value.arena.robot!!.position)
+            assertEquals(2, sends)
+            assertEquals(GridCoordinate(8,10), viewModel.uiState.value.arena.robot!!.position)
         }
     }
-    @Test fun `genuine telemetry during a move corrects the estimate without releasing the lock`() = runTest(dispatcher) {
+
+    @Test fun `invalid updates preserve pose status and all drive permissions in both modes`() = runTest(dispatcher) {
+        for (amd in listOf(false, true)) {
+            viewModel.setAmdToolMode(amd)
+            viewModel.connectionChanged(true)
+            viewModel.accept("STATUS,DONE\nROBOT,8,8,N")
+            advanceUntilIdle()
+            viewModel.addObstacle(GridCoordinate(12,12))
+            val before = viewModel.uiState.value
+            val allowed = ManualCommand.entries.map(viewModel::manualAllowed)
+            for (bad in listOf("ROBOT,8,9", "ROBOT,19,19,N", "ROBOT,-1,8,N",
+                "ROBOT,8,8,X", "ROBOT,8,8,N,extra", "ROBOT,2147483648,8,N",
+                "ROBOT,12,12,N", "STATUS,START,19,19,N", "STATUS,START,12,12,N",
+                "STATUS,START,999999999999999999999,8,N", "STATUS,START,8,8,X",
+                "STATUS,OK,extra", "STATUS", "MSG,[]")) {
+                viewModel.accept(bad)
+                advanceUntilIdle()
+                val after = viewModel.uiState.value
+                assertEquals(bad, before.arena.robot, after.arena.robot)
+                assertEquals(bad, before.status, after.status)
+                assertEquals(bad, before.statusHistory, after.statusHistory)
+                assertEquals(bad, before.manualStatus, after.manualStatus)
+                assertEquals(bad, before.autonomousRunning, after.autonomousRunning)
+                assertEquals(bad, allowed, ManualCommand.entries.map(viewModel::manualAllowed))
+                assertTrue(bad, after.feedbackIsError)
+            }
+            viewModel.moveRobot(GridCoordinate(19,19))
+            assertEquals(before.arena.robot, viewModel.uiState.value.arena.robot)
+            assertEquals(allowed, ManualCommand.entries.map(viewModel::manualAllowed))
+            viewModel.moveRobot(GridCoordinate(5,5))
+            viewModel.drive(ManualCommand.FORWARD) {}
+            advanceUntilIdle()
+            assertEquals(GridCoordinate(5,6), viewModel.uiState.value.arena.robot!!.position)
+        }
+    }
+
+    @Test fun `telemetry corrects estimates while the preview still gates commands`() = runTest(dispatcher) {
         viewModel.connectionChanged(true)
         viewModel.accept("ROBOT,8,8,N")
         advanceUntilIdle()
         viewModel.drive(ManualCommand.FORWARD) {}
-        viewModel.accept("ROBOT,8,9,N")
-        advanceUntilIdle()
-        assertEquals(GridCoordinate(8,9), viewModel.uiState.value.arena.robot!!.position)
-        assertEquals(null, viewModel.uiState.value.arena.robot!!.estimate)
+        viewModel.accept("ROBOT,8,10,N")
+        runCurrent()
         assertFalse(viewModel.manualAllowed(ManualCommand.FORWARD))
-        viewModel.accept("STATUS,OK")
+        assertEquals(null, viewModel.uiState.value.arena.robot!!.estimate)
         advanceUntilIdle()
         viewModel.drive(ManualCommand.FORWARD) {}
         assertEquals(11.0, viewModel.uiState.value.arena.robot!!.estimate!!.y, 0.0001)
@@ -158,28 +269,24 @@ class ArenaViewModelTest {
         assertEquals("debug reply", viewModel.uiState.value.latestReceived)
         assertEquals("DONE", viewModel.uiState.value.status)
     }
-    @Test fun `manual movement reserves before send and cannot queue or edit while pending`() = runTest(dispatcher) {
-        viewModel.connectionChanged(true)
-        viewModel.accept("ROBOT,8,16,N")
-        advanceUntilIdle()
-        var transmissions = 0
-        repeat(100) { viewModel.drive(ManualCommand.FORWARD) { transmissions++ } }
-        assertEquals(1, transmissions)
-        assertEquals(18.0, viewModel.uiState.value.arena.robot!!.estimate!!.y, 0.0001)
-        viewModel.accept("ROBOT,8,16,N")
-        advanceUntilIdle()
-        assertEquals(18.0, viewModel.uiState.value.arena.robot!!.estimate!!.y, 0.0001)
-        viewModel.resetArena()
-        assertTrue(viewModel.uiState.value.manualPending)
-        viewModel.accept("STATUS,OK")
-        advanceUntilIdle()
-        assertFalse(viewModel.uiState.value.manualPending)
-        assertTrue(viewModel.manualAllowed(ManualCommand.REVERSE))
-        viewModel.drive(ManualCommand.FORWARD) { transmissions++ }
-        assertEquals(1, transmissions)
-        viewModel.connectionChanged(false)
-        viewModel.drive(ManualCommand.REVERSE) { transmissions++ }
-        assertEquals(1, transmissions)
+    @Test fun `edge movement stops at footprint boundary and disconnect blocks both modes`() = runTest(dispatcher) {
+        for (amd in listOf(false, true)) {
+            viewModel.setAmdToolMode(amd)
+            viewModel.connectionChanged(true)
+            viewModel.accept("ROBOT,8,17,N")
+            advanceUntilIdle()
+            var transmissions = 0
+            repeat(100) { viewModel.drive(ManualCommand.FORWARD) { transmissions++ } }
+            viewModel.resetArena()
+            assertEquals(GridCoordinate(8,18), viewModel.uiState.value.arena.robot!!.position)
+            advanceUntilIdle()
+            viewModel.drive(ManualCommand.FORWARD) { transmissions++ }
+            assertEquals(1, transmissions)
+            assertTrue(viewModel.manualAllowed(ManualCommand.REVERSE))
+            viewModel.connectionChanged(false)
+            viewModel.drive(ManualCommand.REVERSE) { transmissions++ }
+            assertEquals(1, transmissions)
+        }
     }
 
     @Test fun `failed movement and stop keep controls locked until a fresh pose`() = runTest(dispatcher) {

@@ -136,13 +136,11 @@ class MainActivity : ComponentActivity() {
                 val state by viewModel.state.collectAsStateWithLifecycle()
                 val latest by viewModel.incoming.collectAsStateWithLifecycle(initialValue = "")
                 val commandLogs by viewModel.commandLogs.collectAsStateWithLifecycle()
-                val robotStatus by viewModel.robotStatus.collectAsStateWithLifecycle()
                 val appendNewline by viewModel.appendNewline.collectAsStateWithLifecycle()
 
                 Scaffold(modifier = Modifier.fillMaxSize()) { innerPadding ->
                     IntegratedControllerScreen(
                         status = statusLabel(state),
-                        robotStatus = robotStatus,
                         isConnected = state is ConnectionState.Connected,
                         isBusy = state is ConnectionState.Connecting ||
                             state is ConnectionState.Reconnecting,

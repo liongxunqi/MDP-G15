@@ -5,6 +5,18 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class RobotMotionTest {
+    @Test fun `AMD lateral preview translates directly with its new heading`() {
+        val motion = RobotMotion()
+        val path = DrivePath(DrivePose(8.0,8.0,0.0), ManualCommand.LEFT, amdToolMode = true)
+        motion.snap(state(8,8).robot)
+        motion.retarget(ArenaState(robot = path.at(1.0).asRobotPose().copy(commandedPath = path)), 0)
+        assertEquals(7.5f, motion.sample(90)!!.x, 0.001f)
+        assertEquals(8f, motion.sample(90)!!.y, 0.001f)
+        assertEquals(270f, motion.sample(90)!!.angle, 0.001f)
+        assertEquals(7f, motion.sample(180)!!.x, 0.001f)
+        assertFalse(motion.isRunning(180))
+    }
+
     @Test fun `manual turn follows an arc with intermediate diagonal heading`() {
         val motion = RobotMotion()
         val path = DrivePath(DrivePose(8.0, 8.0, 0.0), ManualCommand.RIGHT)
@@ -22,7 +34,7 @@ class RobotMotionTest {
         val path = DrivePath(DrivePose(8.0, 8.0, 0.0), ManualCommand.FORWARD)
         motion.snap(state(8, 8).robot)
         motion.retarget(ArenaState(robot = path.at(1.0).asRobotPose().copy(commandedPath = path)), 0)
-        assertEquals(9f, motion.sample(325)!!.y, 0.001f)
+        assertEquals(8.5f, motion.sample(325)!!.y, 0.001f)
         motion.snap(null)
         assertNull(motion.sample(650))
     }

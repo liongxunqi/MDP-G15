@@ -82,3 +82,10 @@ object RobotMessageParser {
             ArenaDecodeResult.Ignored -> RobotMessage.Unknown(line)
         }
 }
+
+/** Rejected updates are diagnostics, never a replacement for the last valid robot status. */
+internal fun RobotMessage.displayStatusOr(previous: String): String = when (this) {
+    is RobotMessage.Status -> text
+    is RobotMessage.Target -> "Target $targetId found at obstacle $obstacle"
+    else -> previous
+}

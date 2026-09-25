@@ -51,12 +51,20 @@ class ArenaViewModel(
     private var previewJob: Job? = null
 
     fun manualAllowed(command: ManualCommand): Boolean = connected && !_uiState.value.autonomousRunning &&
-        !_uiState.value.manualAnimating && manualDrive.allowed(_uiState.value.arena, command)
+        !_uiState.value.manualAnimating && !_uiState.value.manualPending &&
+        (_uiState.value.freeMoveMode || manualDrive.allowed(_uiState.value.arena, command, _uiState.value.amdToolMode))
+
+    fun setAmdToolMode(enabled: Boolean): Boolean {
+        if (enabled == _uiState.value.amdToolMode) return true
+        if (blockWhileDriving()) return false
+        _uiState.value = _uiState.value.copy(amdToolMode = enabled)
+        return true
+    }
 
     fun startRun(send: () -> Unit) {
         if (!connected || blockWhileDriving()) return
         manualDrive.invalidate()
-        _uiState.value = _uiState.value.copy(autonomousRunning = true, manualStatus = "Autonomous run — manual driving paused")
+        _uiState.value = _uiState.value.copy(autonomousRunning = true, freeMoveMode = false, manualStatus = "Autonomous run — manual driving paused")
         setFeedback("Run requested.", false)
         send()
     }
@@ -64,7 +72,14 @@ class ArenaViewModel(
     fun rejectUnsafeCustomMessage() = setFeedback("Send one command at a time; movement must pass the arena checks.", true)
 
     fun drive(command: ManualCommand, send: () -> Unit) {
-        if (!manualAllowed(command) || manualDrive.reserve(_uiState.value.arena, command) == null) {
+        if (!manualAllowed(command)) {
+            setFeedback("Movement blocked: wait for completion and a valid pose; check the swept path.", true)
+            return
+        }
+        // Before localization, send commands without inventing a pose or checking a fictitious path.
+        val freeMove = _uiState.value.freeMoveMode
+        val path = if (freeMove) null else manualDrive.reserve(_uiState.value.arena, command, _uiState.value.amdToolMode)
+        if (!freeMove && path == null) {
             setFeedback("Movement blocked: wait for completion and a valid pose; check the swept path.", true)
             return
         }
@@ -72,21 +87,27 @@ class ArenaViewModel(
         _uiState.value = _uiState.value.copy(
             manualPending = true,
             manualAnimating = true,
-            manualStatus = "Moving (estimated) — awaiting completion",
-            arena = _uiState.value.arena.copy(robot = manualDrive.pending!!.let { it.at(1.0).asRobotPose().copy(commandedPath = it) }),
+            manualStatus = if (freeMove) "Free move — position unknown" else "Moving (estimated)",
+            arena = if (path == null) _uiState.value.arena else _uiState.value.arena.copy(
+                robot = path.at(1.0).asRobotPose().copy(commandedPath = path),
+            ),
         )
-        setFeedback("Sent ${command.wire} — waiting for movement completion.", false)
-        val previewDuration = requireNotNull(manualDrive.pending).previewDurationMillis
+        setFeedback(if (freeMove) "Sent ${command.wire} — free move." else "Sent ${command.wire} — previewing movement.", false)
+        val previewDuration = command.previewDurationMillis(_uiState.value.amdToolMode)
         previewJob = viewModelScope.launch {
             delay(previewDuration + 50L) // Allow the next rendered frame to finish the preview.
             _uiState.value = _uiState.value.copy(manualAnimating = false)
         }
-        // uncomment below line so we dont have to wait for STATUS,OK
-        manualDrive.complete()
-        try { send() } catch (error: Exception) {
+        // Both modes keep main's local completion policy; the preview gates repeated taps.
+        try {
+            send()
+            manualDrive.complete()
+            _uiState.value = _uiState.value.copy(manualPending = false,
+                manualStatus = if (_uiState.value.freeMoveMode) "Free move — position unknown" else "Ready — estimated pose")
+        } catch (error: Exception) {
             cancelPreviewGate()
             manualDrive.invalidate()
-            _uiState.value = _uiState.value.copy(manualPending = false, manualStatus = "Send failed — pose unconfirmed")
+            _uiState.value = _uiState.value.copy(manualPending = false, freeMoveMode = false, manualStatus = "Send failed — pose unconfirmed")
             setFeedback("Send failed; robot position needs confirmation.", true)
         }
     }
@@ -94,8 +115,8 @@ class ArenaViewModel(
     fun stopManual(send: () -> Unit) {
         cancelPreviewGate()
         manualDrive.invalidate()
-        _uiState.value = _uiState.value.copy(manualPending = false, autonomousRunning = false, manualStatus = "Stopped — pose unconfirmed")
-        setFeedback("Stop requested — await a fresh robot position before driving.", false)
+        _uiState.value = _uiState.value.copy(manualPending = false, autonomousRunning = false, manualStatus = if (_uiState.value.freeMoveMode) "Free move — position unknown" else "Stopped — pose unconfirmed")
+        setFeedback(if (_uiState.value.freeMoveMode) "Stop requested." else "Stop requested — await a fresh robot position before driving.", false)
         if (connected) send()
     }
     private val obstacleSync = ObstacleSync(outboundSink::submit).also {
@@ -107,7 +128,10 @@ class ArenaViewModel(
             cancelPreviewGate()
             manualDrive.invalidate()
             _uiState.value = _uiState.value.copy(manualPending = false, autonomousRunning = false,
-                manualStatus = if (connected) "Awaiting fresh robot position" else "Disconnected — pose unconfirmed")
+                // A Bluetooth connection is not a pose report, including after reconnect.
+                freeMoveMode = connected,
+                arena = if (connected) _uiState.value.arena.copy(robot = null) else _uiState.value.arena,
+                manualStatus = if (connected) "Free move — position unknown" else "Disconnected — pose unconfirmed")
         }
         this.connected = connected
         if (!useRpiMapSync) return
@@ -132,7 +156,6 @@ class ArenaViewModel(
                         handleInbound(decoded.event, line)
                     }
                     is ArenaDecodeResult.Malformed -> {
-                        if (line.substringBefore(',').trim().equals("ROBOT", true)) invalidateReportedPose()
                         setFeedback(decoded.reason, isError = true)
                     }
                     ArenaDecodeResult.Ignored -> setFeedback("Received: $line", isError = false)
@@ -225,8 +248,8 @@ class ArenaViewModel(
 
     fun undo() {
         if (blockWhileDriving()) return
-        manualDrive.invalidate()
         if (undoHistory.isEmpty()) return
+        manualDrive.invalidate()
         val before = _uiState.value.arena
         val target = undoHistory.removeLast()
         redoHistory.addLast(ArenaEditSnapshot.from(before))
@@ -237,8 +260,8 @@ class ArenaViewModel(
 
     fun redo() {
         if (blockWhileDriving()) return
-        manualDrive.invalidate()
         if (redoHistory.isEmpty()) return
+        manualDrive.invalidate()
         val before = _uiState.value.arena
         val target = redoHistory.removeLast()
         undoHistory.addLast(ArenaEditSnapshot.from(before))
@@ -264,6 +287,8 @@ class ArenaViewModel(
                 if (action is ArenaAction.MoveRobot) reduction.state.robot?.let(manualDrive::seed)
                 _uiState.value = _uiState.value.copy(
                     arena = reduction.state,
+                    freeMoveMode = if (action is ArenaAction.MoveRobot) false else _uiState.value.freeMoveMode,
+                    manualStatus = if (action is ArenaAction.MoveRobot) null else _uiState.value.manualStatus,
                     placementMode = if (leavePlacementMode) false else _uiState.value.placementMode,
                     canUndo = undoHistory.isNotEmpty(),
                     canRedo = false,
@@ -287,33 +312,35 @@ class ArenaViewModel(
         _uiState.value = _uiState.value.copy(manualAnimating = false)
     }
 
-    private val startStatus = Regex("START,([0-9]+),([0-9]+),([NSEW])")
-
-    /**
-     * STATUS,START,<x>,<y>,<N/E/S/W> also places the robot on the arena. It goes through the same
-     * path as ROBOT,<x>,<y>,<dir>, so the pose gets the same fit/obstacle validation.
-     * The status text and autonomous flag are already handled by the Status branch.
-     */
-    private fun applyStartPose(statusText: String, rawMessage: String) {
-        val (x, y, face) = startStatus.matchEntire(statusText)?.destructured ?: return
-        val direction = Direction.fromWire(face) ?: return
-        handleInbound(ArenaInboundEvent.Robot(RobotPose(GridCoordinate(x.toInt(), y.toInt()), direction)), rawMessage)
-    }
-
     private fun handleInbound(event: ArenaInboundEvent, rawMessage: String) {
         when (event) {
             is ArenaInboundEvent.Status -> {
-                val wasPending = manualDrive.pending != null
-                val measuredCompletion = manualDrive.reportedDuringMove != null
-                val autonomous = when (event.text.substringBefore(',')) {
+                val controlStatus = rawMessage.startsWith("STATUS,")
+                val startPose = if (controlStatus && event.text.startsWith("START,")) {
+                    val parts = event.text.split(',')
+                    val x = parts.getOrNull(1)?.toIntOrNull()
+                    val y = parts.getOrNull(2)?.toIntOrNull()
+                    val direction = parts.getOrNull(3)?.let(Direction::fromWire)
+                    if (x == null || y == null || direction == null) {
+                        setFeedback("Invalid start position.", true)
+                        return
+                    }
+                    val pose = RobotPose(GridCoordinate(x, y), direction)
+                    val validation = reducer.reduce(_uiState.value.arena, ArenaAction.ApplyRobotPose(pose))
+                    if (validation is ArenaReduction.Failure) {
+                        setFeedback(validation.reason, true)
+                        return
+                    }
+                    pose
+                } else null
+                val autonomous = when (if (controlStatus) event.text.substringBefore(',') else "") {
                     "START", "RUNNING" -> true
                     "DONE", "FAILED" -> false
                     else -> _uiState.value.autonomousRunning
                 }
-                when (event.text.trim().uppercase()) {
-                    //comment out below lines if we are not relying on Status OK
-                    // "OK" -> if (rawMessage == "STATUS,OK") manualDrive.complete()
-                    // "FAILED", "ERROR", "STOPPED" -> manualDrive.invalidate()
+                if (controlStatus && event.text == "FAILED") {
+                    cancelPreviewGate()
+                    manualDrive.invalidate()
                 }
                 val history = (_uiState.value.statusHistory + event.text).takeLast(MAX_STATUS_HISTORY)
                 _uiState.value = _uiState.value.copy(
@@ -321,17 +348,15 @@ class ArenaViewModel(
                     statusHistory = history,
                     manualPending = manualDrive.pending != null,
                     autonomousRunning = autonomous,
-                    manualStatus = when (event.text.trim().uppercase()) {
-                        "OK" -> if (wasPending && manualDrive.pending == null) {
-                            if (measuredCompletion) "Ready — reported pose" else "Ready — estimated pose"
-                        } else _uiState.value.manualStatus
+                    freeMoveMode = if (autonomous || (controlStatus && event.text == "FAILED")) false else _uiState.value.freeMoveMode,
+                    manualStatus = when (if (controlStatus) event.text else "") {
                         "FAILED" -> "Movement failed — pose unconfirmed"
                         "DONE" -> null
                         else -> if (autonomous) "Autonomous run — manual driving paused" else _uiState.value.manualStatus
                     },
                 )
                 persist()
-                applyStartPose(event.text, rawMessage)
+                startPose?.let { handleInbound(ArenaInboundEvent.Robot(it), rawMessage) }
             }
             is ArenaInboundEvent.Target -> {
                 val action = ArenaAction.ApplyTarget(event.obstacleId, event.targetId, event.face)
@@ -340,6 +365,7 @@ class ArenaViewModel(
                     redoHistory.clear()
                     _uiState.value = _uiState.value.copy(
                         arena = state,
+                        status = "Target ${event.targetId} found at obstacle ${event.obstacleId}",
                         canUndo = false,
                         canRedo = false,
                         feedback = "Target ${event.targetId} applied to obstacle ${event.obstacleId}.",
@@ -350,13 +376,13 @@ class ArenaViewModel(
             }
             is ArenaInboundEvent.Robot -> {
                 val reduction = reducer.reduce(_uiState.value.arena, ArenaAction.ApplyRobotPose(event.pose))
-                if (reduction is ArenaReduction.Failure) invalidateReportedPose()
                 applyReduction(
                     reduction,
                 ) { state ->
                     val accepted = manualDrive.report(event.pose)
                     _uiState.value = _uiState.value.copy(
                         arena = if (accepted) state else _uiState.value.arena,
+                        freeMoveMode = if (accepted) false else _uiState.value.freeMoveMode,
                         manualStatus = when {
                             _uiState.value.autonomousRunning -> _uiState.value.manualStatus
                             manualDrive.pending == null -> null
@@ -368,13 +394,6 @@ class ArenaViewModel(
                 }
             }
         }
-    }
-
-    private fun invalidateReportedPose() {
-        // Bad telemetry must not leave driving enabled against an older, apparently safe pose.
-        // Keep any outstanding command reserved: a parse error does not stop physical movement.
-        manualDrive.flagUncertain()
-        _uiState.value = _uiState.value.copy(manualStatus = "Invalid robot position — driving paused")
     }
 
     private inline fun applyReduction(

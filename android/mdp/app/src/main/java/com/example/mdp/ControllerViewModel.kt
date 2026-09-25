@@ -7,7 +7,6 @@ import android.bluetooth.BluetoothManager
 import android.content.Context
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
-import com.mdp.g15.arena.protocol.StatusMessage
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -57,19 +56,7 @@ class ControllerViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch {
             bt.incoming.collect { line ->
                 val msg = RobotMessageParser.parse(line, obstacleExists)
-                when (msg) {
-                    is RobotMessage.Status ->
-                        _robotStatus.value = msg.text
-                    is RobotMessage.Target ->
-                        _robotStatus.value =
-                            "Target ${msg.targetId} found at obstacle ${msg.obstacle}"
-                    is RobotMessage.TargetRejected ->
-                        _robotStatus.value = msg.reason
-                    is RobotMessage.MalformedStatus ->
-                        _robotStatus.value = StatusMessage.MALFORMED_FEEDBACK
-                    is RobotMessage.Position -> Unit   // arena data, not status
-                    is RobotMessage.Unknown -> Unit    // ignore noise
-                }
+                _robotStatus.value = msg.displayStatusOr(_robotStatus.value)
             }
         }
     }

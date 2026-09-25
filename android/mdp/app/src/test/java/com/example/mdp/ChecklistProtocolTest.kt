@@ -4,6 +4,14 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class ChecklistProtocolTest {
+    @Test fun rejectedMessagesRetainPreviousStatus() {
+        val previous = "RUNNING,1,2"
+        for (line in listOf("STATUS", "STATUS,OK,extra", "STATUS,START,1,2,X", "TARGET,99,11", "noise")) {
+            assertEquals(previous, RobotMessageParser.parse(line) { false }.displayStatusOr(previous))
+        }
+        assertEquals("DONE", RobotMessageParser.parse("STATUS,DONE").displayStatusOr(previous))
+    }
+
     @Test fun `target validation rejects invalid labels and accepts the incoming uppercase rule`() {
         for (target in listOf("-1", "100", "abc", "a", "+1", "A B", "é", "💡")) {
             assertTrue(target, RobotMessageParser.parse("TARGET,1,$target") { true } is RobotMessage.TargetRejected)

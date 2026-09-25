@@ -37,7 +37,7 @@ class IntegratedControllerScreenTest {
     private var connectClicks = 0
     private lateinit var commandLog: CommandLog
     private var connected by mutableStateOf(false)
-    private var robotStatusText by mutableStateOf("Awaiting robot status")
+    private var appendNewline by mutableStateOf(true)
     private val movement = mutableListOf<String>()
     private var targetLookup: (Int) -> Boolean = { false }
     private val targetChecksAtMapWrite = mutableListOf<RobotMessage>()
@@ -49,10 +49,59 @@ class IntegratedControllerScreenTest {
         connectClicks = 0
         commandLog = CommandLog()
         connected = false
-        robotStatusText = "Awaiting robot status"
+        appendNewline = true
         movement.clear()
         targetLookup = { false }
         targetChecksAtMapWrite.clear()
+    }
+
+    @Test
+    fun connectionAllowsFreeCommandsUntilValidPoseArrives() {
+        connected = true
+        setScreen()
+        composeRule.onNodeWithText("Arena").performClick()
+        composeRule.onNodeWithText("◀ Left").assertIsEnabled().performClick()
+        composeRule.runOnIdle { assertEquals(listOf("tl"), movement) }
+        composeRule.waitUntil(5_000) {
+            runCatching { composeRule.onNodeWithText("▲ Forward").assertIsEnabled() }.isSuccess
+        }
+        composeRule.runOnIdle { assertTrue(incoming.tryEmit("ROBOT,99,99,N")) }
+        composeRule.waitForIdle()
+        composeRule.onNodeWithText("▲ Forward").assertIsEnabled()
+        composeRule.runOnIdle { assertTrue(incoming.tryEmit("ROBOT,8,18,N")) }
+        composeRule.waitForIdle()
+        composeRule.onNodeWithText("▲ Forward").assertIsNotEnabled()
+        composeRule.onNodeWithText("▼ Reverse").assertIsEnabled()
+    }
+
+    @Test
+    fun amdToggleControlsMovementAndRejectedUpdatesPreserveDriveButtons() {
+        connected = true
+        setScreen()
+        composeRule.onNodeWithText("Arena").performClick()
+        composeRule.onNodeWithText("Amd tool").performScrollTo().performClick()
+        composeRule.runOnIdle { assertEquals(false, appendNewline) }
+        composeRule.runOnIdle { assertTrue(incoming.tryEmit("STATUS,DONE\nROBOT,8,8,N")) }
+        composeRule.waitForIdle()
+        composeRule.onNodeWithText("◀ Left").assertIsEnabled().performClick()
+        composeRule.onNodeWithText("(7.00, 8.00) • W • estimated").performScrollTo().assertIsDisplayed()
+        composeRule.waitUntil(5_000) {
+            runCatching { composeRule.onNodeWithText("Right ▶").assertIsEnabled() }.isSuccess
+        }
+        composeRule.runOnIdle {
+            assertTrue(incoming.tryEmit("ROBOT,19,19,N\nSTATUS,START,9999999999999999,8,N\nSTATUS,INVALID"))
+        }
+        composeRule.waitForIdle()
+        composeRule.onNodeWithText("Right ▶").assertIsEnabled().performClick()
+        composeRule.onNodeWithText("(8.00, 8.00) • E • estimated").performScrollTo().assertIsDisplayed()
+        composeRule.waitUntil(5_000) {
+            runCatching { composeRule.onNodeWithText("normal").assertIsEnabled() }.isSuccess
+        }
+        composeRule.onNodeWithText("normal").performScrollTo().performClick()
+        composeRule.runOnIdle { assertEquals(true, appendNewline) }
+        composeRule.onNodeWithText("Right ▶").assertIsEnabled().performClick()
+        composeRule.onNodeWithText("(10.91, 5.09) • S • estimated").performScrollTo().assertIsDisplayed()
+        composeRule.runOnIdle { assertEquals(listOf("tl", "tr", "tr"), movement) }
     }
 
     @Test
@@ -99,7 +148,10 @@ class IntegratedControllerScreenTest {
     fun robotStatusIsSharedByControlsAndArena() {
         setScreen()
         composeRule.onNodeWithText("Awaiting robot status").assertIsDisplayed()
-        composeRule.runOnIdle { robotStatusText = "Exploring" }
+        composeRule.runOnIdle { assertTrue(incoming.tryEmit("MSG,[Exploring]")) }
+        composeRule.onNodeWithText("Exploring").assertIsDisplayed()
+        composeRule.runOnIdle { assertTrue(incoming.tryEmit("STATUS,INVALID")) }
+        composeRule.waitForIdle()
         composeRule.onNodeWithText("Exploring").assertIsDisplayed()
         composeRule.onNodeWithText("Arena").performClick()
 
@@ -185,7 +237,7 @@ class IntegratedControllerScreenTest {
         setScreen()
         assertTrue(incoming.tryEmit("ROBOT,8,8,N"))
         composeRule.waitForIdle()
-        composeRule.runOnIdle { robotStatusText = "A detailed status message from the robot. ".repeat(60) }
+        composeRule.runOnIdle { assertTrue(incoming.tryEmit("MSG," + "A detailed status message from the robot. ".repeat(60))) }
         composeRule.onNodeWithText("Arena").performClick()
         composeRule.onNodeWithText("■ Stop").assertIsDisplayed().assertIsEnabled()
         composeRule.onNodeWithTag("arena_grid").assertIsDisplayed()
@@ -200,7 +252,7 @@ class IntegratedControllerScreenTest {
         connected = true
         setScreen()
         composeRule.onNodeWithText("Arena").performClick()
-        composeRule.onNodeWithText("▲ Forward").assertIsNotEnabled()
+        composeRule.onNodeWithText("▲ Forward").assertIsEnabled()
         for (label in listOf("▲ Forward", "◀ Left", "Right ▶", "▼ Reverse", "↖ Forward left", "Forward right ↗", "↙ Back left", "Back right ↘")) {
             assertTrue(incoming.tryEmit("ROBOT,8,8,N"))
             composeRule.waitForIdle()
@@ -208,12 +260,11 @@ class IntegratedControllerScreenTest {
                 runCatching { composeRule.onNodeWithText(label).assertIsEnabled() }.isSuccess
             }
             composeRule.onNodeWithText(label).assertIsDisplayed().assertIsEnabled().performClick()
-            composeRule.onNodeWithText("▲ Forward").assertIsNotEnabled()
+            // Preview completion is time-based; deterministic spam gating is covered by VM tests.
             composeRule.onNodeWithText("■ Stop").assertIsEnabled()
             if (label == "▲ Forward") {
-                composeRule.onNodeWithText("(8.00, 10.00) • N • estimated").performScrollTo().assertIsDisplayed()
+                composeRule.onNodeWithText("(8.00, 9.00) • N • estimated").performScrollTo().assertIsDisplayed()
                 composeRule.onNodeWithTag("arena_grid").assertIsDisplayed()
-                composeRule.onNodeWithText("▲ Forward").performClick()
                 assertEquals(listOf("f"), movement)
             }
             assertTrue(incoming.tryEmit("STATUS,OK"))
@@ -314,7 +365,8 @@ class IntegratedControllerScreenTest {
             val logs by commandLog.entries.collectAsState()
             IntegratedControllerScreen(
                 status = if (connected) "Connected to test robot" else "Disconnected",
-                robotStatus = robotStatusText,
+                appendNewline = appendNewline,
+                onAppendNewlineChange = { appendNewline = it },
                 isConnected = connected,
                 isBusy = false,
                 permissionsGranted = true,
