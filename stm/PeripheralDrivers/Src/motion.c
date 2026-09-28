@@ -80,6 +80,23 @@ static float s_brakeAngle = 0.0f;   /* |heading| when braking started  */
 static float s_arcLag     = MOTION_ARC_LAG_S;
 static uint8_t s_lagSeeded   = 0U;
 
+/* Learning switch - see Motion_SetLearning() in motion.h. OFF at power-on:
+ * nothing changes the calibration unless calibration asked it to. */
+static uint8_t s_learnOn = 0U;
+
+/* Heading carry-over - see HEADING CARRY-OVER in motion.h.
+ *
+ * s_worldBase is the actual heading folded in at the last launch; the live
+ * actual heading is s_worldBase + Odom_GetHeadingTotal(), because the odometry
+ * total runs from that same launch. Folding at LAUNCH rather than at the end
+ * of a move means anything that happened in between - drift while parked, a
+ * nudge during the steering settle - is counted as well. */
+static float    s_worldCmd      = 0.0f;
+static float    s_worldBase     = 0.0f;
+static float    s_lastArcAim    = 0.0f;
+static float    s_lastArcTurned = 0.0f;
+static uint16_t s_carryClamps   = 0U;
+
 /* Cross-check results for the last arc. */
 static float   s_xcheckDeg    = 0.0f;
 static float   s_xcheckErrPct = 0.0f;
@@ -137,8 +154,20 @@ static uint16_t arc_steer_us(void)
 
 void Motion_SetArcProfile(uint8_t idx)
 {
+#if MOTION_PROFILE_LOCK_TIGHT
+    if (idx != 0U) { return; }
+#endif
     if (idx < MOTION_ARC_PROFILE_COUNT) { s_profileIdx = idx; }
 }
+
+void    Motion_SetLearning(uint8_t on)  { s_learnOn = on ? 1U : 0U; }
+uint8_t Motion_LearningEnabled(void)    { return s_learnOn; }
+
+float Motion_GetCommandedHeading(void)  { return s_worldCmd; }
+float Motion_GetActualHeading(void)     { return s_worldBase + Odom_GetHeadingTotal(); }
+float Motion_GetLastArcAimDeg(void)     { return s_lastArcAim; }
+float Motion_GetLastArcTurnedDeg(void)  { return s_lastArcTurned; }
+uint16_t Motion_GetCarryClampCount(void) { return s_carryClamps; }
 
 uint8_t  Motion_GetArcProfile(void)  { return s_profileIdx; }
 uint16_t Motion_GetArcSteerUs(void)  { return arc_steer_us(); }
@@ -255,12 +284,53 @@ static void motion_begin_align(uint16_t servo_us)
     s_state = MOTION_ALIGN;
 }
 
+/* How far the actual heading trails the commanded one, capped. Positive means
+ * the robot needs to turn further counter-clockwise. Call AFTER the fold in
+ * motion_launch(), when s_worldBase is the whole of the actual heading. */
+static float carry_error(void)
+{
+#if MOTION_CARRY_ENABLE
+    float err = s_worldCmd - s_worldBase;
+
+    if ((err > MOTION_CARRY_MAX_DEG) || (err < -MOTION_CARRY_MAX_DEG))
+    {
+        s_carryClamps++;
+        err = (err > 0.0f) ? MOTION_CARRY_MAX_DEG : -MOTION_CARRY_MAX_DEG;
+    }
+    return err;
+#else
+    return 0.0f;
+#endif
+}
+
 /* Settle finished: zero the odometry now, then start driving. */
 static void motion_launch(void)
 {
+    float carry;
+
     s_wrongWay = 0U;
 
+    /* Fold everything the gyro saw since the last launch into the running
+     * actual heading BEFORE the reset below throws it away. */
+    s_worldBase += Odom_GetHeadingTotal();
+    carry = carry_error();
+
     Odom_Reset();
+
+    if (s_kind == MOVE_ARC)
+    {
+        /* Aim for the commanded total, not for "asked from here". Never let
+         * the correction flip the turn round or shrink it to nothing - a
+         * correction that big has already been capped above anyway. */
+        float aim = s_arcTargetDeg + carry;
+
+        if ((s_arcTargetDeg >= 0.0f) && (aim < 1.0f))  { aim = 1.0f;  }
+        if ((s_arcTargetDeg <  0.0f) && (aim > -1.0f)) { aim = -1.0f; }
+
+        s_arcTargetDeg = aim;
+        s_lastArcAim   = aim;
+        s_worldCmd    += (float)s_arcCommandDeg;
+    }
 
     s_arcStartDist = Odom_GetDistance();   /* zero, just after the reset */
 
@@ -280,9 +350,31 @@ static void motion_launch(void)
     }
     else
     {
-        s_holdHeading = Odom_GetHeading();   /* zero, just after the reset */
+        /* Zero just after the reset, plus whatever the last move left
+         * behind - so the straight steers the error out instead of driving
+         * the whole way on it. */
+        s_holdHeading = Odom_GetHeading() + carry;
         Odom_DriveHeading(s_lastRpm, s_holdHeading);
     }
+}
+
+void Motion_ZeroHeading(void)
+{
+    uint32_t pm = crit_enter();
+
+    Odom_Reset();
+    s_worldCmd    = 0.0f;
+    s_worldBase   = 0.0f;
+    s_carryClamps = 0U;
+
+    crit_exit(pm);
+}
+
+void Motion_ResyncHeading(void)
+{
+    uint32_t pm = crit_enter();
+    s_worldCmd = s_worldBase + Odom_GetHeadingTotal();
+    crit_exit(pm);
 }
 
 void Motion_Init(void)
@@ -305,6 +397,12 @@ void Motion_Init(void)
     s_arcCommandDeg = 0;
     s_decelSeeded   = 0U;
     s_lagSeeded     = 0U;
+    s_learnOn       = 0U;
+    s_worldCmd      = 0.0f;
+    s_worldBase     = 0.0f;
+    s_lastArcAim    = 0.0f;
+    s_lastArcTurned = 0.0f;
+    s_carryClamps   = 0U;
 }
 
 void Motion_DriveDistance(int32_t mm)
@@ -464,6 +562,7 @@ void Motion_Tick(void)
          * rather than sit here forever. */
         motion_halt();
         s_state = MOTION_TIMEOUT;
+        Motion_ResyncHeading();   /* the plan no longer describes the robot */
         return;
     }
 
@@ -525,6 +624,7 @@ void Motion_Tick(void)
                     motion_halt();
                     s_wrongWay = 1U;
                     s_state    = MOTION_TIMEOUT;
+                    Motion_ResyncHeading();
                     return;
                 }
             }
@@ -651,15 +751,23 @@ void Motion_Tick(void)
             /* Straight runs: fold this run's mean heading error into the
              * steering centre trim. Once per move, after it has finished, so
              * it cannot interfere with the loop while it is running. */
-            if (s_kind == MOVE_STRAIGHT)
+            if ((s_kind == MOVE_STRAIGHT) && s_learnOn)
             {
                 Odom_LearnTrim();
             }
 
+            if (s_kind == MOVE_ARC)
+            {
+                s_lastArcTurned = Odom_GetHeadingTotal();
+            }
+
 #if MOTION_ARC_ADAPTIVE_BRAKE
             /* Learn. The coast just observed, against the rate we entered the
-             * brake at, gives this floor's deceleration directly. */
-            if (s_kind == MOVE_ARC)
+             * brake at, gives this floor's deceleration directly.
+             *
+             * Only while learning is switched on - see Motion_SetLearning().
+             * During a task the braking model is exactly what was restored. */
+            if ((s_kind == MOVE_ARC) && s_learnOn)
             {
                 float ended = Odom_GetHeadingTotal();
                 float coast;
@@ -708,9 +816,12 @@ void Motion_Tick(void)
                      * rate converts degrees of error into seconds of lag,
                      * which is why this stays correct at other speeds. */
                     {
-                        float want = (s_arcCommandDeg < 0)
-                                   ? (float)(-s_arcCommandDeg)
-                                   : (float)s_arcCommandDeg;
+                        /* Against what the turn AIMED for, which after the
+                         * heading carry-over is not always what was asked.
+                         * Scoring a deliberate 90.5 against 90 would teach
+                         * the lag a half-degree overshoot that never was. */
+                        float want = (s_arcTargetDeg < 0.0f)
+                                   ? -s_arcTargetDeg : s_arcTargetDeg;
                         float over = ended - want;
 
                         /* over / rate IS the lag error in seconds, not a

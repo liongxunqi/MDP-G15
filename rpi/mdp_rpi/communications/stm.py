@@ -157,6 +157,10 @@ US_BIAS_CM = 1.3
 # discovered as a mysterious RESEND halfway through a run.
 CAL_MIN_PROTOCOL = 2
 FU_MIN_PROTOCOL = 3
+# Protocol 4: learning off at power-on (!LEARN0/1), gyro scale (!CALG), the
+# heading carry-over and its ?HDG report, and !PROF locked to TIGHT. Every task
+# now restores a frozen calibration at startup, so this is a hard floor there.
+FROZEN_CAL_MIN_PROTOCOL = 4
 
 # PROTOCOL.md §5 — every tag the firmware can answer a query with.
 # CAL is protocol 2. It must appear here twice over: once so validate_token()
@@ -164,23 +168,23 @@ FU_MIN_PROTOCOL = 3
 # "CAL,..." answer to the waiting thread instead of discarding it as banner
 # noise. Missing from either place and the query fails silently.
 QUERY_TAGS = {"US", "IR", "IRR", "POSE", "DIST", "TURN", "STAT", "IMU", "XCHK",
-              "VER", "CAL"}
+              "VER", "CAL", "HDG"}
 
-# This client implements protocol 3. Compared against the ?VER reply at startup.
-PROTOCOL_VERSION = 3
+# This client implements protocol 4. Compared against the ?VER reply at startup.
+PROTOCOL_VERSION = 4
 
 # FU before F, exactly as the firmware's own parser orders its prefixes: "fu"
 # would otherwise be eaten by "f" and FU20 read as F with an argument of
 # "U20", which does not parse at all.
 _MOVE_RE = re.compile(r"^(FR|FL|FU|RR|RL|F|R)(\d+)$", re.IGNORECASE)
 _QUERY_RE = re.compile(r"^\?([A-Z]+)$", re.IGNORECASE)
-_CONFIG_RE = re.compile(r"^!(PROF[012]|ZERO)$", re.IGNORECASE)
+_CONFIG_RE = re.compile(r"^!(PROF[012]|ZERO|LEARN[01])$", re.IGNORECASE)
 
 # PROTOCOL.md §7 — the three calibration setters, protocol 2. !CALT is the ONLY
 # token anywhere in this protocol that may carry a negative argument: every
 # movement argument is a magnitude with its direction in the opcode, but a
 # steering trim has no opcode to carry its sign.
-_CAL_SET_RE = re.compile(r"^!CAL([DLT])(-?\d+)$", re.IGNORECASE)
+_CAL_SET_RE = re.compile(r"^!CAL([DLTG])(-?\d+)$", re.IGNORECASE)
 
 # Accepted ranges, read out of the FIRMWARE rather than the prose in §7 — they
 # disagree, and the firmware is the thing that will actually refuse you.
@@ -193,6 +197,8 @@ CAL_LIMITS = {
     "D": (501, 29999, "dps² ×10", "50 < decel < 3000 dps²"),
     "L": (0, 2500, "ms ×10", "0 ≤ lag ≤ 250 ms"),
     "T": (-80, 80, "µs, signed", "±80 µs"),
+    # IMU_GYRO_SCALE_MIN/MAX in imu.h. Both ends inclusive there.
+    "G": (9000, 11000, "scale ×10000", "0.90 ≤ gyro scale ≤ 1.10"),
 }
 
 # PROTOCOL.md §9 — the parser returns a parse failure for these, so a line
@@ -645,6 +651,9 @@ class STM:
         Select the arc profile: 0 TIGHT (r=291mm), 1 CLEAN (r=318mm),
         2 SLOW (r=306mm). Persists until changed or reset; default is TIGHT.
 
+        Protocol 4 firmware is LOCKED to TIGHT and answers RESEND to !PROF1/2,
+        so on current firmware this returns False for anything but 0.
+
         Replies plain OK, which is indistinguishable from a movement OK — so
         this MUST NOT be called while a movement line is outstanding.
         """
@@ -712,6 +721,63 @@ class STM:
             logging.error(f"STM: non-integer field in CAL reply {fields}.")
             return None
 
+    def read_cal_full(self, timeout: float = 2.0) -> Optional[dict]:
+        """
+        ?CAL with the protocol 4 fields: decel_x10, lag_ms_x10, trim_us,
+        gyro_x10000 and learn (0/1). The last two are None on older firmware.
+        """
+        fields = self.query_fields("?CAL", timeout)
+        if fields is None or len(fields) < 3:
+            logging.error(f"STM: malformed or missing CAL reply {fields}.")
+            return None
+        try:
+            vals = [int(f) for f in fields]
+        except ValueError:
+            logging.error(f"STM: non-integer field in CAL reply {fields}.")
+            return None
+        return {
+            "decel_x10": vals[0],
+            "lag_ms_x10": vals[1],
+            "trim_us": vals[2],
+            "gyro_x10000": vals[3] if len(vals) > 3 else None,
+            "learn": vals[4] if len(vals) > 4 else None,
+        }
+
+    def read_heading(self, timeout: float = 2.0) -> Optional[dict]:
+        """
+        ?HDG (protocol 4), all in degrees:
+
+            commanded   sum of every arc asked for since !ZERO
+            actual      what the gyro measured over the same span
+            error       commanded - actual: what the NEXT move will correct
+            last_aim    what the last arc aimed for, after carry-over
+            last_turned what it actually turned
+            last_stop_err  last_turned - last_aim: how precisely it stopped
+            clamped     corrections capped at 5° since !ZERO (should stay 0)
+        """
+        fields = self.query_fields("?HDG", timeout)
+        if fields is None or len(fields) < 5:
+            logging.error(f"STM: malformed or missing HDG reply {fields}.")
+            return None
+        try:
+            cmd, act, aim, turned = (int(f) / 10.0 for f in fields[:4])
+            clamped = int(fields[4])
+        except ValueError:
+            logging.error(f"STM: non-integer field in HDG reply {fields}.")
+            return None
+        return {
+            "commanded": cmd, "actual": act, "error": cmd - act,
+            "last_aim": aim, "last_turned": turned,
+            "last_stop_err": turned - aim, "clamped": clamped,
+        }
+
+    def set_learning(self, on: bool, timeout: Optional[float] = None) -> bool:
+        """!LEARN1 / !LEARN0. Same OK-collision caveat as set_profile()."""
+        if not self.send_line([f"!LEARN{1 if on else 0}"]):
+            return False
+        reply = self.wait_reply(timeout)
+        return reply is not None and reply.strip().upper() == "OK"
+
     def _send_cal_token(self, tok: str, retries: int, retry_delay: float) -> bool:
         """
         Send one !CAL* token, retrying while the firmware is busy.
@@ -763,6 +829,7 @@ class STM:
     def set_cal(self, decel_x10: Optional[int] = None,
                 lag_ms_x10: Optional[int] = None,
                 trim_us: Optional[int] = None,
+                gyro_x10000: Optional[int] = None,
                 retries: int = 3, retry_delay: float = 0.2) -> bool:
         """
         Restore saved calibration (PROTOCOL.md §7). Any argument left None is
@@ -780,6 +847,7 @@ class STM:
             ("D", decel_x10, "!CALD"),
             ("L", lag_ms_x10, "!CALL"),
             ("T", trim_us, "!CALT"),
+            ("G", gyro_x10000, "!CALG"),
         ]
         pending = [(k, v, p) for k, v, p in wanted if v is not None]
         if not pending:

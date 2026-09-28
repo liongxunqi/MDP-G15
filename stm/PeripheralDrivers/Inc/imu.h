@@ -98,6 +98,23 @@
 #define IMU_GYRO_FS_DPS         1000.0f
 #define IMU_GYRO_LSB_PER_DPS    32.8f
 
+/* Per-unit correction on top of the datasheet sensitivity.
+ *
+ * 32.8 LSB/dps is the NOMINAL figure; the part is only specified to a few
+ * percent of it. A 2% scale error turns every commanded 90 into 88 or 92 on
+ * the floor while the gyro itself reports a perfect 90 - the error is
+ * invisible to everything on the robot, because the braking model, the arc
+ * termination and ?TURN all read the same gyro. The only way to see it is to
+ * measure a turn against something that is not the gyro: a tape line and a
+ * protractor. calibrate.py guided does exactly that and sends the answer here
+ * with !CALG.
+ *
+ * Multiplies the rate, so heading, yaw rate and the braking prediction all
+ * move together. 1.0 until something better is restored; refused outside
+ * the bounds below, which are far wider than any real part is out by. */
+#define IMU_GYRO_SCALE_MIN      0.90f
+#define IMU_GYRO_SCALE_MAX      1.10f
+
 /* Gyro low-pass bandwidth, GYRO_DLPFCFG.
  *
  *   0 = 196.6 Hz   3 = 51.2 Hz   6 = 5.7 Hz
@@ -196,6 +213,12 @@ float IMU_GetRateDps(void);
 
 /* 1 once the part has answered and been configured. */
 uint8_t IMU_IsReady(void);
+
+/* Gyro scale correction, see IMU_GYRO_SCALE_MIN. The setter returns 0 and
+ * changes nothing outside the bounds. Caller must check the motion layer is
+ * idle - a turn in flight reads the rate every tick. */
+uint8_t IMU_SetGyroScale(float scale);
+float   IMU_GetGyroScale(void);
 
 /* Diagnostics for the OLED. */
 uint8_t  IMU_GetAddress(void);      /* 0x68, 0x69, or 0 if nothing answered */

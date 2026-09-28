@@ -43,6 +43,10 @@ static volatile float    s_rateDps;
 static volatile float    s_headingDeg;
 static volatile uint32_t s_errors;
 
+/* Measured correction on the datasheet sensitivity - see imu.h. RAM only,
+ * restored by the RPi with !CALG like the other calibration values. */
+static float    s_gyroScale = 1.0f;
+
 /* Poll rate diagnostics. IMU_Tick() integrates at a fixed 100 Hz using
  * whatever sample IMU_Poll() last fetched, so if the main loop is not
  * polling at least as fast as the sensor updates (102 Hz), samples go
@@ -301,7 +305,7 @@ void IMU_Poll(void)
     raw = (int16_t)(((uint16_t)buf[0] << 8) | buf[1]);
 
     s_rawZ       = raw;
-    s_rateDps    = (float)(raw - s_bias) / IMU_GYRO_LSB_PER_DPS;
+    s_rateDps    = ((float)(raw - s_bias) / IMU_GYRO_LSB_PER_DPS) * s_gyroScale;
     s_lastGoodMs = HAL_GetTick();
 
     s_polls++;
@@ -401,6 +405,18 @@ void IMU_ResetHeading(void)
 float    IMU_GetHeading(void)    { return s_headingDeg; }
 float    IMU_GetRateDps(void)    { return s_rateDps; }
 uint8_t  IMU_IsReady(void)       { return s_ready; }
+
+uint8_t IMU_SetGyroScale(float scale)
+{
+    if ((scale < IMU_GYRO_SCALE_MIN) || (scale > IMU_GYRO_SCALE_MAX))
+    {
+        return 0U;
+    }
+    s_gyroScale = scale;
+    return 1U;
+}
+
+float IMU_GetGyroScale(void) { return s_gyroScale; }
 uint8_t  IMU_GetAddress(void)    { return s_addr; }
 uint8_t  IMU_GetWhoAmI(void)     { return s_whoami; }
 int16_t  IMU_GetBias(void)       { return s_bias; }

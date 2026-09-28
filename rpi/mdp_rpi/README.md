@@ -391,5 +391,17 @@ A.5 only (`task_a5.py`):
 | `A5_MAX_FACES` | 4 | A block has four; a fifth leg returns you to the first |
 | `A5_MIN_CONFIDENCE` | 0.55 | Second gate, on top of the 0.25 floor in `detect.py` |
 | `A5_SETTLE_S` | 0.3 | Let the chassis stop rocking before `FU` measures |
-| `A5_ARC_PROFILE` | 0 | Profile `A5_ORBIT` was traced for. Checked against `?STAT`, never set |
-| `A5_ORBIT` | `R20,FR90,FL90,R37,FL90` | One face to the next — **the thing you tune** |
+| `A5_ORBIT` | derived from the TIGHT radius | One face to the next — **the thing you tune** |
+| `A5_ORBIT_HEADING_WARN_DEG` | 1.0 | Warn when `?HDG` error after an orbit is larger |
+
+Calibration (every task, `communications/cal_profile.py`):
+
+| Variable | Default | Effect |
+|---|---|---|
+| `CAL_PROFILE` | — | Saved profile restored and frozen at startup. Make it with `python3 calibrate.py guided <name>` |
+| `CAL_REQUIRED` | 1 | `1` refuses to start without `CAL_PROFILE`; `0` runs on compiled seeds (bench only) |
+
+The robot is locked to arc profile 0 (TIGHT) and does not learn during a
+task. Calibrate on the floor you will run on (`calibrate.py guided`), check it
+before the run (`calibrate.py verify`), and read `heading_logs/*.csv` after
+it: one row per move of commanded vs actual heading. See PROTOCOL.md §7.1.

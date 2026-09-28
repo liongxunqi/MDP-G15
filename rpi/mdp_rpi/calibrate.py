@@ -1,447 +1,551 @@
 """
-calibrate.py  —  Run the PROTOCOL.md §7 calibration sequence and save the result
-────────────────────────────────────────────────────────────────────────────────
-The firmware learns three things while it drives — arc deceleration, brake
-engagement lag and steering trim — and loses all three at power-off. A cold
-robot has to converge them again every session, which is the difference between
-a 9 degree error and a 1 degree one on the first turn.
+calibrate.py  —  Calibrate the robot on the floor, check it by eye, save it
+────────────────────────────────────────────────────────────────────────────
+Protocol 4 firmware does NOT learn during a task. Learning is off at power-on
+and every task restores a saved profile and freezes it (see
+communications/cal_profile.py). So the calibration a task drives on is exactly
+what this script measured — which makes this the one place precision is won.
 
-It converges much faster than it used to. The decel and lag take the FIRST
-valid arc outright instead of filtering toward a compiled constant, and the
-trim is measured from the steering loop's own output rather than searched for
-— one arc and one straight now do what took about ten of each. Restoring a
-saved profile still beats both, and the firmware no longer overwrites a
-restored value with the next arc.
-
-This runs the sequence, averages the readings, checks the robot against itself,
-and writes the answer to a named profile you can restore in one command.
-
-    python3 calibrate.py run arena --note "smooth floor, full battery, no load"
+    python3 calibrate.py guided arena --note "arena floor, full battery"
+    python3 calibrate.py verify arena        # square test before a run
+    python3 calibrate.py brakes arena        # re-do braking only (new battery)
     python3 calibrate.py restore arena
     python3 calibrate.py list
     python3 calibrate.py show arena
+    python3 calibrate.py zero                # heading 0 here, after moving it by hand
 
-Profiles live in cal_profiles/<name>.json.
+Then set CAL_PROFILE=arena in .env; task1.py and task_a5.py restore it.
 
-WHY A NAMED PROFILE PER ENVIRONMENT
-───────────────────────────────────
-The numbers do not transfer. They are a property of the surface, the battery
-charge and the weight on the chassis, not of the robot. A profile taken on
-the lab bench will be wrong in the arena, and one taken on a full battery will
-be wrong at the end of a run. Name them after the conditions, not the day.
+THE GUIDED PROCEDURE, AND WHY EACH STEP NEEDS YOUR EYES
+───────────────────────────────────────────────────────
+  1. STRAIGHT   F100 along a tape line, learning the steering trim, until the
+                trim stops moving AND you measure under 1 cm of drift. Also
+                reports the distance scale against your tape.
+  2. GYRO       Four FR90 (a full circle) then four FL90, starting flush with a
+                reference edge. You measure how far past or short of the edge
+                it ended. The gyro cannot see its own scale error - it measures
+                its own turns - so this is the only step that can find it.
+  3. BRAKES     Eight arcs with learning on, then the AVERAGE decel and lag are
+                pushed back and frozen. Then four more arcs with learning off
+                to show how precisely each one stops.
+  4. SQUARE     F50 + FR90 four times with learning off. You measure how far
+                from the start mark it ends and its final angle. Only a profile
+                that passes this is marked verified.
 
-WHY THE MEAN AND NOT THE LAST READING
-─────────────────────────────────────
-The learner does not converge to a point — it scatters around one. Measured
-over six arcs: decel held a spread of about 3% and lag about 26%, with no
-trend in either. Taking the final reading therefore bakes in whichever sample
-happened to be last, and the noisiest sample is as likely as any other. The
-mean of several arcs is the estimate; the spread tells you how much to trust
-it, which is why both are reported and stored.
+Order matters: the braking model is in gyro degrees, so it has to be learned
+AFTER the gyro scale is fixed.
 
-ARC 1 IS NOW THE CLEANEST SAMPLE, NOT THE DIRTIEST
-──────────────────────────────────────────────────
-It used to be burn-in: one update away from the compile-time seed and still
-mostly carrying it, so it was discarded by default. The firmware now takes the
-first valid arc's measurement OUTRIGHT, so arc 1 is the only reading with no
-seed in it at all — it is the noisiest single sample, but it is not biased,
-and neither is any reading after it.
-
-So arc 1 is kept by default now. --drop-first restores the old behaviour, which
-is still reasonable if you would rather average only the smoothed readings.
-
-THE STRAIGHT HAS TO BE LONG ENOUGH
-──────────────────────────────────
-The trim learner now discards the first half second of a straight as launch
-transient and then wants half a second of steady driving, so a straight needs
-about a second of HOLDING — roughly 800mm once the accel and brake ramps are
-paid for. It used to want half that.
-
-A straight that falls short does not fail. The firmware changes the trim by
-nothing and says nothing, and a trim that did not move reads exactly like a
-trim that has converged — so a short run gets saved into a profile as though
-it had been measured. STRAIGHT_CM below is sized with margin for that reason.
+ALWAYS RE-ZERO AFTER YOU TOUCH THE ROBOT
+────────────────────────────────────────
+The firmware now carries heading error from one move into the next. If you
+pick the robot up and straighten it by hand, the gyro sees that rotation and
+the next move would "correct" it straight back. Every prompt that asks you to
+position the robot sends !ZERO afterwards for exactly this reason. Tasks do
+the same at startup.
 """
 
 import argparse
-import json
 import logging
-import os
+import math
 import sys
 from datetime import datetime
-from typing import List, Optional, Tuple
+from typing import List, Optional
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s",
                     datefmt="%H:%M:%S")
 
-from communications.stm import STM, CAL_LIMITS, CAL_MIN_PROTOCOL, PROTOCOL_VERSION
+from communications import cal_profile
+from communications.stm import FROZEN_CAL_MIN_PROTOCOL, STM
 
-PROFILE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cal_profiles")
+# Step 1. F<n> is centimetres.
+STRAIGHT_CM = 100
+STRAIGHT_MAX_RUNS = 6
+TRIM_SETTLED_US = 2          # trim moving less than this per run = converged
+DRIFT_OK_CM = 1.0            # sideways error at 1 m you are prepared to accept
+DISTANCE_OK_PCT = 1.0
 
+# Step 2. Four quarter turns make a full circle and bring the robot back to
+# where it started, so the reference edge is right there to measure against.
+GYRO_LOOPS = [("FR90", 4), ("FL90", 4)]
+GYRO_ASYMMETRY_WARN_PCT = 0.5
+
+# Step 3. Alternating forward/reverse so the heading returns and the robot
+# stays on one patch of floor. Needs about 1.5 m x 1.5 m clear.
+BRAKE_LEARN_SEQ = ["FR90", "RR90", "FL90", "RL90"] * 2
+BRAKE_CHECK_SEQ = ["FR90", "RR90", "FL90", "RL90"]
+STOP_ERR_OK_DEG = 0.5
+
+# Step 4.
+SQUARE_SIDE_CM = 50
+SQUARE_GAP_OK_CM = 3.0
+SQUARE_ANGLE_OK_DEG = 1.0
+SQUARE_HDG_OK_DEG = 0.5
+
+
+# ── Small helpers ─────────────────────────────────────────────────────────────
 
 def _mean(vals) -> float:
-    """
-    Arithmetic mean, computed here rather than with statistics.fmean().
-
-    fmean() is Python 3.8+, and the Pi runs older than that. This is the only
-    thing that needed it, so a two-line helper is cheaper than a version
-    requirement on a robot that is awkward to upgrade mid-project.
-    """
     return sum(vals) / float(len(vals))
 
 
 def _stdev(vals) -> float:
-    """Sample standard deviation. Zero for a single sample rather than raising."""
     if len(vals) < 2:
         return 0.0
     m = _mean(vals)
     return (sum((v - m) ** 2 for v in vals) / (len(vals) - 1)) ** 0.5
 
-# PROTOCOL.md §7. NOTE the straight is F80, not the F600 the document prints:
-# F<n> is CENTIMETRES (§4), so F600 is six metres and does not fit a 2.0m arena.
-#
-# 80cm, not the 50 this used to be. The trim learner now throws away the first
-# 50 ticks of a straight as launch transient before collecting its 50 samples,
-# so it needs about a second of holding rather than half a second. 50cm still
-# cleared that on paper and had almost no margin left for a low battery or a
-# heavier chassis — and falling short is silent, so margin is the whole point.
-STRAIGHT_CM = 80
-ARC_DEG = 90
 
-# Alternating so the robot returns to its start heading and stays on the same
-# patch of floor. At TIGHT (291mm radius) each 90 degree turn eats roughly
-# 291mm forward AND 291mm sideways, so this needs about 1.5m x 1m clear.
-ARC_SEQUENCE = ["FR", "RR", "FR", "RR", "FR", "RR"]
+def ask(prompt: str) -> str:
+    return input(f"  {prompt} ").strip()
 
 
-# ── Wire helpers ──────────────────────────────────────────────────────────────
+def ask_float(prompt: str, allow_blank: bool = True) -> Optional[float]:
+    while True:
+        raw = ask(prompt)
+        if raw == "" and allow_blank:
+            return None
+        try:
+            return float(raw)
+        except ValueError:
+            print("    A number, please (or Enter to skip).")
+
+
+def ask_angle(prompt: str) -> float:
+    """
+    Degrees, or an offset measured along an edge: '12/200' means the robot's
+    side is 12 mm further out at one end than the other over 200 mm, which is
+    atan(12/200) = 3.4 degrees. Easier to measure well than a protractor.
+    Sign is the caller's convention; for offsets put the sign on the first
+    number.
+    """
+    while True:
+        raw = ask(prompt)
+        try:
+            if "/" in raw:
+                off, span = (float(x) for x in raw.split("/", 1))
+                return math.degrees(math.atan2(off, span))
+            return float(raw)
+        except ValueError:
+            print("    Degrees (e.g. -1.5) or offset/span in mm (e.g. -12/200).")
+
+
+def pause(msg: str) -> None:
+    input(f"\n  {msg}\n  Enter when ready, Ctrl-C to abort... ")
+
 
 def send_move(stm: STM, token: str) -> bool:
-    """
-    Send one movement token and wait for its reply. Returns False on anything
-    that is not OK.
-
-    PROTOCOL.md §3: FAIL,* means the robot is not where you think it is. There
-    is no point averaging readings taken after a stalled wheel, so this stops
-    the run rather than carrying on and producing a confident wrong answer.
-    """
+    """One movement line, wait for its reply. Anything but OK stops the run."""
     if not stm.send_line([token]):
         return False
-
     reply = stm.wait_reply()
     if reply is None:
-        logging.error(f"{token}: no reply — lost link (PROTOCOL.md §11).")
+        logging.error(f"{token}: no reply — lost link.")
         return False
-
-    verdict = reply.strip().upper()
-    if verdict == "OK":
+    if reply.strip().upper() == "OK":
         return True
-
-    if verdict.startswith("FAIL"):
-        logging.error(
-            f"{token}: {verdict}. The robot is not where you think it is — "
-            "stopping. Check for a stalled wheel or a dead encoder before "
-            "trusting anything measured after this point."
-        )
-    else:
-        logging.error(f"{token}: unexpected reply {reply!r}.")
+    logging.error(f"{token}: {reply.strip()}. The robot is not where you think "
+                  "it is — stopping. Check for a stalled wheel before trusting "
+                  "anything measured after this.")
     return False
 
 
-def check_version(stm: STM) -> bool:
-    ver = stm.query("?VER")
-    if ver is None:
-        logging.error(
-            "No answer to ?VER. The link may be dead, or the board may be on "
-            "USB Port 1 (UART1, download only — the firmware never transmits "
-            "there). See PROTOCOL.md §1."
-        )
-        return False
+def position_and_zero(stm: STM, msg: str) -> bool:
+    """Ask for the robot to be placed, then make that pose heading 0."""
+    pause(msg)
+    return cal_profile.zero_heading(stm)
 
-    logging.info(f"STM: {ver}")
-    fields = ver.split(",")
-    proto = fields[2].strip() if len(fields) >= 3 else ""
 
-    # A FLOOR, not an equality test. This tool needs ?CAL and the !CAL*
-    # setters and nothing else, and those have been there since protocol 2 —
-    # so anything from 2 upwards can be calibrated. The old exact match
-    # rejected a v3 board that supports every single thing used here, which
-    # turned a firmware upgrade into a calibration outage.
+def connect_and_check(stm: STM) -> bool:
     try:
-        proto_num = int(proto)
-    except ValueError:
-        logging.error(
-            f"Could not read a protocol version out of {ver!r} — expected "
-            "VER,<name>,<proto> (PROTOCOL.md §5)."
-        )
+        stm.connect()
+    except Exception as exc:
+        logging.error(f"Could not open the serial port: {exc}. Check SERIAL_PORT "
+                      "in .env; USB Port 2 is the RPi link.")
         return False
-
-    if proto_num < CAL_MIN_PROTOCOL:
-        logging.error(
-            f"Firmware reports protocol {proto_num}, this tool needs at least "
-            f"{CAL_MIN_PROTOCOL}. Calibration read/write does not exist before "
-            f"protocol {CAL_MIN_PROTOCOL} — flash a newer build first."
-        )
+    proto = cal_profile.firmware_protocol(stm)
+    if proto is None:
         return False
-
-    if proto_num > PROTOCOL_VERSION:
-        logging.warning(
-            f"Firmware reports protocol {proto_num}, newer than the "
-            f"{PROTOCOL_VERSION} this client implements. Calibration is "
-            "unaffected — ?CAL and the setters have not changed — but re-read "
-            "PROTOCOL.md before trusting anything else."
-        )
+    if proto < FROZEN_CAL_MIN_PROTOCOL:
+        logging.error(f"Firmware is protocol {proto}; this tool needs "
+                      f"{FROZEN_CAL_MIN_PROTOCOL}. Flash the current build.")
+        return False
+    if not stm.set_learning(False) or not stm.set_profile(cal_profile.ARC_PROFILE):
+        logging.error("Could not put the robot in a known state (!LEARN0, !PROF0).")
+        return False
     return True
 
 
-# ── The run ───────────────────────────────────────────────────────────────────
+def current_values(stm: STM) -> Optional[dict]:
+    back = stm.read_cal_full()
+    if back is None:
+        logging.error("?CAL did not answer.")
+    return back
 
-def run(stm: STM, arcs: int, profile: int, keep_first: bool
-        ) -> Optional[Tuple[dict, List[Tuple[int, int, int]]]]:
-    """Drive the sequence, sampling ?CAL after every arc."""
-    if not check_version(stm):
-        return None
 
-    before = stm.read_cal()
-    if before is None:
-        logging.error("?CAL did not answer — cannot calibrate.")
-        return None
-    logging.info(f"Starting values: decel={before[0]/10:.1f} dps², "
-                 f"lag={before[1]/10:.1f} ms, trim={before[2]} µs")
+def show_values(label: str, v: dict) -> None:
+    logging.info(f"{label}: decel {v['decel_x10']/10:.1f} dps²  "
+                 f"lag {v['lag_ms_x10']/10:.1f} ms  trim {v['trim_us']:+d} µs  "
+                 f"gyro ×{v['gyro_x10000']/10000:.4f}")
 
-    # Known state. RST or a previous run may have left the queue part-drained
-    # and the steering off centre.
-    logging.info("Squaring up: S, !ZERO, !PROF%d", profile)
-    if not send_move(stm, "S"):
-        return None
-    if not stm.zero_odometry():
-        logging.error("!ZERO refused.")
-        return None
-    if not stm.set_profile(profile):
-        logging.error(f"!PROF{profile} refused.")
-        return None
 
-    # The straight feeds the trim learner. It needs ~1.0s of holding, not the
-    # 0.5s it used to — see STRAIGHT_CM.
-    logging.info(f"Straight: F{STRAIGHT_CM} (trim needs ≥1.0s of holding)")
-    if not send_move(stm, f"F{STRAIGHT_CM}"):
-        return None
+# ── Step 1: straightness ─────────────────────────────────────────────────────
 
-    samples: List[Tuple[int, int, int]] = []
-    for i in range(arcs):
-        token = f"{ARC_SEQUENCE[i % len(ARC_SEQUENCE)]}{ARC_DEG}"
-        logging.info(f"Arc {i + 1}/{arcs}: {token}")
+def step_straight(stm: STM, result: dict) -> bool:
+    print("\n  ── STEP 1: STRAIGHT LINE ──────────────────────────────────────")
+    print(f"  Lay a straight tape line of at least {STRAIGHT_CM + 30} cm. Put the")
+    print("  robot on it, centred and pointing along it, and mark the rear axle.")
+    print(f"  Each run drives F{STRAIGHT_CM} with trim learning on, then reverses")
+    print("  back. Measure the sideways offset of the robot's centre from the")
+    print("  line at the far end, and how far it actually went.")
+
+    if not stm.set_learning(True):
+        return False
+
+    drifts: List[float] = []
+    distances: List[float] = []
+    prev_trim = current_values(stm)["trim_us"]
+    converged = False
+
+    try:
+        for run in range(1, STRAIGHT_MAX_RUNS + 1):
+            if not position_and_zero(stm, f"Run {run}: robot on the line at the start mark."):
+                return False
+            if not send_move(stm, f"F{STRAIGHT_CM}"):
+                return False
+
+            trim = current_values(stm)["trim_us"]
+            drift = ask_float("Sideways offset from the line at the end, cm "
+                              "(+ left, - right, Enter to skip):")
+            dist = ask_float(f"Distance actually travelled, cm (Enter to skip):")
+            if drift is not None:
+                drifts.append(drift)
+            if dist is not None:
+                distances.append(dist)
+
+            moved = trim - prev_trim
+            logging.info(f"  run {run}: trim {trim:+d} µs ({moved:+d})"
+                         + (f", drift {drift:+.1f} cm" if drift is not None else ""))
+            prev_trim = trim
+
+            if not send_move(stm, f"R{STRAIGHT_CM}"):
+                return False
+            # The reverse also feeds the trim; read it so the next run's
+            # "moved" compares like with like.
+            prev_trim = current_values(stm)["trim_us"]
+
+            drift_ok = drift is None or abs(drift) <= DRIFT_OK_CM
+            if run >= 2 and abs(moved) <= TRIM_SETTLED_US and drift_ok:
+                converged = True
+                break
+    finally:
+        stm.set_learning(False)
+
+    if not converged:
+        logging.warning("Trim did not settle, or drift stayed over "
+                        f"{DRIFT_OK_CM} cm, within {STRAIGHT_MAX_RUNS} runs.")
+    if drifts and abs(drifts[-1]) > DRIFT_OK_CM and converged is False:
+        logging.warning(
+            "If the trim HAS stopped moving but the drift has not, the trim is "
+            "not the cause: the heading loop holds the gyro heading, so drift "
+            "means the robot launched crooked or the gyro is drifting. Check "
+            "the start alignment and ?IMU before going further.")
+
+    dist_note = None
+    if distances:
+        err_pct = (_mean(distances) - STRAIGHT_CM) / STRAIGHT_CM * 100.0
+        dist_note = round(err_pct, 2)
+        logging.info(f"  distance: mean {_mean(distances):.1f} cm for {STRAIGHT_CM} "
+                     f"commanded ({err_pct:+.1f}%)")
+        if abs(err_pct) > DISTANCE_OK_PCT:
+            logging.warning(
+                f"Distance is {err_pct:+.1f}% off. That is WHEEL_DIAMETER_MM in "
+                "stm/PeripheralDrivers/Inc/odom.h (compile time), not something "
+                f"calibration can fix. Multiply it by {STRAIGHT_CM/_mean(distances):.4f} "
+                "if the tape is right.")
+
+    result["checks"]["straight"] = {
+        "converged": converged,
+        "drift_cm": drifts,
+        "distance_err_pct": dist_note,
+        "trim_us": prev_trim,
+    }
+    return True
+
+
+# ── Step 2: gyro scale ───────────────────────────────────────────────────────
+
+def step_gyro(stm: STM, result: dict) -> bool:
+    print("\n  ── STEP 2: GYRO SCALE ─────────────────────────────────────────")
+    print("  Put the robot's side flush against a straight reference edge (a")
+    print("  tape line or a ruler taped down). Four quarter turns make a full")
+    print("  circle and bring it back beside the edge. Clear about 1 m x 1 m.")
+    print("  Then measure how far it is rotated from the edge:")
+    print("    + if it turned PAST the edge (too far), - if it stopped SHORT.")
+    print("  Degrees, or offset/span in mm along its side, e.g. +6/200.")
+
+    cal = current_values(stm)
+    scale = cal["gyro_x10000"] / 10000.0
+    ratios = []
+
+    for token, count in GYRO_LOOPS:
+        if not position_and_zero(stm, f"Robot flush with the edge for {count} x {token}."):
+            return False
+        for _ in range(count):
+            if not send_move(stm, token):
+                return False
+        hdg = stm.read_heading()
+        if hdg is None:
+            return False
+        gyro_deg = abs(hdg["actual"])
+        seen = ask_angle(f"{token} x{count}: angle from the edge, degrees "
+                         "(+ past, - short):")
+        real_deg = 360.0 * count / 4.0 + seen
+        ratio = real_deg / gyro_deg
+        ratios.append(ratio)
+        logging.info(f"  {token} x{count}: gyro {gyro_deg:.1f}°, floor "
+                     f"{real_deg:.1f}° → gyro reads ×{1/ratio:.4f} of the truth")
+
+    ratio = _mean(ratios)
+    asym = abs(ratios[0] - ratios[1]) / ratio * 100.0 if len(ratios) > 1 else 0.0
+    if asym > GYRO_ASYMMETRY_WARN_PCT:
+        logging.warning(
+            f"Right and left loops disagree by {asym:.2f}%. A gyro scale error "
+            "is the same both ways, so a difference means something else - "
+            "one direction slipping, or the measurement. Re-measure before "
+            "trusting this.")
+
+    new_scale = scale * ratio
+    new_x10000 = int(round(new_scale * 10000))
+    logging.info(f"  gyro scale ×{scale:.4f} → ×{new_scale:.4f}")
+    if not stm.set_cal(gyro_x10000=new_x10000):
+        logging.error("!CALG refused — scale outside 0.90..1.10? That is not a "
+                      "scale error; re-measure.")
+        return False
+
+    result["checks"]["gyro"] = {"ratios": [round(r, 5) for r in ratios],
+                                "asymmetry_pct": round(asym, 3),
+                                "from": scale, "to": round(new_scale, 5)}
+    return True
+
+
+# ── Step 3: brakes ───────────────────────────────────────────────────────────
+
+def run_arcs(stm: STM, seq: List[str], sample_cal: bool):
+    """Drive arcs one line each; return per-arc ?CAL and ?HDG readings."""
+    cal_samples, stop_errs = [], []
+    for i, token in enumerate(seq, 1):
         if not send_move(stm, token):
             return None
-
-        reading = stm.read_cal()
-        if reading is None:
-            logging.error("?CAL did not answer mid-run.")
+        hdg = stm.read_heading()
+        if hdg is None:
             return None
+        stop_errs.append((token, hdg["last_stop_err"]))
+        line = f"  arc {i}/{len(seq)} {token:5s} stopped {hdg['last_stop_err']:+.1f}° from aim"
+        if sample_cal:
+            cal = current_values(stm)
+            if cal is None:
+                return None
+            cal_samples.append(cal)
+            line += (f"   decel {cal['decel_x10']/10:7.1f}  lag "
+                     f"{cal['lag_ms_x10']/10:5.1f} ms")
+        logging.info(line)
+    return cal_samples, stop_errs
 
-        samples.append(reading)
-        logging.info(f"  decel={reading[0]/10:7.1f} dps²  "
-                     f"lag={reading[1]/10:5.1f} ms  trim={reading[2]:+d} µs")
 
-    used = samples if keep_first else samples[1:]
-    if not used:
-        logging.error("No samples left after discarding arc 1 — run more arcs.")
-        return None
+def summarise_stops(stop_errs) -> dict:
+    by_dir = {}
+    for token, err in stop_errs:
+        by_dir.setdefault(token[:2], []).append(err)
+    worst = max(abs(e) for _, e in stop_errs)
+    logging.info("  per direction mean stop error: " + ", ".join(
+        f"{d} {_mean(v):+.2f}°" for d, v in sorted(by_dir.items())))
+    logging.info(f"  worst single arc: {worst:.2f}° (target ≤ {STOP_ERR_OK_DEG}°)")
+    return {"worst_deg": round(worst, 2),
+            "by_direction": {d: round(_mean(v), 2) for d, v in by_dir.items()},
+            "all": [[t, round(e, 2)] for t, e in stop_errs]}
 
-    def summarise(idx: int):
-        vals = [s[idx] for s in used]
-        return _mean(vals), _stdev(vals), min(vals), max(vals)
 
-    d_mean, d_sd, d_lo, d_hi = summarise(0)
-    l_mean, l_sd, l_lo, l_hi = summarise(1)
-    t_mean, t_sd, t_lo, t_hi = summarise(2)
+def step_brakes(stm: STM, result: dict) -> bool:
+    print("\n  ── STEP 3: BRAKES ─────────────────────────────────────────────")
+    print(f"  {len(BRAKE_LEARN_SEQ)} arcs with learning on, then the averages are")
+    print(f"  frozen and {len(BRAKE_CHECK_SEQ)} more arcs show how precisely they stop.")
+    print("  Needs about 1.5 m x 1.5 m clear.")
 
-    result = {
-        "decel_x10": int(round(d_mean)),
-        "lag_ms_x10": int(round(l_mean)),
-        "trim_us": int(round(t_mean)),
-        "spread": {
-            "decel_x10": {"sd": round(d_sd, 1), "min": d_lo, "max": d_hi},
-            "lag_ms_x10": {"sd": round(l_sd, 1), "min": l_lo, "max": l_hi},
-            "trim_us": {"sd": round(t_sd, 1), "min": t_lo, "max": t_hi},
-        },
-        "arcs_driven": arcs,
-        "arcs_averaged": len(used),
-        "arc_profile": profile,
-        "samples": [list(s) for s in samples],
+    if not position_and_zero(stm, "Robot in the middle of the clear area."):
+        return False
+
+    if not stm.set_learning(True):
+        return False
+    try:
+        out = run_arcs(stm, BRAKE_LEARN_SEQ, sample_cal=True)
+    finally:
+        stm.set_learning(False)
+    if out is None:
+        return False
+    samples, _ = out
+
+    # The learner scatters around the answer rather than converging to it
+    # (decel ~3%, lag ~26% spread), so the last reading is just the last
+    # sample. The mean of all of them is the estimate.
+    decel = [s["decel_x10"] for s in samples]
+    lag = [s["lag_ms_x10"] for s in samples]
+    mean_decel, mean_lag = int(round(_mean(decel))), int(round(_mean(lag)))
+    logging.info(f"  decel mean {mean_decel/10:.1f} dps² (sd {_stdev(decel)/10:.1f}), "
+                 f"lag mean {mean_lag/10:.1f} ms (sd {_stdev(lag)/10:.1f}) — freezing")
+    if not stm.set_cal(decel_x10=mean_decel, lag_ms_x10=mean_lag):
+        return False
+
+    out = run_arcs(stm, BRAKE_CHECK_SEQ, sample_cal=False)
+    if out is None:
+        return False
+    check = summarise_stops(out[1])
+
+    result["spread"] = {"decel_x10": {"sd": round(_stdev(decel), 1),
+                                      "min": min(decel), "max": max(decel)},
+                        "lag_ms_x10": {"sd": round(_stdev(lag), 1),
+                                       "min": min(lag), "max": max(lag)}}
+    result["checks"]["brakes"] = check
+    if check["worst_deg"] > STOP_ERR_OK_DEG:
+        logging.warning(
+            f"An arc stopped {check['worst_deg']:.2f}° from its aim with learning "
+            "off. The carry-over corrects it on the next move, but single-turn "
+            "precision is limited by how repeatably the robot stops - check the "
+            "battery and the floor before re-running.")
+    return True
+
+
+# ── Step 4: square ───────────────────────────────────────────────────────────
+
+def step_square(stm: STM, result: dict, side_cm: int = SQUARE_SIDE_CM) -> bool:
+    print("\n  ── STEP 4: SQUARE ─────────────────────────────────────────────")
+    print(f"  F{side_cm} + FR90, four times, learning off. It should come back to")
+    print("  where it started, facing the same way. Mark the rear axle and lay")
+    print("  a reference edge along the robot's side before it goes.")
+    print(f"  Clear about {side_cm + 70} cm x {side_cm + 70} cm, to the right.")
+
+    if not position_and_zero(stm, "Robot at the start mark, side against the edge."):
+        return False
+
+    stops = []
+    for _ in range(4):
+        for token in (f"F{side_cm}", "FR90"):
+            if not send_move(stm, token):
+                return False
+        hdg = stm.read_heading()
+        if hdg is None:
+            return False
+        stops.append(("FR", hdg["last_stop_err"]))
+        logging.info(f"  corner {len(stops)}: stopped {hdg['last_stop_err']:+.1f}° "
+                     f"from aim, heading error now {hdg['error']:+.1f}°")
+
+    final = stm.read_heading()
+    gap = ask_float("Distance between the start mark and where the rear axle "
+                    "ended, cm:", allow_blank=False)
+    angle = ask_angle("Final angle from the reference edge, degrees "
+                      "(or offset/span mm):")
+
+    worst = max(abs(e) for _, e in stops)
+    passed = (worst <= STOP_ERR_OK_DEG and abs(final["error"]) <= SQUARE_HDG_OK_DEG
+              and abs(angle) <= SQUARE_ANGLE_OK_DEG and gap <= SQUARE_GAP_OK_CM)
+
+    logging.info(f"  worst corner {worst:.2f}° (≤{STOP_ERR_OK_DEG}), gyro heading "
+                 f"error {final['error']:+.2f}° (≤{SQUARE_HDG_OK_DEG}), floor angle "
+                 f"{angle:+.2f}° (≤{SQUARE_ANGLE_OK_DEG}), gap {gap:.1f} cm "
+                 f"(≤{SQUARE_GAP_OK_CM}) → {'PASS' if passed else 'FAIL'}")
+    if abs(final["error"]) <= SQUARE_HDG_OK_DEG < abs(angle):
+        logging.warning(
+            "The gyro says square but the floor says not. That is the gyro "
+            "scale - re-run step 2 (calibrate.py guided) rather than the brakes.")
+
+    result["checks"]["square"] = {
+        "side_cm": side_cm, "worst_corner_deg": round(worst, 2),
+        "gyro_heading_err_deg": round(final["error"], 2),
+        "floor_angle_deg": round(angle, 2), "gap_cm": gap, "passed": passed,
+        "when": datetime.now().isoformat(timespec="seconds"),
     }
-    return result, samples
+    result["verified"] = passed
+    return True
 
 
-def health_checks(stm: STM, result: dict) -> List[str]:
-    """
-    The two checks from PROTOCOL.md §7 that stop a converged-looking CAL from
-    covering for a mechanical fault. If either fails the answer is a spanner,
-    not a number — so they are reported loudly rather than folded into the
-    saved profile as if they were just more data.
-    """
-    warnings: List[str] = []
+# ── Profile bookkeeping ──────────────────────────────────────────────────────
 
-    # 1. Trim near zero. SERVO_CENTER_US carries the measured steering centre,
-    #    so trim has nothing left to absorb. One walking away from zero means
-    #    the centre itself moved.
-    trim = result["trim_us"]
-    lo, hi, _, _ = CAL_LIMITS["T"]
-    if abs(trim) > 0.5 * hi:
-        warnings.append(
-            f"Trim is {trim} µs, over half the ±{hi} limit. The steering centre "
-            "itself has probably moved — check the linkage rather than trusting "
-            "this number."
-        )
-    elif abs(trim) > 20:
-        warnings.append(
-            f"Trim is {trim} µs. Not alarming, but it should hover within a few "
-            "µs of zero; worth watching across sessions."
-        )
-
-    # 2. Cross-check on the CLEAN profile. The encoder-derived angle shares no
-    #    hardware with the gyro, so agreement is real evidence. Only meaningful
-    #    on profile 1 — the others scrub the tyres, inflating the encoder arc.
-    logging.info("Cross-check: !PROF1 then one arc")
-    if not stm.set_profile(1):
-        warnings.append("Could not select !PROF1 — cross-check skipped.")
-        return warnings
-    if not send_move(stm, f"FR{ARC_DEG}"):
-        warnings.append("Cross-check arc failed — cross-check skipped.")
-        return warnings
-
-    fields = stm.query_fields("?XCHK")
-    if fields is None or len(fields) < 4:
-        warnings.append("?XCHK did not answer — cross-check skipped.")
-        return warnings
-
-    enc, gyro, err, ok = (int(f) for f in fields[:4])
-    result["xchk"] = {"enc_x10": enc, "gyro_x10": gyro, "err_pct": err, "ok": ok}
-    logging.info(f"  encoder={enc/10:.1f}°  gyro={gyro/10:.1f}°  "
-                 f"err={err}%  ok={ok}")
-
-    # The gyro field is signed (a right turn reads negative); the firmware
-    # compares magnitudes, so opposite signs here are expected, not a fault.
-    overshoot = abs(gyro) / 10.0 - ARC_DEG
-    logging.info(f"  commanded {ARC_DEG}°, body turned {abs(gyro)/10:.1f}° "
-                 f"({overshoot:+.1f}°)")
-
-    if not ok:
-        warnings.append(
-            f"?XCHK FAILED at {err}%. The encoder and the gyro disagree, which "
-            "means one of them is lying. Do not trust this profile — find the "
-            "mechanical cause first."
-        )
-    return warnings
-
-
-# ── Profile store ─────────────────────────────────────────────────────────────
-
-def save(name: str, result: dict, note: str) -> str:
-    os.makedirs(PROFILE_DIR, exist_ok=True)
-    path = os.path.join(PROFILE_DIR, f"{name}.json")
-    result = dict(result)
-    result["name"] = name
-    result["note"] = note
-    result["taken"] = datetime.now().isoformat(timespec="seconds")
-    with open(path, "w", encoding="utf-8") as fh:
-        json.dump(result, fh, indent=2)
-    return path
-
-
-def load(name: str) -> Optional[dict]:
-    path = os.path.join(PROFILE_DIR, f"{name}.json")
-    if not os.path.exists(path):
-        logging.error(f"No profile named {name!r} in {PROFILE_DIR}.")
-        return None
-    with open(path, encoding="utf-8") as fh:
-        return json.load(fh)
-
-
-def restore_commands(p: dict) -> List[str]:
-    return [f"!CALD{p['decel_x10']}", f"!CALL{p['lag_ms_x10']}",
-            f"!CALT{p['trim_us']}"]
+def snapshot(stm: STM, result: dict) -> bool:
+    v = current_values(stm)
+    if v is None:
+        return False
+    for k in ("decel_x10", "lag_ms_x10", "trim_us", "gyro_x10000"):
+        result[k] = v[k]
+    return True
 
 
 def report(p: dict) -> None:
     print()
-    print(f"  profile : {p.get('name')}")
+    print(f"  profile  : {p.get('name')}   ({'VERIFIED' if p.get('verified') else 'not verified'})")
     if p.get("note"):
-        print(f"  note    : {p['note']}")
-    print(f"  taken   : {p.get('taken')}")
-    print(f"  arcs    : {p.get('arcs_averaged')} averaged "
-          f"of {p.get('arcs_driven')} driven")
-    print()
-    sp = p.get("spread", {})
-    print(f"  decel   : {p['decel_x10']/10:8.1f} dps²   "
-          f"(sd {sp.get('decel_x10', {}).get('sd', '?')})")
-    print(f"  lag     : {p['lag_ms_x10']/10:8.1f} ms     "
-          f"(sd {sp.get('lag_ms_x10', {}).get('sd', '?')})")
-    print(f"  trim    : {p['trim_us']:8d} µs     "
-          f"(sd {sp.get('trim_us', {}).get('sd', '?')})")
-    if "xchk" in p:
-        x = p["xchk"]
-        print(f"  xchk    : {x['err_pct']}% "
-              f"{'OK' if x['ok'] else 'FAILED'}")
-    print()
-    print("  Restore with:   python3 calibrate.py restore "
-          f"{p.get('name')}")
-    print("  Or by hand:     " + "  ".join(restore_commands(p)))
+        print(f"  note     : {p['note']}")
+    print(f"  taken    : {p.get('taken')}")
+    print(f"  decel    : {p['decel_x10']/10:8.1f} dps²")
+    print(f"  lag      : {p['lag_ms_x10']/10:8.1f} ms")
+    print(f"  trim     : {p['trim_us']:8d} µs")
+    print(f"  gyro     : ×{cal_profile.values_of(p)[3]/10000:.4f}")
+    sq = p.get("checks", {}).get("square")
+    if sq:
+        print(f"  square   : gap {sq['gap_cm']} cm, floor angle "
+              f"{sq['floor_angle_deg']:+}°, worst corner {sq['worst_corner_deg']}° "
+              f"— {'PASS' if sq['passed'] else 'FAIL'} ({sq['when']})")
     print()
 
 
-# ── Entry point ───────────────────────────────────────────────────────────────
+# ── Entry point ──────────────────────────────────────────────────────────────
 
 def main() -> int:
-    ap = argparse.ArgumentParser(
-        description="Run and store the PROTOCOL.md §7 calibration sequence.")
+    ap = argparse.ArgumentParser(description="Calibrate, check by eye, and save.")
     sub = ap.add_subparsers(dest="cmd")
     sub.required = True
 
-    r = sub.add_parser("run", help="drive the sequence and save a profile")
-    r.add_argument("name", help="profile name, e.g. arena-full-battery")
-    r.add_argument("--note", default="",
-                   help="surface, battery and weight this was taken on")
-    r.add_argument("--arcs", type=int, default=6,
-                   help="arcs to drive (default 6)")
-    r.add_argument("--profile", type=int, default=0, choices=(0, 1, 2),
-                   help="arc profile to calibrate for (default 0 TIGHT)")
-    r.add_argument("--drop-first", action="store_true",
-                   help="exclude arc 1 from the average. It used to be burn-in; "
-                        "the firmware now takes the first arc outright, so it is "
-                        "the one reading with no compiled seed in it")
-    r.add_argument("--no-xchk", action="store_true",
-                   help="skip the cross-check arc")
+    g = sub.add_parser("guided", help="full on-floor calibration, steps 1-4")
+    g.add_argument("name")
+    g.add_argument("--note", default="", help="floor, battery, load")
+    g.add_argument("--from", dest="start_from", default=None,
+                   help="start from this saved profile instead of the robot's values")
+    g.add_argument("--skip", default="",
+                   help="comma list of steps to skip: straight,gyro,brakes,square")
 
-    s = sub.add_parser("restore", help="send a saved profile to the firmware")
-    s.add_argument("name")
+    b = sub.add_parser("brakes", help="re-do braking only, keep trim and gyro")
+    b.add_argument("name")
+    b.add_argument("--note", default=None)
+
+    v = sub.add_parser("verify", help="restore a profile and run the square test")
+    v.add_argument("name")
+    v.add_argument("--side", type=int, default=SQUARE_SIDE_CM)
+
+    sub.add_parser("zero", help="make the current pose heading 0 (after moving "
+                               "the robot by hand). Tasks do this at startup")
+
+    r = sub.add_parser("restore", help="send a saved profile to the robot, frozen")
+    r.add_argument("name")
 
     sub.add_parser("list", help="list saved profiles")
-
-    sh = sub.add_parser("show", help="print a saved profile")
-    sh.add_argument("name")
+    s = sub.add_parser("show", help="print a saved profile")
+    s.add_argument("name")
 
     args = ap.parse_args()
 
     if args.cmd == "list":
-        if not os.path.isdir(PROFILE_DIR):
-            print("No profiles saved yet.")
-            return 0
-        names = sorted(f[:-5] for f in os.listdir(PROFILE_DIR)
-                       if f.endswith(".json"))
+        names = cal_profile.list_profiles()
         if not names:
             print("No profiles saved yet.")
-            return 0
         for n in names:
-            p = load(n)
+            p = cal_profile.load(n)
             if p:
-                print(f"  {n:24s}  decel {p['decel_x10']/10:7.1f}  "
-                      f"lag {p['lag_ms_x10']/10:5.1f}  trim {p['trim_us']:+d}"
+                print(f"  {n:20s} {'✓' if p.get('verified') else ' '} "
+                      f"decel {p['decel_x10']/10:7.1f}  lag {p['lag_ms_x10']/10:5.1f}  "
+                      f"trim {p['trim_us']:+3d}  gyro ×{cal_profile.values_of(p)[3]/10000:.4f}"
                       f"   {p.get('note', '')}")
         return 0
 
     if args.cmd == "show":
-        p = load(args.name)
+        p = cal_profile.load(args.name)
         if p is None:
             return 1
         report(p)
@@ -449,70 +553,102 @@ def main() -> int:
 
     stm = STM()
     try:
-        stm.connect()
-    except Exception as exc:
-        logging.error(f"Could not open the serial port: {exc}")
-        logging.error("Check SERIAL_PORT in .env, and note PROTOCOL.md §1: USB "
-                      "Port 2 is the RPi link. Port 1 is for download only.")
-        return 1
+        if args.cmd == "zero":
+            # Deliberately NOT connect_and_check(): zeroing must not change the
+            # learning switch or the profile as a side effect.
+            try:
+                stm.connect()
+            except Exception as exc:
+                logging.error(f"Could not open the serial port: {exc}")
+                return 1
+            proto = cal_profile.firmware_protocol(stm)
+            if proto is None or proto < FROZEN_CAL_MIN_PROTOCOL:
+                logging.error("Needs protocol 4 firmware (?HDG). Flash the current build.")
+                return 1
+            before = stm.read_heading()
+            if before is not None:
+                logging.info(f"Before: commanded {before['commanded']:+.1f}°, "
+                             f"actual {before['actual']:+.1f}°, "
+                             f"error {before['error']:+.1f}°")
+            return 0 if cal_profile.zero_heading(stm) else 1
 
-    try:
+        if not connect_and_check(stm):
+            return 1
+
         if args.cmd == "restore":
-            p = load(args.name)
-            if p is None:
+            p = cal_profile.load(args.name)
+            if p is None or not cal_profile.push(stm, p):
                 return 1
-            if not check_version(stm):
-                return 1
-            logging.info(f"Restoring {args.name!r}: "
-                         f"{' '.join(restore_commands(p))}")
-            # set_cal() sends each value on its own line and retries a RESEND
-            # that means BUSY. It must not run while a move is outstanding.
-            if not stm.set_cal(decel_x10=p["decel_x10"],
-                               lag_ms_x10=p["lag_ms_x10"],
-                               trim_us=p["trim_us"]):
-                logging.error("Restore failed — see above.")
-                return 1
-            # Read back rather than trusting three OKs. An OK says the command
-            # was accepted, not that the value is what you meant.
-            back = stm.read_cal()
-            if back != (p["decel_x10"], p["lag_ms_x10"], p["trim_us"]):
-                logging.error(f"Read-back mismatch: firmware holds {back}, "
-                              f"expected {(p['decel_x10'], p['lag_ms_x10'], p['trim_us'])}.")
-                return 1
-            logging.info(f"Restored and verified: CAL,{back[0]},{back[1]},{back[2]}")
+            logging.info(f"Restored {args.name!r}, learning off.")
             return 0
 
-        print()
-        print(f"  About to drive {args.arcs} arcs plus a "
-              f"{STRAIGHT_CM}cm straight.")
-        print("  Clear roughly 1.5m x 1m of floor. Ctrl-C aborts (sends RST).")
-        print()
-        input("  Enter to start, Ctrl-C to cancel... ")
+        if args.cmd == "verify":
+            p = cal_profile.load(args.name)
+            if p is None or not cal_profile.push(stm, p):
+                return 1
+            p.setdefault("checks", {})
+            if not step_square(stm, p, side_cm=args.side):
+                return 1
+            cal_profile.save(args.name, p)
+            report(p)
+            return 0 if p["verified"] else 1
 
-        out = run(stm, args.arcs, args.profile, keep_first=not args.drop_first)
-        if out is None:
+        if args.cmd == "brakes":
+            p = cal_profile.load(args.name)
+            if p is None or not cal_profile.push(stm, p):
+                return 1
+            p.setdefault("checks", {})
+            if args.note is not None:
+                p["note"] = args.note
+            if not step_brakes(stm, p) or not snapshot(stm, p):
+                return 1
+            p["verified"] = False
+            p["taken"] = datetime.now().isoformat(timespec="seconds")
+            cal_profile.save(args.name, p)
+            logging.info("Braking re-done. Run `calibrate.py verify "
+                         f"{args.name}` before relying on it.")
+            report(p)
+            return 0
+
+        # guided
+        skip = {x.strip() for x in args.skip.split(",") if x.strip()}
+        result = {"note": args.note, "checks": {}, "verified": False,
+                  "taken": datetime.now().isoformat(timespec="seconds")}
+        if args.start_from:
+            start = cal_profile.load(args.start_from)
+            if start is None or not cal_profile.push(stm, start):
+                return 1
+        show_values("Starting from", current_values(stm))
+
+        for name, step in (("straight", step_straight), ("gyro", step_gyro),
+                           ("brakes", step_brakes)):
+            if name in skip:
+                logging.info(f"Skipping step {name}.")
+                continue
+            if not step(stm, result):
+                return 1
+
+        if not snapshot(stm, result):
             return 1
-        result, _ = out
+        path = cal_profile.save(args.name, result)
+        logging.info(f"Saved to {path} (not yet verified).")
 
-        warnings = [] if args.no_xchk else health_checks(stm, result)
+        if "square" not in skip:
+            if not step_square(stm, result):
+                return 1
+            cal_profile.save(args.name, result)
 
-        path = save(args.name, result, args.note)
         result["name"] = args.name
-        logging.info(f"Saved to {path}")
         report(result)
-
-        if warnings:
-            print("  WARNINGS — calibration must never hide a fault:")
-            for w in warnings:
-                print(f"    * {w}")
-            print()
-            return 1
-        return 0
+        print(f"  Use it: set CAL_PROFILE={args.name} in .env. Tasks restore it,")
+        print("  freeze learning and zero the heading at startup.\n")
+        return 0 if result.get("verified") else 1
 
     except KeyboardInterrupt:
         print()
-        logging.warning("Aborting — sending RST.")
+        logging.warning("Aborting — RST, learning off.")
         stm.abort()
+        stm.set_learning(False)
         return 130
     finally:
         stm.disconnect()

@@ -8,7 +8,14 @@ Queries, config and the `FAIL,*` replies are implemented in firmware but have
 and the `FAIL,*` rows of §3 as a proposal until that happens — the firmware can
 change if the RPi side wants different names or fields.
 
-**Protocol version: 3** — ask for it with `?VER`.
+**Protocol version: 4** — ask for it with `?VER`.
+
+Version 4 freezes calibration during tasks (§7.1): learning is **off at
+power-on** and runs only after `!LEARN1`; `!CALG` sets a gyro scale; heading
+error now carries from one move into the next and `?HDG` reports it; `!PROF`
+accepts only `0` (the robot is locked to TIGHT). `?CAL` gains two appended
+fields. Movement tokens are unchanged, but a sender that relied on the robot
+learning during a run must now ask for it.
 
 Version 3 adds `FU<n>` (§4.1) and the `FAIL,NOECHO` reply. Movement is purely
 additive; a sender that treats an unrecognised reply as fatal must learn
@@ -230,14 +237,18 @@ arc. Reads all zeros when the check did not run.
 | Send | Effect | Reply |
 |---|---|---|
 | `!PROF0` | Arc profile **TIGHT** — radius 291 mm, fastest | `OK` |
-| `!PROF1` | Arc profile **CLEAN** — radius 318 mm, no tyre scrub, cross-check valid | `OK` |
-| `!PROF2` | Arc profile **SLOW** — radius 306 mm, gentlest | `OK` |
-| `!ZERO` | Zero the odometry and heading | `OK` |
+| `!PROF1` | Arc profile CLEAN — radius 318 mm. **Locked out (v4)** | `RESEND` |
+| `!PROF2` | Arc profile SLOW — radius 306 mm. **Locked out (v4)** | `RESEND` |
+| `!ZERO` | Zero the odometry and heading, **and the heading carry-over** (§7.1) | `OK` |
+| `!LEARN1` / `!LEARN0` | Switch the calibration learners on / off (§7.1) | `OK` |
 
-Profile persists until changed or reset. Default is **TIGHT**.
+**Protocol 4 is locked to TIGHT** (`MOTION_PROFILE_LOCK_TIGHT` in `motion.h`).
+The planner radius, the A5 orbit and the saved calibration all assume it, and
+the braking model is one set of numbers that only fits the profile it was
+measured on. Turning the lock off restores CLEAN and SLOW.
 
-Pick **CLEAN** when the planner needs the robot to finish where it predicted —
-it traces a truer circle. Pick **TIGHT** when floor space is the constraint.
+**Send `!ZERO` after anything moves the robot by hand.** The gyro sees the
+rotation, and without a zero the next move would steer it straight back.
 
 ---
 
@@ -336,6 +347,48 @@ the gyro. Run one `!PROF1` arc at the end of the sequence and check it.
 > **Calibration must never be able to hide a fault.** Both checks exist so a
 > converged-looking `CAL` reply cannot cover for a linkage that has come
 > loose. If either fails, the answer is a spanner, not a number.
+
+> **v4 note on `?XCHK`:** the cross-check only runs on a profile with no
+> differential boost, and TIGHT has 2.0, so on a TIGHT-locked robot it reports
+> 0. The gyro is checked against the floor instead — §7.1, step 2.
+
+### 7.1 Frozen calibration and heading carry-over (protocol 4)
+
+**Learning is off at power-on.** The arc decel/lag learner and the trim
+learner run only between `!LEARN1` and `!LEARN0` (and during the OLED CALIB
+cycle, which switches it on for itself). During a task the robot drives on
+exactly what was restored — nothing a task does can change it.
+
+| Send | Effect | Reply |
+|---|---|---|
+| `!CALG<n>` | Gyro scale, **×10000**, 9000..11000 (0.90..1.10). Same busy/range rules as §7 | `OK` / `RESEND` |
+| `?CAL` | now `CAL,<decel_x10>,<lag_ms_x10>,<trim_us>,<gyro_x10000>,<learn>` | |
+| `?HDG` | `HDG,<commanded_x10>,<actual_x10>,<last_aim_x10>,<last_turned_x10>,<capped>` | |
+
+**The gyro scale** corrects the datasheet sensitivity (32.8 LSB/dps is
+nominal). A scale error is invisible to the robot — the arc termination, the
+braking model and `?TURN` all read the same gyro — so it can only be measured
+against the floor. `calibrate.py guided` does that with two full circles.
+
+**Heading carry-over.** The firmware keeps two totals that survive between
+moves: *commanded* (every arc angle asked for since `!ZERO`) and *actual*
+(everything the gyro measured). Each move aims at the commanded total:
+
+    arc       turns  asked + (commanded - actual)
+    straight  holds  (commanded - actual)
+
+So an `FR90` that stopped at 89.5° is followed by one that turns 90.5°, and a
+straight after it steers the half degree out. Error never builds up past one
+move's worth. The correction is capped at **5°**; beyond that it is a bump or
+a slip, not braking error, and `?HDG`'s last field counts every capped move.
+`RST` and a `FAIL,*` move reset commanded to actual.
+
+From `?HDG`: `commanded - actual` is the error the next move will correct;
+`last_turned - last_aim` is how precisely the last arc stopped.
+
+**Task startup** (`communications/cal_profile.py: prepare_for_task`):
+`!LEARN0`, `!PROF0`, restore the four values from the named profile and read
+them back, then `!ZERO` at the start pose.
 
 ---
 

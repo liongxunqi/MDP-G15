@@ -12,22 +12,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 os.environ["A5_STANDOFF_CM"] = "45"
 os.environ["A5_ORBIT_INSET_CM"] = "20"
 os.environ["A5_CAPTURE_SETTLE_S"] = "2.0"
-os.environ["A5_ARC_PROFILE"] = "1"
+os.environ.pop("A5_ARC_PROFILE", None)
 os.environ["A5_REAR_AXLE_TO_SENSOR_CM"] = "23"
 os.environ["A5_ORBIT_ADVANCE_CORRECTION_CM"] = "10"
 os.environ["A5_ORBIT_CLEARANCE_CM"] = "15"
 os.environ["A5_ORBIT_FR_DEG"] = "90"
 os.environ["A5_ORBIT_FL_DEG"] = "90"
-os.environ["A5_ORBIT_FR_COMMAND_OFFSET_DEG"] = "0"
-os.environ["A5_ORBIT_FL_COMMAND_OFFSET_DEG"] = "0"
-os.environ["A5_ORBIT_RR_COMMAND_OFFSET_DEG"] = "0"
-os.environ["A5_ORBIT_RL_COMMAND_OFFSET_DEG"] = "0"
-os.environ["A5_ORBIT_HEADING_TOLERANCE_DEG"] = "2"
-os.environ["A5_ORBIT_MAX_CORRECTION_DEG"] = "10"
-os.environ["A5_ORBIT_MIN_CORRECTION_DEG"] = "5"
-os.environ["A5_ORBIT_MAX_CORRECTIONS"] = "1"
-os.environ["A5_ORBIT_CORRECTION_COAST_DEG"] = "3.5"
-os.environ["A5_ORBIT"] = "R6,FR90,F15,FL90,F5,FL90,R6"
+os.environ["A5_ORBIT_HEADING_WARN_DEG"] = "1.0"
+os.environ["A5_ORBIT"] = "R6,FR90,F15,FL90,F13,FL90,R9"
 
 if "dotenv" not in sys.modules:
     dotenv = types.ModuleType("dotenv")
@@ -84,15 +76,15 @@ class A5ConfigurationTests(unittest.TestCase):
         task.dry_run = False
         return task
 
-    def test_a5_uses_clean_profile(self):
-        self.assertEqual(ARC_PROFILE, 1)
+    def test_a5_uses_tight_profile(self):
+        self.assertEqual(ARC_PROFILE, 0)
 
-    def test_profile_one_orbit_matches_45cm_standoff(self):
+    def test_tight_orbit_matches_45cm_standoff(self):
         self.assertEqual(STANDOFF_CM, 45)
         self.assertEqual(ORBIT_INSET_CM, 20)
         self.assertEqual(ORBIT_GEOMETRY_STANDOFF_CM, 25)
-        self.assertEqual(DERIVED_ORBIT_LINE, "R20,FR90,F15,FL90,R12,FL90,R6")
-        self.assertEqual(ORBIT_LINE, "R6,FR90,F15,FL90,F5,FL90,R6")
+        self.assertEqual(DERIVED_ORBIT_LINE, "R20,FR90,F15,FL90,R4,FL90,R9")
+        self.assertEqual(ORBIT_LINE, "R6,FR90,F15,FL90,F13,FL90,R9")
         ok, reason = validate_line(ORBIT_LINE.split(","))
         self.assertTrue(ok, reason)
 
@@ -133,80 +125,51 @@ class A5ConfigurationTests(unittest.TestCase):
         with mock.patch("task_a5.sleep"):
             self.assertIsNone(task.look(1))
 
-    def run_orbit(self, turns):
+    def run_orbit(self, heading_error):
         task = self.bare_task()
         sent = []
-        replies = iter([[str(turn)] for turn in turns])
         task._send = lambda line: sent.append(line) or True
-        task.stm = mock.Mock()
-        task.stm.query_fields.side_effect = lambda command: next(replies)
+        task.heading_log = mock.Mock()
+        task.heading_log.record.return_value = {"error": heading_error}
         task._stand_off = mock.Mock(return_value=True)
 
         with mock.patch("task_a5.sleep"):
             completed = task.orbit(1)
         return completed, task, sent
 
-    def test_exact_segment_needs_no_correction(self):
-        completed, task, sent = self.run_orbit([-900, 900, 900])
+    def test_orbit_sends_route_then_restores_standoff(self):
+        completed, task, sent = self.run_orbit(0.2)
 
         self.assertTrue(completed)
         self.assertEqual(
             sent,
-            ["R6", "FR90", "F15", "FL90", "F5", "FL90", "R6", "R20"],
+            ["R6", "FR90", "F15", "FL90", "F13", "FL90", "R9", "R20"],
         )
         task._stand_off.assert_called_once_with(45, max_approach_cm=95)
 
-    def test_correction_occurs_only_after_complete_segment(self):
-        # Raw segment: -92.2 + 85.8 + 87.9 = 81.5 degrees. One executable
-        # final arc corrects it; no correction is interleaved into the route.
-        completed, task, sent = self.run_orbit([-922, 858, 879, 85])
+    def test_orbit_never_injects_a_correction_arc(self):
+        # The firmware carries heading error into the next move itself. A
+        # large residual is logged and warned about, never "fixed" with an
+        # extra arc from here.
+        with self.assertLogs(level="WARNING") as logs:
+            completed, task, sent = self.run_orbit(-3.0)
 
         self.assertTrue(completed)
-        raw_segment = ["R6", "FR90", "F15", "FL90", "F5", "FL90", "R6"]
-        self.assertEqual(sent[:len(raw_segment)], raw_segment)
-        self.assertEqual(sent[len(raw_segment):], ["FL5", "R20"])
-        task._stand_off.assert_called_once()
+        self.assertEqual(sent[-1], "R20")
+        self.assertFalse(any(t[:2] in ("FL", "FR", "RL", "RR") for t in sent[7:]))
+        self.assertTrue(any("off after orbit" in m for m in logs.output))
+        task.heading_log.record.assert_called_once_with("orbit after face 1")
 
-    def test_arc_signs_cover_forward_and_reverse(self):
-        self.assertEqual(TaskA5._arc_heading("FR90"), -90.0)
-        self.assertEqual(TaskA5._arc_heading("FL90"), 90.0)
-        self.assertEqual(TaskA5._arc_heading("RR90"), 90.0)
-        self.assertEqual(TaskA5._arc_heading("RL90"), -90.0)
-
-    def test_angle_error_never_halts_after_correction_limit(self):
+    def test_dry_run_orbit_does_not_query_heading(self):
         task = self.bare_task()
-        sent = []
-        turns = iter([["-20"]])
-        task._send = lambda line: sent.append(line) or True
-        task.stm = mock.Mock()
-        task.stm.query_fields.side_effect = lambda command: next(turns)
+        task.dry_run = True
+        task.heading_log = mock.Mock()
+        task._send = lambda line: True
+        task._stand_off = mock.Mock(return_value=True)
 
-        final_heading = task._correct_segment_heading(-90.0, -20.0)
-
-        self.assertEqual(final_heading, -22.0)
-        self.assertEqual(sent, ["FR10"])
-
-    def test_latest_floor_turns_are_summed_with_their_signs(self):
-        completed, task, sent = self.run_orbit([-924, 906, 864, 54])
-
-        self.assertTrue(completed)
-        raw_segment = ["R6", "FR90", "F15", "FL90", "F5", "FL90", "R6"]
-        self.assertEqual(sent[:len(raw_segment)], raw_segment)
-        self.assertEqual(sent[len(raw_segment):], ["FL5", "R20"])
-        task._stand_off.assert_called_once()
-
-    def test_three_degree_error_uses_moving_arc_not_fl2(self):
-        task = self.bare_task()
-        sent = []
-        task._send = lambda line: sent.append(line) or True
-        task.stm = mock.Mock()
-        task.stm.query_fields.return_value = ["50"]
-
-        final_heading = task._correct_segment_heading(90.0, 87.0)
-
-        self.assertEqual(final_heading, 92.0)
-        self.assertEqual(sent, ["FL5"])
-
+        with mock.patch("task_a5.sleep"):
+            self.assertTrue(task.orbit(1))
+        task.heading_log.record.assert_not_called()
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

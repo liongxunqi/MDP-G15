@@ -166,7 +166,16 @@ typedef enum
      * tests, because this one IS queued and DOES move the robot. Appended
      * after CMD_SET_CAL_TRIM for exactly that reason - do not "tidy" it into
      * the block above. */
-    CMD_FWD_UNTIL_US    /* FU{n}  arg = cm, the gap to stop at     */
+    CMD_FWD_UNTIL_US,   /* FU{n}  arg = cm, the gap to stop at     */
+
+    /* --- Frozen calibration and heading carry-over, protocol 4 -----------
+     *
+     * IMMEDIATE again, but they cannot join the block above without moving
+     * FU into it, so Cmd_IsImmediate() tests this as a second range. Keep
+     * CMD_Q_HDG first and CMD_SET_CAL_GYRO last, or move the endpoints. */
+    CMD_Q_HDG,          /* ?HDG   commanded/actual heading, last arc */
+    CMD_SET_LEARN,      /* !LEARNn arg = 0 off, 1 on               */
+    CMD_SET_CAL_GYRO    /* !CALGn gyro scale x10000 (9000..11000)  */
 } CmdOpcode_t;
 
 /* Bumped whenever the wire format changes in a way a sender must care about.
@@ -177,7 +186,12 @@ typedef enum
  * 3: added FU{n} and the FAIL,NOECHO reply. Additive for movement, but a
  * sender that treats an unrecognised reply as fatal must learn NOECHO before
  * it sends its first FU. */
-#define CMD_PROTOCOL_VERSION    3
+/* 4: added ?HDG, !LEARN0/1, !CALG, extra ?CAL fields, heading carry-over,
+ * learning OFF at power-on, and !PROF refusing anything but 0 (TIGHT lock).
+ * The extra ?CAL fields are appended, so a protocol 2/3 reader that takes the
+ * first three still works. A sender relying on the robot to keep learning
+ * during a run must now send !LEARN1 itself. */
+#define CMD_PROTOCOL_VERSION    4
 #define CMD_FIRMWARE_NAME       "MDPG15-STM32"
 
 /* Replies for a primitive that did not complete. Previously a timed-out move

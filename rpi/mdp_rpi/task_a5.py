@@ -31,6 +31,7 @@ from communications.stm import (
     US_BIAS_CM,
     STM,
 )
+from communications import cal_profile
 from image_capture.camera import Camera
 
 logging.basicConfig(
@@ -48,7 +49,8 @@ ORBIT_INSET_CM = int(os.getenv("A5_ORBIT_INSET_CM", "20"))
 CAPTURE_SETTLE_S = float(os.getenv("A5_CAPTURE_SETTLE_S", "2.0"))
 MAX_APPROACH_CM = int(os.getenv("A5_MAX_APPROACH_CM", "150"))
 MAX_FACES = int(os.getenv("A5_MAX_FACES", "4"))
-ARC_PROFILE = int(os.getenv("A5_ARC_PROFILE", "1"))
+# TIGHT only - the firmware is locked to it and the calibration is taken on it.
+ARC_PROFILE = int(os.getenv("A5_ARC_PROFILE", str(cal_profile.ARC_PROFILE)))
 OBSTACLE_SIZE_CM = float(os.getenv("A5_OBSTACLE_SIZE_CM", "10"))
 ORBIT_BACKUP_CM = int(os.getenv("A5_ORBIT_BACKUP_CM", "20"))
 REAR_AXLE_TO_SENSOR_CM = float(os.getenv("A5_REAR_AXLE_TO_SENSOR_CM", "23"))
@@ -69,34 +71,22 @@ PC_TIMEOUT_S = float(os.getenv("A5_PC_TIMEOUT_S", "30.0"))
 POST_ORBIT_MAX_APPROACH_CM = int(os.getenv("A5_POST_ORBIT_MAX_APPROACH_CM",
                                             str(STANDOFF_CM + 50)))
 
-# Profile 1 CLEAN has a measured 31.8cm radius. A5 requests the real geometric
-# angle, then uses ?TURN to verify and correct the completed heading.
-CLEAN_RADIUS_CM = 31.8
+# Profile 0 TIGHT has a measured 29.1 cm radius (floor chord, motion.c).
+#
+# Heading is no longer corrected here. The firmware carries each move's
+# heading error into the next one (protocol 4), so an FL90 that stopped at
+# 89.5 is made good by the moves after it, including the R and FU that end
+# every orbit. The old Pi-side fix - sum ?TURN, then one 5-10 degree
+# correction arc - could only ever get within 2 degrees, because a turn under
+# 5 degrees does not move the chassis. ?HDG is still read after every orbit
+# and a residual above this is logged loudly, so a bad floor is visible.
+TIGHT_RADIUS_CM = 29.1
 ORBIT_FR_DEG = int(os.getenv("A5_ORBIT_FR_DEG", "90"))
 ORBIT_FL_DEG = int(os.getenv("A5_ORBIT_FL_DEG", "90"))
-ORBIT_FR_COMMAND_OFFSET_DEG = int(
-    os.getenv("A5_ORBIT_FR_COMMAND_OFFSET_DEG", "0")
-)
-ORBIT_FL_COMMAND_OFFSET_DEG = int(
-    os.getenv("A5_ORBIT_FL_COMMAND_OFFSET_DEG", "0")
-)
-ORBIT_RR_COMMAND_OFFSET_DEG = int(
-    os.getenv("A5_ORBIT_RR_COMMAND_OFFSET_DEG", "0")
-)
-ORBIT_RL_COMMAND_OFFSET_DEG = int(
-    os.getenv("A5_ORBIT_RL_COMMAND_OFFSET_DEG", "0")
-)
-ORBIT_HEADING_TOLERANCE_DEG = float(
-    os.getenv("A5_ORBIT_HEADING_TOLERANCE_DEG", "2")
-)
-ORBIT_MAX_CORRECTION_DEG = int(os.getenv("A5_ORBIT_MAX_CORRECTION_DEG", "10"))
-ORBIT_MIN_CORRECTION_DEG = int(os.getenv("A5_ORBIT_MIN_CORRECTION_DEG", "5"))
-ORBIT_MAX_CORRECTIONS = int(os.getenv("A5_ORBIT_MAX_CORRECTIONS", "1"))
-ORBIT_CORRECTION_COAST_DEG = float(
-    os.getenv("A5_ORBIT_CORRECTION_COAST_DEG", "3.5")
-)
-if ARC_PROFILE != 1:
-    raise ValueError("Task A5 is configured only for arc profile 1 CLEAN.")
+ORBIT_HEADING_WARN_DEG = float(os.getenv("A5_ORBIT_HEADING_WARN_DEG", "1.0"))
+if ARC_PROFILE != cal_profile.ARC_PROFILE:
+    raise ValueError("Task A5 runs on arc profile 0 TIGHT only - the firmware "
+                     "is locked to it. Remove A5_ARC_PROFILE from .env.")
 if not (0 < ORBIT_INSET_CM < STANDOFF_CM):
     raise ValueError(
         "A5_ORBIT_INSET_CM must be positive and smaller than A5_STANDOFF_CM."
@@ -105,7 +95,7 @@ if not (0 < ORBIT_INSET_CM < STANDOFF_CM):
 ORBIT_GEOMETRY_STANDOFF_CM = STANDOFF_CM - ORBIT_INSET_CM
 
 
-def _profile_one_orbit() -> str:
+def _tight_orbit() -> str:
     # FU measures from the front ultrasonic sensor, while arc displacement is
     # measured at the driven rear axle. Include that longitudinal offset when
     # placing the axle around the next face.
@@ -118,7 +108,7 @@ def _profile_one_orbit() -> str:
     # Subtracting that measured shortfall from the middle reverse advances the
     # chassis around the obstacle without changing its radial standoff.
     middle_reverse_cm = round(
-        3.0 * CLEAN_RADIUS_CM
+        3.0 * TIGHT_RADIUS_CM
         - radial_cm
         - ORBIT_BACKUP_CM
         - ORBIT_ADVANCE_CORRECTION_CM
@@ -127,7 +117,7 @@ def _profile_one_orbit() -> str:
     # shortened by the same amount, so this adds chassis clearance around the
     # obstacle without changing the final camera standoff.
     outward_reverse_cm = round(
-        radial_cm - CLEAN_RADIUS_CM - ORBIT_CLEARANCE_CM
+        radial_cm - TIGHT_RADIUS_CM - ORBIT_CLEARANCE_CM
     )
     if outward_reverse_cm <= 0:
         raise ValueError("Task A5 orbit geometry produced a non-positive outward reverse.")
@@ -152,10 +142,10 @@ def _profile_one_orbit() -> str:
     return ",".join(tokens)
 
 
-DERIVED_ORBIT_LINE = _profile_one_orbit()
+DERIVED_ORBIT_LINE = _tight_orbit()
 ORBIT_LINE = os.getenv("A5_ORBIT", "").strip() or DERIVED_ORBIT_LINE
 if ORBIT_LINE != DERIVED_ORBIT_LINE:
-    logging.warning("A5_ORBIT overrides profile-1 geometry: derived %s, using %s.",
+    logging.warning("A5_ORBIT overrides TIGHT geometry: derived %s, using %s.",
                     DERIVED_ORBIT_LINE, ORBIT_LINE)
 
 
@@ -166,6 +156,7 @@ class TaskA5:
         self.camera = None
         self.dry_run = dry_run
         self.max_faces = max_faces
+        self.heading_log = None
 
     def _send(self, line: str) -> bool:
         if self.dry_run:
@@ -290,29 +281,14 @@ class TaskA5:
     def orbit(self, face: int) -> bool:
         logging.info(f"── Face {face} was not it — going around ──")
 
-        # Run the geometric segment without injecting corrections between its
-        # primitives. ?TURN is relative to one arc, so add the signed results
-        # and correct the net heading once the complete segment has landed.
-        expected_heading = 0.0
-        actual_heading = 0.0
+        # One primitive per line so each arc gets its own reply and a FAIL is
+        # pinned to the move that caused it. The firmware corrects heading
+        # from move to move by itself; nothing is injected here.
         for token in ORBIT_LINE.split(","):
             token = token.strip()
-            if not token:
-                continue
-            if token.startswith(("FR", "FL", "RR", "RL")):
-                measured = self._send_measured_arc(token)
-                if measured is None:
-                    return False
-                expected_heading += self._arc_heading(token)
-                actual_heading += measured
-            elif not self._send(token):
+            if token and not self._send(token):
                 return False
-
-        corrected_heading = self._correct_segment_heading(
-            expected_heading, actual_heading
-        )
-        if corrected_heading is None:
-            return False
+        self._log_heading(f"orbit after face {face}")
 
         # The compact orbit lands at its smaller sensor radius. Back away by
         # the difference, then let FU trim forward odometry error at the next
@@ -323,111 +299,17 @@ class TaskA5:
         sleep(0.3)
         return self._stand_off(STANDOFF_CM, max_approach_cm=POST_ORBIT_MAX_APPROACH_CM)
 
-    def _read_turn(self, token: str):
-        fields = self.stm.query_fields("?TURN")
-        if not fields:
-            logging.error("No ?TURN reading after %s.", token)
-            return None
-        try:
-            return int(fields[0]) / 10.0
-        except ValueError:
-            logging.error("Invalid ?TURN reading after %s: %s", token, fields)
-            return None
-
-    @staticmethod
-    def _arc_heading(token: str) -> float:
-        heading_sign = {"FR": -1.0, "FL": 1.0, "RR": 1.0, "RL": -1.0}
-        return float(token[2:]) * heading_sign[token[:2]]
-
-    def _send_measured_arc(self, token: str):
-        arc_type = token[:2]
-        requested_deg = float(token[2:])
-        command_offsets = {
-            "FR": ORBIT_FR_COMMAND_OFFSET_DEG,
-            "FL": ORBIT_FL_COMMAND_OFFSET_DEG,
-            "RR": ORBIT_RR_COMMAND_OFFSET_DEG,
-            "RL": ORBIT_RL_COMMAND_OFFSET_DEG,
-        }
-        if arc_type not in command_offsets:
-            logging.error("Unsupported A5 arc token: %s.", token)
-            return None
-
-        command_offset = command_offsets[arc_type]
-        command_deg = int(round(requested_deg + command_offset))
-        if command_deg <= 0:
-            logging.error("A5 arc compensation produced invalid command for %s.", token)
-            return None
-        command = arc_type + str(command_deg)
-        if command != token:
-            logging.info("A5 turn compensation: %s target uses %s command.",
-                         token, command)
-        if not self._send(command):
-            return None
-        if self.dry_run:
-            return self._arc_heading(token)
-
-        measured_deg = self._read_turn(command)
-        if measured_deg is None:
-            return None
-        logging.info("Orbit %s measured %+.1f°.", command, measured_deg)
-        return measured_deg
-
-    def _correct_segment_heading(
-        self, expected_heading: float, actual_heading: float
-    ):
-        logging.info(
-            "Orbit segment complete: heading %+.1f° "
-            "(target %+.1f°, error %+.1f°).",
-            actual_heading, expected_heading, expected_heading - actual_heading,
-        )
-        for attempt in range(1, ORBIT_MAX_CORRECTIONS + 1):
-            error_deg = expected_heading - actual_heading
-            if abs(error_deg) <= ORBIT_HEADING_TOLERANCE_DEG + 1e-6:
-                return actual_heading
-
-            # Final correction only. This chassis cannot pivot in place, so a
-            # short forward arc is the least disruptive available adjustment.
-            correction_deg = max(
-                ORBIT_MIN_CORRECTION_DEG,
-                int(round(abs(error_deg) - ORBIT_CORRECTION_COAST_DEG)),
-            )
-            correction_deg = min(correction_deg, ORBIT_MAX_CORRECTION_DEG)
-            correction_type = "FL" if error_deg > 0.0 else "FR"
-            correction = correction_type + str(correction_deg)
+    def _log_heading(self, label: str) -> None:
+        """Record ?HDG; warn if the heading is further off than it should be."""
+        if self.dry_run or self.heading_log is None:
+            return
+        hdg = self.heading_log.record(label)
+        if hdg is not None and abs(hdg["error"]) > ORBIT_HEADING_WARN_DEG:
             logging.warning(
-                "Final segment correction %d/%d: %s.",
-                attempt, ORBIT_MAX_CORRECTIONS, correction,
-            )
-            if not self._send(correction):
-                return None
-
-            corrected_deg = self._read_turn(correction)
-            if corrected_deg is None:
-                return None
-            previous_error = abs(error_deg)
-            actual_heading += corrected_deg
-            residual_deg = expected_heading - actual_heading
-            logging.info(
-                "Final heading after %s: %+.1f° "
-                "(target %+.1f°, residual %+.1f°).",
-                correction, actual_heading, expected_heading, residual_deg,
-            )
-            if abs(residual_deg) >= previous_error:
-                logging.warning(
-                    "%s did not improve the heading; avoiding correction oscillation.",
-                    correction,
-                )
-                break
-
-        residual_deg = expected_heading - actual_heading
-        if abs(residual_deg) <= ORBIT_HEADING_TOLERANCE_DEG + 1e-6:
-            return actual_heading
-        logging.warning(
-            "Heading remains %+.1f° from target after %d corrections; "
-            "continuing as configured.",
-            residual_deg, ORBIT_MAX_CORRECTIONS,
-        )
-        return actual_heading
+                f"Heading is {hdg['error']:+.1f}° off after {label} (warn at "
+                f"{ORBIT_HEADING_WARN_DEG}°). The next moves will steer it out, "
+                "but an error this size means the calibration does not match "
+                "this floor — run calibrate.py verify.")
 
     def _check_protocol(self) -> bool:
         fields = self.stm.query_fields("?VER")
@@ -466,14 +348,13 @@ class TaskA5:
                 self.stm.disconnect()
                 return 2
 
-            # Select the profile used to derive ORBIT_LINE rather than trusting
-            # whichever profile a previous process left active.
-            if not self.stm.set_profile(ARC_PROFILE):
-                logging.error(f"Could not set arc profile to {ARC_PROFILE} — refusing "
-                              "to run ORBIT_LINE against an unknown radius.")
+            # Learning off, TIGHT, the CAL_PROFILE from .env restored and read
+            # back, and this pose zeroed as heading 0 for the carry-over.
+            if not cal_profile.prepare_for_task(self.stm):
+                logging.error("STM startup failed — not running A5.")
                 self.stm.disconnect()
                 return 2
-            logging.info(f"STM arc profile set to {ARC_PROFILE} for A5.")
+            self.heading_log = cal_profile.HeadingLog(self.stm, "task_a5")
             logging.info(
                 "A5 compact orbit (equivalent %d cm inset), returning to %d cm "
                 "for images: %s",
@@ -525,6 +406,8 @@ class TaskA5:
         finally:
             if self.camera is not None:
                 self.camera.stop_camera()
+            if self.heading_log is not None:
+                self.heading_log.close()
             if not self.dry_run:
                 self.stm.disconnect()
 

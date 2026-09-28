@@ -44,6 +44,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+from communications import cal_profile
 from communications.android import Android
 from communications.pc import PC
 from communications.stm import (
@@ -159,13 +160,12 @@ class Task1:
         self.detect_timeout = float(os.getenv("DETECT_TIMEOUT_S", "0.5"))
         # PROTOCOL.md §3 recommends at most three retransmissions.
         self.max_resends = int(os.getenv("STM_MAX_RESENDS", "3"))
-        # PROTOCOL.md §6: 0 TIGHT (r=291mm), 1 CLEAN (r=318mm), 2 SLOW (r=306mm).
-        # The firmware's own default is TIGHT, and that choice belongs to the
-        # firmware — this client does not override it. Unset (the default here)
-        # means send no !PROF at all and run whatever the STM already selected.
-        # Set STM_ARC_PROFILE only to deliberately ask for a different one.
-        _profile_env = os.getenv("STM_ARC_PROFILE")
-        self.arc_profile = int(_profile_env) if _profile_env not in (None, "") else None
+        # Always TIGHT (r=291mm): the planner's radius, the firmware lock and
+        # the saved calibration all assume it. cal_profile.prepare_for_task()
+        # selects it at startup; there is nothing left to configure here.
+        self.arc_profile = cal_profile.ARC_PROFILE
+        # One CSV row of ?HDG per finished segment - see cal_profile.HeadingLog.
+        self.heading_log = None
 
         logging.info(
             f"Config — segment_delay={self.segment_delay}s  "
@@ -836,6 +836,10 @@ class Task1:
                         logging.warning("OK received but mission is halted — ignoring.")
                         continue
 
+                    # Queries are safe mid-mission (§5): they bypass the queue.
+                    if self.heading_log is not None:
+                        self.heading_log.record(f"segment {just_finished}")
+
                     # Update Android with robot's expected grid position
                     with self._idx_lock:
                         if 0 <= just_finished < len(self.directions):
@@ -904,7 +908,7 @@ class Task1:
 
     # ══ Entry point ═══════════════════════════════════════════════════════════
 
-    def _stm_startup_check(self) -> None:
+    def _stm_startup_check(self) -> bool:
         """
         PROTOCOL.md §10 stage 5 — prove the link before trusting it with motion.
 
@@ -970,25 +974,13 @@ class Task1:
                     "it added is unused here — re-read PROTOCOL.md."
                 )
 
-        if self.arc_profile is None:
-            # No !PROF sent: the firmware's selected profile stands. Ask what it
-            # is rather than assume, so the planner's radius can be checked
-            # against reality instead of against a guess.
-            stat = self.stm.query("?STAT")
-            if stat:
-                logging.info(f"STM: {stat} (arc profile is the last field — §5).")
-            logging.info(
-                "STM: no !PROF sent — running the firmware's own profile "
-                "(default TIGHT, radius 291mm)."
-            )
-        elif self.stm.set_profile(self.arc_profile):
-            logging.info(f"STM: arc profile set to {self.arc_profile}.")
-        else:
-            logging.warning(
-                f"STM: could not set arc profile {self.arc_profile} — the firmware "
-                "keeps whatever it had. If the planner assumed a different radius, "
-                "its turns will land short or long."
-            )
+        # Frozen calibration: learning off, TIGHT, the CAL_PROFILE from .env
+        # restored and read back, heading zeroed at the start pose. Refusing to
+        # start beats a run driven on numbers nobody checked on this floor.
+        if not cal_profile.prepare_for_task(self.stm):
+            return False
+        self.heading_log = cal_profile.HeadingLog(self.stm, "task1")
+        return True
 
     def start(self) -> None:
         """
@@ -1001,7 +993,12 @@ class Task1:
         # ── Connections (order matters: BT can take time) ──────────────────
         logging.info("Connecting to STM32…")
         self.stm.connect()
-        self._stm_startup_check()
+        if not self._stm_startup_check():
+            logging.error("STM startup failed — not starting Task 1. Fix the "
+                          "calibration problem above and start again.")
+            self.camera.stop_camera()
+            self.stm.disconnect()
+            raise SystemExit(2)
 
         logging.info("Starting Bluetooth server (waiting for Android)…")
         self.android.start()          # non-blocking; background accept loop starts
