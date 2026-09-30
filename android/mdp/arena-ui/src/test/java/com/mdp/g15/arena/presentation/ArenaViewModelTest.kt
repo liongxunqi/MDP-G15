@@ -129,7 +129,7 @@ class ArenaViewModelTest {
             advanceUntilIdle()
             viewModel.drive(ManualCommand.RIGHT) {}
             val moving = viewModel.uiState.value
-            viewModel.accept("ROBOT,19,19,N\nSTATUS,START,99,99,N\nSTATUS,FAILED,extra")
+            viewModel.accept("ROBOT,19,19,N\nSTATUS,START,1,99,99,N\nSTATUS,FAILED,extra")
             runCurrent()
             assertEquals(moving.arena.robot, viewModel.uiState.value.arena.robot)
             assertEquals(moving.manualStatus, viewModel.uiState.value.manualStatus)
@@ -258,8 +258,8 @@ class ArenaViewModelTest {
             val allowed = ManualCommand.entries.map(viewModel::manualAllowed)
             for (bad in listOf("ROBOT,8,9", "ROBOT,19,19,N", "ROBOT,-1,8,N",
                 "ROBOT,8,8,X", "ROBOT,8,8,N,extra", "ROBOT,2147483648,8,N",
-                "ROBOT,12,12,N", "STATUS,START,19,19,N", "STATUS,START,12,12,N",
-                "STATUS,START,999999999999999999999,8,N", "STATUS,START,8,8,X",
+                "ROBOT,12,12,N", "STATUS,START,1,19,19,N", "STATUS,START,1,12,12,N",
+                "STATUS,START,1,999999999999999999999,8,N", "STATUS,START,1,8,8,X",
                 "STATUS,OK,extra", "STATUS", "MSG,[]")) {
                 viewModel.accept(bad)
                 advanceUntilIdle()
@@ -491,12 +491,13 @@ class ArenaViewModelTest {
 
     @Test
     fun `status start places the robot and marks the run autonomous`() = runTest(dispatcher) {
-        viewModel.accept("STATUS,START,2,3,E")
+        viewModel.accept("STATUS,START,4,2,3,E")
         advanceUntilIdle()
 
         val ui = viewModel.uiState.value
-        assertEquals("START,2,3,E", ui.status)
+        assertEquals("START,4,2,3,E", ui.status)
         assertTrue(ui.autonomousRunning)
+        assertFalse(ui.startPending)
         assertEquals(GridCoordinate(2, 3), ui.arena.robot?.position)
         assertEquals(Direction.EAST, ui.arena.robot?.direction)
     }
@@ -504,10 +505,61 @@ class ArenaViewModelTest {
     @Test
     fun `status start that does not fit leaves the robot alone`() = runTest(dispatcher) {
         viewModel.accept("ROBOT,8,8,N")
-        viewModel.accept("STATUS,START,19,19,N")
+        viewModel.accept("STATUS,START,4,19,19,N")
         advanceUntilIdle()
 
         assertEquals(GridCoordinate(8, 8), viewModel.uiState.value.arena.robot?.position)
+    }
+
+    @Test
+    fun `begin guards double taps and distinguishes requested from running`() = runTest(dispatcher) {
+        viewModel.connectionChanged(true)
+        var sends = 0
+
+        viewModel.beginMission { sends++ }
+        assertEquals(1, sends)
+        assertTrue(viewModel.uiState.value.startPending)
+        assertFalse(viewModel.uiState.value.autonomousRunning)
+        assertFalse(viewModel.manualAllowed(ManualCommand.FORWARD))
+
+        // A second tap while the first is outstanding must not send again.
+        viewModel.beginMission { sends++ }
+        assertEquals(1, sends)
+
+        // ACK alone does not promote to running.
+        viewModel.accept("STATUS,ACK,BEGIN,7")
+        advanceUntilIdle()
+        assertTrue(viewModel.uiState.value.startPending)
+        assertFalse(viewModel.uiState.value.autonomousRunning)
+
+        // Only START/RUNNING actually starts the mission.
+        viewModel.accept("STATUS,START,7,2,2,N")
+        advanceUntilIdle()
+        assertFalse(viewModel.uiState.value.startPending)
+        assertTrue(viewModel.uiState.value.autonomousRunning)
+
+        // A tap is allowed again only after the mission resolves.
+        viewModel.accept("STATUS,DONE")
+        advanceUntilIdle()
+        viewModel.beginMission { sends++ }
+        assertEquals(2, sends)
+    }
+
+    @Test
+    fun `a dropped connection clears a pending start instead of resending it`() = runTest(dispatcher) {
+        viewModel.connectionChanged(true)
+        var sends = 0
+        viewModel.beginMission { sends++ }
+        assertEquals(1, sends)
+        assertTrue(viewModel.uiState.value.startPending)
+
+        viewModel.connectionChanged(false)
+        assertFalse(viewModel.uiState.value.startPending)
+
+        // Reconnecting must not auto-resend BEGIN — only a fresh, deliberate tap does.
+        viewModel.connectionChanged(true)
+        assertFalse(viewModel.uiState.value.startPending)
+        assertEquals(1, sends)
     }
 
     @Test

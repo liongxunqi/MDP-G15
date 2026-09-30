@@ -149,7 +149,7 @@ fun IntegratedControllerScreen(
                     onForwardRight = { arenaViewModel.drive(ManualCommand.FORWARD_RIGHT, onForwardRight) },
                     onBackLeft = { arenaViewModel.drive(ManualCommand.BACK_LEFT, onBackLeft) },
                     onBackRight = { arenaViewModel.drive(ManualCommand.BACK_RIGHT, onBackRight) },
-                    onBegin = { arenaViewModel.startRun(onBegin) },
+                    onBegin = { arenaViewModel.beginMission(onBegin) },
                     onPath = { arenaViewModel.startRun(onPath) },
                     onSendCustomMessage = { message ->
                         val command = ManualCommand.entries.firstOrNull { it.wire == message.trim().lowercase() }
@@ -157,7 +157,7 @@ fun IntegratedControllerScreen(
                             '\n' in message || '\r' in message -> arenaViewModel.rejectUnsafeCustomMessage()
                             command != null -> arenaViewModel.drive(command, movementCallbacks.getValue(command))
                             message.trim().equals("s", true) -> arenaViewModel.stopManual(onStop)
-                            message.trim().equals("BEGIN", true) -> arenaViewModel.startRun(onBegin)
+                            message.trim().equals("BEGIN", true) -> arenaViewModel.beginMission(onBegin)
                             message.trim().equals("PATH", true) -> arenaViewModel.startRun(onPath)
                             else -> onSendCustomMessage(message)
                         }

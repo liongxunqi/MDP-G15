@@ -51,7 +51,7 @@ class ArenaViewModel(
     private var previewJob: Job? = null
 
     fun manualAllowed(command: ManualCommand): Boolean = connected && !_uiState.value.autonomousRunning &&
-        !_uiState.value.manualAnimating && !_uiState.value.manualPending &&
+        !_uiState.value.startPending && !_uiState.value.manualAnimating && !_uiState.value.manualPending &&
         manualDrive.allowed(_uiState.value.arena, command, _uiState.value.amdToolMode)
 
     fun setAmdToolMode(enabled: Boolean): Boolean {
@@ -66,6 +66,32 @@ class ArenaViewModel(
         manualDrive.invalidate()
         _uiState.value = _uiState.value.copy(autonomousRunning = true, placementMode = false, manualStatus = "Autonomous run — manual driving paused")
         setFeedback("Run requested.", false)
+        send()
+    }
+
+    /**
+     * The Start (BEGIN) button. Distinct from [startRun]: a tap alone must never claim the
+     * robot is running — [ArenaUiState.startPending] covers "requested, not yet acknowledged
+     * or running" so the UI (and [manualAllowed]) can tell the two apart. A second tap while
+     * a request is outstanding is a no-op — the RPi dedupes on its side too, but a duplicate
+     * BEGIN should never leave here in the first place. No retry/resend is scheduled on
+     * timeout or reconnect; [connectionChanged] clears the pending flag so a fresh, deliberate
+     * tap is required instead.
+     */
+    fun beginMission(send: () -> Unit) {
+        if (!connected) return
+        if (_uiState.value.startPending) {
+            setFeedback("Start already requested — waiting for the RPi.", true)
+            return
+        }
+        if (blockWhileDriving()) return
+        manualDrive.invalidate()
+        _uiState.value = _uiState.value.copy(
+            startPending = true,
+            placementMode = false,
+            manualStatus = "Start requested — awaiting acknowledgement",
+        )
+        setFeedback("Start requested.", false)
         send()
     }
 
@@ -127,6 +153,10 @@ class ArenaViewModel(
             cancelPreviewGate()
             manualDrive.invalidate()
             _uiState.value = _uiState.value.copy(manualPending = false, autonomousRunning = false,
+                // A dropped/regained link never resends BEGIN on its own — an outstanding start
+                // request is invalidated here, same as a pending manual command, and needs a
+                // fresh, deliberate tap.
+                startPending = false,
                 // A Bluetooth connection is not a pose report, including after reconnect.
                 arena = if (connected) _uiState.value.arena.copy(robot = null) else _uiState.value.arena,
                 manualStatus = if (connected) "Awaiting initial robot position" else "Disconnected — pose unconfirmed")
@@ -333,10 +363,12 @@ class ArenaViewModel(
             is ArenaInboundEvent.Status -> {
                 val controlStatus = rawMessage.startsWith("STATUS,")
                 val startPose = if (controlStatus && event.text.startsWith("START,")) {
+                    // STATUS,START,<missionId>,<x>,<y>,<dir> — the mission id is RPi-side
+                    // dedupe/diagnostic state; Android only needs it for the status text below.
                     val parts = event.text.split(',')
-                    val x = parts.getOrNull(1)?.toIntOrNull()
-                    val y = parts.getOrNull(2)?.toIntOrNull()
-                    val direction = parts.getOrNull(3)?.let(Direction::fromWire)
+                    val x = parts.getOrNull(2)?.toIntOrNull()
+                    val y = parts.getOrNull(3)?.toIntOrNull()
+                    val direction = parts.getOrNull(4)?.let(Direction::fromWire)
                     if (x == null || y == null || direction == null) {
                         setFeedback("Invalid start position.", true)
                         return
@@ -354,6 +386,13 @@ class ArenaViewModel(
                     "DONE", "FAILED" -> false
                     else -> _uiState.value.autonomousRunning
                 }
+                // ACK only confirms the RPi saw BEGIN — still not running until START/RUNNING.
+                // A late/duplicate ACK for an old request is harmless: it can only clear a flag
+                // that a real START/RUNNING/DONE/FAILED would have cleared anyway.
+                val startPending = when (if (controlStatus) event.text.substringBefore(',') else "") {
+                    "START", "RUNNING", "DONE", "FAILED" -> false
+                    else -> _uiState.value.startPending
+                }
                 if (controlStatus && event.text == "FAILED") {
                     cancelPreviewGate()
                     manualDrive.invalidate()
@@ -364,11 +403,16 @@ class ArenaViewModel(
                     statusHistory = history,
                     manualPending = manualDrive.pending != null,
                     autonomousRunning = autonomous,
+                    startPending = startPending,
                     placementMode = if (autonomous) false else _uiState.value.placementMode,
-                    manualStatus = when (if (controlStatus) event.text else "") {
-                        "FAILED" -> "Movement failed — pose unconfirmed"
-                        "DONE" -> null
-                        else -> if (autonomous) "Autonomous run — manual driving paused" else _uiState.value.manualStatus
+                    manualStatus = when {
+                        !controlStatus -> _uiState.value.manualStatus
+                        event.text == "FAILED" -> "Movement failed — pose unconfirmed"
+                        event.text == "DONE" -> null
+                        event.text.startsWith("ACK,BEGIN,") ->
+                            "Start acknowledged (mission ${event.text.substringAfterLast(',')}) — awaiting path"
+                        autonomous -> "Autonomous run — manual driving paused"
+                        else -> _uiState.value.manualStatus
                     },
                 )
                 persist()

@@ -17,5 +17,8 @@ data class ArenaUiState(
     val manualAnimating: Boolean = false,
     val manualStatus: String? = null,
     val autonomousRunning: Boolean = false,
+    /** True from a Start tap until STATUS,ACK/START/RUNNING/DONE/FAILED resolves it. Distinct
+     *  from [autonomousRunning]: a tap alone must never claim the robot is moving. */
+    val startPending: Boolean = false,
     val obstacleSyncStatus: String = "Map offline — edits saved locally",
 )

@@ -122,6 +122,15 @@ class Task1:
         self.path_requested: bool = False   # True while OBSTACLES request is in-flight
         self.halted: bool = False           # True after FAIL,* or exhausted RESENDs
 
+        # ── Mission start handshake ───────────────────────────────────────────
+        # A repeated/late BEGIN must be a safe no-op once one is already in
+        # flight — resetting segments_index/halted/_resend_counts a second time
+        # mid-mission would corrupt a run that is already under way. mission_id
+        # gives Android something to log/display; mission_state is what BEGIN
+        # actually dedupes on.
+        self.mission_id: int = 0
+        self.mission_state: str = "IDLE"    # IDLE | START_REQUESTED | RUNNING
+
         # ── A.5 state ─────────────────────────────────────────────────────────
         # Off unless this was constructed by task_a5.py. Everything it touches
         # is guarded, so Task 1 behaves exactly as it did.
@@ -342,6 +351,10 @@ class Task1:
         # Cleared so a retry is possible at all: _request_path_from_pc()
         # refuses to send while a request is in flight.
         self.path_requested = False
+        # A BEGIN that was waiting on this PATH is not going to be served by
+        # it — let a fresh BEGIN through instead of dedupeing forever against
+        # a request that can now never complete.
+        self.mission_state = "IDLE"
         try:
             self.android.send("STATUS,FAILED")
         except OSError as exc:
@@ -426,6 +439,30 @@ class Task1:
             logging.warning(f"Could not notify Android of running status: {exc}")
         return True
 
+    def _begin_running(self, mission_id: int) -> None:
+        """
+        Send STATUS,START and kick the segment pump.
+
+        Split out of the BEGIN handler because PATH can also trigger it: if
+        Android sends BEGIN before the PC's PATH reply lands, BEGIN only gets
+        as far as START_REQUESTED, and it is pc_receive() that must finish the
+        job once PATH finally arrives.
+        """
+        with self._idx_lock:
+            if self.directions:
+                start_pose = self.directions[0]
+                try:
+                    self.android.send(
+                        f"STATUS,START,{mission_id},{start_pose['x']},"
+                        f"{start_pose['y']},{start_pose['dir']}"
+                    )
+                except OSError as exc:
+                    logging.warning(f"Could not notify Android of start position: {exc}")
+
+        self.mission_state = "RUNNING"
+        if not self._send_next_segment():
+            logging.warning("BEGIN: mission started but no segments to send.")
+
     # ── Failure handling ───────────────────────────────────────────────────────
 
     def _halt_mission(self, reason: str) -> None:
@@ -448,6 +485,10 @@ class Task1:
         pose = self.stm.query("?POSE")
         stat = self.stm.query("?STAT")
         logging.error(f"Halt diagnostics — {pose or 'POSE unavailable'} | {stat or 'STAT unavailable'}")
+
+        # Mission is over from Android's point of view — a later BEGIN is a new
+        # request, not a duplicate of the one that just failed.
+        self.mission_state = "IDLE"
 
         try:
             self.android.send("STATUS,FAILED")
@@ -595,9 +636,36 @@ class Task1:
                         self._request_path_from_pc()
 
                 elif tag == "BEGIN":
-                    # ── User pressed Start ────────────────────────────────────
+                    # ── User pressed Start ─────────────────────────────────────
+                    if self.mission_state in ("START_REQUESTED", "RUNNING"):
+                        # Duplicate tap, a resend after a lost ACK, or a stale
+                        # replay from Android — re-ack the SAME id and touch
+                        # nothing else. Resetting segments_index/halted again
+                        # here would restart a mission already under way.
+                        logging.info(
+                            f"Android: duplicate BEGIN ignored — mission "
+                            f"{self.mission_id} already {self.mission_state}."
+                        )
+                        try:
+                            self.android.send(f"STATUS,ACK,BEGIN,{self.mission_id}")
+                        except OSError as exc:
+                            logging.warning(f"Could not re-ack BEGIN: {exc}")
+                        continue
+
+                    self.mission_id += 1
+                    self.mission_state = "START_REQUESTED"
+                    mission_id = self.mission_id
+
+                    # Acknowledge immediately — before path/segment work — so a
+                    # delayed PATH never reads on Android as an unacknowledged
+                    # button press.
+                    try:
+                        self.android.send(f"STATUS,ACK,BEGIN,{mission_id}")
+                    except OSError as exc:
+                        logging.warning(f"Could not ack BEGIN: {exc}")
+
                     if not self.started:
-                        logging.info("Android: BEGIN received — mission starting.")
+                        logging.info(f"Android: BEGIN received — mission {mission_id} starting.")
                         self.started = True
 
                     with self._idx_lock:
@@ -614,18 +682,7 @@ class Task1:
                         )
                         continue
 
-                    with self._idx_lock:
-                        if self.directions:
-                            start_pose = self.directions[0]
-                            try:
-                                self.android.send(
-                                    f"STATUS,START,{start_pose['x']},{start_pose['y']},{start_pose['dir']}"
-                                )
-                            except OSError as exc:
-                                logging.warning(f"Could not notify Android of start position: {exc}")
-
-                    if not self._send_next_segment():
-                        logging.warning("Android: BEGIN received but no segments to send.")
+                    self._begin_running(mission_id)
 
                 else:
                     logging.warning(f"Android: unrecognised message '{msg}' — ignoring.")
@@ -675,19 +732,9 @@ class Task1:
                     )
 
                     # If Android already sent BEGIN but PATH hadn't arrived yet,
-                    # kick off the first segment now
-                    if self.started and self.segments_index == 0:
-                        with self._idx_lock:
-                            if self.directions:
-                                start_pose = self.directions[0]
-                                try:
-                                    self.android.send(
-                                        f"STATUS,START,{start_pose['x']},{start_pose['y']},{start_pose['dir']}"
-                                    )
-                                except OSError as exc:
-                                    logging.warning(f"Could not notify Android of start position: {exc}")
-                        if not self._send_next_segment():
-                            logging.warning("PC: PATH arrived but no segments to send.")
+                    # finish what BEGIN started now.
+                    if self.mission_state == "START_REQUESTED" and self.segments_index == 0:
+                        self._begin_running(self.mission_id)
 
                 elif msg.startswith("OBJECT"):
                     # ── PC replied with a detection result ────────────────────
@@ -871,6 +918,8 @@ class Task1:
                         else:
                             shots = len(self.obstacle_order) or len(self.segments)
                         self.pc.send(f"STITCH,{max(shots - 1, 0)}\n")
+                        # A later BEGIN is a new mission, not a duplicate of this one.
+                        self.mission_state = "IDLE"
                         self.android.send("STATUS,DONE")
 
                         if self.a5_mode:

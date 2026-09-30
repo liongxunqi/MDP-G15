@@ -6,7 +6,7 @@ import org.junit.Test
 class ChecklistProtocolTest {
     @Test fun rejectedMessagesRetainPreviousStatus() {
         val previous = "RUNNING,1,2"
-        for (line in listOf("STATUS", "STATUS,OK,extra", "STATUS,START,1,2,X", "TARGET,99,11", "noise")) {
+        for (line in listOf("STATUS", "STATUS,OK,extra", "STATUS,START,4,1,2,X", "TARGET,99,11", "noise")) {
             assertEquals(previous, RobotMessageParser.parse(line) { false }.displayStatusOr(previous))
         }
         assertEquals("DONE", RobotMessageParser.parse("STATUS,DONE").displayStatusOr(previous))
@@ -32,7 +32,8 @@ class ChecklistProtocolTest {
     @Test fun `status target and robot reports remain recognized`() {
         assertEquals(RobotMessage.Status("OK"), RobotMessageParser.parse("STATUS,OK"))
         assertEquals(RobotMessage.Status("RUNNING,3,12"), RobotMessageParser.parse("STATUS,RUNNING,3,12"))
-        assertEquals(RobotMessage.Status("START,1,2,N"), RobotMessageParser.parse("STATUS,START,1,2,N"))
+        assertEquals(RobotMessage.Status("START,4,1,2,N"), RobotMessageParser.parse("STATUS,START,4,1,2,N"))
+        assertEquals(RobotMessage.Status("ACK,BEGIN,4"), RobotMessageParser.parse("STATUS,ACK,BEGIN,4"))
         assertEquals(RobotMessage.MalformedStatus, RobotMessageParser.parse("STATUS,Exploring"))
         assertEquals(RobotMessage.MalformedStatus, RobotMessageParser.parse("STATUS,DONE,extra"))
         assertEquals(RobotMessage.MalformedStatus, RobotMessageParser.parse("STATUS"))
