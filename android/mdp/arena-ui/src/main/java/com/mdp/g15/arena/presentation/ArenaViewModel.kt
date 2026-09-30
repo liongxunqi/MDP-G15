@@ -52,7 +52,7 @@ class ArenaViewModel(
 
     fun manualAllowed(command: ManualCommand): Boolean = connected && !_uiState.value.autonomousRunning &&
         !_uiState.value.manualAnimating && !_uiState.value.manualPending &&
-        (_uiState.value.freeMoveMode || manualDrive.allowed(_uiState.value.arena, command, _uiState.value.amdToolMode))
+        manualDrive.allowed(_uiState.value.arena, command, _uiState.value.amdToolMode)
 
     fun setAmdToolMode(enabled: Boolean): Boolean {
         if (enabled == _uiState.value.amdToolMode) return true
@@ -64,7 +64,7 @@ class ArenaViewModel(
     fun startRun(send: () -> Unit) {
         if (!connected || blockWhileDriving()) return
         manualDrive.invalidate()
-        _uiState.value = _uiState.value.copy(autonomousRunning = true, freeMoveMode = false, manualStatus = "Autonomous run — manual driving paused")
+        _uiState.value = _uiState.value.copy(autonomousRunning = true, placementMode = false, manualStatus = "Autonomous run — manual driving paused")
         setFeedback("Run requested.", false)
         send()
     }
@@ -76,23 +76,22 @@ class ArenaViewModel(
             setFeedback("Movement blocked: wait for completion and a valid pose; check the swept path.", true)
             return
         }
-        // Before localization, send commands without inventing a pose or checking a fictitious path.
-        val freeMove = _uiState.value.freeMoveMode
-        val path = if (freeMove) null else manualDrive.reserve(_uiState.value.arena, command, _uiState.value.amdToolMode)
-        if (!freeMove && path == null) {
+        val path = manualDrive.reserve(_uiState.value.arena, command, _uiState.value.amdToolMode)
+        if (path == null) {
             setFeedback("Movement blocked: wait for completion and a valid pose; check the swept path.", true)
             return
         }
         // Reserve synchronously before calling the transport, even if Compose has not recomposed.
         _uiState.value = _uiState.value.copy(
             manualPending = true,
+            placementMode = false,
             manualAnimating = true,
-            manualStatus = if (freeMove) "Free move — position unknown" else "Moving (estimated)",
-            arena = if (path == null) _uiState.value.arena else _uiState.value.arena.copy(
+            manualStatus = "Moving (estimated)",
+            arena = _uiState.value.arena.copy(
                 robot = path.at(1.0).asRobotPose().copy(commandedPath = path),
             ),
         )
-        setFeedback(if (freeMove) "Sent ${command.wire} — free move." else "Sent ${command.wire} — previewing movement.", false)
+        setFeedback("Sent ${command.wire} — previewing movement.", false)
         val previewDuration = command.previewDurationMillis(_uiState.value.amdToolMode)
         previewJob = viewModelScope.launch {
             delay(previewDuration + 50L) // Allow the next rendered frame to finish the preview.
@@ -103,11 +102,11 @@ class ArenaViewModel(
             send()
             manualDrive.complete()
             _uiState.value = _uiState.value.copy(manualPending = false,
-                manualStatus = if (_uiState.value.freeMoveMode) "Free move — position unknown" else "Ready — estimated pose")
+                manualStatus = "Ready — estimated pose")
         } catch (error: Exception) {
             cancelPreviewGate()
             manualDrive.invalidate()
-            _uiState.value = _uiState.value.copy(manualPending = false, freeMoveMode = false, manualStatus = "Send failed — pose unconfirmed")
+            _uiState.value = _uiState.value.copy(manualPending = false, manualStatus = "Send failed — pose unconfirmed")
             setFeedback("Send failed; robot position needs confirmation.", true)
         }
     }
@@ -115,8 +114,8 @@ class ArenaViewModel(
     fun stopManual(send: () -> Unit) {
         cancelPreviewGate()
         manualDrive.invalidate()
-        _uiState.value = _uiState.value.copy(manualPending = false, autonomousRunning = false, manualStatus = if (_uiState.value.freeMoveMode) "Free move — position unknown" else "Stopped — pose unconfirmed")
-        setFeedback(if (_uiState.value.freeMoveMode) "Stop requested." else "Stop requested — await a fresh robot position before driving.", false)
+        _uiState.value = _uiState.value.copy(manualPending = false, autonomousRunning = false, manualStatus = "Stopped — pose unconfirmed")
+        setFeedback("Stop requested — await a fresh robot position before driving.", false)
         if (connected) send()
     }
     private val obstacleSync = ObstacleSync(outboundSink::submit).also {
@@ -129,9 +128,8 @@ class ArenaViewModel(
             manualDrive.invalidate()
             _uiState.value = _uiState.value.copy(manualPending = false, autonomousRunning = false,
                 // A Bluetooth connection is not a pose report, including after reconnect.
-                freeMoveMode = connected,
                 arena = if (connected) _uiState.value.arena.copy(robot = null) else _uiState.value.arena,
-                manualStatus = if (connected) "Free move — position unknown" else "Disconnected — pose unconfirmed")
+                manualStatus = if (connected) "Awaiting initial robot position" else "Disconnected — pose unconfirmed")
         }
         this.connected = connected
         if (!useRpiMapSync) return
@@ -156,7 +154,7 @@ class ArenaViewModel(
                         handleInbound(decoded.event, line)
                     }
                     is ArenaDecodeResult.Malformed -> {
-                        setFeedback(decoded.reason, isError = true)
+                        setFeedback("Couldn’t apply this update. The previous state was kept.", isError = true)
                     }
                     ArenaDecodeResult.Ignored -> setFeedback("Received: $line", isError = false)
                 }
@@ -165,11 +163,29 @@ class ArenaViewModel(
     }
 
     fun setPlacementMode(enabled: Boolean) {
+        if (enabled) {
+            if (blockWhileDriving()) return
+            val arena = _uiState.value.arena
+            if (arena.obstacles.size >= arena.config.maxObstacles) {
+                setFeedback("Cannot place more than ${arena.config.maxObstacles} obstacles.", true)
+                return
+            }
+            if (reducer.firstFreeObstacleCell(arena) == null) {
+                setFeedback("No free cell is available for an obstacle.", true)
+                return
+            }
+        }
         _uiState.value = _uiState.value.copy(
             placementMode = enabled,
             feedback = if (enabled) "Touch an empty cell to place an obstacle." else "Placement cancelled.",
             feedbackIsError = false,
         )
+    }
+
+    /** Ignore stale view callbacks after cancellation or the first successful placement. */
+    fun placeObstacle(position: GridCoordinate) {
+        if (!_uiState.value.placementMode) return
+        addObstacle(position)
     }
 
     fun spawnObstacle() = dispatchLocal(
@@ -225,6 +241,7 @@ class ArenaViewModel(
     fun resetArena() {
         if (blockWhileDriving()) return
         manualDrive.invalidate()
+        _uiState.value = _uiState.value.copy(placementMode = false)
         val before = _uiState.value.arena
         if (before.obstacles.isEmpty() && before.robot == null) {
             setFeedback("Arena is already empty.", isError = false)
@@ -287,7 +304,6 @@ class ArenaViewModel(
                 if (action is ArenaAction.MoveRobot) reduction.state.robot?.let(manualDrive::seed)
                 _uiState.value = _uiState.value.copy(
                     arena = reduction.state,
-                    freeMoveMode = if (action is ArenaAction.MoveRobot) false else _uiState.value.freeMoveMode,
                     manualStatus = if (action is ArenaAction.MoveRobot) null else _uiState.value.manualStatus,
                     placementMode = if (leavePlacementMode) false else _uiState.value.placementMode,
                     canUndo = undoHistory.isNotEmpty(),
@@ -348,7 +364,7 @@ class ArenaViewModel(
                     statusHistory = history,
                     manualPending = manualDrive.pending != null,
                     autonomousRunning = autonomous,
-                    freeMoveMode = if (autonomous || (controlStatus && event.text == "FAILED")) false else _uiState.value.freeMoveMode,
+                    placementMode = if (autonomous) false else _uiState.value.placementMode,
                     manualStatus = when (if (controlStatus) event.text else "") {
                         "FAILED" -> "Movement failed — pose unconfirmed"
                         "DONE" -> null
@@ -382,7 +398,6 @@ class ArenaViewModel(
                     val accepted = manualDrive.report(event.pose)
                     _uiState.value = _uiState.value.copy(
                         arena = if (accepted) state else _uiState.value.arena,
-                        freeMoveMode = if (accepted) false else _uiState.value.freeMoveMode,
                         manualStatus = when {
                             _uiState.value.autonomousRunning -> _uiState.value.manualStatus
                             manualDrive.pending == null -> null

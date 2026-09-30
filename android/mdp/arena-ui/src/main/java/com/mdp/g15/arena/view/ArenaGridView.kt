@@ -109,6 +109,7 @@ class ArenaGridView @JvmOverloads constructor(
     private var robotGrabOffsetY = 0
     private var longPressTriggered = false
     private var multiTouchOccurred = false
+    private var tapMoved = false
 
     private val longPressRunnable = Runnable {
         when {
@@ -185,12 +186,13 @@ class ArenaGridView @JvmOverloads constructor(
                 dragY = event.y
                 longPressTriggered = false
                 multiTouchOccurred = false
+                tapMoved = false
                 val coordinate = coordinateAtTouch(event.x, event.y)
                 val robot = state.robot
                 val robotHere = coordinate != null && robot != null &&
                     coordinate in robot.position.footprint(state.config.robotFootprintCells)
-                pressedObstacleId = if (robotHere) null else coordinate?.let(::obstacleAt)?.id
-                robotPressed = robotHere
+                pressedObstacleId = if (placementMode || robotHere) null else coordinate?.let(::obstacleAt)?.id
+                robotPressed = robotHere && !placementMode
                 if (robotHere) {
                     robotGrabOffsetX = coordinate!!.x - robot!!.position.x
                     robotGrabOffsetY = coordinate.y - robot.position.y
@@ -221,6 +223,7 @@ class ArenaGridView @JvmOverloads constructor(
                 dragY = event.y
                 if (!longPressTriggered && hypot(event.x - downX, event.y - downY) > touchSlop) {
                     handler.removeCallbacks(longPressRunnable)
+                    tapMoved = true
                 }
                 if (draggingObstacleId != null || draggingRobot) invalidate()
                 return true
@@ -252,7 +255,7 @@ class ArenaGridView @JvmOverloads constructor(
                             interactionListener?.onMoveRobot(destination)
                         }
                     }
-                    multiTouchOccurred -> Unit
+                    multiTouchOccurred || tapMoved || hypot(event.x - downX, event.y - downY) > touchSlop -> Unit
                     else -> {
                         performClick()
                         val coordinate = coordinateAtTouch(event.x, event.y)

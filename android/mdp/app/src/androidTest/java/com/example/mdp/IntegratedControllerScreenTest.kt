@@ -20,6 +20,12 @@ import androidx.compose.ui.test.junit4.StateRestorationTester
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
+import androidx.compose.ui.test.performTouchInput
+import androidx.compose.ui.test.click
+import androidx.compose.ui.geometry.Offset
+import com.mdp.g15.arena.view.ArenaGeometry
+import com.mdp.g15.arena.domain.ArenaConfig
+import com.mdp.g15.arena.domain.GridCoordinate
 import androidx.compose.ui.test.performClick
 import kotlinx.coroutines.flow.MutableSharedFlow
 import org.junit.Assert.assertEquals
@@ -56,22 +62,42 @@ class IntegratedControllerScreenTest {
     }
 
     @Test
-    fun connectionAllowsFreeCommandsUntilValidPoseArrives() {
+    fun addWaitsForGridTapAndCanBeCancelledOrRetried() {
         connected = true
         setScreen()
         composeRule.onNodeWithText("Arena").performClick()
-        composeRule.onNodeWithText("◀ Left").assertIsEnabled().performClick()
-        composeRule.runOnIdle { assertEquals(listOf("tl"), movement) }
-        composeRule.waitUntil(5_000) {
-            runCatching { composeRule.onNodeWithText("▲ Forward").assertIsEnabled() }.isSuccess
-        }
+        composeRule.onNodeWithText("Add obstacle").performScrollTo().performClick()
+        assertEquals(listOf("CLEAR"), outbound)
+        composeRule.onNodeWithText("Cancel placement").performScrollTo().performClick()
+        clickGridCell(3,4)
+        assertEquals(listOf("CLEAR"), outbound)
+        addAt(3,4)
+        assertEquals("CLEAR\nOBSTACLE,1,30,40,SKIP", outbound.last())
+        composeRule.onNodeWithText("Add obstacle").performScrollTo().performClick()
+        clickGridCell(3,4)
+        composeRule.onNodeWithText("Cancel placement").assertIsDisplayed()
+        assertEquals(2, outbound.size)
+        clickGridCell(4,4)
+        assertEquals(3, outbound.size)
+        assertTrue(outbound.last().endsWith("OBSTACLE,2,40,40,SKIP"))
+        clickGridCell(5,4)
+        assertEquals(3, outbound.size)
+    }
+
+    @Test
+    fun connectionWaitsForValidInitialPose() {
+        connected = true
+        setScreen()
+        composeRule.onNodeWithText("Arena").performClick()
+        composeRule.onNodeWithText("◀ Left").assertIsNotEnabled()
+        composeRule.onNodeWithText("■ Stop").assertIsEnabled()
         composeRule.runOnIdle { assertTrue(incoming.tryEmit("ROBOT,99,99,N")) }
         composeRule.waitForIdle()
-        composeRule.onNodeWithText("▲ Forward").assertIsEnabled()
-        composeRule.runOnIdle { assertTrue(incoming.tryEmit("ROBOT,8,18,N")) }
-        composeRule.waitForIdle()
         composeRule.onNodeWithText("▲ Forward").assertIsNotEnabled()
-        composeRule.onNodeWithText("▼ Reverse").assertIsEnabled()
+        composeRule.runOnIdle { assertTrue(incoming.tryEmit("ROBOT,2,2,N")) }
+        composeRule.waitForIdle()
+        composeRule.onNodeWithText("▲ Forward").assertIsEnabled().performClick()
+        composeRule.runOnIdle { assertEquals(listOf("f"), movement) }
     }
 
     @Test
@@ -109,7 +135,7 @@ class IntegratedControllerScreenTest {
         connected = true
         setScreen()
         composeRule.onNodeWithText("Arena").performClick()
-        composeRule.onNodeWithText("Add obstacle").performScrollTo().performClick()
+        addAt(0, 0)
         // Captured synchronously inside the outgoing map callback, not after recomposition.
         assertEquals(RobotMessage.Target(1, "11"), targetChecksAtMapWrite.last())
         composeRule.onNodeWithText("Undo").performScrollTo().performClick()
@@ -158,6 +184,7 @@ class IntegratedControllerScreenTest {
         composeRule.onNodeWithText("Exploring").assertIsDisplayed()
         composeRule.onNodeWithText("20 × 20", substring = true).assertDoesNotExist()
         composeRule.onNodeWithText("Latest action").assertIsDisplayed()
+        composeRule.onNodeWithText("Couldn’t apply this update. The previous state was kept.").performScrollTo().assertIsDisplayed()
     }
 
     @Test
@@ -165,14 +192,14 @@ class IntegratedControllerScreenTest {
         connected = true
         setScreen()
         composeRule.onNodeWithText("Arena").performClick()
-        composeRule.onNodeWithText("Add obstacle").performScrollTo().performClick()
+        addAt(0, 0)
 
         composeRule.waitForIdle()
 
         assertEquals(2, outbound.size) // initial map, then completed placement
         assertEquals("CLEAR", outbound.first())
         assertEquals("CLEAR\nOBSTACLE,1,0,0,SKIP", outbound.last())
-        repeat(2) { composeRule.onNodeWithText("Add obstacle").performScrollTo().performClick() }
+        repeat(2) { addAt(it + 1, 0) }
         assertEquals(4, outbound.size)
         assertEquals("CLEAR\nOBSTACLE,1,0,0,SKIP\nOBSTACLE,2,10,0,SKIP\nOBSTACLE,3,20,0,SKIP", outbound.last())
         composeRule.onNodeWithText("W").performScrollTo().performClick()
@@ -180,12 +207,12 @@ class IntegratedControllerScreenTest {
     }
 
     @Test
-    fun immediateAddStopsAtLimitAndUndoRedoRestoresAvailability() {
+    fun tapPlacementStopsAtLimitAndUndoRedoRestoresAvailability() {
         connected = true
         setScreen()
         composeRule.onNodeWithText("Arena").performClick()
         repeat(50) {
-            composeRule.onNodeWithText("Add obstacle").performScrollTo().performClick()
+            addAt(it % 20, it / 20)
         }
         composeRule.onNodeWithText("Obstacle limit reached").assertIsNotEnabled()
         assertEquals(51, outbound.size) // connection snapshot plus 50 additions
@@ -252,7 +279,7 @@ class IntegratedControllerScreenTest {
         connected = true
         setScreen()
         composeRule.onNodeWithText("Arena").performClick()
-        composeRule.onNodeWithText("▲ Forward").assertIsEnabled()
+        composeRule.onNodeWithText("▲ Forward").assertIsNotEnabled()
         for (label in listOf("▲ Forward", "◀ Left", "Right ▶", "▼ Reverse", "↖ Forward left", "Forward right ↗", "↙ Back left", "Back right ↘")) {
             assertTrue(incoming.tryEmit("ROBOT,8,8,N"))
             composeRule.waitForIdle()
@@ -290,7 +317,7 @@ class IntegratedControllerScreenTest {
         connected = true
         setScreen()
         composeRule.onNodeWithText("Arena").performClick()
-        composeRule.onNodeWithText("Add obstacle").performScrollTo().assertIsDisplayed().performClick()
+        addAt(0, 0)
         composeRule.onNodeWithText("N").performScrollTo().assertIsDisplayed().performClick()
         assertEquals(3, outbound.size)
         assertEquals(outbound[1].replace("SKIP", "NORTH"), outbound[2])
@@ -307,7 +334,7 @@ class IntegratedControllerScreenTest {
     fun offlineMapIsSentOnConnectAndResentOnReconnectWithoutMovementReplay() {
         setScreen()
         composeRule.onNodeWithText("Arena").performClick()
-        composeRule.onNodeWithText("Add obstacle").performScrollTo().performClick()
+        addAt(0, 0)
         assertTrue(outbound.isEmpty())
         composeRule.runOnIdle { connected = true }
         composeRule.waitForIdle()
@@ -346,6 +373,22 @@ class IntegratedControllerScreenTest {
         assertEquals(1, scans)
         assertEquals(item, selected)
         assertTrue(dismissed)
+    }
+
+    private fun addAt(x: Int, y: Int) {
+        composeRule.onNodeWithText("Add obstacle").performScrollTo().performClick()
+        clickGridCell(x, y)
+    }
+
+    private fun clickGridCell(x: Int, y: Int) {
+        val density = InstrumentationRegistry.getInstrumentation().targetContext.resources.displayMetrics.density
+        composeRule.onNodeWithTag("arena_grid").performTouchInput {
+            val geometry = ArenaGeometry()
+            geometry.update(width, height, ArenaConfig(), 30f * density, 8f * density)
+            val cell = geometry.cellBounds(GridCoordinate(x, y))
+            click(Offset(cell.centerX, cell.centerY))
+        }
+        composeRule.waitForIdle()
     }
 
     private fun capture(name: String) {

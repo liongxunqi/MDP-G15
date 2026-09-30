@@ -22,36 +22,101 @@ import org.junit.Test
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class ArenaViewModelTest {
-    @Test fun `connection permits all free commands until valid pose enables map checks in both modes`() = runTest(dispatcher) {
+    @Test fun `reset cancels placement even when the arena was already empty`() {
+        viewModel.setPlacementMode(true)
+        viewModel.resetArena()
+        viewModel.placeObstacle(GridCoordinate(3,3))
+        assertFalse(viewModel.uiState.value.placementMode)
+        assertTrue(viewModel.uiState.value.arena.obstacles.isEmpty())
+        assertTrue(sent.isEmpty())
+    }
+
+    @Test fun `placement is cancellable single shot and invalid taps preserve placement`() = runTest(dispatcher) {
+        viewModel.accept("ROBOT,8,8,N")
+        advanceUntilIdle()
+        viewModel.addObstacle(GridCoordinate(1,1))
+        sent.clear()
+        viewModel.setPlacementMode(true)
+        assertTrue(sent.isEmpty())
+        for (cell in listOf(GridCoordinate(-1,0), GridCoordinate(20,0), GridCoordinate(1,1), GridCoordinate(8,8), GridCoordinate(9,9))) {
+            viewModel.placeObstacle(cell)
+            assertTrue(viewModel.uiState.value.placementMode)
+            assertTrue(viewModel.uiState.value.feedbackIsError)
+            assertEquals(1, viewModel.uiState.value.arena.obstacles.size)
+            assertTrue(sent.isEmpty())
+        }
+        viewModel.setPlacementMode(false)
+        viewModel.placeObstacle(GridCoordinate(2,2))
+        assertTrue(sent.isEmpty())
+        viewModel.setPlacementMode(true)
+        viewModel.placeObstacle(GridCoordinate(19,19))
+        viewModel.placeObstacle(GridCoordinate(2,2))
+        assertEquals(1, sent.size)
+        assertFalse(viewModel.uiState.value.placementMode)
+        assertEquals(GridCoordinate(19,19), viewModel.uiState.value.arena.obstacles[2]!!.position)
+        assertEquals(2, viewModel.uiState.value.arena.selectedObstacleId)
+        viewModel.undo()
+        assertEquals(1, viewModel.uiState.value.arena.obstacles.size)
+        viewModel.redo()
+        assertEquals(2, viewModel.uiState.value.arena.obstacles.size)
+    }
+
+    @Test fun `placement cannot exceed cap and rejected attempts do not consume IDs`() {
+        repeat(50) { index ->
+            viewModel.setPlacementMode(true)
+            viewModel.placeObstacle(GridCoordinate(index % 20, index / 20))
+        }
+        viewModel.setPlacementMode(true)
+        assertFalse(viewModel.uiState.value.placementMode)
+        viewModel.placeObstacle(GridCoordinate(19,19))
+        assertEquals(50, sent.size)
+        viewModel.removeObstacle(17)
+        viewModel.setPlacementMode(true)
+        viewModel.placeObstacle(GridCoordinate(19,19))
+        assertEquals(17, viewModel.uiState.value.arena.selectedObstacleId)
+    }
+
+    @Test fun `movement cancels placement and stale taps cannot edit during or after movement`() = runTest(dispatcher) {
+        viewModel.connectionChanged(true)
+        viewModel.accept("ROBOT,8,8,N")
+        advanceUntilIdle()
+        viewModel.setPlacementMode(true)
+        viewModel.drive(ManualCommand.FORWARD) {}
+        assertFalse(viewModel.uiState.value.placementMode)
+        viewModel.setPlacementMode(true)
+        assertFalse(viewModel.uiState.value.placementMode)
+        viewModel.placeObstacle(GridCoordinate(1,1))
+        advanceUntilIdle()
+        viewModel.placeObstacle(GridCoordinate(1,1))
+        assertTrue(viewModel.uiState.value.arena.obstacles.isEmpty())
+        viewModel.setPlacementMode(true)
+        viewModel.accept("STATUS,RUNNING,1,1")
+        advanceUntilIdle()
+        assertFalse(viewModel.uiState.value.placementMode)
+        viewModel.setPlacementMode(true)
+        assertFalse(viewModel.uiState.value.placementMode)
+    }
+
+    @Test fun `connection and reconnect require a valid pose before any movement in both modes`() = runTest(dispatcher) {
         for (amd in listOf(false, true)) {
             viewModel.connectionChanged(false)
             viewModel.setAmdToolMode(amd)
-            assertTrue(ManualCommand.entries.none(viewModel::manualAllowed))
             viewModel.connectionChanged(true)
-            assertTrue(viewModel.uiState.value.freeMoveMode)
-            assertEquals(null, viewModel.uiState.value.arena.robot)
             var sends = 0
-            for (command in ManualCommand.entries) {
-                assertTrue(viewModel.manualAllowed(command))
-                viewModel.drive(command) { sends++ }
-                viewModel.drive(command) { sends++ }
-                assertEquals(null, viewModel.uiState.value.arena.robot)
-                advanceUntilIdle()
-            }
-            assertEquals(8, sends)
-            viewModel.stopManual {}
-            assertTrue(ManualCommand.entries.all(viewModel::manualAllowed))
+            for (command in ManualCommand.entries) viewModel.drive(command) { sends++ }
+            assertEquals(0, sends)
             viewModel.accept("ROBOT,99,99,N")
             advanceUntilIdle()
-            assertTrue(ManualCommand.entries.all(viewModel::manualAllowed))
-            viewModel.accept("ROBOT,8,18,N")
+            assertTrue(ManualCommand.entries.none(viewModel::manualAllowed))
+            viewModel.accept("ROBOT,2,2,N")
             advanceUntilIdle()
-            assertFalse(viewModel.uiState.value.freeMoveMode)
-            assertFalse(viewModel.manualAllowed(ManualCommand.FORWARD))
-            assertTrue(viewModel.manualAllowed(ManualCommand.REVERSE))
+            assertTrue(viewModel.manualAllowed(ManualCommand.FORWARD))
+            viewModel.drive(ManualCommand.FORWARD) { sends++ }
+            advanceUntilIdle()
+            assertEquals(1, sends)
             viewModel.connectionChanged(false)
             viewModel.connectionChanged(true)
-            assertTrue(ManualCommand.entries.all(viewModel::manualAllowed))
+            assertTrue(ManualCommand.entries.none(viewModel::manualAllowed))
             assertEquals(null, viewModel.uiState.value.arena.robot)
         }
     }
@@ -75,13 +140,13 @@ class ArenaViewModelTest {
         }
     }
 
-    @Test fun `invalid input preserves initial free mode and never unlocks a failed send`() = runTest(dispatcher) {
+    @Test fun `invalid input never enables unlocalized movement or unlocks a failed send`() = runTest(dispatcher) {
         for (amd in listOf(false, true)) {
             viewModel.setAmdToolMode(amd)
             viewModel.connectionChanged(true)
             viewModel.accept("ROBOT,99,99,N")
             advanceUntilIdle()
-            assertTrue(ManualCommand.entries.all(viewModel::manualAllowed))
+            assertTrue(ManualCommand.entries.none(viewModel::manualAllowed))
             assertEquals(null, viewModel.uiState.value.arena.robot)
             viewModel.accept("ROBOT,8,8,N")
             advanceUntilIdle()
@@ -406,7 +471,7 @@ class ArenaViewModelTest {
         advanceUntilIdle()
 
         assertEquals("DONE", viewModel.uiState.value.status)
-        assertEquals("Malformed status received", viewModel.uiState.value.feedback)
+        assertEquals("Couldn’t apply this update. The previous state was kept.", viewModel.uiState.value.feedback)
         assertTrue(viewModel.uiState.value.feedbackIsError)
     }
 
@@ -414,11 +479,11 @@ class ArenaViewModelTest {
     fun `routine status and robot telemetry refresh latest action without cancelling editing`() = runTest(dispatcher) {
         viewModel.setPlacementMode(true)
 
-        viewModel.accept("STATUS,RUNNING,1,4")
+        viewModel.accept("STATUS,CONNECTED TO RPI")
         viewModel.accept("ROBOT,7,2,W")
         advanceUntilIdle()
 
-        assertEquals("RUNNING,1,4", viewModel.uiState.value.status)
+        assertEquals("CONNECTED TO RPI", viewModel.uiState.value.status)
         assertEquals("Received: ROBOT,7,2,W", viewModel.uiState.value.feedback)
         assertTrue(viewModel.uiState.value.placementMode)
         assertEquals(GridCoordinate(7, 2), viewModel.uiState.value.arena.robot?.position)

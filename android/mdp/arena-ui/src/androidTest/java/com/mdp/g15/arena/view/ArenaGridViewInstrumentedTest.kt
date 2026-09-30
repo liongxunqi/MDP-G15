@@ -23,6 +23,42 @@ import java.util.concurrent.atomic.AtomicReference
 @RunWith(AndroidJUnit4::class)
 class ArenaGridViewInstrumentedTest {
     @Test
+    fun placementSwipesCancelledTouchesAndLongPressesDoNotEditExistingObjects() {
+        val context = ApplicationProvider.getApplicationContext<android.content.Context>()
+        val view = createView(context)
+        val events = mutableListOf<String>()
+        view.interactionListener = object : ArenaInteractionListener {
+            override fun onAddObstacle(position: GridCoordinate) { events.add("add:$position") }
+            override fun onSelectObstacle(obstacleId: Int?) { events.add("select") }
+            override fun onMoveObstacle(obstacleId: Int, destination: GridCoordinate) { events.add("move") }
+            override fun onRemoveObstacle(obstacleId: Int) { events.add("remove") }
+            override fun onMoveRobot(destination: GridCoordinate) { events.add("robot") }
+        }
+        val start = cellCenter(context, GridCoordinate(1,1))
+        val end = cellCenter(context, GridCoordinate(5,5))
+        val time = SystemClock.uptimeMillis()
+        onMain {
+            prepare(view, ArenaState(obstacles = mapOf(1 to Obstacle(1, GridCoordinate(1,1)))), true)
+            dispatch(view, time, time, MotionEvent.ACTION_DOWN, start.first, start.second)
+        }
+        Thread.sleep(ViewConfiguration.getLongPressTimeout().toLong() + 100)
+        onMain {
+            dispatch(view, time, time + 700, MotionEvent.ACTION_MOVE, -50f, -50f)
+            dispatch(view, time, time + 710, MotionEvent.ACTION_UP, -50f, -50f)
+            dispatch(view, time, time, MotionEvent.ACTION_DOWN, end.first, end.second)
+            dispatch(view, time, time + 10, MotionEvent.ACTION_CANCEL, end.first, end.second)
+            dispatch(view, time, time, MotionEvent.ACTION_DOWN, start.first, start.second)
+            dispatch(view, time, time + 10, MotionEvent.ACTION_MOVE, end.first, end.second)
+            dispatch(view, time, time + 20, MotionEvent.ACTION_UP, end.first, end.second)
+            dispatch(view, time, time, MotionEvent.ACTION_DOWN, start.first, start.second)
+            dispatch(view, time, time + 20, MotionEvent.ACTION_UP, end.first, end.second)
+            assertTrue(events.isEmpty())
+            dispatchTap(view, end.first, end.second)
+            assertEquals(listOf("add:GridCoordinate(x=5, y=5)"), events)
+        }
+    }
+
+    @Test
     fun rendersChecklistStateWithoutThrowing() {
         val context = ApplicationProvider.getApplicationContext<android.content.Context>()
         val view = createView(context)

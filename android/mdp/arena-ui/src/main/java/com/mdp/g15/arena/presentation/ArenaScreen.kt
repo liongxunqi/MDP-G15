@@ -53,7 +53,7 @@ fun ArenaScreen(
     var confirmReset by remember { mutableStateOf(false) }
     val interactions = remember(viewModel) {
         object : ArenaInteractionListener {
-            override fun onAddObstacle(position: GridCoordinate) = viewModel.addObstacle(position)
+            override fun onAddObstacle(position: GridCoordinate) = viewModel.placeObstacle(position)
             override fun onSelectObstacle(obstacleId: Int?) = viewModel.selectObstacle(obstacleId)
             override fun onMoveObstacle(obstacleId: Int, destination: GridCoordinate) =
                 viewModel.moveObstacle(obstacleId, destination)
@@ -278,12 +278,13 @@ private fun ArenaStatusPanel(
 
             val atObstacleLimit = state.arena.obstacles.size >= state.arena.config.maxObstacles
             Button(
-                onClick = viewModel::spawnObstacle,
-                enabled = !atObstacleLimit && !state.manualPending && !state.manualAnimating && !state.autonomousRunning,
+                onClick = { viewModel.setPlacementMode(!state.placementMode) },
+                enabled = state.placementMode || (!atObstacleLimit && !state.manualPending && !state.manualAnimating && !state.autonomousRunning),
                 modifier = Modifier.fillMaxWidth(),
             ) {
                 Text(
                     when {
+                        state.placementMode -> "Cancel placement"
                         atObstacleLimit -> "Obstacle limit reached"
                         else -> "Add obstacle"
                     },

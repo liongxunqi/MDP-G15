@@ -12,7 +12,6 @@ data class ArenaUiState(
     val placementMode: Boolean = false,
     val canUndo: Boolean = false,
     val canRedo: Boolean = false,
-    val freeMoveMode: Boolean = false,
     val amdToolMode: Boolean = false,
     val manualPending: Boolean = false,
     val manualAnimating: Boolean = false,
