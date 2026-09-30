@@ -99,6 +99,65 @@ A5_FACE_NAME = {0: "N", 2: "E", 4: "S", 6: "W"}
 # is what task1_pc.py sends when YOLO found nothing.
 A5_NOT_A_TARGET = {"bullseye", "dot", "none"}
 
+# ── Checklist image → image-ID mapping ──────────────────────────────────────
+# Android's TARGET wire field is 1-2 uppercase alphanumeric characters
+# (TargetId.kt), so it can carry an image ID like "19" or "40" but not a class
+# name like "seven". This maps a detected class name to the checklist's image
+# ID instead of forwarding the class name itself.
+#
+# CAUTION — NOT VERIFIED AGAINST YOUR MODEL: the keys below are the class
+# names this repo's own training data (pc_side/weights/best.pt) is presumed to
+# use, but that file isn't checked in and this repo has no data.yaml/class
+# list to confirm it against. Both the digit ("7") and the word ("seven")
+# forms are listed as keys, on the guess that one of the two matches — before
+# relying on this, print `model.names` from image_recognition/detect.py (the
+# loaded YOLO model) and correct any keys that don't match.
+IMAGE_ID_BY_CLASS = {
+    "1": 11, "one": 11,
+    "2": 12, "two": 12,
+    "3": 13, "three": 13,
+    "4": 14, "four": 14,
+    "5": 15, "five": 15,
+    "6": 16, "six": 16,
+    "7": 17, "seven": 17,
+    "8": 18, "eight": 18,
+    "9": 19, "nine": 19,
+    "A": 20, "B": 21, "C": 22, "D": 23, "E": 24, "F": 25, "G": 26, "H": 27,
+    "S": 28, "T": 29, "U": 30, "V": 31, "W": 32, "X": 33, "Y": 34, "Z": 35,
+    "up_arrow": 36, "up": 36,
+    "down_arrow": 37, "down": 37,
+    "right_arrow": 38, "right": 38,
+    "left_arrow": 39, "left": 39,
+    "stop": 40,
+}
+# Case-insensitive fallback — tried only if the exact-case lookup above misses.
+_IMAGE_ID_BY_CLASS_LOWER = {name.lower(): image_id for name, image_id in IMAGE_ID_BY_CLASS.items()}
+
+
+def _image_id_for(class_name: str) -> str:
+    """
+    Translate a detected class name into its checklist image ID.
+
+    Falls back to the raw class name (and logs a warning) for anything not in
+    the table, rather than guessing — Android will reject a TARGET field
+    longer than 2 characters or containing lowercase letters anyway
+    (TargetId.kt), so an unmapped name surfaces as a visible rejection on the
+    tablet instead of silently showing the wrong ID.
+    """
+    name = class_name.strip()
+    image_id = IMAGE_ID_BY_CLASS.get(name)
+    if image_id is None:
+        image_id = _IMAGE_ID_BY_CLASS_LOWER.get(name.lower())
+    if image_id is None:
+        logging.warning(
+            f"No image-ID mapping for detected class '{class_name}' — "
+            "forwarding the raw class name to Android instead. Check "
+            "IMAGE_ID_BY_CLASS against the model's actual class names."
+        )
+        return class_name
+    return str(image_id)
+
+
 # Team contract with the Android side: this exact word, on its own, asks the
 # RPi to resend its current state after a reconnect.
 SYNC = "SYNC"
@@ -330,7 +389,7 @@ class Task1:
 
         # Folded back to the id Android actually knows about.
         target_id = self._a5_base_id if self._a5_base_id is not None else face_id
-        self._send_to_android(f"TARGET,{target_id},{name}")
+        self._send_to_android(f"TARGET,{target_id},{_image_id_for(name)}")
 
     def _request_path_from_pc(self) -> bool:
         """Send current obstacle list to PC for pathfinding.  Idempotent."""
@@ -850,7 +909,7 @@ class Task1:
                     elif self.a5_mode:
                         self._a5_report(obstacle_id, class_id, confidence)
                     else:
-                        self._send_to_android(f"TARGET,{obstacle_id},{class_id}")
+                        self._send_to_android(f"TARGET,{obstacle_id},{_image_id_for(class_id)}")
 
                 else:
                     logging.warning(f"PC: unrecognised message '{msg}' — ignoring.")
