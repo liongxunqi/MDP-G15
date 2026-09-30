@@ -1,5 +1,12 @@
 package com.example.mdp
 
+/**
+ * Sent once per transition into [ConnectionState.Connected] (first connect and every
+ * reconnect). The RPi replies by resending its latest TARGET/ROBOT/STATUS snapshot as
+ * ordinary lines, so the map self-heals after whatever was lost while the link was down.
+ * Team contract with the RPi side — keep this the only place the literal string lives.
+ */
+const val SYNC = "SYNC"
 
 /**
  * Manual movement commands (checklist C.3).

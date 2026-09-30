@@ -28,9 +28,23 @@ Task 1 message flow
 
 Thread-safety notes
 ────────────────────
-  _idx_lock     guards  segments, segments_index, obstacle_order, directions
-  image_done    Event: stm_thread produces (waits for result), pc_thread sets it
-  path_ready    Event: android_thread waits on it; pc_thread sets it
+  _idx_lock       guards  segments, segments_index, obstacle_order, directions
+  _snapshot_lock  guards  _target_snapshot, _robot_snapshot, _status_snapshot —
+                  every message TO Android goes through _send_to_android(),
+                  which is the only writer, so sends from android_thread,
+                  pc_thread and stm_thread can never interleave into a
+                  corrupted line or a stale snapshot
+  image_done      Event: stm_thread produces (waits for result), pc_thread sets it
+  path_ready      Event: android_thread waits on it; pc_thread sets it
+
+Reconnect (SYNC)
+────────────────
+  A Bluetooth drop can lose a write silently — send() can succeed into a
+  half-open socket before the drop is noticed. Rather than track exactly what
+  was lost, the RPi keeps only the LATEST state (per obstacle for TARGET, one
+  slot each for ROBOT/STATUS) and replays all of it when Android sends the
+  bare line "SYNC" after reconnecting. The snapshot is cleared on a fresh
+  (non-duplicate) BEGIN, so a RETRY's new maze never resurfaces old targets.
 """
 
 import json
@@ -85,6 +99,10 @@ A5_FACE_NAME = {0: "N", 2: "E", 4: "S", 6: "W"}
 # is what task1_pc.py sends when YOLO found nothing.
 A5_NOT_A_TARGET = {"bullseye", "dot", "none"}
 
+# Team contract with the Android side: this exact word, on its own, asks the
+# RPi to resend its current state after a reconnect.
+SYNC = "SYNC"
+
 
 class Task1:
     """Orchestrates the three-thread pipeline for Task 1."""
@@ -130,6 +148,21 @@ class Task1:
         # actually dedupes on.
         self.mission_id: int = 0
         self.mission_state: str = "IDLE"    # IDLE | START_REQUESTED | RUNNING
+
+        # ── Android state snapshot (for SYNC after a reconnect) ────────────────
+        # The tablet's Bluetooth link can drop and a write can succeed into a
+        # half-open socket before that is noticed, so anything sent in that
+        # window is gone from the tablet's point of view even though send()
+        # here reported no error. Rather than trying to detect and resend the
+        # exact lost writes, the RPi keeps the LATEST state and replays that
+        # in full when asked — simpler, and correct regardless of how much
+        # was actually lost. _send_to_android() is the only place this is
+        # written; android_receive()'s SYNC branch is the only place it is
+        # read back out.
+        self._snapshot_lock = Lock()
+        self._target_snapshot: dict = {}      # obstacle_id (str) -> full "TARGET,..." line
+        self._robot_snapshot: str | None = None
+        self._status_snapshot: str | None = None
 
         # ── A.5 state ─────────────────────────────────────────────────────────
         # Off unless this was constructed by task_a5.py. Everything it touches
@@ -297,7 +330,7 @@ class Task1:
 
         # Folded back to the id Android actually knows about.
         target_id = self._a5_base_id if self._a5_base_id is not None else face_id
-        self.android.send(f"TARGET,{target_id},{name}")
+        self._send_to_android(f"TARGET,{target_id},{name}")
 
     def _request_path_from_pc(self) -> bool:
         """Send current obstacle list to PC for pathfinding.  Idempotent."""
@@ -313,6 +346,64 @@ class Task1:
         self._arm_path_watchdog()
         logging.info(f"Sent OBSTACLES to PC ({len(outgoing)} obstacle(s)).")
         return True
+
+    # ── Android state snapshot ────────────────────────────────────────────────
+
+    def _send_to_android(self, line: str) -> bool:
+        """
+        The single chokepoint for every message this class sends to Android.
+
+        Records the line into the snapshot BEFORE attempting the write, so a
+        failed or lost send never loses state — only the write can fail, never
+        the bookkeeping. android_thread, pc_thread and stm_thread all call
+        this concurrently (BEGIN acks, TARGET forwards, ROBOT updates), so the
+        snapshot update and the socket write are both taken under one lock per
+        call — one thread's line can never interleave with another's.
+
+        Returns True if the write reached the socket, False otherwise (the
+        caller decides whether that is worth logging further).
+        """
+        with self._snapshot_lock:
+            if line.startswith("TARGET,"):
+                obstacle_id = line.split(",", 2)[1]
+                self._target_snapshot[obstacle_id] = line
+            elif line.startswith("ROBOT,"):
+                self._robot_snapshot = line
+            elif line.startswith("STATUS,"):
+                self._status_snapshot = line
+
+            try:
+                self.android.send(line)
+                return True
+            except OSError as exc:
+                logging.warning(f"Could not send to Android ({exc}): {line}")
+                return False
+
+    def _reset_android_snapshot(self) -> None:
+        """A RETRY plans a new maze — the previous run's targets must not reappear."""
+        with self._snapshot_lock:
+            self._target_snapshot.clear()
+            self._robot_snapshot = None
+            self._status_snapshot = None
+
+    def _sync_android(self) -> None:
+        """Resend the latest known state — called when Android asks for SYNC."""
+        with self._snapshot_lock:
+            targets = list(self._target_snapshot.values())
+            robot = self._robot_snapshot
+            status = self._status_snapshot
+
+        logging.info(
+            f"Android: SYNC — resending {len(targets)} target(s), "
+            f"{'a robot pose' if robot else 'no robot pose'}, "
+            f"{'a status' if status else 'no status'}."
+        )
+        for line in targets:
+            self._send_to_android(line)
+        if robot:
+            self._send_to_android(robot)
+        if status:
+            self._send_to_android(status)
 
     # ── PATH watchdog ─────────────────────────────────────────────────────────
 
@@ -355,10 +446,7 @@ class Task1:
         # it — let a fresh BEGIN through instead of dedupeing forever against
         # a request that can now never complete.
         self.mission_state = "IDLE"
-        try:
-            self.android.send("STATUS,FAILED")
-        except OSError as exc:
-            logging.warning(f"Could not tell Android the planner failed: {exc}")
+        self._send_to_android("STATUS,FAILED")
 
     # ── STM segment helpers ────────────────────────────────────────────────────
 
@@ -433,10 +521,7 @@ class Task1:
             f"STM segment {self.segments_index}/{len(self.segments)} sent: {seg}"
         ) 
         # for individual segments when they start running
-        try:
-            self.android.send(f"STATUS,RUNNING,{self.segments_index},{len(self.segments)}")
-        except OSError as exc:
-            logging.warning(f"Could not notify Android of running status: {exc}")
+        self._send_to_android(f"STATUS,RUNNING,{self.segments_index},{len(self.segments)}")
         return True
 
     def _begin_running(self, mission_id: int) -> None:
@@ -451,13 +536,10 @@ class Task1:
         with self._idx_lock:
             if self.directions:
                 start_pose = self.directions[0]
-                try:
-                    self.android.send(
-                        f"STATUS,START,{mission_id},{start_pose['x']},"
-                        f"{start_pose['y']},{start_pose['dir']}"
-                    )
-                except OSError as exc:
-                    logging.warning(f"Could not notify Android of start position: {exc}")
+                self._send_to_android(
+                    f"STATUS,START,{mission_id},{start_pose['x']},"
+                    f"{start_pose['y']},{start_pose['dir']}"
+                )
 
         self.mission_state = "RUNNING"
         if not self._send_next_segment():
@@ -490,10 +572,7 @@ class Task1:
         # request, not a duplicate of the one that just failed.
         self.mission_state = "IDLE"
 
-        try:
-            self.android.send("STATUS,FAILED")
-        except OSError as exc:
-            logging.error(f"Could not notify Android of halt: {exc}")
+        self._send_to_android("STATUS,FAILED")
 
     # ── Image detection with retry ────────────────────────────────────────────
 
@@ -646,23 +725,21 @@ class Task1:
                             f"Android: duplicate BEGIN ignored — mission "
                             f"{self.mission_id} already {self.mission_state}."
                         )
-                        try:
-                            self.android.send(f"STATUS,ACK,BEGIN,{self.mission_id}")
-                        except OSError as exc:
-                            logging.warning(f"Could not re-ack BEGIN: {exc}")
+                        self._send_to_android(f"STATUS,ACK,BEGIN,{self.mission_id}")
                         continue
 
                     self.mission_id += 1
                     self.mission_state = "START_REQUESTED"
                     mission_id = self.mission_id
+                    # A fresh (non-duplicate) BEGIN is where a run starts: the
+                    # previous run's targets/pose/status must not reappear on
+                    # a later SYNC, e.g. after a RETRY plans a new maze.
+                    self._reset_android_snapshot()
 
                     # Acknowledge immediately — before path/segment work — so a
                     # delayed PATH never reads on Android as an unacknowledged
                     # button press.
-                    try:
-                        self.android.send(f"STATUS,ACK,BEGIN,{mission_id}")
-                    except OSError as exc:
-                        logging.warning(f"Could not ack BEGIN: {exc}")
+                    self._send_to_android(f"STATUS,ACK,BEGIN,{mission_id}")
 
                     if not self.started:
                         logging.info(f"Android: BEGIN received — mission {mission_id} starting.")
@@ -683,6 +760,10 @@ class Task1:
                         continue
 
                     self._begin_running(mission_id)
+
+                elif tag == SYNC:
+                    # ── Tablet reconnected and wants the current state ─────────
+                    self._sync_android()
 
                 else:
                     logging.warning(f"Android: unrecognised message '{msg}' — ignoring.")
@@ -769,7 +850,7 @@ class Task1:
                     elif self.a5_mode:
                         self._a5_report(obstacle_id, class_id, confidence)
                     else:
-                        self.android.send(f"TARGET,{obstacle_id},{class_id}")
+                        self._send_to_android(f"TARGET,{obstacle_id},{class_id}")
 
                 else:
                     logging.warning(f"PC: unrecognised message '{msg}' — ignoring.")
@@ -891,7 +972,7 @@ class Task1:
                             robot_pose = None
 
                     if robot_pose:
-                        self.android.send(
+                        self._send_to_android(
                             f"ROBOT,{robot_pose['x']},{robot_pose['y']},{robot_pose['dir']}"
                         )
                     
@@ -920,7 +1001,7 @@ class Task1:
                         self.pc.send(f"STITCH,{max(shots - 1, 0)}\n")
                         # A later BEGIN is a new mission, not a duplicate of this one.
                         self.mission_state = "IDLE"
-                        self.android.send("STATUS,DONE")
+                        self._send_to_android("STATUS,DONE")
 
                         if self.a5_mode:
                             if self._a5_found is not None:

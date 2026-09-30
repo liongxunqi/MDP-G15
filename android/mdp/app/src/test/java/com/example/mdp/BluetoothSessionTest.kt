@@ -52,4 +52,15 @@ class BluetoothSessionTest {
             assertEquals(0L, closed.count)
         }
     }
+
+    @Test
+    fun `onConnected sends exactly SYNC, once per call`() {
+        val sent = mutableListOf<String>()
+        onConnected(sent::add)
+        assertEquals(listOf(SYNC), sent)
+
+        // A reconnect calls this again — one more SYNC, not a repeat of the first send.
+        onConnected(sent::add)
+        assertEquals(listOf(SYNC, SYNC), sent)
+    }
 }

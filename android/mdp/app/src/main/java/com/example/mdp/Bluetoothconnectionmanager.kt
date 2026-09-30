@@ -155,6 +155,10 @@ class BluetoothConnectionManager(
             attempt = 0
             outgoing.open()
             _state.value = ConnectionState.Connected(safeName(device))
+            // Resync the map: whatever the RPi sent while we were down (including the last
+            // few writes into a half-open socket just before the drop was noticed) is gone,
+            // so ask it to resend its current snapshot as ordinary TARGET/ROBOT/STATUS lines.
+            onConnected(::send)
 
             try {
                 runSession(socket)

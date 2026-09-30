@@ -13,7 +13,7 @@ class ObstacleSyncTest {
         assertEquals("CLEAR", ObstacleSync.encode(emptyMap()))
     }
 
-    @Test fun `deletion replaces remaining map and reconnect sends latest offline state`() {
+    @Test fun `only the first connect sends the full map — a later reconnect sends nothing`() {
         val sent = mutableListOf<String>()
         val sync = ObstacleSync(sent::add)
         val a = Obstacle(1, GridCoordinate(3, 4), Direction.NORTH)
@@ -24,26 +24,28 @@ class ObstacleSyncTest {
         assertEquals(ObstacleSync.encode(mapOf(1 to a, 2 to b)), sent.last())
         sync.update(mapOf(2 to b))
         assertEquals("CLEAR\nOBSTACLE,2,50,60,EAST", sent.last())
+        val beforeReconnect = sent.size
         sync.connectionChanged(false)
-        sync.update(emptyMap())
-        assertEquals(2, sent.size)
+        sync.update(emptyMap())          // offline edit — not transmitted
+        assertEquals(beforeReconnect, sent.size)
         sync.connectionChanged(true)
-        assertEquals("CLEAR", sent.last())
+        // A reconnect must NOT resend the map — the RPi's own state is untouched by a drop,
+        // and resending CLEAR would wipe and replan it for no reason.
+        assertEquals(beforeReconnect, sent.size)
         assertTrue(sync.status.contains("unconfirmed"))
     }
 
-    @Test fun `received targets and unchanged map never cause an echo or needless rebuild`() {
+    @Test fun `a reconnect never re-sends the map, even if it changed while offline`() {
         val sent = mutableListOf<String>()
         val sync = ObstacleSync(sent::add)
         val a = Obstacle(1, GridCoordinate(3, 4), Direction.NORTH)
         sync.update(mapOf(1 to a))
-        sync.connectionChanged(true)
-        sync.update(mapOf(1 to a.copy(targetId = "11")))
-        sync.update(mapOf(1 to a.copy(targetFace = Direction.EAST)), transmit = false)
-        sync.connectionChanged(true)
-        assertEquals(1, sent.size)
+        sync.connectionChanged(true)   // first connect: sends the initial map once
+        sync.update(mapOf(1 to a.copy(targetFace = Direction.EAST)))                 // live edit: sends
+        sync.update(mapOf(1 to a.copy(position = GridCoordinate(9, 9))), transmit = false) // offline-style edit: not sent
+        assertEquals(2, sent.size)
         sync.connectionChanged(false)
-        sync.connectionChanged(true)
-        assertEquals("CLEAR\nOBSTACLE,1,30,40,EAST", sent.last())
+        sync.connectionChanged(true)   // reconnect: no resend, even though the map changed offline
+        assertEquals(2, sent.size)
     }
 }

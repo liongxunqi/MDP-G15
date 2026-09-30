@@ -233,6 +233,25 @@ class ArenaReducerTest {
         assertTrue(reducer.canMoveRobot(state, GridCoordinate(18, 18)))
     }
 
+    @Test fun `a repeated identical TARGET after a resync leaves the obstacle unchanged`() {
+        val state = ArenaState(obstacles = mapOf(1 to Obstacle(1, GridCoordinate(4, 4))))
+        val once = reducer.success(state, ArenaAction.ApplyTarget(1, "A9", Direction.NORTH))
+        // Simulates the RPi resending the exact same TARGET line after a SYNC.
+        val twice = reducer.success(once, ArenaAction.ApplyTarget(1, "A9", Direction.NORTH))
+        assertEquals(once, twice)
+        assertEquals(once.obstacles, twice.obstacles)
+        assertEquals(1, twice.obstacles.size)
+    }
+
+    @Test fun `a changed TARGET for the same obstacle updates it in place, not a duplicate`() {
+        val state = ArenaState(obstacles = mapOf(1 to Obstacle(1, GridCoordinate(4, 4))))
+        val first = reducer.success(state, ArenaAction.ApplyTarget(1, "A9", Direction.NORTH))
+        val updated = reducer.success(first, ArenaAction.ApplyTarget(1, "B3", Direction.EAST))
+        assertEquals(1, updated.obstacles.size)
+        assertEquals("B3", updated.obstacles.getValue(1).targetId)
+        assertEquals(Direction.EAST, updated.obstacles.getValue(1).targetFace)
+    }
+
     private fun ArenaReducer.success(state: ArenaState, action: ArenaAction): ArenaState =
         (reduce(state, action) as ArenaReduction.Success).state
 }

@@ -26,3 +26,13 @@ internal suspend fun runBluetoothSession(
         keepalive.cancel()
     }
 }
+
+/**
+ * Runs exactly once per transition into Connected, right after the state flips and before
+ * [runBluetoothSession] starts — see [BluetoothConnectionManager.maintainConnection]. Split out
+ * as a plain function (rather than inlined) so "SYNC is sent, and only once" is unit-testable
+ * without a real BluetoothAdapter/-Socket, which this module has no way to mock.
+ */
+internal fun onConnected(send: (String) -> Unit) {
+    send(SYNC)
+}

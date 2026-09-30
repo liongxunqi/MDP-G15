@@ -512,6 +512,35 @@ class ArenaViewModelTest {
     }
 
     @Test
+    fun `a resync burst of TARGET ROBOT and STATUS applies exactly like live messages`() = runTest(dispatcher) {
+        // Confirms requirement 3: nothing SYNC-specific is needed here — the RPi's snapshot
+        // reply arrives as ordinary wire lines through the same accept() path as any live
+        // message, so a multi-line burst is handled identically to receiving them one at a time.
+        viewModel.addObstacle(GridCoordinate(1, 1))
+        viewModel.connectionChanged(true)
+
+        val burst = "TARGET,1,A9,N\nROBOT,8,8,N\nSTATUS,RUNNING,1,4"
+        viewModel.accept(burst)
+        advanceUntilIdle()
+        val afterFirst = viewModel.uiState.value
+
+        assertEquals("A9", afterFirst.arena.obstacles.getValue(1).targetId)
+        assertEquals(GridCoordinate(8, 8), afterFirst.arena.robot?.position)
+        assertEquals("RUNNING,1,4", afterFirst.status)
+
+        // A reconnect resending the identical snapshot must converge to the same state,
+        // not duplicate or drift it.
+        viewModel.accept(burst)
+        advanceUntilIdle()
+        val afterSecond = viewModel.uiState.value
+
+        assertEquals(afterFirst.arena.obstacles, afterSecond.arena.obstacles)
+        assertEquals(afterFirst.arena.robot, afterSecond.arena.robot)
+        assertEquals(afterFirst.status, afterSecond.status)
+        assertEquals(1, afterSecond.arena.obstacles.size)
+    }
+
+    @Test
     fun `begin guards double taps and distinguishes requested from running`() = runTest(dispatcher) {
         viewModel.connectionChanged(true)
         var sends = 0
