@@ -11,7 +11,12 @@ from stm_tokens import TokenError, arc, fwd, rev
 STEP_MM = 50.0
 GOAL_TOL_STAGES_MM = (40.0, 80.0, 150.0, 250.0)
 REV_COST_MULT = 1.15
-MAX_EXPANSIONS = 200_000
+MAX_EXPANSIONS = 30_000
+# The assessment arena is open - no boundary boards - so the body may hang
+# this far past the 2 m line. Without it, a face pointing at a nearby edge has
+# nowhere to back out and turn, and that obstacle is a dead end. Set 0 to
+# treat the edge as a wall again.
+ARENA_OVERHANG_MM = 250.0
 
 _HEADINGS = (0.0, math.pi / 2, math.pi, -math.pi / 2)  # E, N, W, S
 
@@ -70,8 +75,9 @@ def _point_blocked(x, y, theta, boxes, arena_mm, half_length_mm, half_width_mm) 
     # exact rotated-rect bounding half-extent, not just the 4 cardinal cases
     half_extent_x = half_length_mm * abs(math.cos(theta)) + half_width_mm * abs(math.sin(theta))
     half_extent_y = half_length_mm * abs(math.sin(theta)) + half_width_mm * abs(math.cos(theta))
-    if not (half_extent_x <= x <= arena_mm - half_extent_x
-            and half_extent_y <= y <= arena_mm - half_extent_y):
+    lo_x, hi_x = half_extent_x - ARENA_OVERHANG_MM, arena_mm - half_extent_x + ARENA_OVERHANG_MM
+    lo_y, hi_y = half_extent_y - ARENA_OVERHANG_MM, arena_mm - half_extent_y + ARENA_OVERHANG_MM
+    if not (lo_x <= x <= hi_x and lo_y <= y <= hi_y):
         return True
     for xmin, ymin, xmax, ymax in boxes:
         if xmin <= x <= xmax and ymin <= y <= ymax:

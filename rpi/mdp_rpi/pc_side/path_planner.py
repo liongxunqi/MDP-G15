@@ -30,12 +30,12 @@ ROBOT_PLANNING_SIZE_MM = 300.0
 ROBOT_PLANNING_HALF_MM = ROBOT_PLANNING_SIZE_MM / 2.0
 VIRTUAL_OBSTACLE_HALF_MM = (OBSTACLE_SIZE_MM + ROBOT_PLANNING_SIZE_MM) / 2.0
 
-STANDOFF_MM = 450.0
+STANDOFF_MM = 200.0
 REV_AFTER_PHOTO_CM = 15
-STANDOFF_ANCHOR_BUFFER_MM = 350.0
+STANDOFF_ANCHOR_BUFFER_MM = 150.0
 FU_COMPENSATE = False
 
-EXHAUSTIVE_LIMIT = 7
+EXHAUSTIVE_LIMIT = 8
 
 FACE_FROM_D = {0: "N", 2: "E", 4: "S", 6: "W"}
 
@@ -187,22 +187,65 @@ def _route_cost(order, cache) -> float:
     return total
 
 
+def _reachable(visitable, cache):
+    """Split obstacles into those with at least one finite edge INTO them
+    (from the start or another obstacle) and those with none, which can never
+    appear in any tour."""
+    ids = [o["id"] for o in visitable]
+    ok, dropped = [], []
+    for obs in visitable:
+        sources = ["START"] + [i for i in ids if i != obs["id"]]
+        if any(math.isfinite(_edge_cost(cache, src, obs["id"])) for src in sources):
+            ok.append(obs)
+        else:
+            dropped.append(obs)
+    return ok, dropped
+
+
+def _prefix_score(order, cache):
+    """(obstacles reached before the first impossible leg, cost of those legs)."""
+    visited, cost, prev_id = 0, 0.0, "START"
+    for obs in order:
+        step = _edge_cost(cache, prev_id, obs["id"])
+        if not math.isfinite(step):
+            break
+        visited += 1
+        cost += step
+        prev_id = obs["id"]
+    return visited, cost
+
+
 def _visit_order(visitable, cache):
+    """Always returns every obstacle, best first. When no complete tour exists
+    - two dead ends, say - the order that reaches the MOST obstacles before
+    its first impossible leg wins, cheapest among those. plan_mission() then
+    skips whatever comes after that leg instead of losing the whole plan."""
     if len(visitable) <= 1:
         return list(visitable)
 
-    if len(visitable) <= EXHAUSTIVE_LIMIT:
-        best_order, best_cost = None, math.inf
-        for perm in itertools.permutations(visitable):
-            cost = _route_cost(list(perm), cache)
-            if cost < best_cost:
-                best_cost, best_order = cost, list(perm)
-        if best_order is None:
-            logging.error("No feasible visit order — every obstacle unreachable.")
-            return []
-        logging.info(f"Visit order: {[o['id'] for o in best_order]}  cost={best_cost:.0f}mm")
-        return best_order
+    if len(visitable) > EXHAUSTIVE_LIMIT:
+        return _greedy_order(visitable, cache)
 
+    best_key, best_order = None, None
+    for perm in itertools.permutations(visitable):
+        visited, cost = _prefix_score(perm, cache)
+        key = (-visited, cost)
+        if best_key is None or key < best_key:
+            best_key, best_order = key, list(perm)
+    assert best_key is not None and best_order is not None  # len >= 2, so a perm exists
+
+    visited = -best_key[0]
+    if visited < len(visitable):
+        logging.warning(
+            f"No complete tour: best order reaches {visited}/{len(visitable)} "
+            f"obstacles; skipping {[o['id'] for o in best_order[visited:]]}."
+        )
+    logging.info(f"Visit order: {[o['id'] for o in best_order]}  cost={best_key[1]:.0f}mm")
+    return best_order
+
+
+def _greedy_order(visitable, cache):
+    """Nearest-neighbour, then 2-opt. Always returns an order, never None."""
     remaining = list(visitable)
     order = []
     prev_id = "START"
@@ -227,7 +270,12 @@ def _visit_order(visitable, cache):
     return order
 
 
-STANDOFF_FALLBACKS_MM = (STANDOFF_MM, 250.0, 200.0, 150.0, 100.0, 70.0, FU_MIN_CM * 10.0)
+# Only ever step DOWN from STANDOFF_MM, so retuning it can't make a fallback
+# try a wider standoff than the one that just failed.
+STANDOFF_FALLBACKS_MM = tuple(dict.fromkeys(
+    s for s in (STANDOFF_MM, 250.0, 200.0, 150.0, 100.0, 70.0, FU_MIN_CM * 10.0)
+    if s <= STANDOFF_MM
+))
 ANCHOR_BUFFER_FALLBACKS_MM = (STANDOFF_ANCHOR_BUFFER_MM, 100.0, 50.0, 0.0)
 ROBOT_HALF_FALLBACKS_MM = (ROBOT_PLANNING_HALF_MM, ROBOT_HALF_LENGTH_MM)
 
@@ -293,6 +341,10 @@ def plan_mission(obstacles: List[dict], arc_profile: int = PROFILE_TIGHT) -> dic
         visitable.append(obs)
 
     edge_cache = _build_edge_cache(start, visitable, anchor_by_id, final_by_id, radius_mm, obstacles)
+
+    visitable, unreachable = _reachable(visitable, edge_cache)
+    for obs in unreachable:
+        logging.error(f"Obstacle {obs['id']}: no route into it from anywhere — dropped.")
     order = _visit_order(visitable, edge_cache)
 
     segments: List[List[str]] = []
@@ -311,6 +363,10 @@ def plan_mission(obstacles: List[dict], arc_profile: int = PROFILE_TIGHT) -> dic
         if cached is not None:
             tokens, poses, _ = cached
             tokens, poses = list(tokens), list(poses)
+        elif (cur_id, obs["id"]) in edge_cache:
+            # Already searched and failed - searching again only burns time.
+            logging.error(f"Obstacle {obs['id']}: no route from {cur_id} — skipping.")
+            continue
         else:
             try:
                 tokens, poses, _ = _search(cur, anchor, radius_mm, obstacles, obs["id"])
