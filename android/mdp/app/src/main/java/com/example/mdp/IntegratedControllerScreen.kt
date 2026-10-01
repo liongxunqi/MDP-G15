@@ -3,6 +3,8 @@ package com.example.mdp
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Row
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.Button
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.foundation.layout.Column
@@ -17,6 +19,8 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
@@ -28,6 +32,7 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import com.mdp.g15.arena.domain.ManualCommand
 import com.mdp.g15.arena.integration.ArenaOutboundSink
 import com.mdp.g15.arena.presentation.ArenaScreen
+import com.mdp.g15.arena.presentation.Task1Phase
 import com.mdp.g15.arena.presentation.ArenaViewModel
 import kotlinx.coroutines.flow.Flow
 
@@ -86,6 +91,23 @@ fun IntegratedControllerScreen(
     }
 
     val arenaState by arenaViewModel.uiState.collectAsState()
+    // Keep the foreground controller awake through setup, disconnects and result viewing.
+    // Scope this to the host view rather than a tab that gets disposed on navigation.
+    val hostView = LocalView.current
+    DisposableEffect(hostView) {
+        val previouslyAwake = hostView.keepScreenOn
+        hostView.keepScreenOn = true
+        onDispose { hostView.keepScreenOn = previouslyAwake }
+    }
+    val beginTask1: () -> Unit = {
+        if (arenaViewModel.startRun(onBegin)) selectedTab = ControllerTab.ARENA.ordinal
+    }
+    LaunchedEffect(arenaState.task1Phase) {
+        if (arenaState.task1Phase in setOf(Task1Phase.START_REQUESTED, Task1Phase.RUNNING,
+                Task1Phase.UNKNOWN, Task1Phase.COMPLETED, Task1Phase.FAILED)) {
+            selectedTab = ControllerTab.ARENA.ordinal
+        }
+    }
     DisposableEffect(arenaViewModel, onObstacleLookupAvailable) {
         onObstacleLookupAvailable { id -> id in arenaViewModel.uiState.value.arena.obstacles }
         onDispose { onObstacleLookupAvailable { false } }
@@ -149,21 +171,22 @@ fun IntegratedControllerScreen(
                     onForwardRight = { arenaViewModel.drive(ManualCommand.FORWARD_RIGHT, onForwardRight) },
                     onBackLeft = { arenaViewModel.drive(ManualCommand.BACK_LEFT, onBackLeft) },
                     onBackRight = { arenaViewModel.drive(ManualCommand.BACK_RIGHT, onBackRight) },
-                    onBegin = { arenaViewModel.beginMission(onBegin) },
-                    onPath = { arenaViewModel.startRun(onPath) },
+                    onBegin = beginTask1,
+                    onPath = { arenaViewModel.preparePath(onPath) },
                     onSendCustomMessage = { message ->
                         val command = ManualCommand.entries.firstOrNull { it.wire == message.trim().lowercase() }
                         when {
                             '\n' in message || '\r' in message -> arenaViewModel.rejectUnsafeCustomMessage()
                             command != null -> arenaViewModel.drive(command, movementCallbacks.getValue(command))
                             message.trim().equals("s", true) -> arenaViewModel.stopManual(onStop)
-                            message.trim().equals("BEGIN", true) -> arenaViewModel.beginMission(onBegin)
-                            message.trim().equals("PATH", true) -> arenaViewModel.startRun(onPath)
+                            message.trim().equals("BEGIN", true) -> beginTask1()
+                            message.trim().equals("PATH", true) -> arenaViewModel.preparePath(onPath)
                             else -> onSendCustomMessage(message)
                         }
                     },
                     modifier = Modifier.fillMaxSize(),
                     showManualPad = false,
+                    showTaskButtons = false,
                 )
 
                 ControllerTab.LOGS -> CommandLogScreen(commandLogs, onClearLogs)
@@ -179,6 +202,19 @@ fun IntegratedControllerScreen(
                             onChange = { value ->
                                 if (arenaViewModel.setAmdToolMode(!value)) onAppendNewlineChange(value)
                             },
+                        )
+                    },
+                    taskControls = {
+                        Task1Controls(
+                            phase = arenaState.task1Phase,
+                            canRequest = arenaViewModel.canRequestTask1(),
+                            startIssue = arenaViewModel.task1StartIssue(),
+                            plannerInfo = arenaState.plannerInfo,
+                            hasResults = arenaState.arena.obstacles.values.any { it.targetId != null },
+                            canNewAttempt = !arenaState.autonomousRunning && !arenaState.manualPending && !arenaState.manualAnimating,
+
+                            onStart = beginTask1,
+                            onNewAttempt = arenaViewModel::newAttempt,
                         )
                     },
                     drivingControls = {
@@ -213,5 +249,54 @@ private fun NewlineModeButtons(appendNewline: Boolean, enabled: Boolean, onChang
             OutlinedButton(enabled = enabled, onClick = { onChange(false) }, modifier = Modifier.weight(1f)) { Text("Amd tool") }
             Button(enabled = enabled, onClick = { onChange(true) }, modifier = Modifier.weight(1f)) { Text("normal") }
         }
+    }
+}
+
+@Composable
+private fun Task1Controls(
+    phase: Task1Phase,
+    canRequest: Boolean,
+    hasResults: Boolean,
+    canNewAttempt: Boolean,
+    startIssue: String?,
+    plannerInfo: String,
+    onStart: () -> Unit,
+    onNewAttempt: () -> Unit,
+) {
+    var confirmNewAttempt by rememberSaveable { mutableStateOf(false) }
+    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        Text("Task 1 • ${phase.label}", style = MaterialTheme.typography.titleSmall)
+        if (phase in setOf(Task1Phase.COMPLETED, Task1Phase.FAILED, Task1Phase.STOPPED) ||
+            (hasResults && phase in setOf(Task1Phase.SETUP, Task1Phase.PATH_REQUESTED))) {
+            OutlinedButton(onClick = { confirmNewAttempt = true }, enabled = canNewAttempt) {
+                Text("New attempt")
+            }
+        } else {
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Button(onClick = onStart, enabled = canRequest, modifier = Modifier.weight(1f)) {
+                    Text("Start Task 1")
+                }
+            }
+        }
+        if (phase in setOf(Task1Phase.SETUP, Task1Phase.PATH_REQUESTED, Task1Phase.START_REQUESTED)) {
+            Text(plannerInfo, style = MaterialTheme.typography.bodySmall)
+            if (startIssue != null && phase != Task1Phase.START_REQUESTED) {
+                Text(startIssue, style = MaterialTheme.typography.bodySmall)
+            }
+        }
+    }
+    if (confirmNewAttempt) {
+        AlertDialog(
+            onDismissRequest = { confirmNewAttempt = false },
+            title = { Text("Prepare a new attempt?") },
+            text = { Text("Save the result-map screenshot first. Previous image results will be cleared; obstacle positions and faces will be kept. No command will be sent to the robot.") },
+            confirmButton = {
+                TextButton(enabled = canNewAttempt, onClick = {
+                    confirmNewAttempt = false
+                    onNewAttempt()
+                }) { Text("Clear results") }
+            },
+            dismissButton = { TextButton(onClick = { confirmNewAttempt = false }) { Text("Cancel") } },
+        )
     }
 }

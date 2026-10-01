@@ -29,13 +29,10 @@ class ObstacleSync(private val send: (String) -> Unit) {
         if (connected && transmit) send(snapshot)
     }
 
-    fun connectionChanged(value: Boolean) {
+    fun connectionChanged(value: Boolean, transmit: Boolean = true) {
         if (value == connected) return
         connected = value
-        if (connected && !hasSyncedOnce) {
-            send(snapshot)
-            hasSyncedOnce = true
-        }
+        if (connected && transmit) send(snapshot)
     }
 
     companion object {

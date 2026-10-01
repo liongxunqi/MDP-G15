@@ -24,6 +24,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -47,6 +48,7 @@ fun ArenaScreen(
     robotStatus: String? = null,
     modifier: Modifier = Modifier,
     drivingControls: (@Composable () -> Unit)? = null,
+    taskControls: (@Composable () -> Unit)? = null,
     belowResetControls: (@Composable () -> Unit)? = null,
 ) {
     val state by viewModel.uiState.collectAsState()
@@ -79,6 +81,7 @@ fun ArenaScreen(
                         .fillMaxHeight(),
                 )
                 Column(Modifier.weight(1.25f).fillMaxHeight(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    taskControls?.invoke()
                     drivingControls?.invoke()
                     ArenaStatusPanel(
                         state = state,
@@ -102,6 +105,7 @@ fun ArenaScreen(
                     interactions = interactions,
                     modifier = Modifier.fillMaxWidth().weight(1f),
                 )
+                taskControls?.invoke()
                 drivingControls?.invoke()
                 ArenaStatusPanel(
                     state = state,
@@ -143,6 +147,11 @@ private fun ArenaCanvas(
     squareViewport: Boolean = false,
 ) {
     var gridView by remember { mutableStateOf<ArenaGridView?>(null) }
+    LaunchedEffect(gridView, state.task1Phase) {
+        if (state.task1Phase !in setOf(Task1Phase.SETUP, Task1Phase.PATH_REQUESTED)) {
+            gridView?.fitToView()
+        }
+    }
 
     Card(
         modifier = modifier.testTag("arena_grid_card"),

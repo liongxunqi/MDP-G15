@@ -300,6 +300,10 @@ class ArenaViewModelTest {
         viewModel.connectionChanged(true)
         viewModel.accept("ROBOT,8,8,N")
         advanceUntilIdle()
+        repeat(4) {
+            viewModel.addObstacle(GridCoordinate(it, 0))
+            viewModel.setTargetFace(Direction.NORTH)
+        }
         var runs = 0
         viewModel.drive(ManualCommand.FORWARD) {}
         viewModel.startRun { runs++ }
@@ -327,7 +331,7 @@ class ArenaViewModelTest {
         advanceUntilIdle()
         assertFalse(viewModel.uiState.value.feedbackIsError)
         assertEquals("STATUS,DONE", viewModel.uiState.value.latestReceived)
-        assertEquals("Received: STATUS,DONE", viewModel.uiState.value.feedback)
+        assertEquals("Status: Done", viewModel.uiState.value.feedback)
         assertEquals(GridCoordinate(4,5), viewModel.uiState.value.arena.robot!!.position)
         viewModel.accept("debug reply")
         advanceUntilIdle()
@@ -416,7 +420,8 @@ class ArenaViewModelTest {
         viewModel.spawnObstacle()
         assertTrue(viewModel.uiState.value.arena.obstacles.isEmpty())
         advanceUntilIdle()
-        viewModel.startRun {}
+        viewModel.accept("STATUS,RUNNING,1,3")
+        advanceUntilIdle()
         viewModel.spawnObstacle()
         assertTrue(viewModel.uiState.value.arena.obstacles.isEmpty())
         viewModel.accept("STATUS,DONE")
@@ -484,7 +489,7 @@ class ArenaViewModelTest {
         advanceUntilIdle()
 
         assertEquals("CONNECTED TO RPI", viewModel.uiState.value.status)
-        assertEquals("Received: ROBOT,7,2,W", viewModel.uiState.value.feedback)
+        assertEquals("Robot position updated to (7, 2), facing west.", viewModel.uiState.value.feedback)
         assertTrue(viewModel.uiState.value.placementMode)
         assertEquals(GridCoordinate(7, 2), viewModel.uiState.value.arena.robot?.position)
     }

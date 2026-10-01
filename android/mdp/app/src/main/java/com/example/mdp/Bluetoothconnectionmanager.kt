@@ -220,12 +220,18 @@ class BluetoothConnectionManager(
      * reconnect — instead of sitting on a false "Connected". The empty line is
      * ignored by the receiver (readLoop skips empty lines too, so a heartbeat that
      * loops back would be dropped rather than mistaken for a real message).
+     *
+     * DISABLED: suspected of contributing to stray bytes on the RPi side. Left as a
+     * no-op (rather than removed) so the call site and runBluetoothSession's wiring
+     * don't need to change. Re-enabling loses nothing extra that wasn't already true
+     * with it on; disabling it means a silently dead link (read() blocked with no
+     * exception, normal-mode case) is no longer detected until the next real write.
      */
     private suspend fun heartbeatLoop() {
-        while (currentCoroutineContext().isActive) {
-            delay(HEARTBEAT_INTERVAL_MS)
-            outgoing.submit("")   // writeLoop appends the delimiter -> just "\n"
-        }
+        // while (currentCoroutineContext().isActive) {
+        //     delay(HEARTBEAT_INTERVAL_MS)
+        //     outgoing.submit("")   // writeLoop appends the delimiter -> just "\n"
+        // }
     }
 
     /** Read bytes, accumulate, and emit each complete delimiter-terminated message. */

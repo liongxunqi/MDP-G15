@@ -10,6 +10,7 @@ interface ArenaMessageCodec {
 }
 
 sealed interface ArenaInboundEvent {
+    data class PlannerReady(val mapHash: String? = null) : ArenaInboundEvent
     data class Status(val text: String) : ArenaInboundEvent
     data class Target(
         val obstacleId: Int,
