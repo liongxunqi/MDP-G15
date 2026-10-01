@@ -15,6 +15,14 @@ class CsvArenaMessageCodec : ArenaMessageCodec {
 
         val command = clean.substringBefore(',').trim().uppercase()
         return when (command) {
+            "PLANNER" -> {
+                val match = PLANNER_READY.matchEntire(clean)
+                if (match == null) {
+                    ArenaDecodeResult.Malformed("Invalid planning readiness update.")
+                } else ArenaDecodeResult.Decoded(ArenaInboundEvent.PlannerReady(
+                    match.groupValues[1].takeIf(String::isNotEmpty),
+                ))
+            }
             "MSG" -> decodeStatus(clean)
             "TARGET" -> decodeTarget(clean)
             "ROBOT" -> decodeRobot(clean)
@@ -87,4 +95,10 @@ class CsvArenaMessageCodec : ArenaMessageCodec {
             ArenaInboundEvent.Robot(RobotPose(GridCoordinate(x, y), direction)),
         )
     }
+    companion object {
+        // Validate the entire framed payload, never a substring or just its tag.
+        // Transport whitespace/CRLF is normalized above; internal whitespace is invalid.
+        private val PLANNER_READY = Regex("PLANNER,READY(?:,([0-9a-f]{64}))?")
+    }
+
 }

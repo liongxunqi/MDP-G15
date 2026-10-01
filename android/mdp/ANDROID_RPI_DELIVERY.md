@@ -7,14 +7,17 @@ It is read directly from Git, not merged, modified or deployed by this work.
 ## Obstacle map
 
 The integrated app sends one ordered batch after each completed map edit and each
-connection/reconnection: `CLEAR`, then `OBSTACLE,id,x,y,FACING` for every current
+setup connection/reconnection: `CLEAR`, then `OBSTACLE,id,x,y,FACING` for every current
 obstacle. A deleted obstacle is absent from that replacement list. Reset sends
 only `CLEAR`. Placement, dragging, faces, undo and redo use the same path.
 Coordinates are multiplied by ten because the existing RPi divides them by ten;
 directions use NORTH/EAST/SOUTH/WEST, or SKIP for an unset face. IDs are preserved.
 The reusable arena module's original delta codec remains available to other hosts.
 
-Offline edits are retained in saved Android arena state. Reconnecting publishes
+Active/uncertain runs and completed-result viewing do not resend a map on reconnect.
+See [Task 1 assessment](TASK1_ASSESSMENT.md) for the current run/result lifecycle.
+
+Offline edits are retained in saved Android arena state. Reconnecting during setup publishes
 the latest full map, rather than replaying old edits. Received TARGET/ROBOT/status
 messages do not echo back as edits. Recognition IDs and physical robot pose remain
 incoming telemetry; the RPi has no API to set these from the tablet. Dragging the

@@ -276,6 +276,7 @@ fun ControllerScreen(
     reverseEnabled: Boolean = true,
     modifier: Modifier = Modifier,
     showManualPad: Boolean = true,
+    showTaskButtons: Boolean = true,
 ) {
     Box(modifier = modifier.fillMaxSize(), contentAlignment = Alignment.TopCenter) {
         Column(
@@ -340,10 +341,10 @@ fun ControllerScreen(
                         enabled = isConnected && customMessage.isNotBlank(),
                         modifier = Modifier.fillMaxWidth(),
                     ) { Text("Send") }
-                    Button(onClick = onBegin, enabled = isConnected, modifier = Modifier.fillMaxWidth()) {
+                    if (showTaskButtons) Button(onClick = onBegin, enabled = isConnected, modifier = Modifier.fillMaxWidth()) {
                         Text("Begin")
                     }
-                    Button(onClick = onPath, enabled = isConnected, modifier = Modifier.fillMaxWidth()) {
+                    if (showTaskButtons) Button(onClick = onPath, enabled = isConnected, modifier = Modifier.fillMaxWidth()) {
                         Text("Send Path")
                     }
                     if (showManualPad) DPad(

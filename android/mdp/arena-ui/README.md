@@ -46,8 +46,11 @@ the final valid edit is submitted after release.
 
 The integrated controller enables `ArenaViewModel.Factory(..., useRpiMapSync = true)`
 and calls `connectionChanged(isConnected)`. This adapter replaces the full RPi map
-with a `CLEAR` + obstacle batch after local edits and reconnects, using the existing
-RPi units and full direction names. It does not claim acknowledged delivery.
+with a `CLEAR` + obstacle batch after local edits and setup reconnects, using the existing
+RPi units and full direction names. Active/uncertain runs and completed-result viewing
+do not resend the map on reconnect. It does not claim acknowledged delivery.
+See [Task 1 assessment](../TASK1_ASSESSMENT.md) for planning, starting, result retention
+and the Android/PC evidence handoff.
 See [Android/RPi delivery](../ANDROID_RPI_DELIVERY.md) for the protocol and limits.
 
 ## Host integration

@@ -26,6 +26,7 @@ import androidx.compose.ui.geometry.Offset
 import com.mdp.g15.arena.view.ArenaGeometry
 import com.mdp.g15.arena.domain.ArenaConfig
 import com.mdp.g15.arena.domain.GridCoordinate
+import androidx.compose.ui.test.performTextInput
 import androidx.compose.ui.test.performClick
 import kotlinx.coroutines.flow.MutableSharedFlow
 import org.junit.Assert.assertEquals
@@ -59,6 +60,144 @@ class IntegratedControllerScreenTest {
         movement.clear()
         targetLookup = { false }
         targetChecksAtMapWrite.clear()
+    }
+
+    @Test
+    fun singleStartExplainsIncompleteSetupAndPlannerNotificationIsOptional() {
+        connected = true
+        setScreen()
+        composeRule.onNodeWithText("Arena").performClick()
+        composeRule.onNodeWithText("Prepare Path").assertDoesNotExist()
+        composeRule.onNodeWithText("Start Task 1").assertIsNotEnabled()
+        composeRule.onNodeWithText("Task 1 needs 4–8 obstacles (0 placed).").assertIsDisplayed()
+        repeat(4) { addAt(it, 0) }
+        composeRule.onNodeWithText("Start Task 1").assertIsNotEnabled()
+        composeRule.onNodeWithText("Choose an image face for obstacle(s): 1, 2, 3, 4.").assertIsDisplayed()
+        composeRule.runOnIdle { assertTrue(incoming.tryEmit("PLANNER,READY")) }
+        composeRule.waitForIdle()
+        composeRule.onNodeWithText("RPi reports path ready — map version unverified").assertIsDisplayed()
+        composeRule.onNodeWithText("Start Task 1").assertIsNotEnabled()
+        repeat(4) {
+            clickGridCell(it, 0)
+            composeRule.onNodeWithText("N").performScrollTo().performClick()
+        }
+        composeRule.onNodeWithText("Planning confirmation unavailable — Start can proceed once setup is complete").assertIsDisplayed()
+        composeRule.onNodeWithText("Start Task 1").assertIsEnabled().performClick()
+        composeRule.runOnIdle { assertEquals(listOf("BEGIN"), movement) }
+    }
+
+    @Test
+    fun task1PlanningStartAndResultsNeedNoFurtherNavigation() {
+        connected = true
+        setScreen()
+        composeRule.onNodeWithText("Begin").assertDoesNotExist()
+        composeRule.onNodeWithText("Send Path").assertDoesNotExist()
+        composeRule.onNodeWithText("Arena").performClick()
+        setupTask1()
+        repeat(3) { composeRule.onNodeWithText("+ Zoom in").performClick() }
+        composeRule.onNodeWithText("Prepare Path").assertDoesNotExist()
+        composeRule.onNodeWithText("Start Task 1").assertIsEnabled().performClick()
+        composeRule.onNodeWithText("Start Task 1").assertIsNotEnabled()
+        composeRule.runOnIdle { assertEquals(listOf("BEGIN"), movement) }
+        composeRule.runOnIdle { assertTrue(incoming.tryEmit("STATUS,RUNNING,1,2\nTARGET,1,20\nSTATUS,DONE")) }
+        composeRule.waitForIdle()
+        composeRule.onNodeWithText("Task 1 • Completed — results retained").assertIsDisplayed()
+        composeRule.onNodeWithTag("arena_grid").assertIsDisplayed()
+        capture("task1-completed")
+        composeRule.runOnIdle { connected = false }
+        composeRule.waitForIdle()
+        composeRule.onNodeWithText("Task 1 • Completed — results retained").assertIsDisplayed()
+        composeRule.onNodeWithText("New attempt").performClick()
+        composeRule.onNodeWithText("Cancel").performClick()
+        composeRule.onNodeWithText(" • target 20", substring = true).performScrollTo().assertIsDisplayed()
+        composeRule.onNodeWithText("New attempt").performClick()
+        composeRule.onNodeWithText("Clear results").performClick()
+        composeRule.onNodeWithText("Task 1 • Setup").assertIsDisplayed()
+        composeRule.onNodeWithText(" • target 20", substring = true).assertDoesNotExist()
+        composeRule.onNodeWithText("Start Task 1").assertIsNotEnabled()
+    }
+
+    @Test
+    fun customBeginShowsArenaAndReconnectDoesNotResendMapDuringRun() {
+        connected = true
+        setScreen()
+        composeRule.onNodeWithText("Arena").performClick()
+        setupTask1()
+        composeRule.onNodeWithText("Controls").performClick()
+        val writesBeforeRun = outbound.toList()
+        composeRule.onNodeWithText("Custom message (0/50)").performScrollTo().performTextInput("BEGIN")
+        composeRule.onNodeWithText("Send").performClick()
+        composeRule.onNodeWithText("Task 1 • Start requested — awaiting robot").assertIsDisplayed()
+        composeRule.onNodeWithTag("arena_grid").assertIsDisplayed()
+        composeRule.runOnIdle { connected = false }
+        composeRule.waitForIdle()
+        composeRule.runOnIdle { connected = true }
+        composeRule.waitForIdle()
+        composeRule.onNodeWithText("Task 1 • Connection interrupted — run status unknown").assertIsDisplayed()
+        composeRule.onNodeWithText("Start Task 1").assertIsNotEnabled()
+        composeRule.runOnIdle {
+            assertEquals(writesBeforeRun, outbound)
+            assertEquals(listOf("BEGIN"), movement)
+        }
+    }
+
+    @Test
+    fun screenAwakeSurvivesCompletionDisconnectAndRestorationAndIsReleasedOnDisposal() {
+        var host: android.view.View? = null
+        var show by mutableStateOf(true)
+        connected = true
+        val restoration = StateRestorationTester(composeRule)
+        restoration.setContent {
+            host = androidx.compose.ui.platform.LocalView.current
+            if (show) ScreenContent()
+        }
+        composeRule.runOnIdle { assertTrue(host!!.keepScreenOn) }
+        composeRule.onNodeWithText("Arena").performClick()
+        setupTask1()
+        composeRule.onNodeWithText("Start Task 1").performClick()
+        composeRule.runOnIdle { assertTrue(incoming.tryEmit("STATUS,DONE")) }
+        composeRule.waitForIdle()
+        composeRule.runOnIdle { connected = false }
+        composeRule.waitForIdle()
+        restoration.emulateSavedInstanceStateRestore()
+        composeRule.onNodeWithText("Task 1 • Completed — results retained").assertIsDisplayed()
+        composeRule.runOnIdle {
+            assertTrue(host!!.keepScreenOn)
+            show = false
+        }
+        composeRule.waitForIdle()
+        composeRule.runOnIdle { assertTrue(!host!!.keepScreenOn) }
+    }
+
+    @Test
+    fun foregroundTask1StaysAwakePastDeviceTimeout() {
+        val instrumentation = InstrumentationRegistry.getInstrumentation()
+        fun shell(command: String): String = android.os.ParcelFileDescriptor.AutoCloseInputStream(
+            instrumentation.uiAutomation.executeShellCommand(command)
+        ).bufferedReader().use { it.readText().trim() }
+        val timeout = shell("settings get system screen_off_timeout")
+        val plugged = shell("settings get global stay_on_while_plugged_in")
+        try {
+            shell("settings put system screen_off_timeout 15000")
+            shell("settings put global stay_on_while_plugged_in 0")
+            connected = true
+            setScreen()
+            composeRule.onNodeWithText("Arena").performClick()
+            setupTask1()
+            composeRule.onNodeWithText("Start Task 1").performClick()
+            composeRule.runOnIdle { assertTrue(incoming.tryEmit("STATUS,DONE")) }
+            composeRule.waitForIdle()
+            // No touch or UI assertion during the inactivity interval.
+            android.os.SystemClock.sleep(18_000)
+            val power = instrumentation.targetContext.getSystemService(android.os.PowerManager::class.java)
+            assertTrue("Result presentation must survive the normal inactivity timeout", power.isInteractive)
+            composeRule.onNodeWithText("Task 1 • Completed — results retained").assertIsDisplayed()
+        } finally {
+            if (timeout == "null") shell("settings delete system screen_off_timeout")
+            else shell("settings put system screen_off_timeout $timeout")
+            if (plugged == "null") shell("settings delete global stay_on_while_plugged_in")
+            else shell("settings put global stay_on_while_plugged_in $plugged")
+        }
     }
 
     @Test
@@ -373,6 +512,14 @@ class IntegratedControllerScreenTest {
         assertEquals(1, scans)
         assertEquals(item, selected)
         assertTrue(dismissed)
+    }
+
+    private fun setupTask1() {
+        for (x in 0..3) {
+            addAt(x, 0)
+            composeRule.onNodeWithText("N").performScrollTo().performClick()
+        }
+        clickGridCell(0, 0)
     }
 
     private fun addAt(x: Int, y: Int) {

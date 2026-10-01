@@ -23,6 +23,26 @@ import java.util.concurrent.atomic.AtomicReference
 @RunWith(AndroidJUnit4::class)
 class ArenaGridViewInstrumentedTest {
     @Test
+    fun fitToViewRestoresFullArenaAfterSetupZoom() {
+        val context = ApplicationProvider.getApplicationContext<android.content.Context>()
+        val view = createView(context)
+        onMain {
+            prepare(view, ArenaState(obstacles = mapOf(
+                1 to Obstacle(1, GridCoordinate(0, 0), Direction.NORTH, "20"),
+                2 to Obstacle(2, GridCoordinate(19, 19), Direction.SOUTH, "38"),
+            )), false)
+            fun capture(): Bitmap = Bitmap.createBitmap(view.width, view.height, Bitmap.Config.ARGB_8888).also {
+                view.draw(Canvas(it))
+            }
+            val overview = capture()
+            repeat(4) { view.zoomIn() }
+            assertTrue(!overview.sameAs(capture()))
+            view.fitToView()
+            assertTrue(overview.sameAs(capture()))
+        }
+    }
+
+    @Test
     fun placementSwipesCancelledTouchesAndLongPressesDoNotEditExistingObjects() {
         val context = ApplicationProvider.getApplicationContext<android.content.Context>()
         val view = createView(context)

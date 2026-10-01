@@ -61,12 +61,80 @@ class ArenaViewModel(
         return true
     }
 
-    fun startRun(send: () -> Unit) {
-        if (!connected || blockWhileDriving()) return
+    /** Local setup validation only: optional planner telemetry never gates Start. */
+    fun task1StartIssue(): String? {
+        val state = _uiState.value
+        return when {
+            !connected -> "Connect to the robot before starting."
+            state.autonomousRunning -> "A run is already active or awaiting confirmation."
+            state.manualPending || state.manualAnimating -> "Wait for manual movement to finish."
+            state.placementMode -> "Finish or cancel obstacle placement."
+            state.task1Phase !in setOf(Task1Phase.SETUP, Task1Phase.PATH_REQUESTED) ||
+                state.arena.obstacles.values.any { it.targetId != null } -> "Prepare a new attempt to clear previous results."
+            state.arena.obstacles.size !in 4..8 -> "Task 1 needs 4–8 obstacles (${state.arena.obstacles.size} placed)."
+            state.arena.obstacles.values.any { it.targetFace == null } -> "Choose an image face for obstacle(s): " +
+                state.arena.obstacles.values.filter { it.targetFace == null }.map { it.id }.sorted().joinToString(", ") + "."
+            else -> null
+        }
+    }
+
+    fun canRequestTask1(): Boolean = task1StartIssue() == null
+
+    fun preparePath(send: () -> Unit): Boolean {
+        task1StartIssue()?.let { setFeedback(it, true); return false }
+        _uiState.value = _uiState.value.copy(task1Phase = Task1Phase.PATH_REQUESTED, plannerInfo = DEFAULT_PLANNER_INFO)
+        persist(transmitMap = false)
+        return try {
+            send()
+            setFeedback("Path requested. Start only after supervisor approval.", false)
+            true
+        } catch (error: Exception) {
+            _uiState.value = _uiState.value.copy(task1Phase = Task1Phase.SETUP)
+            persist(transmitMap = false)
+            setFeedback("Path request failed. Check the connection before retrying.", true)
+            false
+        }
+    }
+
+    fun startRun(send: () -> Unit): Boolean {
+        task1StartIssue()?.let { setFeedback(it, true); return false }
         manualDrive.invalidate()
-        _uiState.value = _uiState.value.copy(autonomousRunning = true, placementMode = false, manualStatus = "Autonomous run — manual driving paused")
-        setFeedback("Run requested.", false)
-        send()
+        // Reserve synchronously: a second tap must never enqueue another BEGIN.
+        _uiState.value = _uiState.value.copy(autonomousRunning = true,
+            task1Phase = Task1Phase.START_REQUESTED, placementMode = false,
+            manualStatus = "Start requested — awaiting robot")
+        persist(transmitMap = false)
+        return try {
+            send()
+            setFeedback("Start requested. Waiting for robot progress.", false)
+            true
+        } catch (error: Exception) {
+            // A throwing transport may have partially sent BEGIN. Never retry automatically.
+            _uiState.value = _uiState.value.copy(task1Phase = Task1Phase.UNKNOWN,
+                manualStatus = "Start delivery uncertain — run status unknown")
+            persist(transmitMap = false)
+            setFeedback("Start delivery uncertain. No automatic retry was sent.", true)
+            true
+        }
+    }
+
+    /** Explicit post-run action: retain setup, but never carry detections/undo into another attempt. */
+    fun newAttempt() {
+        if (blockWhileDriving()) return
+        manualDrive.invalidate()
+        undoHistory.clear()
+        redoHistory.clear()
+        _uiState.value = _uiState.value.copy(
+            arena = _uiState.value.arena.copy(obstacles = _uiState.value.arena.obstacles.mapValues {
+                (_, obstacle) -> obstacle.copy(targetId = null)
+            }),
+            task1Phase = Task1Phase.SETUP, plannerInfo = DEFAULT_PLANNER_INFO, status = "Awaiting robot status",
+            statusHistory = listOf("Awaiting robot status"), latestReceived = "",
+            canUndo = false, canRedo = false, placementMode = false,
+            manualStatus = "New attempt — confirm robot position",
+        )
+        persist(transmitMap = false)
+        setFeedback("Previous image results cleared. Obstacle layout retained.", false)
     }
 
     fun rejectUnsafeCustomMessage() = setFeedback("Send one command at a time; movement must pass the arena checks.", true)
@@ -76,6 +144,7 @@ class ArenaViewModel(
             setFeedback("Movement blocked: wait for completion and a valid pose; check the swept path.", true)
             return
         }
+        _uiState.value = _uiState.value.copy(plannerInfo = DEFAULT_PLANNER_INFO)
         val path = manualDrive.reserve(_uiState.value.arena, command, _uiState.value.amdToolMode)
         if (path == null) {
             setFeedback("Movement blocked: wait for completion and a valid pose; check the swept path.", true)
@@ -106,6 +175,7 @@ class ArenaViewModel(
         } catch (error: Exception) {
             cancelPreviewGate()
             manualDrive.invalidate()
+            _uiState.value = _uiState.value.copy(plannerInfo = DEFAULT_PLANNER_INFO)
             _uiState.value = _uiState.value.copy(manualPending = false, manualStatus = "Send failed — pose unconfirmed")
             setFeedback("Send failed; robot position needs confirmation.", true)
         }
@@ -114,8 +184,11 @@ class ArenaViewModel(
     fun stopManual(send: () -> Unit) {
         cancelPreviewGate()
         manualDrive.invalidate()
-        _uiState.value = _uiState.value.copy(manualPending = false, autonomousRunning = false, manualStatus = "Stopped — pose unconfirmed")
+        _uiState.value = _uiState.value.copy(manualPending = false, autonomousRunning = false,
+            task1Phase = if (_uiState.value.autonomousRunning) Task1Phase.STOPPED else _uiState.value.task1Phase,
+            manualStatus = "Stopped — pose unconfirmed")
         setFeedback("Stop requested — await a fresh robot position before driving.", false)
+        persist(transmitMap = false)
         if (connected) send()
     }
     private val obstacleSync = ObstacleSync(outboundSink::submit).also {
@@ -124,16 +197,21 @@ class ArenaViewModel(
 
     fun connectionChanged(connected: Boolean) {
         if (this.connected != connected) {
+            _uiState.value = _uiState.value.copy(plannerInfo = DEFAULT_PLANNER_INFO)
             cancelPreviewGate()
             manualDrive.invalidate()
-            _uiState.value = _uiState.value.copy(manualPending = false, autonomousRunning = false,
+            _uiState.value = _uiState.value.copy(manualPending = false,
+                task1Phase = if (_uiState.value.autonomousRunning) Task1Phase.UNKNOWN else _uiState.value.task1Phase,
                 // A Bluetooth connection is not a pose report, including after reconnect.
-                arena = if (connected) _uiState.value.arena.copy(robot = null) else _uiState.value.arena,
-                manualStatus = if (connected) "Awaiting initial robot position" else "Disconnected — pose unconfirmed")
+                arena = if (connected && _uiState.value.task1Phase == Task1Phase.SETUP) _uiState.value.arena.copy(robot = null) else _uiState.value.arena,
+                manualStatus = if (_uiState.value.autonomousRunning) "Connection interrupted — run status unknown"
+                    else if (connected) "Awaiting initial robot position" else "Disconnected — pose unconfirmed")
         }
         this.connected = connected
+        persist(transmitMap = false)
         if (!useRpiMapSync) return
-        obstacleSync.connectionChanged(connected)
+        obstacleSync.connectionChanged(connected, transmit = !_uiState.value.autonomousRunning &&
+            _uiState.value.task1Phase in setOf(Task1Phase.SETUP, Task1Phase.PATH_REQUESTED))
         updateSyncStatus()
     }
 
@@ -150,13 +228,13 @@ class ArenaViewModel(
                 _uiState.value = _uiState.value.copy(latestReceived = line)
                 when (val decoded = codec.decode(line)) {
                     is ArenaDecodeResult.Decoded -> {
-                        setFeedback("Received: $line", isError = false)
+                        setFeedback("Update received.", isError = false)
                         handleInbound(decoded.event, line)
                     }
                     is ArenaDecodeResult.Malformed -> {
                         setFeedback("Couldn’t apply this update. The previous state was kept.", isError = true)
                     }
-                    ArenaDecodeResult.Ignored -> setFeedback("Received: $line", isError = false)
+                    ArenaDecodeResult.Ignored -> setFeedback("Unrecognised update received; current state kept.", isError = false)
                 }
             }
         }
@@ -251,6 +329,7 @@ class ArenaViewModel(
         val reset = (reducer.reduce(before, ArenaAction.Reset) as ArenaReduction.Success).state
         _uiState.value = _uiState.value.copy(
             arena = reset,
+            task1Phase = Task1Phase.SETUP,
             placementMode = false,
             canUndo = undoHistory.isNotEmpty(),
             canRedo = false,
@@ -304,6 +383,8 @@ class ArenaViewModel(
                 if (action is ArenaAction.MoveRobot) reduction.state.robot?.let(manualDrive::seed)
                 _uiState.value = _uiState.value.copy(
                     arena = reduction.state,
+                    plannerInfo = if (action is ArenaAction.MoveRobot) DEFAULT_PLANNER_INFO else _uiState.value.plannerInfo,
+                    task1Phase = if (_uiState.value.task1Phase == Task1Phase.PATH_REQUESTED) Task1Phase.SETUP else _uiState.value.task1Phase,
                     manualStatus = if (action is ArenaAction.MoveRobot) null else _uiState.value.manualStatus,
                     placementMode = if (leavePlacementMode) false else _uiState.value.placementMode,
                     canUndo = undoHistory.isNotEmpty(),
@@ -330,6 +411,24 @@ class ArenaViewModel(
 
     private fun handleInbound(event: ArenaInboundEvent, rawMessage: String) {
         when (event) {
+            is ArenaInboundEvent.PlannerReady -> {
+                if (!connected || _uiState.value.task1Phase !in setOf(Task1Phase.SETUP,
+                        Task1Phase.PATH_REQUESTED, Task1Phase.START_REQUESTED)) {
+                    setFeedback("Planning update received; current run status kept.", false)
+                    return
+                }
+                val hash = java.security.MessageDigest.getInstance("SHA-256")
+                    .digest(ObstacleSync.encode(_uiState.value.arena.obstacles).toByteArray(Charsets.UTF_8))
+                    .joinToString("") { "%02x".format(it) }
+                if (event.mapHash != null && event.mapHash != hash) {
+                    setFeedback("Planning update refers to a different map; current setup kept.", false)
+                    return
+                }
+                _uiState.value = _uiState.value.copy(plannerInfo = if (event.mapHash == null)
+                    "RPi reports path ready — map version unverified"
+                    else "RPi reports path ready for this obstacle map")
+                setFeedback(_uiState.value.plannerInfo, false)
+            }
             is ArenaInboundEvent.Status -> {
                 val controlStatus = rawMessage.startsWith("STATUS,")
                 val startPose = if (controlStatus && event.text.startsWith("START,")) {
@@ -349,6 +448,15 @@ class ArenaViewModel(
                     }
                     pose
                 } else null
+                val terminal = _uiState.value.task1Phase in setOf(Task1Phase.COMPLETED, Task1Phase.FAILED, Task1Phase.STOPPED)
+                val tag = if (controlStatus) event.text.substringBefore(',') else ""
+                if (terminal && tag in setOf("START", "RUNNING")) return
+                val phase = when (tag) {
+                    "START", "RUNNING" -> Task1Phase.RUNNING
+                    "DONE" -> if (terminal) _uiState.value.task1Phase else Task1Phase.COMPLETED
+                    "FAILED" -> if (terminal) _uiState.value.task1Phase else Task1Phase.FAILED
+                    else -> _uiState.value.task1Phase
+                }
                 val autonomous = when (if (controlStatus) event.text.substringBefore(',') else "") {
                     "START", "RUNNING" -> true
                     "DONE", "FAILED" -> false
@@ -364,6 +472,7 @@ class ArenaViewModel(
                     statusHistory = history,
                     manualPending = manualDrive.pending != null,
                     autonomousRunning = autonomous,
+                    task1Phase = phase,
                     placementMode = if (autonomous) false else _uiState.value.placementMode,
                     manualStatus = when (if (controlStatus) event.text else "") {
                         "FAILED" -> "Movement failed — pose unconfirmed"
@@ -371,6 +480,16 @@ class ArenaViewModel(
                         else -> if (autonomous) "Autonomous run — manual driving paused" else _uiState.value.manualStatus
                     },
                 )
+                val readableStatus = if (controlStatus) when (tag) {
+                    "DONE" -> "Done"
+                    "FAILED" -> "Failed"
+                    "OK" -> "OK"
+                    "START" -> "Started"
+                    "RUNNING" -> event.text.split(',').let { "Running (step ${it[1]} of ${it[2]})" }
+                    "CONNECTED TO RPI" -> "Connected to RPi"
+                    else -> event.text
+                } else event.text
+                setFeedback("Status: $readableStatus", false)
                 persist()
                 startPose?.let { handleInbound(ArenaInboundEvent.Robot(it), rawMessage) }
             }
@@ -405,6 +524,13 @@ class ArenaViewModel(
                             else -> _uiState.value.manualStatus
                         },
                     )
+                    if (!rawMessage.startsWith("STATUS,")) {
+                        setFeedback(if (accepted) {
+                            "Robot position updated to (${event.pose.position.x}, ${event.pose.position.y}), facing ${event.pose.direction.name.lowercase()}."
+                        } else {
+                            "Robot position update received; current movement estimate kept."
+                        }, false)
+                    }
                     persist()
                 }
             }
@@ -430,6 +556,8 @@ class ArenaViewModel(
     private fun updateAfterHistory(state: ArenaState, feedback: String) {
         _uiState.value = _uiState.value.copy(
             arena = state,
+            plannerInfo = DEFAULT_PLANNER_INFO,
+            task1Phase = if (_uiState.value.task1Phase == Task1Phase.PATH_REQUESTED) Task1Phase.SETUP else _uiState.value.task1Phase,
             placementMode = false,
             canUndo = undoHistory.isNotEmpty(),
             canRedo = redoHistory.isNotEmpty(),
@@ -463,7 +591,13 @@ class ArenaViewModel(
         val robot = savedStateHandle.get<String>(KEY_ROBOT)?.let(::decodeRobot)
         val selected = savedStateHandle.get<Int>(KEY_SELECTED)?.takeIf(obstacles::containsKey)
         val status = savedStateHandle.get<String>(KEY_STATUS).orEmpty().ifBlank { "Awaiting robot status" }
+        val savedPhase = savedStateHandle.get<String>(KEY_TASK1)?.let { name ->
+            Task1Phase.entries.firstOrNull { it.name == name }
+        } ?: Task1Phase.SETUP
+        val active = savedPhase in setOf(Task1Phase.START_REQUESTED, Task1Phase.RUNNING, Task1Phase.UNKNOWN)
         return ArenaUiState(
+            task1Phase = if (active) Task1Phase.UNKNOWN else savedPhase,
+            autonomousRunning = active,
             arena = ArenaState(
                 robot = robot,
                 obstacles = obstacles,
@@ -474,7 +608,14 @@ class ArenaViewModel(
         )
     }
 
+    private var plannerMapSnapshot: String? = null
+
     private fun persist(transmitMap: Boolean = true) {
+        val snapshot = ObstacleSync.encode(_uiState.value.arena.obstacles)
+        if (plannerMapSnapshot != snapshot) {
+            _uiState.value = _uiState.value.copy(plannerInfo = DEFAULT_PLANNER_INFO)
+            plannerMapSnapshot = snapshot
+        }
         val state = _uiState.value
         if (useRpiMapSync) {
             obstacleSync.update(state.arena.obstacles, transmit = transmitMap)
@@ -486,6 +627,7 @@ class ArenaViewModel(
         savedStateHandle[KEY_ROBOT] = state.arena.robot?.takeIf { it.estimate == null }?.let(::encodeRobot)
         savedStateHandle[KEY_SELECTED] = state.arena.selectedObstacleId
         savedStateHandle[KEY_STATUS] = state.status
+        savedStateHandle[KEY_TASK1] = state.task1Phase.name
     }
 
     private fun encodeObstacle(obstacle: Obstacle): String = listOf(
@@ -542,6 +684,7 @@ class ArenaViewModel(
         private const val KEY_OBSTACLES = "arena.obstacles"
         private const val KEY_ROBOT = "arena.robot"
         private const val KEY_SELECTED = "arena.selected"
+        private const val KEY_TASK1 = "arena.task1.phase"
         private const val KEY_STATUS = "arena.status"
     }
 }

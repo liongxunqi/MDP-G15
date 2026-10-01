@@ -520,6 +520,12 @@ class ArenaGridView @JvmOverloads constructor(
         panY = panY.coerceIn(minPanY, 0f)
     }
 
+    /** Restore the full-map overview for hands-off run/result presentation. */
+    fun fitToView() {
+        resetToFit()
+        invalidate()
+    }
+
     fun zoomIn() = setScale(scale + ZOOM_STEP)
 
     fun zoomOut() = setScale(scale - ZOOM_STEP)
