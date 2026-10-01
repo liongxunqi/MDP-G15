@@ -8,7 +8,10 @@ Queries, config and the `FAIL,*` replies are implemented in firmware but have
 and the `FAIL,*` rows of §3 as a proposal until that happens — the firmware can
 change if the RPi side wants different names or fields.
 
-**Protocol version: 4** — ask for it with `?VER`.
+**Protocol version: 5** — ask for it with `?VER`.
+
+Version 5 adds `!CALSL` / `!CALSR`, a separate arc steering deflection for
+each side (§7.1), and appends the two values in force to `?CAL`. Additive.
 
 Version 4 freezes calibration during tasks (§7.1): learning is **off at
 power-on** and runs only after `!LEARN1`; `!CALG` sets a gyro scale; heading
@@ -362,13 +365,21 @@ exactly what was restored — nothing a task does can change it.
 | Send | Effect | Reply |
 |---|---|---|
 | `!CALG<n>` | Gyro scale, **×10000**, 9000..11000 (0.90..1.10). Same busy/range rules as §7 | `OK` / `RESEND` |
-| `?CAL` | now `CAL,<decel_x10>,<lag_ms_x10>,<trim_us>,<gyro_x10000>,<learn>` | |
+| `!CALSL<n>` / `!CALSR<n>` | Left / right arc deflection from centre, **µs**. Left 300..574, right 300..626 (servo limits). **v5** | `OK` / `RESEND` |
+| `?CAL` | now `CAL,<decel_x10>,<lag_ms_x10>,<trim_us>,<gyro_x10000>,<learn>,<steer_left_us>,<steer_right_us>` (last two v5) | |
 | `?HDG` | `HDG,<commanded_x10>,<actual_x10>,<last_aim_x10>,<last_turned_x10>,<capped>` | |
 
 **The gyro scale** corrects the datasheet sensitivity (32.8 LSB/dps is
 nominal). A scale error is invisible to the robot — the arc termination, the
 braking model and `?TURN` all read the same gyro — so it can only be measured
 against the floor. `calibrate.py guided` does that with two full circles.
+
+**Per-side steering (v5).** The same pulse either side of centre does not
+give the same wheel angle, so left and right turns trace different circles
+even though the gyro stops both at the right angle. Each side's deflection is
+its own calibration value; `calibrate.py radius` measures each side's radius
+with a floor chord and adjusts them until both match the planner's 29.1 cm.
+Until something is restored, both sides use the symmetric 574 µs.
 
 **Heading carry-over.** The firmware keeps two totals that survive between
 moves: *commanded* (every arc angle asked for since `!ZERO`) and *actual*

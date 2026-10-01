@@ -9,6 +9,7 @@ what this script measured — which makes this the one place precision is won.
     python3 calibrate.py guided arena --note "arena floor, full battery"
     python3 calibrate.py verify arena        # square test before a run
     python3 calibrate.py brakes arena        # re-do braking only (new battery)
+    python3 calibrate.py radius arena        # re-match left/right turn radius
     python3 calibrate.py restore arena
     python3 calibrate.py list
     python3 calibrate.py show arena
@@ -25,15 +26,23 @@ THE GUIDED PROCEDURE, AND WHY EACH STEP NEEDS YOUR EYES
                 reference edge. You measure how far past or short of the edge
                 it ended. The gyro cannot see its own scale error - it measures
                 its own turns - so this is the only step that can find it.
-  3. BRAKES     Eight arcs with learning on, then the AVERAGE decel and lag are
+  3. RADIUS    FR90 and FL90 from a mark under the rear axle; you measure how
+                far the axle moved. That chord is the turn radius, per side.
+                The left and right steering are adjusted until both match the
+                29.1 cm the planner and the A5 orbit assume. The same pulse
+                either side of centre does not give the same wheel angle, so
+                without this a left turn and a right turn land the robot in
+                different places even when both stop at exactly 90 degrees.
+  4. BRAKES     Eight arcs with learning on, then the AVERAGE decel and lag are
                 pushed back and frozen. Then four more arcs with learning off
                 to show how precisely each one stops.
-  4. SQUARE     F50 + FR90 four times with learning off. You measure how far
+  5. SQUARE     F50 + FR90 four times with learning off. You measure how far
                 from the start mark it ends and its final angle. Only a profile
                 that passes this is marked verified.
 
 Order matters: the braking model is in gyro degrees, so it has to be learned
-AFTER the gyro scale is fixed.
+AFTER the gyro scale is fixed - and after the radius, because a different
+steering angle turns at a different rate and coasts a different amount.
 
 ALWAYS RE-ZERO AFTER YOU TOUCH THE ROBOT
 ────────────────────────────────────────
@@ -55,7 +64,8 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s",
                     datefmt="%H:%M:%S")
 
 from communications import cal_profile
-from communications.stm import FROZEN_CAL_MIN_PROTOCOL, STM
+from communications.stm import (CAL_LIMITS, FROZEN_CAL_MIN_PROTOCOL,
+                                 STEER_CAL_MIN_PROTOCOL, STM)
 
 # Step 1. F<n> is centimetres.
 STRAIGHT_CM = 100
@@ -69,13 +79,21 @@ DISTANCE_OK_PCT = 1.0
 GYRO_LOOPS = [("FR90", 4), ("FL90", 4)]
 GYRO_ASYMMETRY_WARN_PCT = 0.5
 
-# Step 3. Alternating forward/reverse so the heading returns and the robot
+# Step 3. The radius both sides are matched to: what the planner
+# (pc_side/stm_tokens.py TURN_RADIUS_MM) and A5 (TIGHT_RADIUS_CM) assume.
+RADIUS_TARGET_CM = 29.1
+RADIUS_TOL_CM = 0.5
+RADIUS_RUNS = 2              # turns measured per side per round
+RADIUS_MAX_ROUNDS = 4
+RADIUS_MAX_STEP_US = 60      # never move one side's steering further per round
+
+# Step 4. Alternating forward/reverse so the heading returns and the robot
 # stays on one patch of floor. Needs about 1.5 m x 1.5 m clear.
 BRAKE_LEARN_SEQ = ["FR90", "RR90", "FL90", "RL90"] * 2
 BRAKE_CHECK_SEQ = ["FR90", "RR90", "FL90", "RL90"]
 STOP_ERR_OK_DEG = 0.5
 
-# Step 4.
+# Step 5.
 SQUARE_SIDE_CM = 50
 SQUARE_GAP_OK_CM = 3.0
 SQUARE_ANGLE_OK_DEG = 1.0
@@ -328,7 +346,123 @@ def step_gyro(stm: STM, result: dict) -> bool:
     return True
 
 
-# ── Step 3: brakes ───────────────────────────────────────────────────────────
+# ── Step 3: radius, per side ─────────────────────────────────────────────────
+
+def measure_side(stm: STM, token: str, runs: int) -> Optional[List[float]]:
+    """
+    Turn radius from the floor: the chord between two marks under the rear
+    axle centre, one before the turn and one after. For a turn of theta the
+    chord is 2 R sin(theta/2), so R = chord / (2 sin(theta/2)) - using the
+    angle the gyro says it actually turned, not the 90 asked for.
+    """
+    radii = []
+    if not position_and_zero(stm, f"{token}: robot with room to turn "
+                             f"{'right' if token[1] == 'R' else 'left'}, about 70 cm clear."):
+        return None
+    for i in range(1, runs + 1):
+        pause(f"{token} {i}/{runs}: mark the floor under the CENTRE of the "
+              "rear axle.")
+        if not send_move(stm, token):
+            return None
+        hdg = stm.read_heading()
+        if hdg is None:
+            return None
+        turned = abs(hdg["last_turned"])
+        chord = ask_float("Straight-line distance from the mark to the rear "
+                          "axle centre now, cm:", allow_blank=False)
+        r = chord / (2.0 * math.sin(math.radians(turned) / 2.0))
+        radii.append(r)
+        logging.info(f"  {token} {i}: turned {turned:.1f}°, chord {chord:.1f} cm "
+                     f"→ radius {r:.1f} cm")
+    return radii
+
+
+def step_radius(stm: STM, result: dict, target_cm: float = RADIUS_TARGET_CM) -> bool:
+    print("\n  ── STEP 3: TURN RADIUS, PER SIDE ──────────────────────────────")
+    print(f"  Matches the left and right turn radius to {target_cm} cm. For each")
+    print("  turn: mark the floor under the centre of the rear axle, let it")
+    print("  turn, then measure straight from the mark to the axle centre.")
+    print("  A tape or ruler across the gap is enough - it is a straight line.")
+
+    proto = cal_profile.firmware_protocol(stm)
+    if proto is None or proto < STEER_CAL_MIN_PROTOCOL:
+        logging.error(f"Per-side steering needs protocol {STEER_CAL_MIN_PROTOCOL} "
+                      "firmware. Flash the current build.")
+        return False
+
+    cal = current_values(stm)
+    if cal is None:
+        return False
+    steer = {"L": cal["steer_left_us"], "R": cal["steer_right_us"]}
+    limit = {"L": CAL_LIMITS["SL"][1], "R": CAL_LIMITS["SR"][1]}
+    floor_us = CAL_LIMITS["SL"][0]
+    history = []
+
+    for rnd in range(1, RADIUS_MAX_ROUNDS + 1):
+        logging.info(f"Round {rnd}: steering left {steer['L']} µs, right {steer['R']} µs")
+        got = {}
+        for side, token in (("R", "FR90"), ("L", "FL90")):
+            radii = measure_side(stm, token, RADIUS_RUNS)
+            if radii is None:
+                return False
+            got[side] = _mean(radii)
+        history.append({"steer_l": steer["L"], "steer_r": steer["R"],
+                        "radius_l_cm": round(got["L"], 2),
+                        "radius_r_cm": round(got["R"], 2)})
+        logging.info(f"  radius: left {got['L']:.1f} cm, right {got['R']:.1f} cm "
+                     f"(target {target_cm} ± {RADIUS_TOL_CM})")
+
+        if all(abs(got[s] - target_cm) <= RADIUS_TOL_CM for s in "LR"):
+            break
+        if rnd == RADIUS_MAX_ROUNDS:
+            logging.warning(f"Not within ±{RADIUS_TOL_CM} cm after {rnd} rounds — "
+                            "keeping the last values. Check the linkage for play.")
+            break
+
+        # Smaller wheel angle, wider circle: R is roughly inversely
+        # proportional to the deflection over this range, so scale each
+        # side by measured/target and let the next round correct the rest.
+        capped = []
+        for s_ in "LR":
+            if abs(got[s_] - target_cm) <= RADIUS_TOL_CM:
+                continue
+            want = steer[s_] * got[s_] / target_cm
+            step = max(-RADIUS_MAX_STEP_US, min(RADIUS_MAX_STEP_US, want - steer[s_]))
+            new = int(round(steer[s_] + step))
+            new = max(floor_us, min(limit[s_], new))
+            if new == steer[s_]:
+                capped.append(s_)
+            steer[s_] = new
+
+        if capped:
+            names = {"L": "left", "R": "right"}
+            side = capped[0]
+            logging.warning(
+                f"The {names[side]} side is at its servo limit ({steer[side]} µs) "
+                f"and still turns {got[side]:.1f} cm wide of {target_cm}.")
+            ans = ask(f"Match the other side to {got[side]:.1f} cm instead? "
+                      "The planner and A5 radius must then be changed to match. [y/N]")
+            if ans.lower().startswith("y"):
+                target_cm = round(got[side], 1)
+            else:
+                logging.warning("Keeping the target; this side cannot reach it.")
+
+        if not stm.set_cal(steer_left_us=steer["L"], steer_right_us=steer["R"]):
+            return False
+
+    result["steer_left_us"] = steer["L"]
+    result["steer_right_us"] = steer["R"]
+    result["checks"]["radius"] = {"target_cm": target_cm, "rounds": history}
+    if abs(target_cm - RADIUS_TARGET_CM) > 1e-6:
+        logging.warning(
+            f"Turn radius is now {target_cm} cm, not {RADIUS_TARGET_CM}. Update "
+            f"TURN_RADIUS_MM[PROFILE_TIGHT] in pc_side/stm_tokens.py to "
+            f"{int(round(target_cm * 10))} and TIGHT_RADIUS_CM in task_a5.py to "
+            f"{target_cm}, then re-check A5_ORBIT.")
+    return True
+
+
+# ── Step 4: brakes ───────────────────────────────────────────────────────────
 
 def run_arcs(stm: STM, seq: List[str], sample_cal: bool):
     """Drive arcs one line each; return per-arc ?CAL and ?HDG readings."""
@@ -366,7 +500,7 @@ def summarise_stops(stop_errs) -> dict:
 
 
 def step_brakes(stm: STM, result: dict) -> bool:
-    print("\n  ── STEP 3: BRAKES ─────────────────────────────────────────────")
+    print("\n  ── STEP 4: BRAKES ─────────────────────────────────────────────")
     print(f"  {len(BRAKE_LEARN_SEQ)} arcs with learning on, then the averages are")
     print(f"  frozen and {len(BRAKE_CHECK_SEQ)} more arcs show how precisely they stop.")
     print("  Needs about 1.5 m x 1.5 m clear.")
@@ -414,10 +548,10 @@ def step_brakes(stm: STM, result: dict) -> bool:
     return True
 
 
-# ── Step 4: square ───────────────────────────────────────────────────────────
+# ── Step 5: square ───────────────────────────────────────────────────────────
 
 def step_square(stm: STM, result: dict, side_cm: int = SQUARE_SIDE_CM) -> bool:
-    print("\n  ── STEP 4: SQUARE ─────────────────────────────────────────────")
+    print("\n  ── STEP 5: SQUARE ─────────────────────────────────────────────")
     print(f"  F{side_cm} + FR90, four times, learning off. It should come back to")
     print("  where it started, facing the same way. Mark the rear axle and lay")
     print("  a reference edge along the robot's side before it goes.")
@@ -473,8 +607,10 @@ def snapshot(stm: STM, result: dict) -> bool:
     v = current_values(stm)
     if v is None:
         return False
-    for k in ("decel_x10", "lag_ms_x10", "trim_us", "gyro_x10000"):
-        result[k] = v[k]
+    for k in ("decel_x10", "lag_ms_x10", "trim_us", "gyro_x10000",
+              "steer_left_us", "steer_right_us"):
+        if v.get(k) is not None:
+            result[k] = v[k]
     return True
 
 
@@ -488,6 +624,13 @@ def report(p: dict) -> None:
     print(f"  lag      : {p['lag_ms_x10']/10:8.1f} ms")
     print(f"  trim     : {p['trim_us']:8d} µs")
     print(f"  gyro     : ×{cal_profile.values_of(p)[3]/10000:.4f}")
+    print(f"  steering : left {cal_profile.values_of(p)[4]} µs, "
+          f"right {cal_profile.values_of(p)[5]} µs")
+    rad = p.get("checks", {}).get("radius")
+    if rad and rad.get("rounds"):
+        last = rad["rounds"][-1]
+        print(f"  radius   : left {last['radius_l_cm']} cm, right "
+              f"{last['radius_r_cm']} cm (target {rad['target_cm']})")
     sq = p.get("checks", {}).get("square")
     if sq:
         print(f"  square   : gap {sq['gap_cm']} cm, floor angle "
@@ -509,11 +652,16 @@ def main() -> int:
     g.add_argument("--from", dest="start_from", default=None,
                    help="start from this saved profile instead of the robot's values")
     g.add_argument("--skip", default="",
-                   help="comma list of steps to skip: straight,gyro,brakes,square")
+                   help="comma list of steps to skip: straight,gyro,radius,brakes,square")
 
     b = sub.add_parser("brakes", help="re-do braking only, keep trim and gyro")
     b.add_argument("name")
     b.add_argument("--note", default=None)
+
+    rd = sub.add_parser("radius", help="re-match left/right turn radius, keep the rest")
+    rd.add_argument("name")
+    rd.add_argument("--target", type=float, default=RADIUS_TARGET_CM,
+                    help=f"radius both sides are matched to, cm (default {RADIUS_TARGET_CM})")
 
     v = sub.add_parser("verify", help="restore a profile and run the square test")
     v.add_argument("name")
@@ -540,7 +688,8 @@ def main() -> int:
             if p:
                 print(f"  {n:20s} {'✓' if p.get('verified') else ' '} "
                       f"decel {p['decel_x10']/10:7.1f}  lag {p['lag_ms_x10']/10:5.1f}  "
-                      f"trim {p['trim_us']:+3d}  gyro ×{cal_profile.values_of(p)[3]/10000:.4f}"
+                      f"trim {p['trim_us']:+3d}  gyro ×{cal_profile.values_of(p)[3]/10000:.4f}  "
+                      f"steer L{cal_profile.values_of(p)[4]}/R{cal_profile.values_of(p)[5]}"
                       f"   {p.get('note', '')}")
         return 0
 
@@ -593,6 +742,22 @@ def main() -> int:
             report(p)
             return 0 if p["verified"] else 1
 
+        if args.cmd == "radius":
+            p = cal_profile.load(args.name)
+            if p is None or not cal_profile.push(stm, p):
+                return 1
+            p.setdefault("checks", {})
+            if not step_radius(stm, p, target_cm=args.target):
+                return 1
+            p["verified"] = False
+            p["taken"] = datetime.now().isoformat(timespec="seconds")
+            cal_profile.save(args.name, p)
+            logging.info("Radius matched. The steering changed, so the braking "
+                         "no longer fits it: run `calibrate.py brakes "
+                         f"{args.name}` and then `verify {args.name}`.")
+            report(p)
+            return 0
+
         if args.cmd == "brakes":
             p = cal_profile.load(args.name)
             if p is None or not cal_profile.push(stm, p):
@@ -621,7 +786,7 @@ def main() -> int:
         show_values("Starting from", current_values(stm))
 
         for name, step in (("straight", step_straight), ("gyro", step_gyro),
-                           ("brakes", step_brakes)):
+                           ("radius", step_radius), ("brakes", step_brakes)):
             if name in skip:
                 logging.info(f"Skipping step {name}.")
                 continue

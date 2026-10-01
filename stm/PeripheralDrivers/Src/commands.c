@@ -115,7 +115,7 @@ uint8_t Cmd_IsImmediate(CmdOpcode_t op)
      * silently handed to the movement parser instead. Append new ones before
      * this endpoint and move the endpoint with them. */
     return (((op >= CMD_Q_US)  && (op <= CMD_SET_CAL_TRIM)) ||
-            ((op >= CMD_Q_HDG) && (op <= CMD_SET_CAL_GYRO))) ? 1U : 0U;
+            ((op >= CMD_Q_HDG) && (op <= CMD_SET_CAL_STEER_R))) ? 1U : 0U;
 }
 
 Command_t Cmd_ParseToken(const char *token)
@@ -181,6 +181,24 @@ Command_t Cmd_ParseToken(const char *token)
         {
             if (!parse_uint(&token[n], &arg)) { return cmd; }
             cmd.op  = CMD_SET_CAL_LAG;
+            cmd.arg = arg;
+            return cmd;
+        }
+
+        /* "!calsl" / "!calsr" share no prefix with "!call" past the fourth
+         * character, so the order against the others does not matter. */
+        if ((n = token_starts(token, "!calsl")) != 0U)
+        {
+            if (!parse_uint(&token[n], &arg)) { return cmd; }
+            cmd.op  = CMD_SET_CAL_STEER_L;
+            cmd.arg = arg;
+            return cmd;
+        }
+
+        if ((n = token_starts(token, "!calsr")) != 0U)
+        {
+            if (!parse_uint(&token[n], &arg)) { return cmd; }
+            cmd.op  = CMD_SET_CAL_STEER_R;
             cmd.arg = arg;
             return cmd;
         }

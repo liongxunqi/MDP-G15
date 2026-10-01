@@ -29,7 +29,8 @@ import time
 from datetime import datetime
 from typing import Optional
 
-from communications.stm import FROZEN_CAL_MIN_PROTOCOL, STM
+from communications.stm import (FROZEN_CAL_MIN_PROTOCOL, STEER_CAL_MIN_PROTOCOL,
+                                 STM)
 
 _HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PROFILE_DIR = os.path.join(_HERE, "cal_profiles")
@@ -40,6 +41,11 @@ ARC_PROFILE = 0
 
 # A profile saved before the gyro scale existed restores as 1.0.
 DEFAULT_GYRO_X10000 = 10000
+
+# A profile saved before per-side steering existed restores both sides to the
+# firmware's symmetric TIGHT deflection: 575 asked, 574 after the left side's
+# servo limit (motion.c arc_steer_us()).
+DEFAULT_STEER_US = 574
 
 
 # ── Store ─────────────────────────────────────────────────────────────────────
@@ -63,6 +69,8 @@ def load(name: str) -> Optional[dict]:
     with open(path, encoding="utf-8") as fh:
         p = json.load(fh)
     p.setdefault("gyro_x10000", DEFAULT_GYRO_X10000)
+    p.setdefault("steer_left_us", DEFAULT_STEER_US)
+    p.setdefault("steer_right_us", DEFAULT_STEER_US)
     return p
 
 
@@ -79,9 +87,11 @@ def save(name: str, profile: dict) -> str:
 
 
 def values_of(p: dict) -> tuple:
-    """The four numbers the firmware holds, in ?CAL order."""
+    """The six numbers the firmware holds, in ?CAL order (learn left out)."""
     return (int(p["decel_x10"]), int(p["lag_ms_x10"]), int(p["trim_us"]),
-            int(p.get("gyro_x10000", DEFAULT_GYRO_X10000)))
+            int(p.get("gyro_x10000", DEFAULT_GYRO_X10000)),
+            int(p.get("steer_left_us", DEFAULT_STEER_US)),
+            int(p.get("steer_right_us", DEFAULT_STEER_US)))
 
 
 # ── Talking to the robot ──────────────────────────────────────────────────────
@@ -100,21 +110,47 @@ def firmware_protocol(stm: STM) -> Optional[int]:
         return None
 
 
-def push(stm: STM, p: dict) -> bool:
-    """Send a profile's four values and read them back. Robot must be idle."""
-    decel, lag, trim, gyro = values_of(p)
+def push(stm: STM, p: dict, proto: Optional[int] = None) -> bool:
+    """
+    Send a profile's values and read them back. Robot must be idle.
+
+    Per-side steering needs protocol 5. On a protocol 4 board it is skipped -
+    unless the profile actually differs from the symmetric default, in which
+    case restoring the rest would quietly drive turns the profile was not
+    measured on, so it refuses instead.
+    """
+    if proto is None:
+        proto = firmware_protocol(stm)
+        if proto is None:
+            return False
+
+    decel, lag, trim, gyro, steer_l, steer_r = values_of(p)
+    with_steer = proto >= STEER_CAL_MIN_PROTOCOL
+    if not with_steer and (steer_l, steer_r) != (DEFAULT_STEER_US, DEFAULT_STEER_US):
+        logging.error(
+            f"This profile sets per-side steering (left {steer_l}, right "
+            f"{steer_r} µs) but the firmware is protocol {proto}; it needs "
+            f"{STEER_CAL_MIN_PROTOCOL}. Flash the current build.")
+        return False
+
     if not stm.set_cal(decel_x10=decel, lag_ms_x10=lag, trim_us=trim,
-                       gyro_x10000=gyro):
+                       gyro_x10000=gyro,
+                       steer_left_us=steer_l if with_steer else None,
+                       steer_right_us=steer_r if with_steer else None):
         logging.error("Calibration restore failed — see above.")
         return False
     back = stm.read_cal_full()
     if back is None:
         return False
+    want = (decel, lag, trim, gyro)
     got = (back["decel_x10"], back["lag_ms_x10"], back["trim_us"],
            back["gyro_x10000"])
-    if got != (decel, lag, trim, gyro):
+    if with_steer:
+        want += (steer_l, steer_r)
+        got += (back["steer_left_us"], back["steer_right_us"])
+    if got != want:
         logging.error(f"Read-back mismatch: firmware holds {got}, "
-                      f"expected {(decel, lag, trim, gyro)}.")
+                      f"expected {want}.")
         return False
     return True
 
@@ -198,12 +234,13 @@ def prepare_for_task(stm: STM, name: Optional[str] = None,
             logging.warning(
                 f"Profile {name!r} never passed the square check "
                 "(calibrate.py verify). Running on it anyway.")
-        if not push(stm, p):
+        if not push(stm, p, proto):
             return False
         logging.info(
             f"Calibration {name!r} restored and verified: "
             f"decel {p['decel_x10']/10:.1f} dps², lag {p['lag_ms_x10']/10:.1f} ms, "
-            f"trim {p['trim_us']:+d} µs, gyro ×{values_of(p)[3]/10000:.4f} "
+            f"trim {p['trim_us']:+d} µs, gyro ×{values_of(p)[3]/10000:.4f}, "
+            f"steer L {values_of(p)[4]} / R {values_of(p)[5]} µs "
             f"(taken {p.get('taken', '?')}; {p.get('note', '')})")
     elif required:
         logging.error(

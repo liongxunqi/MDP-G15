@@ -375,6 +375,29 @@ const ArcProfile_t *Motion_GetArcProfileInfo(uint8_t idx);
  * what was asked for. */
 uint16_t    Motion_GetArcSteerUs(void);
 
+/* ---------------------------------------------------------------------------
+ * PER-SIDE ARC STEERING
+ *
+ * The same pulse either side of centre does not give the same wheel angle:
+ * the linkage is not symmetric, and neither is the play in it. So a left
+ * and a right turn at the same deflection trace different circles - the gyro
+ * still stops both at 90 degrees, but they land the robot in different
+ * places, while the planner and the A5 orbit assume one radius both ways.
+ *
+ * Each side's deflection is therefore its own calibration value, measured
+ * by `calibrate.py radius` (floor chord per side) and restored with the rest
+ * of the profile via !CALSL / !CALSR. 0 means "use the profile's symmetric
+ * value", which is what the robot does until something is restored.
+ *
+ * Bounds: never past the servo limits on that side, and never below
+ * MOTION_ARC_STEER_MIN_US, which is far wider than any turn the planner
+ * could use. Refused, not clamped, like every other setter.
+ * ------------------------------------------------------------------------- */
+#define MOTION_ARC_STEER_MIN_US   300U
+
+uint8_t     Motion_SetArcSteerSideUs(uint8_t right, uint16_t us);
+uint16_t    Motion_GetArcSteerSideUs(uint8_t right);   /* the value in force */
+
 typedef enum
 {
     MOTION_IDLE = 0,

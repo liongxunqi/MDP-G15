@@ -161,6 +161,8 @@ FU_MIN_PROTOCOL = 3
 # heading carry-over and its ?HDG report, and !PROF locked to TIGHT. Every task
 # now restores a frozen calibration at startup, so this is a hard floor there.
 FROZEN_CAL_MIN_PROTOCOL = 4
+# Protocol 5: per-side arc deflection (!CALSL / !CALSR), two more ?CAL fields.
+STEER_CAL_MIN_PROTOCOL = 5
 
 # PROTOCOL.md §5 — every tag the firmware can answer a query with.
 # CAL is protocol 2. It must appear here twice over: once so validate_token()
@@ -171,7 +173,7 @@ QUERY_TAGS = {"US", "IR", "IRR", "POSE", "DIST", "TURN", "STAT", "IMU", "XCHK",
               "VER", "CAL", "HDG"}
 
 # This client implements protocol 4. Compared against the ?VER reply at startup.
-PROTOCOL_VERSION = 4
+PROTOCOL_VERSION = 5
 
 # FU before F, exactly as the firmware's own parser orders its prefixes: "fu"
 # would otherwise be eaten by "f" and FU20 read as F with an argument of
@@ -184,7 +186,7 @@ _CONFIG_RE = re.compile(r"^!(PROF[012]|ZERO|LEARN[01])$", re.IGNORECASE)
 # token anywhere in this protocol that may carry a negative argument: every
 # movement argument is a magnitude with its direction in the opcode, but a
 # steering trim has no opcode to carry its sign.
-_CAL_SET_RE = re.compile(r"^!CAL([DLTG])(-?\d+)$", re.IGNORECASE)
+_CAL_SET_RE = re.compile(r"^!CAL(SL|SR|[DLTG])(-?\d+)$", re.IGNORECASE)
 
 # Accepted ranges, read out of the FIRMWARE rather than the prose in §7 — they
 # disagree, and the firmware is the thing that will actually refuse you.
@@ -199,6 +201,10 @@ CAL_LIMITS = {
     "T": (-80, 80, "µs, signed", "±80 µs"),
     # IMU_GYRO_SCALE_MIN/MAX in imu.h. Both ends inclusive there.
     "G": (9000, 11000, "scale ×10000", "0.90 ≤ gyro scale ≤ 1.10"),
+    # Motion_SetArcSteerSideUs(): MOTION_ARC_STEER_MIN_US up to the room the
+    # servo limits leave on that side - centre 1474, limits 900..2100.
+    "SL": (300, 574, "µs", "300 ≤ left deflection ≤ 574 µs"),
+    "SR": (300, 626, "µs", "300 ≤ right deflection ≤ 626 µs"),
 }
 
 # PROTOCOL.md §9 — the parser returns a parse failure for these, so a line
@@ -741,6 +747,8 @@ class STM:
             "trim_us": vals[2],
             "gyro_x10000": vals[3] if len(vals) > 3 else None,
             "learn": vals[4] if len(vals) > 4 else None,
+            "steer_left_us": vals[5] if len(vals) > 5 else None,
+            "steer_right_us": vals[6] if len(vals) > 6 else None,
         }
 
     def read_heading(self, timeout: float = 2.0) -> Optional[dict]:
@@ -830,6 +838,8 @@ class STM:
                 lag_ms_x10: Optional[int] = None,
                 trim_us: Optional[int] = None,
                 gyro_x10000: Optional[int] = None,
+                steer_left_us: Optional[int] = None,
+                steer_right_us: Optional[int] = None,
                 retries: int = 3, retry_delay: float = 0.2) -> bool:
         """
         Restore saved calibration (PROTOCOL.md §7). Any argument left None is
@@ -848,6 +858,8 @@ class STM:
             ("L", lag_ms_x10, "!CALL"),
             ("T", trim_us, "!CALT"),
             ("G", gyro_x10000, "!CALG"),
+            ("SL", steer_left_us, "!CALSL"),
+            ("SR", steer_right_us, "!CALSR"),
         ]
         pending = [(k, v, p) for k, v, p in wanted if v is not None]
         if not pending:

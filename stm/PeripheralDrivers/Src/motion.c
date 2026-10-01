@@ -143,6 +143,10 @@ static const ArcProfile_t *prof(void) { return &s_profiles[s_profileIdx]; }
  * shorten one direction only and turns would come out lopsided with nothing
  * on screen to say why. Taking the smaller of the two available sides keeps
  * left and right identical whatever a profile asks for. */
+/* Per-side deflection, [0] left [1] right. 0 = the symmetric profile value.
+ * See PER-SIDE ARC STEERING in motion.h. */
+static uint16_t s_steerSideUs[2] = { 0U, 0U };
+
 static uint16_t arc_steer_us(void)
 {
     uint16_t hi = (uint16_t)(SERVO_MAX_US - SERVO_CENTER_US);
@@ -171,6 +175,24 @@ uint16_t Motion_GetCarryClampCount(void) { return s_carryClamps; }
 
 uint8_t  Motion_GetArcProfile(void)  { return s_profileIdx; }
 uint16_t Motion_GetArcSteerUs(void)  { return arc_steer_us(); }
+
+uint16_t Motion_GetArcSteerSideUs(uint8_t right)
+{
+    uint16_t us = s_steerSideUs[right ? 1U : 0U];
+    return (us != 0U) ? us : arc_steer_us();
+}
+
+uint8_t Motion_SetArcSteerSideUs(uint8_t right, uint16_t us)
+{
+    /* How far this side can go before the servo clamps it. */
+    uint16_t room = right ? (uint16_t)(SERVO_MAX_US - SERVO_CENTER_US)
+                          : (uint16_t)(SERVO_CENTER_US - SERVO_MIN_US);
+
+    if ((us < MOTION_ARC_STEER_MIN_US) || (us > room)) { return 0U; }
+
+    s_steerSideUs[right ? 1U : 0U] = us;
+    return 1U;
+}
 
 const ArcProfile_t *Motion_GetArcProfileInfo(uint8_t idx)
 {
@@ -440,9 +462,10 @@ void Motion_DriveArc(int16_t degrees, uint8_t forward, uint8_t right)
     s_dir      = forward ? 1 : -1;
     s_arcRight = right ? 1U : 0U;
 
+    /* Each side's own deflection - see PER-SIDE ARC STEERING in motion.h. */
     s_arcServoUs = right
-                 ? (uint16_t)(SERVO_CENTER_US + arc_steer_us())
-                 : (uint16_t)(SERVO_CENTER_US - arc_steer_us());
+                 ? (uint16_t)(SERVO_CENTER_US + Motion_GetArcSteerSideUs(1U))
+                 : (uint16_t)(SERVO_CENTER_US - Motion_GetArcSteerSideUs(0U));
 
     /* Which way the BODY rotates.
      *

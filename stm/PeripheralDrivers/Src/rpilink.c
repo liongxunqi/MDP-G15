@@ -341,21 +341,25 @@ static void answer_immediate(const Command_t *c)
            like any other query - it only reads. Lag is x10 MILLISECONDS, not
            x10 seconds: MOTION_ARC_LAG_MAX_S is 0.25, so seconds x10 would
            quantise the whole usable range into three steps. */
-        /* Protocol 4 appends gyro scale x10000 and the learning switch.
-           Appended, not inserted, so older readers of three fields still
-           read the right three. */
-        snprintf(b, sizeof(b), "CAL,%d,%d,%d,%d,%u\n",
+        /* Protocol 4 appends gyro scale x10000 and the learning switch;
+           protocol 5 the left and right arc deflections in force. Appended,
+           not inserted, so older readers still read the right fields. */
+        snprintf(b, sizeof(b), "CAL,%d,%d,%d,%d,%u,%u,%u\n",
                  (int)scaled10(Motion_GetArcDecel()),
                  (int)scaled10(Motion_GetArcLag() * 1000.0f),
                  (int)Odom_GetHeadingTrim(),
                  (int)((IMU_GetGyroScale() * 10000.0f) + 0.5f),
-                 (unsigned)Motion_LearningEnabled());
+                 (unsigned)Motion_LearningEnabled(),
+                 (unsigned)Motion_GetArcSteerSideUs(0U),
+                 (unsigned)Motion_GetArcSteerSideUs(1U));
         break;
 
     case CMD_SET_CAL_DECEL:
     case CMD_SET_CAL_LAG:
     case CMD_SET_CAL_TRIM:
     case CMD_SET_CAL_GYRO:
+    case CMD_SET_CAL_STEER_L:
+    case CMD_SET_CAL_STEER_R:
         /* THE INTERFERENCE GUARD.
          *
          * These are the only immediate commands that write state a move in
@@ -388,6 +392,16 @@ static void answer_immediate(const Command_t *c)
             else if (c->op == CMD_SET_CAL_GYRO)
             {
                 ok = IMU_SetGyroScale((float)c->arg / 10000.0f);
+            }
+            else if ((c->op == CMD_SET_CAL_STEER_L) ||
+                     (c->op == CMD_SET_CAL_STEER_R))
+            {
+                /* Busy-guarded with the rest: the deflection is latched
+                   when an arc is queued, and changing it under a turn in
+                   its steering settle would split the difference. */
+                ok = Motion_SetArcSteerSideUs(
+                         (c->op == CMD_SET_CAL_STEER_R) ? 1U : 0U,
+                         (uint16_t)c->arg);
             }
             else
             {
