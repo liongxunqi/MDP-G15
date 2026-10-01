@@ -13,6 +13,7 @@ Release/
 *.map
 *.list
 *.su
+*.jpg
 
 # Generated/received images
 rpi/mdp_rpi/pc_side/received/

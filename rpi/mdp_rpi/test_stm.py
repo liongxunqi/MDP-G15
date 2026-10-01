@@ -32,7 +32,7 @@ metre, 8.6 s worst case. Do not mistake that silence for a dead link.
 Calibration (PROTOCOL.md §7) is a script you send, not a firmware mode. The
 sequence that converges it:
 
-    !PROF0 / F600 / FR90 / RR90 / FR90 / RR90, with ?CAL after each —
+    !PROF1 / F600 / FR90 / RR90 / FR90 / RR90, with ?CAL after each —
     stop when decel and lag stop moving.
 
 A setter answering RESEND while the robot is moving means BUSY, not malformed:
@@ -54,6 +54,8 @@ import sys
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%H:%M:%S")
 
 from communications.stm import STM
+
+DEFAULT_ARC_PROFILE = 1
 
 
 def send_and_report(stm: STM, line: str) -> None:
@@ -138,6 +140,13 @@ def main() -> None:
         action="store_true",
         help="run PROTOCOL.md §10 stages 3-5 and 9 (no motion), then exit",
     )
+    parser.add_argument(
+        "--profile",
+        type=int,
+        choices=(0, 1, 2),
+        default=DEFAULT_ARC_PROFILE,
+        help="select the STM arc profile on startup (default: 1 CLEAN)",
+    )
     args = parser.parse_args()
 
     stm = STM()
@@ -151,6 +160,12 @@ def main() -> None:
             "the firmware never transmits there."
         )
         sys.exit(1)
+
+    if not stm.set_profile(args.profile):
+        logging.error("Could not select STM arc profile %d.", args.profile)
+        stm.disconnect()
+        sys.exit(1)
+    logging.info("STM arc profile set to %d.", args.profile)
 
     if args.bringup:
         bringup(stm)
