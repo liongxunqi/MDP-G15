@@ -1,14 +1,4 @@
-"""Obstacle-aware hybrid A* motion planner.
-
-Grid + quarter-turn primitives (FORWARD_LEFT/RIGHT, BACKWARD_LEFT/RIGHT),
-similar to SC2079-master's pathfinding service, but using this team's
-measured turn radii from stm_tokens.TURN_RADIUS_MM instead of a generic
-assumed radius, and with collision checking done during search instead of
-after the fact.
-
-State space is (x_mm, y_mm, heading), heading restricted to the 4 cardinal
-directions since every primitive here is a 90-degree arc or a straight line.
-"""
+"""Hybrid A* motion planner: grid + quarter-turn primitives, collision-checked."""
 
 import heapq
 import logging
@@ -45,8 +35,7 @@ def _heading_index(theta: float) -> int:
 
 
 def _arc_delta(theta0: float, dir_sign: int, kappa_sign: int, phi: float, radius: float):
-    """Bicycle-model arc kinematics. dir_sign: +1 forward, -1 reverse.
-    kappa_sign: +1 left steer, -1 right steer."""
+    # dir_sign: +1 fwd, -1 rev. kappa_sign: +1 left, -1 right.
     theta_f = theta0 + dir_sign * kappa_sign * phi
     dx = radius * kappa_sign * (math.sin(theta_f) - math.sin(theta0))
     dy = radius * kappa_sign * (math.cos(theta0) - math.cos(theta_f))
@@ -77,8 +66,12 @@ def _obstacle_aabb_mm(obstacle: dict, virtual_half_mm: float) -> Tuple[float, fl
     return (cx - virtual_half_mm, cy - virtual_half_mm, cx + virtual_half_mm, cy + virtual_half_mm)
 
 
-def _point_blocked(x, y, boxes, arena_mm, margin_mm) -> bool:
-    if not (margin_mm <= x <= arena_mm - margin_mm and margin_mm <= y <= arena_mm - margin_mm):
+def _point_blocked(x, y, theta, boxes, arena_mm, half_length_mm, half_width_mm) -> bool:
+    # exact rotated-rect bounding half-extent, not just the 4 cardinal cases
+    half_extent_x = half_length_mm * abs(math.cos(theta)) + half_width_mm * abs(math.sin(theta))
+    half_extent_y = half_length_mm * abs(math.sin(theta)) + half_width_mm * abs(math.cos(theta))
+    if not (half_extent_x <= x <= arena_mm - half_extent_x
+            and half_extent_y <= y <= arena_mm - half_extent_y):
         return True
     for xmin, ymin, xmax, ymax in boxes:
         if xmin <= x <= xmax and ymin <= y <= ymax:
@@ -86,31 +79,33 @@ def _point_blocked(x, y, boxes, arena_mm, margin_mm) -> bool:
     return False
 
 
-def _arc_clear(x0, y0, theta0, dir_sign, kappa_sign, radius, boxes, arena_mm, margin_mm, samples=6) -> bool:
+def _arc_clear(x0, y0, theta0, dir_sign, kappa_sign, radius, boxes, arena_mm,
+                half_length_mm, half_width_mm, samples=6) -> bool:
     for i in range(1, samples + 1):
         phi = _QUARTER_TURN * i / samples
-        dx, dy, _ = _arc_delta(theta0, dir_sign, kappa_sign, phi, radius)
-        if _point_blocked(x0 + dx, y0 + dy, boxes, arena_mm, margin_mm):
+        dx, dy, theta_i = _arc_delta(theta0, dir_sign, kappa_sign, phi, radius)
+        if _point_blocked(x0 + dx, y0 + dy, theta_i, boxes, arena_mm, half_length_mm, half_width_mm):
             return False
     return True
 
 
-def _straight_clear(x0, y0, theta, forward, boxes, arena_mm, margin_mm, samples=3) -> bool:
+def _straight_clear(x0, y0, theta, forward, boxes, arena_mm,
+                     half_length_mm, half_width_mm, samples=3) -> bool:
     sign = 1 if forward else -1
     for i in range(1, samples + 1):
         d = STEP_MM * i / samples
         x = x0 + sign * d * math.cos(theta)
         y = y0 + sign * d * math.sin(theta)
-        if _point_blocked(x, y, boxes, arena_mm, margin_mm):
+        if _point_blocked(x, y, theta, boxes, arena_mm, half_length_mm, half_width_mm):
             return False
     return True
 
 
-def _neighbours(state: _State, radius_mm, boxes, arena_mm, margin_mm):
+def _neighbours(state: _State, radius_mm, boxes, arena_mm, half_length_mm, half_width_mm):
     theta = _HEADINGS[state.h]
 
     for forward in (True, False):
-        if _straight_clear(state.x, state.y, theta, forward, boxes, arena_mm, margin_mm):
+        if _straight_clear(state.x, state.y, theta, forward, boxes, arena_mm, half_length_mm, half_width_mm):
             sign = 1 if forward else -1
             nx = state.x + sign * STEP_MM * math.cos(theta)
             ny = state.y + sign * STEP_MM * math.sin(theta)
@@ -122,7 +117,7 @@ def _neighbours(state: _State, radius_mm, boxes, arena_mm, margin_mm):
             yield _State(round(nx), round(ny), state.h), token, cost
 
     for name, dir_sign, kappa_sign, token_fn in _ARC_PRIMITIVES:
-        if _arc_clear(state.x, state.y, theta, dir_sign, kappa_sign, radius_mm, boxes, arena_mm, margin_mm):
+        if _arc_clear(state.x, state.y, theta, dir_sign, kappa_sign, radius_mm, boxes, arena_mm, half_length_mm, half_width_mm):
             dx, dy, theta_f = _arc_delta(theta, dir_sign, kappa_sign, _QUARTER_TURN, radius_mm)
             nx, ny = state.x + dx, state.y + dy
             try:
@@ -148,7 +143,7 @@ def _reconstruct(came_from, token_of, end: _State):
 
 
 def _astar(start_x, start_y, start_theta, goal_x, goal_y, goal_theta,
-           radius_mm, boxes, arena_mm, margin_mm, goal_tol_mm):
+           radius_mm, boxes, arena_mm, half_length_mm, half_width_mm, goal_tol_mm):
     start = _State(round(start_x), round(start_y), _heading_index(start_theta))
     goal_h = _heading_index(goal_theta)
 
@@ -171,7 +166,7 @@ def _astar(start_x, start_y, start_theta, goal_x, goal_y, goal_theta,
             tokens, states = _reconstruct(came_from, token_of, current)
             return tokens, states, cost_so_far[current]
 
-        for nxt, token, step_cost in _neighbours(current, radius_mm, boxes, arena_mm, margin_mm):
+        for nxt, token, step_cost in _neighbours(current, radius_mm, boxes, arena_mm, half_length_mm, half_width_mm):
             new_cost = cost_so_far[current] + step_cost
             if nxt not in cost_so_far or new_cost < cost_so_far[nxt]:
                 cost_so_far[nxt] = new_cost
@@ -187,24 +182,20 @@ def _astar(start_x, start_y, start_theta, goal_x, goal_y, goal_theta,
 def search_leg(
     start_x: float, start_y: float, start_theta: float,
     goal_x: float, goal_y: float, goal_theta: float,
-    radius_mm: float, boxes, arena_mm: float, margin_mm: float,
+    radius_mm: float, boxes, arena_mm: float,
+    half_length_mm: float, half_width_mm: float,
 ) -> Tuple[List[str], List[Tuple[float, float, float]], float]:
-    """Returns (tokens, poses, cost). Raises NoPathFound if every tolerance
-    stage in GOAL_TOL_STAGES_MM fails."""
     for stage, tol in enumerate(GOAL_TOL_STAGES_MM):
         result = _astar(start_x, start_y, start_theta, goal_x, goal_y, goal_theta,
-                         radius_mm, boxes, arena_mm, margin_mm, tol)
+            radius_mm, boxes, arena_mm, half_length_mm, half_width_mm, tol)
         if result is not None:
             tokens, states, cost = result
             if stage > 0:
-                logging.warning(
-                    f"search_leg: had to relax tolerance to {tol}mm to find a path "
-                    f"(final pose off by up to {tol}mm from the ideal)."
-                )
+                logging.warning(f"search_leg: relaxed tolerance to {tol}mm")
             poses = [(s.x, s.y, _HEADINGS[s.h]) for s in states]
             return tokens, poses, cost
 
     raise NoPathFound(
-        f"No collision-free path from ({start_x:.0f},{start_y:.0f}) to "
-        f"({goal_x:.0f},{goal_y:.0f}) even at {GOAL_TOL_STAGES_MM[-1]}mm tolerance."
+        f"No path from ({start_x:.0f},{start_y:.0f}) to "
+        f"({goal_x:.0f},{goal_y:.0f}) at {GOAL_TOL_STAGES_MM[-1]}mm tolerance."
     )

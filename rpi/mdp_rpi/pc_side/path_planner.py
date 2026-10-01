@@ -1,26 +1,4 @@
-"""Task 1 path planning: visit order + motion.
-
-Replaces compute_path()'s stub in task1_pc.py.
-
-  1. Visit order — exhaustive permutation search over obstacles (<=7),
-     scored by real A* path cost between viewing poses (grid_search.py).
-     Falls back to nearest-neighbour + 2-opt above that.
-  2. Viewing pose — for each obstacle, the (x, y, theta) the robot's
-     centre must reach to photograph it: STANDOFF_MM out from the image
-     face, facing the obstacle.
-  3. Motion — obstacle-aware hybrid A* (grid_search.py) using this team's
-     measured turn radii, converted straight into STM tokens and chunked
-     per PROTOCOL.md §2.
-  4. Post-photo — back away REV_AFTER_PHOTO_CM before planning the next leg,
-     since the obstacle now blocks the robot.
-  5. dirs[] — one {x,y,dir} entry per output line, from the exact states
-     reached by the tokens that get sent.
-
-dubins.py (closed-form Dubins solver) is no longer used here — an earlier
-version of this planner used it directly, but it can't reverse mid-manoeuvre
-and only warns about obstacle collisions instead of avoiding them. Kept
-around as validated reference code.
-"""
+"""Task 1 path planning: visit order + motion. Replaces compute_path()'s stub in task1_pc.py."""
 
 import itertools
 import logging
@@ -32,6 +10,7 @@ from stm_tokens import (
     FU_MAX_CM,
     FU_MIN_CM,
     PROFILE_TIGHT,
+    ROBOT_LENGTH_CM,
     ROBOT_WIDTH_CM,
     TURN_RADIUS_MM,
     TokenError,
@@ -45,63 +24,28 @@ from stm_tokens import (
 import grid_search
 
 ARENA_MM = ARENA_CM * 10
-
-# The spec block. NOTHING MEASURES IT — the robot has no way to, so this is an
-# assumption from the course spec, not an observation.
-#
-# It sets where the viewing pose goes, and that use is self-correcting: the
-# approach ends on FU<n>, which stands still, reads the real gap with the
-# ultrasonic and drives that, so the robot stops the right distance from
-# whatever is actually there whatever this says.
 OBSTACLE_SIZE_MM = 100.0
 
 ROBOT_PLANNING_SIZE_MM = 300.0
 ROBOT_PLANNING_HALF_MM = ROBOT_PLANNING_SIZE_MM / 2.0
+VIRTUAL_OBSTACLE_HALF_MM = (OBSTACLE_SIZE_MM + ROBOT_PLANNING_SIZE_MM) / 2.0
 
-# Extra room left around an obstacle when PLANNING A PATH PAST IT. Split out
-# from OBSTACLE_SIZE_MM because the two uses are not the same kind of number
-# and only one of them is checked by a sensor.
-#
-# Going around is open-loop and has nothing watching it. The front ultrasonic
-# points the wrong way — during an orbit the block is to the SIDE — and the
-# side IRs saturate below 10cm (5cm and 8cm both read ~9cm, see ir.h), which
-# is exactly the range a clip happens in. FIR/FIL, which would act on them,
-# are reserved and unimplemented. So there is no sensor answer here and the
-# margin has to be bought up front.
-#
-# Without it there is essentially none. The virtual box keeps the robot's
-# CENTRE 200mm from the block centre; the real robot's worst-case half-extent
-# is ~148mm at a corner (188 x 230 plate) and the block's half-width is 50mm,
-# leaving about 2mm. The whole allowance is consumed by the robot's own
-# corners, so an obstacle wider than 100mm is clipped by the excess — and the
-# first anyone would know is a stalled wheel and FAIL,TIMEOUT 15 seconds later.
-#
-# Costs orbit radius one-for-one: +20mm here is +20mm of swing per face.
-# Nothing on a lone central block; worth re-checking before an 8-obstacle
-# arena, where it eats into what is reachable.
-OBSTACLE_CLEARANCE_MM = 20.0
-
-VIRTUAL_OBSTACLE_HALF_MM = (
-    (OBSTACLE_SIZE_MM + ROBOT_PLANNING_SIZE_MM) / 2.0 + OBSTACLE_CLEARANCE_MM
-)
-
-STANDOFF_MM = 300.0
+STANDOFF_MM = 450.0
 REV_AFTER_PHOTO_CM = 15
-
-# Anchor the search this far short of the true standoff pose; the last bit
-# is driven with fwd_until() on ultrasonic feedback instead of odometry.
-STANDOFF_ANCHOR_BUFFER_MM = 150.0
+STANDOFF_ANCHOR_BUFFER_MM = 350.0
 FU_COMPENSATE = False
 
 EXHAUSTIVE_LIMIT = 7
 
 FACE_FROM_D = {0: "N", 2: "E", 4: "S", 6: "W"}
 
+# centre of the 40x40cm start zone, not the robot's bare minimum clearance
 START_X_MM = 200.0
 START_Y_MM = 200.0
 START_THETA = math.pi / 2
 
-ROBOT_MARGIN_MM = ROBOT_WIDTH_CM * 10 / 2.0
+ROBOT_HALF_LENGTH_MM = ROBOT_LENGTH_CM * 10 / 2.0
+ROBOT_HALF_WIDTH_MM = ROBOT_WIDTH_CM * 10 / 2.0
 
 
 class Pose:
@@ -118,8 +62,8 @@ def _wrap(theta):
     return math.atan2(math.sin(theta), math.cos(theta))
 
 
-def _viewing_pose(obstacle: dict) -> Optional[Pose]:
-    """Robot-centre pose to photograph this obstacle. None for SKIP (d=8)."""
+def _viewing_pose(obstacle: dict, standoff_mm: float = STANDOFF_MM,
+                   robot_half_mm: float = ROBOT_PLANNING_HALF_MM) -> Optional[Pose]:
     d = obstacle.get("d")
     if d not in FACE_FROM_D:
         return None
@@ -128,7 +72,7 @@ def _viewing_pose(obstacle: dict) -> Optional[Pose]:
     cx = obstacle["x"] * 100.0 + OBSTACLE_SIZE_MM / 2.0
     cy = obstacle["y"] * 100.0 + OBSTACLE_SIZE_MM / 2.0
     half = OBSTACLE_SIZE_MM / 2.0
-    dist_from_face = STANDOFF_MM + ROBOT_PLANNING_HALF_MM
+    dist_from_face = standoff_mm + robot_half_mm
 
     if face == "N":
         return Pose(cx, cy + half + dist_from_face, -math.pi / 2)
@@ -141,14 +85,15 @@ def _viewing_pose(obstacle: dict) -> Optional[Pose]:
     return None
 
 
-def _anchor_pose(obstacle: dict) -> Optional[Pose]:
-    final = _viewing_pose(obstacle)
+def _anchor_pose(obstacle: dict, standoff_mm: float = STANDOFF_MM,
+                  buffer_mm: float = STANDOFF_ANCHOR_BUFFER_MM,
+                  robot_half_mm: float = ROBOT_PLANNING_HALF_MM) -> Optional[Pose]:
+    final = _viewing_pose(obstacle, standoff_mm, robot_half_mm)
     if final is None:
         return None
-    extra = STANDOFF_ANCHOR_BUFFER_MM
     return Pose(
-        final.x - extra * math.cos(final.theta),
-        final.y - extra * math.sin(final.theta),
+        final.x - buffer_mm * math.cos(final.theta),
+        final.y - buffer_mm * math.sin(final.theta),
         final.theta,
     )
 
@@ -166,26 +111,53 @@ def _obstacle_boxes(obstacles: List[dict], exclude_id) -> List[Tuple[float, floa
     return [_obstacle_aabb_mm(o) for o in obstacles if o.get("id") != exclude_id]
 
 
+def _pose_can_escape(pose: Pose, own_box, radius_mm: float) -> bool:
+    state = grid_search._State(round(pose.x), round(pose.y), grid_search._heading_index(pose.theta))
+    for _ in grid_search._neighbours(state, radius_mm, [own_box], ARENA_MM, ROBOT_HALF_LENGTH_MM, ROBOT_HALF_WIDTH_MM):
+        return True
+    return False
+
+
 def _search(from_pose: Pose, to_pose: Pose, radius_mm, obstacles, exclude_id):
     boxes = _obstacle_boxes(obstacles, exclude_id)
     tokens, raw_poses, cost = grid_search.search_leg(
         from_pose.x, from_pose.y, from_pose.theta,
         to_pose.x, to_pose.y, to_pose.theta,
-        radius_mm, boxes, ARENA_MM, ROBOT_MARGIN_MM,
+        radius_mm, boxes, ARENA_MM, ROBOT_HALF_LENGTH_MM, ROBOT_HALF_WIDTH_MM,
     )
     poses = [Pose(x, y, t) for x, y, t in raw_poses]
     return tokens, poses, cost
 
 
-def _build_edge_cache(start, visitable, anchor_by_id, radius_mm, obstacles):
-    """Precompute every edge the TSP search could need, once, so exhaustive
-    search over N obstacles costs N*(N+1) A* calls, not N!."""
+def _pose_in_bounds(pose: Pose) -> bool:
+    return not grid_search._point_blocked(
+        pose.x, pose.y, pose.theta, [], ARENA_MM, ROBOT_HALF_LENGTH_MM, ROBOT_HALF_WIDTH_MM,
+    )
+
+
+BACKAWAY_FALLBACKS_CM = (REV_AFTER_PHOTO_CM, 10, 5, 0)
+
+
+def _feasible_backaway(final_pose: Pose, own_box, radius_mm: float) -> int:
+    for cm in BACKAWAY_FALLBACKS_CM:
+        if cm == 0:
+            return 0
+        bx = final_pose.x - cm * 10.0 * math.cos(final_pose.theta)
+        by = final_pose.y - cm * 10.0 * math.sin(final_pose.theta)
+        back_pose = Pose(bx, by, final_pose.theta)
+        if _pose_in_bounds(back_pose) and _pose_can_escape(back_pose, own_box, radius_mm):
+            return cm
+    return 0
+
+
+def _build_edge_cache(start, visitable, anchor_by_id, final_by_id, radius_mm, obstacles):
     cache = {}
     from_nodes = [("START", start)]
     for obs in visitable:
-        final = _viewing_pose(obs)
-        bx = final.x - REV_AFTER_PHOTO_CM * 10.0 * math.cos(final.theta)
-        by = final.y - REV_AFTER_PHOTO_CM * 10.0 * math.sin(final.theta)
+        final = final_by_id[obs["id"]]
+        backaway_cm = _feasible_backaway(final, _obstacle_aabb_mm(obs), radius_mm)
+        bx = final.x - backaway_cm * 10.0 * math.cos(final.theta)
+        by = final.y - backaway_cm * 10.0 * math.sin(final.theta)
         from_nodes.append((obs["id"], Pose(bx, by, final.theta)))
 
     for from_id, from_pose in from_nodes:
@@ -215,31 +187,6 @@ def _route_cost(order, cache) -> float:
     return total
 
 
-def _reachable(visitable, cache):
-    """
-    Split the obstacles into those the robot can get to and those it cannot.
-
-    An obstacle with no finite edge INTO it from anywhere — the start or any
-    other obstacle — cannot appear in any tour, and leaving it in makes every
-    permutation cost infinity. That is not a hypothetical: a block within
-    about 65 cm of a wall puts its wall-facing approach outside the arena, and
-    A.5 declares all four faces, so it hits one whenever the obstacle is near
-    an edge.
-
-    Dropping them is the honest outcome. Three faces is still a search; the
-    one pointing into a wall was never photographable.
-    """
-    ids = [o["id"] for o in visitable]
-    ok, dropped = [], []
-    for obs in visitable:
-        sources = ["START"] + [i for i in ids if i != obs["id"]]
-        if any(math.isfinite(_edge_cost(cache, src, obs["id"])) for src in sources):
-            ok.append(obs)
-        else:
-            dropped.append(obs)
-    return ok, dropped
-
-
 def _visit_order(visitable, cache):
     if len(visitable) <= 1:
         return list(visitable)
@@ -250,31 +197,12 @@ def _visit_order(visitable, cache):
             cost = _route_cost(list(perm), cache)
             if cost < best_cost:
                 best_cost, best_order = cost, list(perm)
-
         if best_order is None:
-            # Every permutation cost infinity, so no complete tour exists.
-            # This used to fall straight through to the log line below and
-            # raise TypeError on None — a crash rather than a plan, which on
-            # the wire means the RPi waits for a PATH that never comes.
-            #
-            # Visiting some obstacles beats visiting none, so fall back to the
-            # greedy order. The per-leg search in plan_mission() catches
-            # NoPathFound and skips, so an unreachable leg is dropped there.
-            logging.warning(
-                "No finite tour over %d obstacle(s) — falling back to nearest-"
-                "neighbour order and skipping whatever cannot be reached.",
-                len(visitable),
-            )
-            return _greedy_order(visitable, cache)
-
-        logging.info(f"Visit order (exhaustive): {[o['id'] for o in best_order]}  cost={best_cost:.0f}mm")
+            logging.error("No feasible visit order — every obstacle unreachable.")
+            return []
+        logging.info(f"Visit order: {[o['id'] for o in best_order]}  cost={best_cost:.0f}mm")
         return best_order
 
-    return _greedy_order(visitable, cache)
-
-
-def _greedy_order(visitable, cache):
-    """Nearest-neighbour, then 2-opt. Always returns an order, never None."""
     remaining = list(visitable)
     order = []
     prev_id = "START"
@@ -295,8 +223,34 @@ def _greedy_order(visitable, cache):
                 if cand_cost < best_cost - 1e-6:
                     order, best_cost = candidate, cand_cost
                     improved = True
-    logging.info(f"Visit order (NN+2opt): {[o['id'] for o in order]}  cost={best_cost:.0f}mm")
+    logging.info(f"Visit order: {[o['id'] for o in order]}  cost={best_cost:.0f}mm")
     return order
+
+
+STANDOFF_FALLBACKS_MM = (STANDOFF_MM, 250.0, 200.0, 150.0, 100.0, 70.0, FU_MIN_CM * 10.0)
+ANCHOR_BUFFER_FALLBACKS_MM = (STANDOFF_ANCHOR_BUFFER_MM, 100.0, 50.0, 0.0)
+ROBOT_HALF_FALLBACKS_MM = (ROBOT_PLANNING_HALF_MM, ROBOT_HALF_LENGTH_MM)
+
+
+def _feasible_approach(obstacle: dict, radius_mm: float) -> Optional[Tuple[float, float, float]]:
+    own_box = _obstacle_aabb_mm(obstacle)
+    for robot_half_mm in ROBOT_HALF_FALLBACKS_MM:
+        for standoff in STANDOFF_FALLBACKS_MM:
+            final = _viewing_pose(obstacle, standoff, robot_half_mm)
+            if final is None:
+                return None
+            if not _pose_in_bounds(final) or not _pose_can_escape(final, own_box, radius_mm):
+                continue
+            for buffer_mm in ANCHOR_BUFFER_FALLBACKS_MM:
+                anchor = _anchor_pose(obstacle, standoff, buffer_mm, robot_half_mm)
+                if _pose_in_bounds(anchor):
+                    if (standoff, buffer_mm, robot_half_mm) != (STANDOFF_FALLBACKS_MM[0], ANCHOR_BUFFER_FALLBACKS_MM[0], ROBOT_HALF_FALLBACKS_MM[0]):
+                        logging.warning(
+                            f"Obstacle {obstacle.get('id')}: reduced to {standoff:.0f}mm "
+                            f"standoff, {buffer_mm:.0f}mm buffer, {robot_half_mm:.0f}mm half-length."
+                        )
+                    return standoff, buffer_mm, robot_half_mm
+    return None
 
 
 def _nearest_cardinal(theta: float) -> str:
@@ -322,58 +276,36 @@ def plan_mission(obstacles: List[dict], arc_profile: int = PROFILE_TIGHT) -> dic
 
     anchor_by_id = {}
     final_by_id = {}
+    standoff_by_id = {}
     visitable = []
     for obs in obstacles:
-        final = _viewing_pose(obs)
-        if final is None:
-            logging.info(f"Obstacle {obs.get('id')}: SKIP (d={obs.get('d')}) — no viewing pose.")
+        if obs.get("d") not in FACE_FROM_D:
+            logging.info(f"Obstacle {obs.get('id')}: SKIP (d={obs.get('d')}).")
             continue
-        anchor = _anchor_pose(obs)
-        for pose in (final, anchor):
-            if not (0 <= pose.x <= ARENA_MM and 0 <= pose.y <= ARENA_MM):
-                logging.warning(
-                    f"Obstacle {obs.get('id')}: pose {pose} falls outside the arena "
-                    "— too close to a wall for this standoff."
-                )
-        anchor_by_id[obs["id"]] = anchor
-        final_by_id[obs["id"]] = final
+        approach = _feasible_approach(obs, radius_mm)
+        if approach is None:
+            logging.error(f"Obstacle {obs['id']}: no legal viewing pose — skipping.")
+            continue
+        standoff, buffer_mm, robot_half_mm = approach
+        anchor_by_id[obs["id"]] = _anchor_pose(obs, standoff, buffer_mm, robot_half_mm)
+        final_by_id[obs["id"]] = _viewing_pose(obs, standoff, robot_half_mm)
+        standoff_by_id[obs["id"]] = standoff
         visitable.append(obs)
 
-    edge_cache = _build_edge_cache(start, visitable, anchor_by_id, radius_mm, obstacles)
-
-    # Drop anything nothing can reach before the tour is searched, rather than
-    # letting it make every permutation infinite. See _reachable().
-    visitable, unreachable = _reachable(visitable, edge_cache)
-    for obs in unreachable:
-        logging.error(
-            f"Obstacle {obs.get('id')}: no approach exists from anywhere — "
-            f"dropped. Its viewing pose is most likely outside the arena, "
-            f"which happens when the obstacle sits within about 65cm of a wall "
-            f"and the image face points at it."
-        )
-
-    if not visitable:
-        logging.error(
-            "No obstacle can be reached — returning an empty path rather than "
-            "no path at all, so the caller gets an answer instead of waiting "
-            "for one."
-        )
-        return {"segments": [], "obstacle_ids": [], "segment_obstacles": [], "dirs": []}
-
+    edge_cache = _build_edge_cache(start, visitable, anchor_by_id, final_by_id, radius_mm, obstacles)
     order = _visit_order(visitable, edge_cache)
 
     segments: List[List[str]] = []
     segment_obstacles: List[Optional[str]] = []
     dirs: List[dict] = []
 
-    fu_target_cm = round(STANDOFF_MM / 10.0)
-    assert FU_MIN_CM <= fu_target_cm <= FU_MAX_CM
-
     cur = start
     cur_id = "START"
     for obs in order:
         anchor = anchor_by_id[obs["id"]]
         final = final_by_id[obs["id"]]
+        fu_target_cm = round(standoff_by_id[obs["id"]] / 10.0)
+        assert FU_MIN_CM <= fu_target_cm <= FU_MAX_CM
 
         cached = edge_cache.get((cur_id, obs["id"]))
         if cached is not None:
@@ -403,21 +335,25 @@ def plan_mission(obstacles: List[dict], arc_profile: int = PROFILE_TIGHT) -> dic
             line_len = len(line)
             pose_after_line = poses[line_start + line_len - 1]
             dirs.append(_pose_to_dir_entry(pose_after_line))
-            segment_obstacles.append(obs["id"] if i == len(lines) - 1 else None)
+            segment_obstacles.append(str(obs["id"]) if i == len(lines) - 1 else None)
             line_start += line_len
 
         cur = Pose(final.x, final.y, final.theta)
 
-        try:
-            rev_tokens = [rev(REV_AFTER_PHOTO_CM), stop()]
-        except TokenError as exc:
-            logging.error(f"Could not build reverse-away tokens: {exc}")
-            rev_tokens = []
+        backaway_cm = _feasible_backaway(final, _obstacle_aabb_mm(obs), radius_mm)
+        rev_tokens = []
+        if backaway_cm > 0:
+            try:
+                rev_tokens = [rev(backaway_cm), stop()]
+            except TokenError as exc:
+                logging.error(f"Could not build reverse-away tokens: {exc}")
+        else:
+            logging.warning(f"Obstacle {obs['id']}: no room to back away — skipping.")
 
         if rev_tokens:
             rev_lines = chunk_tokens(rev_tokens)
-            bx = cur.x - REV_AFTER_PHOTO_CM * 10.0 * math.cos(cur.theta)
-            by = cur.y - REV_AFTER_PHOTO_CM * 10.0 * math.sin(cur.theta)
+            bx = cur.x - backaway_cm * 10.0 * math.cos(cur.theta)
+            by = cur.y - backaway_cm * 10.0 * math.sin(cur.theta)
             back_pose = Pose(bx, by, cur.theta)
             for line in rev_lines:
                 segments.append(line)
