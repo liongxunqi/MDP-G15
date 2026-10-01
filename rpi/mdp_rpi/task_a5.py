@@ -7,8 +7,8 @@ RPi movement/camera with PC-hosted detection. No Android or pathfinding.
     python3 task_a5.py --dry-run
     python3 task_a5.py --faces 2
 
-Loop: approach to standoff, look at the face in front, if it's not a valid
-image orbit to the next face and repeat.
+Loop: approach to standoff, photograph every face, and orbit between faces.
+Detection results are recorded but never terminate the four-face inspection.
 """
 
 import argparse
@@ -281,14 +281,13 @@ class TaskA5:
             logging.info("Nothing detected on this face.")
             return None
         if name.lower() in NOT_A_TARGET:
-            logging.info(f"Found '{name}' (conf={conf:.2f}) — that is the marker, "
-                         f"not a target. Wrong face.")
-            return None
-        logging.info(f"Valid image: '{name}' at conf={conf:.2f}.")
+            logging.info(f"Detected marker '{name}' at conf={conf:.2f}.")
+            return name, conf
+        logging.info(f"Detected image '{name}' at conf={conf:.2f}.")
         return name, conf
 
     def orbit(self, face: int) -> bool:
-        logging.info(f"── Face {face} was not it — going around ──")
+        logging.info(f"── Face {face} checked — moving to face {face + 1} ──")
 
         # Run the geometric segment without injecting corrections between its
         # primitives. ?TURN is relative to one arc, so add the signed results
@@ -492,30 +491,29 @@ class TaskA5:
             if not self.approach():
                 return 2
 
+            observations = []
             for face in range(1, self.max_faces + 1):
                 hit = self.look(face)
                 if hit is LOOK_ERROR:
                     return 2
-                if hit is not None:
-                    name, conf = hit
-                    logging.info("=" * 58)
-                    logging.info(f"A.5 COMPLETE — valid image '{name}' "
-                                 f"(conf={conf:.2f}) found on face {face} of "
-                                 f"{self.max_faces}.")
-                    logging.info("Annotated image saved on the PC under runs/predict/.")
-                    logging.info("=" * 58)
-                    return 0
+                observations.append((face, hit))
 
                 if face == self.max_faces:
                     break
                 if not self.orbit(face):
                     return 2
 
-            logging.warning(f"Went around all {self.max_faces} faces without finding "
-                            f"a valid image. Either the standoff framing is off or "
-                            f"the orbit is not landing square — check the stills in "
-                            f"captured_images/.")
-            return 1
+            logging.info("=" * 58)
+            logging.info("A.5 COMPLETE — inspected all %d faces.", self.max_faces)
+            for face, hit in observations:
+                if hit is None:
+                    logging.info("Face %d: nothing detected.", face)
+                else:
+                    name, conf = hit
+                    logging.info("Face %d: %s (conf=%.2f).", face, name, conf)
+            logging.info("Annotated images saved on the PC under runs/predict/.")
+            logging.info("=" * 58)
+            return 0
 
         except KeyboardInterrupt:
             logging.warning("Interrupted — aborting the robot.")

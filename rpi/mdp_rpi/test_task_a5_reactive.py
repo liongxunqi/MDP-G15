@@ -124,14 +124,39 @@ class A5ConfigurationTests(unittest.TestCase):
         with mock.patch("task_a5.sleep"):
             self.assertEqual(task.look(1), ("W", 0.30))
 
-    def test_bullseye_remains_a_wrong_face_at_any_confidence(self):
+    def test_bullseye_is_returned_as_an_observation(self):
         task = self.bare_task()
         task.camera = mock.Mock()
         task.camera.capture_image.return_value = b"jpeg-data"
         task._detect_on_pc = mock.Mock(return_value=("bullseye", 0.99))
 
         with mock.patch("task_a5.sleep"):
-            self.assertIsNone(task.look(1))
+            self.assertEqual(task.look(1), ("bullseye", 0.99))
+
+    def test_run_checks_all_faces_regardless_of_detection(self):
+        task = TaskA5(dry_run=True, max_faces=4)
+        task.approach = mock.Mock(return_value=True)
+        task.look = mock.Mock(side_effect=[
+            ("bullseye", 0.90),
+            ("W", 0.80),
+            None,
+            ("dot", 0.70),
+        ])
+        task.orbit = mock.Mock(return_value=True)
+        camera = mock.Mock()
+
+        with mock.patch("task_a5.Camera", return_value=camera):
+            self.assertEqual(task.run(), 0)
+
+        self.assertEqual(
+            task.look.call_args_list,
+            [mock.call(1), mock.call(2), mock.call(3), mock.call(4)],
+        )
+        self.assertEqual(
+            task.orbit.call_args_list,
+            [mock.call(1), mock.call(2), mock.call(3)],
+        )
+        camera.stop_camera.assert_called_once()
 
     def run_orbit(self, turns):
         task = self.bare_task()
