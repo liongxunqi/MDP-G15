@@ -38,6 +38,9 @@ Desktop.ini
 # ===== Editor/IDE junk (if either of you uses VSCode too) =====
 .vscode/
 
+__pycache__/
+*.pyc
+
 # ===== STM32 firmware lives in stm/ =====
 # The CubeIDE project (.project, .cproject, STM32X.ioc, linker scripts) is
 # tracked under stm/ and governed by stm/.gitignore. Keep those files tracked —
