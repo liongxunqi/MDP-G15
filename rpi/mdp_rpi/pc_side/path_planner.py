@@ -1,8 +1,18 @@
-"""Task 1 path planning: visit order + motion. Replaces compute_path()'s stub in task1_pc.py."""
+"""Task 1 path planning: visit order + motion. Replaces compute_path()'s stub in task1_pc.py.
+
+Per obstacle the planner picks a photo pose: nose toward the image, the
+ultrasonic reading the chosen standoff. Each leg drives onto the straight
+approach line in front of that pose, then FU<n> closes the rest. Legs avoid
+EVERY obstacle, including the one being approached, and the next leg starts
+from where the photo was taken.
+"""
 
 import itertools
 import logging
 import math
+import re
+import time
+from collections import namedtuple
 from typing import Dict, List, Optional, Tuple
 
 from stm_tokens import (
@@ -13,11 +23,9 @@ from stm_tokens import (
     ROBOT_LENGTH_CM,
     ROBOT_WIDTH_CM,
     TURN_RADIUS_MM,
-    TokenError,
     chunk_tokens,
     fwd,
     fwd_until,
-    rev,
     stop,
 )
 
@@ -26,14 +34,34 @@ import grid_search
 ARENA_MM = ARENA_CM * 10
 OBSTACLE_SIZE_MM = 100.0
 
-ROBOT_PLANNING_SIZE_MM = 300.0
-ROBOT_PLANNING_HALF_MM = ROBOT_PLANNING_SIZE_MM / 2.0
-VIRTUAL_OBSTACLE_HALF_MM = (OBSTACLE_SIZE_MM + ROBOT_PLANNING_SIZE_MM) / 2.0
+# Clearance kept between the robot's real outline and every obstacle, on top
+# of the 23 x 18.8 cm footprint itself. Covers odometry drift and turn slop.
+COLLISION_MARGIN_MM = 30.0
 
-STANDOFF_MM = 200.0
-REV_AFTER_PHOTO_CM = 15
-STANDOFF_ANCHOR_BUFFER_MM = 150.0
+# Ultrasonic reading at the photo, cm - the FU<n> target - tried in this order.
+# 30 is where YOLO is most confident; further out is next best; 28 works but
+# its confidence is shaky, so it is only used when nothing else fits.
+STANDOFF_PREFERENCE_CM = (30, 32, 35, 38, 40, 42, 45)
+STANDOFF_LAST_RESORT_CM = (28,)
+STANDOFF_CANDIDATES_CM = STANDOFF_PREFERENCE_CM + STANDOFF_LAST_RESORT_CM
 FU_COMPENSATE = False
+
+# How far back from the photo pose a leg may join the approach line, and how
+# far off it sideways. Off-line by more than this and the camera misses the
+# 10 cm image, or the ultrasonic locks onto a neighbouring obstacle.
+APPROACH_LINE_MAX_MM = 600.0
+APPROACH_LATERAL_TOL_MM = 25.0
+# FU is slow and its beam spreads (PROTOCOL.md 4.1), so F<n> covers most of
+# the approach line and FU only the last stretch - at most FU_RUNIN_MM, and
+# less if a neighbouring obstacle sits inside the beam from further back.
+# FU stops at the NEAREST echo: a neighbour closer than the image would stop
+# the robot short, or make it reverse to reach the standoff.
+FU_RUNIN_MM = 150.0
+SONAR_HALF_ANGLE_DEG = 10.0
+
+# The RPi gives up on PATH after PATH_TIMEOUT_S (30 s). Stop trying other
+# standoffs once this much time has gone and send the best plan so far.
+PLAN_TIME_BUDGET_S = 20.0
 
 EXHAUSTIVE_LIMIT = 8
 
@@ -47,6 +75,8 @@ START_THETA = math.pi / 2
 ROBOT_HALF_LENGTH_MM = ROBOT_LENGTH_CM * 10 / 2.0
 ROBOT_HALF_WIDTH_MM = ROBOT_WIDTH_CM * 10 / 2.0
 
+_STRAIGHT_RE = re.compile(r"^([FR])(\d+)$")
+
 
 class Pose:
     __slots__ = ("x", "y", "theta")
@@ -58,12 +88,18 @@ class Pose:
         return f"Pose({self.x:.1f}, {self.y:.1f}, {math.degrees(self.theta):.1f}deg)"
 
 
+# fu_runin_mm: how far before the photo pose FU may start with only the
+# target in its beam; None when even FU from the photo pose itself would hear
+# a neighbour first, and the approach has to be F<n> alone.
+PhotoOption = namedtuple("PhotoOption", "standoff_cm pose line fu_runin_mm")
+
+
 def _wrap(theta):
     return math.atan2(math.sin(theta), math.cos(theta))
 
 
-def _viewing_pose(obstacle: dict, standoff_mm: float = STANDOFF_MM,
-                   robot_half_mm: float = ROBOT_PLANNING_HALF_MM) -> Optional[Pose]:
+def _viewing_pose(obstacle: dict, standoff_mm: float) -> Optional[Pose]:
+    """Robot centre when its front sensor reads standoff_mm to the image face."""
     d = obstacle.get("d")
     if d not in FACE_FROM_D:
         return None
@@ -71,106 +107,118 @@ def _viewing_pose(obstacle: dict, standoff_mm: float = STANDOFF_MM,
 
     cx = obstacle["x"] * 100.0 + OBSTACLE_SIZE_MM / 2.0
     cy = obstacle["y"] * 100.0 + OBSTACLE_SIZE_MM / 2.0
-    half = OBSTACLE_SIZE_MM / 2.0
-    dist_from_face = standoff_mm + robot_half_mm
+    dist = OBSTACLE_SIZE_MM / 2.0 + standoff_mm + ROBOT_HALF_LENGTH_MM
 
     if face == "N":
-        return Pose(cx, cy + half + dist_from_face, -math.pi / 2)
+        return Pose(cx, cy + dist, -math.pi / 2)
     if face == "S":
-        return Pose(cx, cy - half - dist_from_face, math.pi / 2)
+        return Pose(cx, cy - dist, math.pi / 2)
     if face == "E":
-        return Pose(cx + half + dist_from_face, cy, math.pi)
-    if face == "W":
-        return Pose(cx - half - dist_from_face, cy, 0.0)
-    return None
-
-
-def _anchor_pose(obstacle: dict, standoff_mm: float = STANDOFF_MM,
-                  buffer_mm: float = STANDOFF_ANCHOR_BUFFER_MM,
-                  robot_half_mm: float = ROBOT_PLANNING_HALF_MM) -> Optional[Pose]:
-    final = _viewing_pose(obstacle, standoff_mm, robot_half_mm)
-    if final is None:
-        return None
-    return Pose(
-        final.x - buffer_mm * math.cos(final.theta),
-        final.y - buffer_mm * math.sin(final.theta),
-        final.theta,
-    )
+        return Pose(cx + dist, cy, math.pi)
+    return Pose(cx - dist, cy, 0.0)
 
 
 def _obstacle_aabb_mm(obstacle: dict) -> Tuple[float, float, float, float]:
-    cx = obstacle["x"] * 100.0 + OBSTACLE_SIZE_MM / 2.0
-    cy = obstacle["y"] * 100.0 + OBSTACLE_SIZE_MM / 2.0
-    return (
-        cx - VIRTUAL_OBSTACLE_HALF_MM, cy - VIRTUAL_OBSTACLE_HALF_MM,
-        cx + VIRTUAL_OBSTACLE_HALF_MM, cy + VIRTUAL_OBSTACLE_HALF_MM,
-    )
+    """The obstacle grown by COLLISION_MARGIN_MM on every side."""
+    x0 = obstacle["x"] * 100.0 - COLLISION_MARGIN_MM
+    y0 = obstacle["y"] * 100.0 - COLLISION_MARGIN_MM
+    size = OBSTACLE_SIZE_MM + 2 * COLLISION_MARGIN_MM
+    return (x0, y0, x0 + size, y0 + size)
 
 
-def _obstacle_boxes(obstacles: List[dict], exclude_id) -> List[Tuple[float, float, float, float]]:
-    return [_obstacle_aabb_mm(o) for o in obstacles if o.get("id") != exclude_id]
-
-
-def _pose_can_escape(pose: Pose, own_box, radius_mm: float) -> bool:
-    state = grid_search._State(round(pose.x), round(pose.y), grid_search._heading_index(pose.theta))
-    for _ in grid_search._neighbours(state, radius_mm, [own_box], ARENA_MM, ROBOT_HALF_LENGTH_MM, ROBOT_HALF_WIDTH_MM):
-        return True
-    return False
-
-
-def _search(from_pose: Pose, to_pose: Pose, radius_mm, obstacles, exclude_id):
-    boxes = _obstacle_boxes(obstacles, exclude_id)
-    tokens, raw_poses, cost = grid_search.search_leg(
-        from_pose.x, from_pose.y, from_pose.theta,
-        to_pose.x, to_pose.y, to_pose.theta,
-        radius_mm, boxes, ARENA_MM, ROBOT_HALF_LENGTH_MM, ROBOT_HALF_WIDTH_MM,
-    )
-    poses = [Pose(x, y, t) for x, y, t in raw_poses]
-    return tokens, poses, cost
-
-
-def _pose_in_bounds(pose: Pose) -> bool:
+def _pose_clear(x, y, theta, boxes) -> bool:
     return not grid_search._point_blocked(
-        pose.x, pose.y, pose.theta, [], ARENA_MM, ROBOT_HALF_LENGTH_MM, ROBOT_HALF_WIDTH_MM,
+        x, y, theta, boxes, ARENA_MM, ROBOT_HALF_LENGTH_MM, ROBOT_HALF_WIDTH_MM,
     )
 
 
-BACKAWAY_FALLBACKS_CM = (REV_AFTER_PHOTO_CM, 10, 5, 0)
+def _sonar_sees_target_first(pose: Pose, back_mm: float, standoff_mm: float,
+                             others: List[dict]) -> bool:
+    """From back_mm behind pose - anywhere across the approach line's width -
+    is the image face the nearest echo in the cone?"""
+    c, s = math.cos(pose.theta), math.sin(pose.theta)
+    squares = [(o["x"] * 100.0, o["y"] * 100.0) for o in others]
+    target_range = standoff_mm + back_mm
+    steps = 4
+    for side in (-APPROACH_LATERAL_TOL_MM, 0.0, APPROACH_LATERAL_TOL_MM):
+        sx = pose.x + (ROBOT_HALF_LENGTH_MM - back_mm) * c - side * s
+        sy = pose.y + (ROBOT_HALF_LENGTH_MM - back_mm) * s + side * c
+        for i in range(-steps, steps + 1):
+            a = pose.theta + math.radians(SONAR_HALF_ANGLE_DEG) * i / steps
+            ca, sa = math.cos(a), math.sin(a)
+            limit = target_range / max(abs(math.cos(a - pose.theta)), 1e-6)
+            d = 0.0
+            while d < limit:
+                px, py = sx + d * ca, sy + d * sa
+                if any(x0 <= px <= x0 + OBSTACLE_SIZE_MM and y0 <= py <= y0 + OBSTACLE_SIZE_MM
+                       for x0, y0 in squares):
+                    return False
+                d += 10.0
+    return True
 
 
-def _feasible_backaway(final_pose: Pose, own_box, radius_mm: float) -> int:
-    for cm in BACKAWAY_FALLBACKS_CM:
-        if cm == 0:
-            return 0
-        bx = final_pose.x - cm * 10.0 * math.cos(final_pose.theta)
-        by = final_pose.y - cm * 10.0 * math.sin(final_pose.theta)
-        back_pose = Pose(bx, by, final_pose.theta)
-        if _pose_in_bounds(back_pose) and _pose_can_escape(back_pose, own_box, radius_mm):
-            return cm
-    return 0
+def _fu_runin(pose: Pose, standoff_mm: float, others: List[dict]) -> Optional[float]:
+    runin = None
+    back = 0.0
+    while back <= FU_RUNIN_MM:
+        if not _sonar_sees_target_first(pose, back, standoff_mm, others):
+            break
+        runin = back
+        back += 25.0
+    return runin
 
 
-def _build_edge_cache(start, visitable, anchor_by_id, final_by_id, radius_mm, obstacles):
-    cache = {}
-    from_nodes = [("START", start)]
-    for obs in visitable:
-        final = final_by_id[obs["id"]]
-        backaway_cm = _feasible_backaway(final, _obstacle_aabb_mm(obs), radius_mm)
-        bx = final.x - backaway_cm * 10.0 * math.cos(final.theta)
-        by = final.y - backaway_cm * 10.0 * math.sin(final.theta)
-        from_nodes.append((obs["id"], Pose(bx, by, final.theta)))
+def _photo_options(obstacle: dict, boxes, obstacles: List[dict]) -> List[PhotoOption]:
+    """Every standoff in STANDOFF_CANDIDATES_CM whose photo pose is clear, in
+    preference order, each with the stretch of approach line that is clear."""
+    options = []
+    for standoff_cm in STANDOFF_CANDIDATES_CM:
+        pose = _viewing_pose(obstacle, standoff_cm * 10.0)
+        if pose is None or not _pose_clear(pose.x, pose.y, pose.theta, boxes):
+            continue
+        length = 0.0
+        while length + 10.0 <= APPROACH_LINE_MAX_MM:
+            back = length + 10.0
+            if not _pose_clear(pose.x - back * math.cos(pose.theta),
+                               pose.y - back * math.sin(pose.theta), pose.theta, boxes):
+                break
+            length = back
+        line = grid_search.ApproachLine(pose.x, pose.y, pose.theta, length, APPROACH_LATERAL_TOL_MM)
+        others = [o for o in obstacles if o is not obstacle
+                  and (o["x"], o["y"]) != (obstacle["x"], obstacle["y"])]
+        runin = _fu_runin(pose, standoff_cm * 10.0, others)
+        options.append(PhotoOption(standoff_cm, pose, line, runin))
+    return options
 
-    for from_id, from_pose in from_nodes:
-        for obs in visitable:
-            if from_id == obs["id"]:
-                continue
-            anchor = anchor_by_id[obs["id"]]
-            try:
-                cache[(from_id, obs["id"])] = _search(from_pose, anchor, radius_mm, obstacles, obs["id"])
-            except grid_search.NoPathFound as exc:
-                logging.warning(f"TSP edge {from_id} -> obstacle {obs['id']}: {exc}")
-                cache[(from_id, obs["id"])] = None
-    return cache
+
+def _search_leg(from_pose: Pose, option: PhotoOption, radius_mm, boxes):
+    """(tokens, poses, cost) onto option's approach line, or None. Cost
+    includes the straight run-in along the line, so legs compare fairly."""
+    try:
+        tokens, raw_poses, cost = grid_search.search_leg(
+            from_pose.x, from_pose.y, from_pose.theta, option.line,
+            radius_mm, boxes, ARENA_MM, ROBOT_HALF_LENGTH_MM, ROBOT_HALF_WIDTH_MM,
+        )
+    except grid_search.NoPathFound:
+        return None
+    poses = [Pose(x, y, t) for x, y, t in raw_poses]
+    back, _ = option.line.offsets(poses[-1].x, poses[-1].y)
+    return tokens, poses, cost + max(back, 0.0)
+
+
+def _merge_straights(tokens: List[str], poses: List[Pose]):
+    """F5,F5,F5 -> F15. poses[i] is the pose AFTER tokens[i]."""
+    out_t, out_p = [], []
+    for tok, pose in zip(tokens, poses):
+        m = _STRAIGHT_RE.match(tok)
+        prev = _STRAIGHT_RE.match(out_t[-1]) if out_t else None
+        if m and prev and m.group(1) == prev.group(1):
+            out_t[-1] = f"{m.group(1)}{int(prev.group(2)) + int(m.group(2))}"
+            out_p[-1] = pose
+        else:
+            out_t.append(tok)
+            out_p.append(pose)
+    return out_t, out_p
 
 
 def _edge_cost(cache, from_id, to_id) -> float:
@@ -215,7 +263,7 @@ def _prefix_score(order, cache):
     return visited, cost
 
 
-def _visit_order(visitable, cache):
+def _visit_order(visitable, cache, quiet=False):
     """Always returns every obstacle, best first. When no complete tour exists
     - two dead ends, say - the order that reaches the MOST obstacles before
     its first impossible leg wins, cheapest among those. plan_mission() then
@@ -235,12 +283,13 @@ def _visit_order(visitable, cache):
     assert best_key is not None and best_order is not None  # len >= 2, so a perm exists
 
     visited = -best_key[0]
-    if visited < len(visitable):
+    if visited < len(visitable) and not quiet:
         logging.warning(
             f"No complete tour: best order reaches {visited}/{len(visitable)} "
             f"obstacles; skipping {[o['id'] for o in best_order[visited:]]}."
         )
-    logging.info(f"Visit order: {[o['id'] for o in best_order]}  cost={best_key[1]:.0f}mm")
+    if not quiet:
+        logging.info(f"Visit order: {[o['id'] for o in best_order]}  cost={best_key[1]:.0f}mm")
     return best_order
 
 
@@ -270,35 +319,43 @@ def _greedy_order(visitable, cache):
     return order
 
 
-# Only ever step DOWN from STANDOFF_MM, so retuning it can't make a fallback
-# try a wider standoff than the one that just failed.
-STANDOFF_FALLBACKS_MM = tuple(dict.fromkeys(
-    s for s in (STANDOFF_MM, 250.0, 200.0, 150.0, 100.0, 70.0, FU_MIN_CM * 10.0)
-    if s <= STANDOFF_MM
-))
-ANCHOR_BUFFER_FALLBACKS_MM = (STANDOFF_ANCHOR_BUFFER_MM, 100.0, 50.0, 0.0)
-ROBOT_HALF_FALLBACKS_MM = (ROBOT_PLANNING_HALF_MM, ROBOT_HALF_LENGTH_MM)
+class _Legs:
+    """Every leg searched so far, keyed by which standoff each end uses, so
+    switching an obstacle's standoff back and forth never searches twice."""
 
+    def __init__(self, start, options, radius_mm, boxes, deadline):
+        self.start, self.options = start, options
+        self.radius_mm, self.boxes = radius_mm, boxes
+        self.deadline = deadline
+        self.legs = {}
 
-def _feasible_approach(obstacle: dict, radius_mm: float) -> Optional[Tuple[float, float, float]]:
-    own_box = _obstacle_aabb_mm(obstacle)
-    for robot_half_mm in ROBOT_HALF_FALLBACKS_MM:
-        for standoff in STANDOFF_FALLBACKS_MM:
-            final = _viewing_pose(obstacle, standoff, robot_half_mm)
-            if final is None:
-                return None
-            if not _pose_in_bounds(final) or not _pose_can_escape(final, own_box, radius_mm):
-                continue
-            for buffer_mm in ANCHOR_BUFFER_FALLBACKS_MM:
-                anchor = _anchor_pose(obstacle, standoff, buffer_mm, robot_half_mm)
-                if _pose_in_bounds(anchor):
-                    if (standoff, buffer_mm, robot_half_mm) != (STANDOFF_FALLBACKS_MM[0], ANCHOR_BUFFER_FALLBACKS_MM[0], ROBOT_HALF_FALLBACKS_MM[0]):
-                        logging.warning(
-                            f"Obstacle {obstacle.get('id')}: reduced to {standoff:.0f}mm "
-                            f"standoff, {buffer_mm:.0f}mm buffer, {robot_half_mm:.0f}mm half-length."
-                        )
-                    return standoff, buffer_mm, robot_half_mm
-    return None
+    def _from_pose(self, from_id, choice):
+        if from_id == "START":
+            return self.start
+        return self.options[from_id][choice[from_id]].pose
+
+    def view(self, visitable, choice) -> dict:
+        """{(from_id, to_id): (tokens, poses, cost) or None} for the current choice."""
+        ids = [o["id"] for o in visitable]
+        cache = {}
+        for from_id in ["START"] + ids:
+            from_c = None if from_id == "START" else choice[from_id]
+            for to_id in ids:
+                if to_id == from_id:
+                    continue
+                key = (from_id, from_c, to_id, choice[to_id])
+                if key not in self.legs and time.monotonic() > self.deadline:
+                    # Out of time: treat it as impossible rather than make the
+                    # RPi wait past its PATH timeout. Not cached - it isn't known.
+                    cache[(from_id, to_id)] = None
+                    continue
+                if key not in self.legs:
+                    self.legs[key] = _search_leg(
+                        self._from_pose(from_id, choice),
+                        self.options[to_id][choice[to_id]], self.radius_mm, self.boxes,
+                    )
+                cache[(from_id, to_id)] = self.legs[key]
+        return cache
 
 
 def _nearest_cardinal(theta: float) -> str:
@@ -318,106 +375,142 @@ def _pose_to_dir_entry(pose: Pose) -> dict:
     return {"x": int(gx), "y": int(gy), "dir": _nearest_cardinal(pose.theta)}
 
 
-def plan_mission(obstacles: List[dict], arc_profile: int = PROFILE_TIGHT) -> dict:
+def _choose_tour(visitable, legs: _Legs, options):
+    """Visit order + standoff per obstacle. Starts every obstacle at its most
+    preferred standoff; while the tour misses some, moves those (and the dead
+    end that cut the tour short) to their next standoff, keeping the best."""
+    deadline = legs.deadline
+    choice = {o["id"]: 0 for o in visitable}
+    best = None
+    while True:
+        cache = legs.view(visitable, choice)
+        ok, unreachable = _reachable(visitable, cache)
+        order = _visit_order(ok, cache, quiet=True) + unreachable
+        reached, cost = _prefix_score(order, cache)
+        if best is None or (reached, -cost) > (best[0], -best[1]):
+            best = (reached, cost, order, dict(choice), cache)
+        if reached == len(visitable):
+            break
+        if time.monotonic() > deadline:
+            logging.warning(f"Planning budget of {PLAN_TIME_BUDGET_S:.0f}s used — "
+                            "sending the best plan so far.")
+            break
+        retry = order[reached:] + (order[reached - 1:reached] if reached else [])
+        changed = False
+        for obs in retry:
+            if choice[obs["id"]] + 1 < len(options[obs["id"]]):
+                choice[obs["id"]] += 1
+                changed = True
+        if not changed:
+            break
+
+    reached, cost, order, choice, cache = best
+    if reached < len(order):
+        logging.warning(
+            f"No complete tour: best order reaches {reached}/{len(order)} "
+            f"obstacles; skipping {[o['id'] for o in order[reached:]]}."
+        )
+    logging.info(f"Visit order: {[o['id'] for o in order]}  cost={cost:.0f}mm")
+    return order, choice, cache
+
+
+def plan_mission(obstacles: List[dict], arc_profile: int = PROFILE_TIGHT,
+                 details: Optional[dict] = None) -> dict:
+    """Plan Task 1. Pass a dict as `details` to get each photo's pose and
+    standoff back (tests and the simulator use it; the RPi does not)."""
+    t0 = time.monotonic()
     radius_mm = TURN_RADIUS_MM[arc_profile]
     start = Pose(START_X_MM, START_Y_MM, START_THETA)
+    # Every obstacle, the one being approached included: even the closest
+    # photo pose (28 cm) is far outside its margin, so nothing needs excluding.
+    boxes = [_obstacle_aabb_mm(o) for o in obstacles]
 
-    anchor_by_id = {}
-    final_by_id = {}
-    standoff_by_id = {}
+    options: Dict[object, List[PhotoOption]] = {}
     visitable = []
+    skipped = {}
     for obs in obstacles:
         if obs.get("d") not in FACE_FROM_D:
             logging.info(f"Obstacle {obs.get('id')}: SKIP (d={obs.get('d')}).")
             continue
-        approach = _feasible_approach(obs, radius_mm)
-        if approach is None:
-            logging.error(f"Obstacle {obs['id']}: no legal viewing pose — skipping.")
+        opts = _photo_options(obs, boxes, obstacles)
+        if not opts:
+            logging.error(
+                f"Obstacle {obs['id']}: no clear photo spot at "
+                f"{min(STANDOFF_CANDIDATES_CM)}-{max(STANDOFF_CANDIDATES_CM)} cm — skipping."
+            )
+            skipped[obs["id"]] = "no photo spot"
             continue
-        standoff, buffer_mm, robot_half_mm = approach
-        anchor_by_id[obs["id"]] = _anchor_pose(obs, standoff, buffer_mm, robot_half_mm)
-        final_by_id[obs["id"]] = _viewing_pose(obs, standoff, robot_half_mm)
-        standoff_by_id[obs["id"]] = standoff
+        options[obs["id"]] = opts
         visitable.append(obs)
 
-    edge_cache = _build_edge_cache(start, visitable, anchor_by_id, final_by_id, radius_mm, obstacles)
-
-    visitable, unreachable = _reachable(visitable, edge_cache)
-    for obs in unreachable:
-        logging.error(f"Obstacle {obs['id']}: no route into it from anywhere — dropped.")
-    order = _visit_order(visitable, edge_cache)
+    legs = _Legs(start, options, radius_mm, boxes, t0 + PLAN_TIME_BUDGET_S)
+    order, choice, cache = _choose_tour(visitable, legs, options)
 
     segments: List[List[str]] = []
     segment_obstacles: List[Optional[str]] = []
     dirs: List[dict] = []
+    photo_poses, standoffs = {}, {}
 
-    cur = start
     cur_id = "START"
     for obs in order:
-        anchor = anchor_by_id[obs["id"]]
-        final = final_by_id[obs["id"]]
-        fu_target_cm = round(standoff_by_id[obs["id"]] / 10.0)
-        assert FU_MIN_CM <= fu_target_cm <= FU_MAX_CM
-
-        cached = edge_cache.get((cur_id, obs["id"]))
-        if cached is not None:
-            tokens, poses, _ = cached
-            tokens, poses = list(tokens), list(poses)
-        elif (cur_id, obs["id"]) in edge_cache:
-            # Already searched and failed - searching again only burns time.
+        option = options[obs["id"]][choice[obs["id"]]]
+        leg = cache.get((cur_id, obs["id"]))
+        if leg is None:
             logging.error(f"Obstacle {obs['id']}: no route from {cur_id} — skipping.")
+            skipped[obs["id"]] = "no route"
             continue
+
+        search_tokens, search_poses, _ = leg
+        tokens, poses = _merge_straights(list(search_tokens), list(search_poses[1:]))
+
+        final = option.pose
+        back, _ = option.line.offsets(search_poses[-1].x, search_poses[-1].y)
+        runin = option.fu_runin_mm
+        # F<n> up to where FU may start (all the way, if FU can't be trusted).
+        # Rounded UP before FU, so it never starts further out than the beam
+        # was checked; to the nearest cm without FU, so F can't overshoot.
+        if runin is None:
+            run_cm = round(back / 10.0)
         else:
-            try:
-                tokens, poses, _ = _search(cur, anchor, radius_mm, obstacles, obs["id"])
-            except grid_search.NoPathFound as exc:
-                logging.error(f"Obstacle {obs['id']}: unreachable — {exc}. Skipping.")
-                continue
-
-        try:
-            tokens.append(fwd_until(fu_target_cm, compensate=FU_COMPENSATE))
-        except TokenError as exc:
-            logging.error(f"fwd_until() rejected for obstacle {obs['id']}: {exc} — using fwd() instead.")
-            tokens.append(fwd(round(STANDOFF_ANCHOR_BUFFER_MM / 10.0)))
-        poses.append(Pose(final.x, final.y, final.theta))
-
+            run_cm = math.ceil((back - runin) / 10.0 - 1e-6)
+        if run_cm > 0:
+            rest = back - run_cm * 10.0
+            tokens.append(fwd(run_cm))
+            poses.append(Pose(final.x - rest * math.cos(final.theta),
+                              final.y - rest * math.sin(final.theta), final.theta))
+        if runin is None:
+            logging.warning(f"Obstacle {obs['id']}: a neighbour is inside the ultrasonic "
+                            f"beam — final approach on odometry only, no FU.")
+        else:
+            assert FU_MIN_CM <= option.standoff_cm <= FU_MAX_CM
+            tokens.append(fwd_until(option.standoff_cm, compensate=FU_COMPENSATE))
+            poses.append(final)
         tokens.append(stop())
-        poses.append(Pose(final.x, final.y, final.theta))
+        poses.append(final)
 
-        lines = chunk_tokens(tokens)
+        if option.standoff_cm != STANDOFF_CANDIDATES_CM[0]:
+            level = logging.WARNING if option.standoff_cm in STANDOFF_LAST_RESORT_CM else logging.INFO
+            logging.log(level, f"Obstacle {obs['id']}: photo at {option.standoff_cm} cm"
+                               f"{' (last resort)' if level == logging.WARNING else ''}.")
+
         line_start = 0
+        lines = chunk_tokens(tokens)
         for i, line in enumerate(lines):
             segments.append(line)
-            line_len = len(line)
-            pose_after_line = poses[line_start + line_len - 1]
-            dirs.append(_pose_to_dir_entry(pose_after_line))
+            line_start += len(line)
+            dirs.append(_pose_to_dir_entry(poses[line_start - 1]))
             segment_obstacles.append(str(obs["id"]) if i == len(lines) - 1 else None)
-            line_start += line_len
 
-        cur = Pose(final.x, final.y, final.theta)
-
-        backaway_cm = _feasible_backaway(final, _obstacle_aabb_mm(obs), radius_mm)
-        rev_tokens = []
-        if backaway_cm > 0:
-            try:
-                rev_tokens = [rev(backaway_cm), stop()]
-            except TokenError as exc:
-                logging.error(f"Could not build reverse-away tokens: {exc}")
-        else:
-            logging.warning(f"Obstacle {obs['id']}: no room to back away — skipping.")
-
-        if rev_tokens:
-            rev_lines = chunk_tokens(rev_tokens)
-            bx = cur.x - backaway_cm * 10.0 * math.cos(cur.theta)
-            by = cur.y - backaway_cm * 10.0 * math.sin(cur.theta)
-            back_pose = Pose(bx, by, cur.theta)
-            for line in rev_lines:
-                segments.append(line)
-                segment_obstacles.append(None)
-                dirs.append(_pose_to_dir_entry(back_pose))
-            cur = back_pose
-
+        photo_poses[obs["id"]] = (final.x, final.y, final.theta)
+        standoffs[obs["id"]] = option.standoff_cm
         cur_id = obs["id"]
+
+    logging.info(f"Planned {len(photo_poses)}/{len(obstacles)} photo(s) in "
+                 f"{time.monotonic() - t0:.1f}s.")
+    if details is not None:
+        details["photo_poses"] = photo_poses
+        details["standoff_cm"] = standoffs
+        details["skipped"] = skipped
 
     return {
         "segments": segments,

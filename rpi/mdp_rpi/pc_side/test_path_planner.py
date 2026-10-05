@@ -3,9 +3,9 @@ test_path_planner.py  —  the tour search must always return a tour
 ───────────────────────────────────────────────────────────────────
     python3 test_path_planner.py          # from pc_side/
 
-Fast: no A*, no grid search. These drive _visit_order() and _reachable()
-against a hand-made edge cache, so they run in milliseconds where a real
-plan_mission() over four coincident faces takes minutes.
+Fast. Most of these drive _visit_order() and _reachable() against a
+hand-made edge cache; the rest plan one-obstacle scenes. For whole layouts,
+replayed and collision-checked, run test_mission_sim.py.
 
 WHAT IT IS PROTECTING
 ─────────────────────
@@ -126,6 +126,53 @@ class PlanMissionTests(unittest.TestCase):
         for key in ("segments", "obstacle_ids", "segment_obstacles", "dirs"):
             self.assertIn(key, result)
         self.assertEqual(result["segments"], [])
+
+
+def options_for(target, *others):
+    every = [target, *others]
+    boxes = [pp._obstacle_aabb_mm(o) for o in every]
+    return [op.standoff_cm for op in pp._photo_options(target, boxes, every)]
+
+
+class PhotoDistanceTests(unittest.TestCase):
+    """The ultrasonic reading at each photo: 30 cm first, then further out up
+    to 45, and 28 only when nothing else fits."""
+
+    def test_open_floor_uses_30(self):
+        self.assertEqual(options_for({"id": 1, "x": 10, "y": 10, "d": 0})[0], 30)
+
+    def test_28_is_tried_last(self):
+        # Facing the top edge: 35+ would hang the robot too far off the arena.
+        self.assertEqual(options_for({"id": 1, "x": 10, "y": 16, "d": 0}), [30, 32, 28])
+
+    def test_a_blocked_30_moves_further_out(self):
+        # A neighbour diagonally behind blocks 28-42; only 45 clears it.
+        self.assertEqual(
+            options_for({"id": 1, "x": 10, "y": 10, "d": 0}, {"id": 2, "x": 11, "y": 14, "d": 0}),
+            [45],
+        )
+
+    def test_no_room_at_any_distance_is_skipped_not_fudged(self):
+        details = {}
+        result = pp.plan_mission([{"id": 1, "x": 10, "y": 17, "d": 0}], details=details)
+        self.assertEqual(result["segments"], [])
+        self.assertEqual(details["skipped"], {1: "no photo spot"})
+
+
+class LegOutputTests(unittest.TestCase):
+
+    def test_straights_are_merged(self):
+        poses = [pp.Pose(i, 0, 0) for i in range(5)]
+        tokens, merged = pp._merge_straights(["F5", "F5", "FR90", "R5", "R5"], poses)
+        self.assertEqual(tokens, ["F10", "FR90", "R10"])
+        self.assertIs(merged[0], poses[1])   # pose after the LAST merged token
+
+    def test_a_simple_plan_ends_each_photo_with_fu_at_the_chosen_distance(self):
+        details = {}
+        result = pp.plan_mission([{"id": 1, "x": 10, "y": 10, "d": 0}], details=details)
+        self.assertEqual(result["segment_obstacles"][-1], "1")
+        self.assertEqual(result["segments"][-1][-2:], ["FU30", "S"])
+        self.assertEqual(details["standoff_cm"], {1: 30})
 
 
 if __name__ == "__main__":
