@@ -1,5 +1,5 @@
 """
-pc_side/test_run_log.py  —  check run_log.py end-to-end, no robot needed
+pc/test_run_log.py  —  check run_log.py end-to-end, no robot needed
 ─────────────────────────────────────────────────────────────────────────
 Runs the real task1_pc.main() against a fake RPi on localhost. YOLO is
 stubbed out (and OpenCV too, if missing), so neither needs installing.
@@ -13,7 +13,7 @@ The fake RPi sends:
     python3 test_run_log.py
 
 Expected: a "Run finished … error(s), … warning(s)" summary at the end,
-and a new logs/task1_pc_<timestamp>.log in mdp_rpi/logs/ containing it.
+and a new task1_pc_<timestamp>.log in pc/logs/ containing it.
 """
 
 import json

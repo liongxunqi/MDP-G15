@@ -24,12 +24,21 @@ RPi/
 ├── image_capture/
 │   └── camera.py               ← picamera2 wrapper (no blocking input() calls)
 │
-└── pc_side/                    ← run these on the PC, not the RPi
-    ├── task1_pc.py             ← PC server: pathfinding + YOLO detection
-    ├── pc_config.py            ← PC-side config
-    ├── requirements_pc.txt
-    └── weights/
-        └── best.pt             ← put your trained YOLO weights here
+└── run_log.py                  ← per-run log files + end-of-run summary
+                                  (also used by pc/task1_pc.py)
+```
+
+The PC side is not in this folder. It lives at the repo root:
+
+```
+pc/                             ← run these on the PC, not the RPi
+├── task1_pc.py                 ← PC server: pathfinding + YOLO detection
+├── image_recognition/detect.py
+├── requirements_pc.txt
+└── weights/best.pt             ← put your trained YOLO weights here
+algo/                           ← the path planner task1_pc.py calls
+├── path_planner.py, grid_search.py, stm_tokens.py
+└── tests/                      ← unit tests + test_mission_sim.py
 ```
 
 ---
@@ -54,7 +63,7 @@ nano .env
 ## One-time PC Setup
 
 ```bash
-cd pc_side
+cd pc            # from the repo root
 pip install -r requirements_pc.txt
 # Copy your trained weights:
 mkdir weights && cp /path/to/best.pt weights/
@@ -116,7 +125,7 @@ problem is motion, not the link.
 ### Step 4 — Test YOLO detection (PC only, no RPi needed)
 
 ```python
-# Run from pc_side/
+# Run from pc/
 from task1_pc import run_detection
 class_id, conf = run_detection("path/to/test_image.jpg")
 print(class_id, conf)
@@ -130,7 +139,7 @@ Order of startup matters:
 
 1. **RPi:** `python3 task1.py`  ← **must start first.** The RPi is the TCP
    *server*; it binds, listens, and blocks on `accept()`
-2. **PC:** `cd pc_side && python3 task1_pc.py` — it *connects*, with no retry,
+2. **PC:** `python3 pc/task1_pc.py` (from the repo root) — it *connects*, with no retry,
    so starting it first just gets connection refused
 3. **Android:** connect via Bluetooth, send obstacles, press Send Data, press Begin
 
@@ -159,7 +168,7 @@ each. Planned and collision-checked, rather than dead-reckoned.
 python3 task_a5.py
 
 # 2. PC — connects to the RPi. No retry, so it must come second.
-cd pc_side && python3 task1_pc.py
+python3 pc/task1_pc.py          # from the repo root
 
 # 3. Android — place ONE obstacle, Send Data, Begin. Exactly as Task 1.
 ```
@@ -243,7 +252,8 @@ python3 task_a5_reactive.py --dry-run     # no motion: prove camera + PC
 ```bash
 python3 test_task_a5.py                  # 17 tests — fan-out, fold-back, filter
 python3 test_task_a5_reactive.py         # 24 tests — the standalone sequence
-cd pc_side && python3 test_path_planner.py   # 10 tests — the tour search
+python3 ../../algo/tests/test_path_planner.py    # 16 tests — planner
+python3 ../../algo/tests/test_mission_sim.py     # replays whole layouts
 ```
 
 Neither needs a robot, a PC, Bluetooth or pyserial. Geometry is not covered by
@@ -356,7 +366,7 @@ Three things that surprise people:
 It is also **precise but not accurate**: the sensor reads about 1.3 cm long and
 every pass reads through that same offset, so it cannot average out. `FU20`
 settles around 18.7 cm from the obstacle, repeatably. Ask for `FU21`, or use
-`stm_tokens.fwd_until(20, compensate=True)` — and re-measure the offset on your
+`algo/stm_tokens.fwd_until(20, compensate=True)` — and re-measure the offset on your
 own sensor before trusting it.
 
 Confirm with `?US`, not `?DIST`: `?DIST` reports only the last leg of the

@@ -1,6 +1,6 @@
 """
-pc_side/task1_pc.py  —  PC algorithm + image-recognition server for Task 1
-───────────────────────────────────────────────────────────────────────────
+pc/task1_pc.py  —  PC algorithm + image-recognition server for Task 1
+──────────────────────────────────────────────────────────────────────
 Run this on the PC BEFORE starting task1.py on the RPi.
 
 What it does
@@ -19,8 +19,9 @@ Setup
 ──────
 pip install ultralytics opencv-python
 
-Put your trained weights at:  pc_side/weights/best.pt
-Put your detect.py at:        pc_side/image_recognition/detect.py
+Put your trained weights at:  pc/weights/best.pt
+Put your detect.py at:        pc/image_recognition/detect.py
+The path planner lives in algo/; run_log.py in rpi/mdp_rpi/.
 
 Edit RPI_IP below to match your RPi's actual IP (check with: hostname -I on RPi).
 """
@@ -46,16 +47,19 @@ ANNOTATED_DIR   = "runs/predict"      # YOLO-annotated outputs saved here
 STITCHED_OUTPUT = "stitched_result.jpg"
 
 # ── Logging ────────────────────────────────────────────────────────────────────
-# run_log.py lives one level up, in mdp_rpi/
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# Shared with the RPi side, so it lives in rpi/mdp_rpi/. Logs go to pc/logs/.
+PC_DIR = os.path.dirname(os.path.abspath(__file__))
+REPO_ROOT = os.path.dirname(PC_DIR)
+sys.path.insert(0, os.path.join(REPO_ROOT, "rpi", "mdp_rpi"))
 import run_log  # noqa: E402
 
-run_log.setup("task1_pc", "%(asctime)s [PC] %(levelname)s — %(message)s")
+run_log.setup("task1_pc", "%(asctime)s [PC] %(levelname)s — %(message)s",
+              log_dir=os.path.join(PC_DIR, "logs"))
 
 # ── Detection — uses your detect.py directly ──────────────────────────────────
-# detect.py lives at pc_side/image_recognition/detect.py
+# detect.py lives at pc/image_recognition/detect.py
 # It exposes:  detect(image_path) -> (class_name, confidence)
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, PC_DIR)
 from image_recognition.detect import detect as _detect
 
 
@@ -75,6 +79,7 @@ def run_detection(image_path: str):
 #                         that line, or None for pure travel
 #   "dirs"              — robot pose per line, for the Android map
 
+sys.path.insert(0, os.path.join(REPO_ROOT, "algo"))
 from stm_tokens import PROFILE_NAMES, TURN_RADIUS_MM  # noqa: E402
 from path_planner import plan_mission  # noqa: E402
 

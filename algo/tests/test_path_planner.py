@@ -1,7 +1,7 @@
 """
 test_path_planner.py  —  the tour search must always return a tour
 ───────────────────────────────────────────────────────────────────
-    python3 test_path_planner.py          # from pc_side/
+    python3 algo/tests/test_path_planner.py      # from the repo root
 
 Fast. Most of these drive _visit_order() and _reachable() against a
 hand-made edge cache; the rest plan one-obstacle scenes. For whole layouts,
@@ -34,7 +34,7 @@ import sys
 import unittest
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # algo/
 
 import path_planner as pp
 

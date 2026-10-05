@@ -5,7 +5,8 @@ Call setup() once, at the top of an entry point, in place of
 logging.basicConfig(). Every run then:
 
   • prints to the console exactly as before
-  • writes the full log to  logs/<name>_<YYYYmmdd_HHMMSS>.log
+  • writes the full log to  logs/<name>_<YYYYmmdd_HHMMSS>.log  (next to this
+    file, or wherever log_dir says)
   • logs uncaught exceptions (main thread AND worker threads) with traceback
   • on exit, prints and saves a summary of every WARNING / ERROR / CRITICAL
 
@@ -36,8 +37,11 @@ class _ProblemCollector(logging.Handler):
         self.records.append(record)
 
 
-def setup(name: str, fmt: str, datefmt: str = "%H:%M:%S") -> str:
+def setup(name: str, fmt: str, datefmt: str = "%H:%M:%S", log_dir: str = None) -> str:
     """Configure root logging for this run. Returns the log file path."""
+    global LOG_DIR
+    if log_dir is not None:
+        LOG_DIR = log_dir
     os.makedirs(LOG_DIR, exist_ok=True)
     path = os.path.join(LOG_DIR, f"{name}_{datetime.now():%Y%m%d_%H%M%S}.log")
 

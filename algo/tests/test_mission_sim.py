@@ -1,9 +1,9 @@
 """
-pc_side/test_mission_sim.py  —  replay plan_mission() output and check it
-──────────────────────────────────────────────────────────────────────────
-    python3 test_mission_sim.py              # fixed layouts + 30 random ones
-    python3 test_mission_sim.py --random 100 # more random layouts
-    python3 test_mission_sim.py --seed 7     # a different random set
+algo/tests/test_mission_sim.py  —  replay plan_mission() output and check it
+──────────────────────────────────────────────────────────────────────────────
+    python3 algo/tests/test_mission_sim.py              # fixed + 30 random layouts
+    python3 algo/tests/test_mission_sim.py --random 0   # fixed layouts only
+    python3 algo/tests/test_mission_sim.py --seed 7     # a different random set
 
 No robot, no RPi, no YOLO. Each layout goes through the real plan_mission(),
 then every token the STM would receive is replayed here, independently of
@@ -39,7 +39,7 @@ import sys
 import time
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # algo/
 
 import grid_search  # noqa: E402
 import path_planner as pp  # noqa: E402

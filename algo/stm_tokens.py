@@ -1,13 +1,13 @@
 """
-pc_side/stm_tokens.py
-─────────────────────
+algo/stm_tokens.py
+──────────────────
 Token builders and Ackermann geometry for the STM32 movement protocol.
 
-This module is the PC-side counterpart to communications/stm.py. It is
-deliberately self-contained — no pyserial, no RPi imports — because pc_side/ is
-deployed to the algorithm PC, a different machine from the Pi. The §2 caps are
-therefore restated here rather than imported. If PROTOCOL.md changes, both
-copies must change.
+This module is the PC-side counterpart to rpi/mdp_rpi/communications/stm.py.
+It is deliberately self-contained — no pyserial, no RPi imports — because the
+planner runs on the algorithm PC, a different machine from the Pi. The §2 caps
+and FU limits are therefore restated here rather than imported. If
+stm/PROTOCOL.md changes, both copies must change.
 
 Everything here is real and tested. The live path selection in
 task1_pc.compute_path is supplied by path_planner.py and uses these builders.
