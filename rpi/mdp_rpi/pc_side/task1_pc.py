@@ -46,11 +46,11 @@ ANNOTATED_DIR   = "runs/predict"      # YOLO-annotated outputs saved here
 STITCHED_OUTPUT = "stitched_result.jpg"
 
 # ── Logging ────────────────────────────────────────────────────────────────────
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [PC] %(levelname)s — %(message)s",
-    datefmt="%H:%M:%S",
-)
+# run_log.py lives one level up, in mdp_rpi/
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import run_log  # noqa: E402
+
+run_log.setup("task1_pc", "%(asctime)s [PC] %(levelname)s — %(message)s")
 
 # ── Detection — uses your detect.py directly ──────────────────────────────────
 # detect.py lives at pc_side/image_recognition/detect.py

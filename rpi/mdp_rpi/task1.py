@@ -55,11 +55,9 @@ from communications.stm import (
 )
 from image_capture.camera import Camera
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(threadName)s] %(levelname)s — %(message)s",
-    datefmt="%H:%M:%S",
-)
+import run_log
+
+run_log.setup("task1", "%(asctime)s [%(threadName)s] %(levelname)s — %(message)s")
 
 
 # ── Checklist A.5 ─────────────────────────────────────────────────────────────

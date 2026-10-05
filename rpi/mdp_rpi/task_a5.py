@@ -33,11 +33,9 @@ from communications.stm import (
 )
 from image_capture.camera import Camera
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [A5] %(levelname)s — %(message)s",
-    datefmt="%H:%M:%S",
-)
+import run_log
+
+run_log.setup("task_a5", "%(asctime)s [A5] %(levelname)s — %(message)s")
 
 # bullseye is the "right obstacle, wrong face" marker, not a target. dot is filler.
 NOT_A_TARGET = {"bullseye", "dot"}
