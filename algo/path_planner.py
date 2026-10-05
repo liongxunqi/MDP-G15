@@ -369,9 +369,20 @@ def _nearest_cardinal(theta: float) -> str:
     return "S"
 
 
+# Android draws the robot as an N x N block of 10 cm cells and places it by the
+# block's BOTTOM-LEFT cell (arena-ui ArenaConfig.robotFootprintCells, default 2).
+ANDROID_ROBOT_CELLS = 2
+
+
 def _pose_to_dir_entry(pose: Pose) -> dict:
-    gx = max(0, min(19, round(pose.x / 100.0)))
-    gy = max(0, min(19, round(pose.y / 100.0)))
+    """The bottom-left cell of the block Android draws, chosen so that block is
+    centred on the robot's real centre. A robot centred at (20, 20) cm sends
+    (1, 1): cells 1-2, i.e. 10-30 cm, centred at 20 cm."""
+    n = ANDROID_ROBOT_CELLS
+    top = 20 - n   # last anchor that keeps the whole block on the 20 x 20 grid
+    # floor(v + 0.5): halves always round up (Python's round() goes to even).
+    gx = max(0, min(top, math.floor(pose.x / 100.0 - n / 2.0 + 0.5)))
+    gy = max(0, min(top, math.floor(pose.y / 100.0 - n / 2.0 + 0.5)))
     return {"x": int(gx), "y": int(gy), "dir": _nearest_cardinal(pose.theta)}
 
 

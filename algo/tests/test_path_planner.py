@@ -175,5 +175,30 @@ class LegOutputTests(unittest.TestCase):
         self.assertEqual(details["standoff_cm"], {1: 30})
 
 
+class AndroidPoseTests(unittest.TestCase):
+    """dirs carry the bottom-left cell of the 2 x 2 block Android draws."""
+
+    def entry(self, x_mm, y_mm, theta=math.pi / 2):
+        return pp._pose_to_dir_entry(pp.Pose(x_mm, y_mm, theta))
+
+    def test_start_pose_draws_centred_on_the_start_zone(self):
+        # Robot centre (20, 20) cm -> block over cells 1-2 = 10-30 cm.
+        self.assertEqual(self.entry(200, 200), {"x": 1, "y": 1, "dir": "N"})
+
+    def test_block_is_centred_on_the_robot(self):
+        # Centre (104, 156) cm -> the 2x2 block nearest to centred on it starts
+        # at (9, 15): it covers 90-110 and 150-170 cm, centred at (100, 160).
+        self.assertEqual(self.entry(1040, 1560, 0.0), {"x": 9, "y": 15, "dir": "E"})
+
+    def test_halves_round_the_same_way_on_both_axes(self):
+        e = self.entry(1050, 1550)
+        self.assertEqual((e["x"], e["y"]), (10, 15))
+
+    def test_overhanging_robot_is_kept_on_the_grid(self):
+        # Photo spots may hang past the edge; Android only accepts 0..18.
+        self.assertEqual(self.entry(-50, 2150, math.pi)["x"], 0)
+        self.assertEqual(self.entry(-50, 2150, math.pi)["y"], 18)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
