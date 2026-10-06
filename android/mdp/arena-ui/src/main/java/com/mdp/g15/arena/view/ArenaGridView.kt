@@ -104,7 +104,7 @@ class ArenaGridView @JvmOverloads constructor(
     private var draggingObstacleId: Int? = null
     private var robotPressed = false
     private var draggingRobot = false
-    /** Offset, in cells, of the pressed point from the robot's footprint anchor (bottom-left). */
+    /** Offset, in cells, of the pressed point from the robot's centre cell. */
     private var robotGrabOffsetX = 0
     private var robotGrabOffsetY = 0
     private var longPressTriggered = false
@@ -135,7 +135,8 @@ class ArenaGridView @JvmOverloads constructor(
     }
 
     fun render(state: ArenaState, placementMode: Boolean) {
-        if (draggingRobot || this.state.config != state.config || this.state.obstacles != state.obstacles) {
+        if (draggingRobot || this.state.config != state.config || this.state.obstacles != state.obstacles ||
+            (this.state.robot?.estimate != null && state.robot?.estimate == null)) {
             robotMotion.snap(state.robot)
         } else if (this.state.robot != state.robot) {
             robotMotion.retarget(state, SystemClock.uptimeMillis())
@@ -300,8 +301,11 @@ class ArenaGridView @JvmOverloads constructor(
         val robot = state.robot ?: return
         val now = SystemClock.uptimeMillis()
         val visual = robotMotion.sample(now) ?: return
-        val bounds = geometry.footprintBounds(robot.position, state.config.robotFootprintCells) ?: return
+        val bounds = geometry.footprintBounds(robot.position, state.config.robotFootprintCells)
         val checkpoint = canvas.save()
+        canvas.clipRect(geometry.arenaLeft, geometry.arenaTop,
+            geometry.arenaLeft + geometry.arenaWidth, geometry.arenaTop + geometry.arenaHeight)
+        clipRobotAroundObstacles(canvas)
         canvas.translate(
             (visual.x - robot.position.x) * geometry.cellSize,
             -(visual.y - robot.position.y) * geometry.cellSize,
@@ -395,9 +399,12 @@ class ArenaGridView @JvmOverloads constructor(
         }
     }
 
-    /** [anchor] is the robot footprint's bottom-left cell (see [ArenaConfig.robotFootprintCells]). */
-    private fun drawRobot(canvas: Canvas, anchor: GridCoordinate, direction: Direction) {
-        val bounds = geometry.footprintBounds(anchor, state.config.robotFootprintCells) ?: return
+    /** [center] is the centre cell of the robot footprint. */
+    private fun drawRobot(canvas: Canvas, center: GridCoordinate, direction: Direction) {
+        val bounds = geometry.footprintBounds(center, state.config.robotFootprintCells)
+        val clip = canvas.save()
+        canvas.clipRect(geometry.arenaLeft, geometry.arenaTop,
+            geometry.arenaLeft + geometry.arenaWidth, geometry.arenaTop + geometry.arenaHeight)
         val radius = (bounds.right - bounds.left) * 0.38f
         canvas.drawCircle(bounds.centerX, bounds.centerY, radius, robotPaint)
 
@@ -427,6 +434,34 @@ class ArenaGridView @JvmOverloads constructor(
         }
         nose.close()
         canvas.drawPath(nose, robotDirectionPaint)
+        canvas.restoreToCount(clip)
+    }
+
+    /** Keep obstacle cells visible even when a reported robot pose overlaps them. */
+    private fun clipRobotAroundObstacles(canvas: Canvas) {
+        if (state.obstacles.isEmpty()) return
+        val visibleArea = Path().apply {
+            fillType = Path.FillType.EVEN_ODD
+            addRect(
+                geometry.arenaLeft,
+                geometry.arenaTop,
+                geometry.arenaLeft + geometry.arenaWidth,
+                geometry.arenaTop + geometry.arenaHeight,
+                Path.Direction.CW,
+            )
+            state.obstacles.values.forEach { obstacle ->
+                val bounds = geometry.cellBounds(obstacle.position)
+                addRect(bounds.left, bounds.top, bounds.right, bounds.bottom, Path.Direction.CW)
+            }
+        }
+        canvas.clipPath(visibleArea)
+    }
+
+    private fun drawRobotDragImage(canvas: Canvas, center: GridCoordinate, direction: Direction) {
+        val checkpoint = canvas.save()
+        clipRobotAroundObstacles(canvas)
+        drawRobot(canvas, center, direction)
+        canvas.restoreToCount(checkpoint)
     }
 
     private fun drawDragPreview(canvas: Canvas) {
@@ -470,14 +505,13 @@ class ArenaGridView @JvmOverloads constructor(
         val contentX = toContentX(dragX)
         val contentY = toContentY(dragY)
         val underFinger = coordinateAtTouch(dragX, dragY)
-        val anchor = underFinger?.let { GridCoordinate(it.x - robotGrabOffsetX, it.y - robotGrabOffsetY) }
-        val bounds = anchor?.let { geometry.footprintBounds(it, state.config.robotFootprintCells) }
-        if (anchor == null || bounds == null || !ArenaReducer().canMoveRobot(state, anchor)) {
-            state.robot?.let { drawRobot(canvas, it.position, it.direction) }
+        val center = underFinger?.let { GridCoordinate(it.x - robotGrabOffsetX, it.y - robotGrabOffsetY) }
+        if (center == null || !ArenaReducer().canMoveRobot(state, center)) {
+            state.robot?.let { drawRobotDragImage(canvas, it.position, it.direction) }
             drawInvalidDropIndicator(canvas, contentX, contentY)
             return
         }
-        drawRobot(canvas, anchor, direction)
+        drawRobotDragImage(canvas, center, direction)
     }
 
     private fun drawInvalidDropIndicator(canvas: Canvas, x: Float, y: Float) {

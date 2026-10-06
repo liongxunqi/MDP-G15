@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>MDP Algorithm Simulator</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header>
+    <h1>MDP Algorithm Simulator</h1>
+    <p class="subtitle">Shortest-time Hamiltonian path over a 20&times;20 grid </p>
+  </header>
+
+  <main>
+    <section class="panel controls">
+      <h2>Obstacles</h2>
+      <p class="hint">Click an empty cell to place an obstacle (facing North). Click an obstacle to select it and edit its facing below. Right-click (or long-press) an obstacle to remove it.</p>
+
+      <p id="no-selection-hint" class="hint">No obstacle selected.</p>
+      <div id="selected-obstacle-panel" class="row" style="display: none; flex-direction: column; align-items: stretch;">
+        <div class="row" style="margin-bottom: 6px;">
+          <strong>Obstacle #<span id="selected-obstacle-id"></span></strong>
+        </div>
+        <div class="row buttons facing-buttons">
+          <button type="button" data-facing="N">N</button>
+          <button type="button" data-facing="E">E</button>
+          <button type="button" data-facing="S">S</button>
+          <button type="button" data-facing="W">W</button>
+        </div>
+        <div class="row buttons">
+          <button type="button" id="remove-obstacle-btn">Remove obstacle</button>
+        </div>
+      </div>
+
+      <div class="row">
+        <label for="preset">Load preset</label>
+        <select id="preset">
+          <option value="">— custom —</option>
+          <option value="basic">Basic (3 obstacles)</option>
+          <option value="spread">Spread out (5 obstacles)</option>
+          <option value="corners">Corners + center (5 obstacles)</option>
+          <option value="diagonal">Diagonal (5 obstacles)</option>
+          <option value="cluster">Clustered (5 obstacles)</option>
+        </select>
+      </div>
+
+      <div class="row">
+        <label for="start-x">Start pose</label>
+        <span class="start-pose-inputs">
+          x <input id="start-x" type="number" min="0" max="19" value="0" />
+          y <input id="start-y" type="number" min="0" max="19" value="0" />
+          facing
+          <select id="start-facing">
+            <option value="N" selected>N</option>
+            <option value="E">E</option>
+            <option value="S">S</option>
+            <option value="W">W</option>
+          </select>
+        </span>
+      </div>
+
+      <div class="row buttons">
+        <button id="clear-btn">Clear grid</button>
+        <button id="run-btn" class="primary">Run Hamiltonian Search</button>
+      </div>
+
+      <div id="status" class="status"></div>
+
+      <h2>Playback</h2>
+      <div class="row buttons">
+        <button id="play-btn" disabled>Play</button>
+        <button id="step-back-btn" disabled>&larr; Step</button>
+        <button id="step-fwd-btn" disabled>Step &rarr;</button>
+      </div>
+      <div class="row">
+        <label for="speed-select">Speed</label>
+        <select id="speed-select">
+          <option value="0.25">0.25&times;</option>
+          <option value="0.5">0.5&times;</option>
+          <option value="1" selected>1&times;</option>
+          <option value="2">2&times;</option>
+          <option value="4">4&times;</option>
+        </select>
+      </div>
+      <input id="step-slider" type="range" min="0" max="0" value="0" disabled />
+      <div id="step-label" class="hint">Step 0 / 0</div>
+
+      <h2>Recognition log</h2>
+      <ol id="log"></ol>
+    </section>
+
+    <section class="panel">
+      <canvas id="grid" width="670" height="670"></canvas>
+    </section>
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>

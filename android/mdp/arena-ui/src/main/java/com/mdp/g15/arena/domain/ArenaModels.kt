@@ -9,7 +9,7 @@ data class ArenaConfig(
     init {
         require(columns > 0) { "Arena columns must be positive." }
         require(rows > 0) { "Arena rows must be positive." }
-        require(robotFootprintCells in 1..3) { "Robot footprint must be between 1 and 3 cells." }
+        require(robotFootprintCells in 1..3 && robotFootprintCells % 2 == 1) { "Robot footprint must have a centre cell." }
         require(maxObstacles > 0) { "Arena must allow at least one obstacle." }
     }
 
@@ -27,9 +27,9 @@ fun GridCoordinate.step(direction: Direction): GridCoordinate = when (direction)
     Direction.WEST -> copy(x = x - 1)
 }
 
-/** All cells of a [size] x [size] square footprint anchored at this coordinate's bottom-left corner. */
+/** All cells of a [size] x [size] square footprint centred on this cell. */
 fun GridCoordinate.footprint(size: Int): List<GridCoordinate> =
-    (0 until size).flatMap { dx -> (0 until size).map { dy -> GridCoordinate(x + dx, y + dy) } }
+    (-size / 2..size / 2).flatMap { dx -> (-size / 2..size / 2).map { dy -> GridCoordinate(x + dx, y + dy) } }
 
 enum class Direction(val wireValue: String) {
     NORTH("N"),
@@ -95,18 +95,20 @@ data class ArenaEditSnapshot(
     val obstacles: Map<Int, Obstacle>,
     val selectedObstacleId: Int?,
     val robot: RobotPose?,
+    val poseRevision: Long,
 ) {
-    fun applyTo(state: ArenaState): ArenaState = state.copy(
+    fun applyTo(state: ArenaState, currentPoseRevision: Long): ArenaState = state.copy(
         obstacles = obstacles,
         selectedObstacleId = selectedObstacleId?.takeIf(obstacles::containsKey),
-        robot = robot,
+        robot = if (poseRevision == currentPoseRevision) robot else state.robot,
     )
 
     companion object {
-        fun from(state: ArenaState): ArenaEditSnapshot = ArenaEditSnapshot(
+        fun from(state: ArenaState, poseRevision: Long): ArenaEditSnapshot = ArenaEditSnapshot(
             obstacles = state.obstacles,
             selectedObstacleId = state.selectedObstacleId,
             robot = state.robot,
+            poseRevision = poseRevision,
         )
     }
 }

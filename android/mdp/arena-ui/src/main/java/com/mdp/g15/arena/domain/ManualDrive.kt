@@ -23,13 +23,13 @@ enum class ManualCommand(val wire: String, val reverse: Boolean = false, val tur
 data class DrivePose(val x: Double, val y: Double, val heading: Double) {
     fun samePose(other: DrivePose): Boolean = abs(x - other.x) < 1e-8 && abs(y - other.y) < 1e-8 &&
         abs(((heading - other.heading) % 360.0 + 540.0) % 360.0 - 180.0) < 1e-8
-    fun asRobotPose() = RobotPose(GridCoordinate(floor(x + 1e-8).toInt(), floor(y + 1e-8).toInt()),
+    fun asRobotPose() = RobotPose(GridCoordinate(round(x).toInt(), round(y).toInt()),
         Direction.entries[((heading / 90.0).roundToInt() % 4 + 4) % 4], this)
     fun bounds(size: Int): DoubleArray {
         val half = size / 2.0
         val a = Math.toRadians(heading)
         val extent = half * (abs(sin(a)) + abs(cos(a)))
-        return doubleArrayOf(x + half - extent, y + half - extent, x + half + extent, y + half + extent)
+        return doubleArrayOf(x + 0.5 - extent, y + 0.5 - extent, x + 0.5 + extent, y + 0.5 + extent)
     }
     fun overlaps(cell: GridCoordinate, size: Int): Boolean {
         val b = bounds(size)
@@ -83,7 +83,8 @@ data class DrivePath(val start: DrivePose, val command: ManualCommand, val radiu
     fun fits(state: ArenaState): Boolean {
         fun bounds(p: DrivePose): DoubleArray {
             val size = state.config.robotFootprintCells
-            return if (amdToolMode) doubleArrayOf(p.x, p.y, p.x + size, p.y + size) else p.bounds(size)
+            return if (amdToolMode) doubleArrayOf(p.x + 0.5 - size / 2.0, p.y + 0.5 - size / 2.0,
+                p.x + 0.5 + size / 2.0, p.y + 0.5 + size / 2.0) else p.bounds(size)
         }
 
         var previous = bounds(at(0.0))
@@ -118,11 +119,9 @@ class ManualDriveGuard {
         private set
     fun report(robot: RobotPose): Boolean {
         // A pose report is not a command completion acknowledgement.
-        if (pending == null) { pose = DrivePose.from(robot); uncertain = false }
-        else {
-            if (DrivePose.from(robot).samePose(pending!!.start)) return false
-            reportedDuringMove = robot
-        }
+        pose = DrivePose.from(robot)
+        uncertain = false
+        if (pending != null) reportedDuringMove = robot
         return true
     }
     /** Operator-placed pose (drag and drop): trusted as the new known pose. Never mid-move. */

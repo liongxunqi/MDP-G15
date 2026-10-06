@@ -15,6 +15,7 @@ import com.mdp.g15.arena.domain.GridCoordinate
 import com.mdp.g15.arena.domain.Obstacle
 import com.mdp.g15.arena.domain.RobotPose
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -100,6 +101,57 @@ class ArenaGridViewInstrumentedTest {
         view.draw(Canvas(bitmap))
 
         assertTrue(bitmap.getPixel(400, 400) != 0)
+    }
+
+    @Test
+    fun reportedEdgeCentresRemainVisible() {
+        val view = createView(ApplicationProvider.getApplicationContext())
+        onMain {
+            prepare(view, ArenaState(), false)
+            fun capture() = Bitmap.createBitmap(view.width, view.height, Bitmap.Config.ARGB_8888).also {
+                view.draw(Canvas(it))
+            }
+            val empty = capture()
+            for (centre in listOf(GridCoordinate(0, 0), GridCoordinate(19, 19))) {
+                view.render(ArenaState(robot = RobotPose(centre, Direction.NORTH)), false)
+                assertTrue("Robot at $centre must draw even with a clipped footprint", !empty.sameAs(capture()))
+            }
+        }
+    }
+
+    @Test
+    fun reportedRobotIsClippedOutOfObstacleCells() {
+        val context = ApplicationProvider.getApplicationContext<android.content.Context>()
+        val view = createView(context)
+        val obstacleCell = GridCoordinate(8, 8)
+        val obstacle = Obstacle(1, obstacleCell, Direction.NORTH, "11")
+        onMain {
+            fun capture() = Bitmap.createBitmap(view.width, view.height, Bitmap.Config.ARGB_8888).also {
+                view.draw(Canvas(it))
+            }
+            prepare(view, ArenaState(obstacles = mapOf(1 to obstacle)), false)
+            val obstacleOnly = capture()
+            view.render(
+                ArenaState(
+                    robot = RobotPose(obstacleCell, Direction.NORTH),
+                    obstacles = mapOf(1 to obstacle),
+                ),
+                false,
+            )
+            val withRobot = capture()
+            val (obstacleX, obstacleY) = cellCenter(context, obstacleCell)
+            val (robotX, robotY) = cellCenter(context, GridCoordinate(9, 8))
+            assertEquals(
+                "The robot must not cover the obstacle label",
+                obstacleOnly.getPixel(obstacleX.toInt(), obstacleY.toInt()),
+                withRobot.getPixel(obstacleX.toInt(), obstacleY.toInt()),
+            )
+            assertNotEquals(
+                "The robot must remain visible outside the obstacle cell",
+                obstacleOnly.getPixel(robotX.toInt(), robotY.toInt()),
+                withRobot.getPixel(robotX.toInt(), robotY.toInt()),
+            )
+        }
     }
 
     @Test

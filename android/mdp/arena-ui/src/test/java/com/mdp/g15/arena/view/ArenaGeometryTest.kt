@@ -39,6 +39,22 @@ class ArenaGeometryTest {
     }
 
     @Test
+    fun `robot bounds use the centre cell and remain available at an edge`() {
+        val centre = geometry.footprintBounds(GridCoordinate(1, 1), 3)
+        val bottomLeft = geometry.cellBounds(GridCoordinate(0, 0))
+        val topRight = geometry.cellBounds(GridCoordinate(2, 2))
+        assertEquals(bottomLeft.left, centre.left, 0.001f)
+        assertEquals(bottomLeft.bottom, centre.bottom, 0.001f)
+        assertEquals(topRight.right, centre.right, 0.001f)
+        assertEquals(topRight.top, centre.top, 0.001f)
+        assertEquals(geometry.cellBounds(GridCoordinate(1, 1)).centerX, centre.centerX, 0.001f)
+
+        val edge = geometry.footprintBounds(GridCoordinate(0, 0), 3)
+        assertEquals(geometry.arenaLeft - geometry.cellSize, edge.left, 0.001f)
+        assertEquals(geometry.arenaTop + geometry.arenaHeight + geometry.cellSize, edge.bottom, 0.001f)
+    }
+
+    @Test
     fun `arena remains square and centered in rectangular viewport`() {
         geometry.update(800, 500, ArenaConfig(), axisPadding = 40f, outerPadding = 10f)
 

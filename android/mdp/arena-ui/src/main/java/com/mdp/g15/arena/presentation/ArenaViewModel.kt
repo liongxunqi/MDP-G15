@@ -47,6 +47,7 @@ class ArenaViewModel(
     private val _uiState = MutableStateFlow(restoreUiState())
     val uiState: StateFlow<ArenaUiState> = _uiState.asStateFlow()
     private val manualDrive = ManualDriveGuard()
+    private var poseRevision = 0L
     private var connected = false
     private var previewJob: Job? = null
 
@@ -388,8 +389,8 @@ class ArenaViewModel(
         manualDrive.invalidate()
         val before = _uiState.value.arena
         val target = undoHistory.removeLast()
-        redoHistory.addLast(ArenaEditSnapshot.from(before))
-        val restored = target.applyTo(before)
+        redoHistory.addLast(ArenaEditSnapshot.from(before, poseRevision))
+        val restored = target.applyTo(before, poseRevision)
         syncObstacleDiff(before, restored)
         updateAfterHistory(restored, "Last arena edit undone.")
     }
@@ -400,8 +401,8 @@ class ArenaViewModel(
         manualDrive.invalidate()
         val before = _uiState.value.arena
         val target = redoHistory.removeLast()
-        undoHistory.addLast(ArenaEditSnapshot.from(before))
-        val restored = target.applyTo(before)
+        undoHistory.addLast(ArenaEditSnapshot.from(before, poseRevision))
+        val restored = target.applyTo(before, poseRevision)
         syncObstacleDiff(before, restored)
         updateAfterHistory(restored, "Arena edit restored.")
     }
@@ -568,22 +569,19 @@ class ArenaViewModel(
                 applyReduction(
                     reduction,
                 ) { state ->
-                    val accepted = manualDrive.report(event.pose)
+                    cancelPreviewGate()
+                    manualDrive.report(event.pose)
+                    poseRevision++
                     _uiState.value = _uiState.value.copy(
-                        arena = if (accepted) state else _uiState.value.arena,
+                        arena = state,
                         manualStatus = when {
                             _uiState.value.autonomousRunning -> _uiState.value.manualStatus
                             manualDrive.pending == null -> null
-                            accepted -> "Moving — reported pose; awaiting completion"
-                            else -> _uiState.value.manualStatus
+                            else -> "Moving — reported pose; awaiting completion"
                         },
                     )
                     if (!rawMessage.startsWith("STATUS,")) {
-                        setFeedback(if (accepted) {
-                            "Robot position updated to (${event.pose.position.x}, ${event.pose.position.y}), facing ${event.pose.direction.name.lowercase()}."
-                        } else {
-                            "Robot position update received; current movement estimate kept."
-                        }, false)
+                        setFeedback("Robot position updated to (${event.pose.position.x}, ${event.pose.position.y}), facing ${event.pose.direction.name.lowercase()}.", false)
                     }
                     persist()
                 }
@@ -603,7 +601,7 @@ class ArenaViewModel(
 
     private fun pushUndo(state: ArenaState) {
         if (undoHistory.size == MAX_UNDO_HISTORY) undoHistory.removeFirst()
-        undoHistory.addLast(ArenaEditSnapshot.from(state))
+        undoHistory.addLast(ArenaEditSnapshot.from(state, poseRevision))
         redoHistory.clear()
     }
 
@@ -642,7 +640,6 @@ class ArenaViewModel(
             .orEmpty()
             .mapNotNull(::decodeObstacle)
             .associateBy(Obstacle::id)
-        val robot = savedStateHandle.get<String>(KEY_ROBOT)?.let(::decodeRobot)
         val selected = savedStateHandle.get<Int>(KEY_SELECTED)?.takeIf(obstacles::containsKey)
         val status = savedStateHandle.get<String>(KEY_STATUS).orEmpty().ifBlank { "Awaiting robot status" }
         val savedPhase = savedStateHandle.get<String>(KEY_TASK1)?.let { name ->
@@ -653,7 +650,7 @@ class ArenaViewModel(
             task1Phase = if (active) Task1Phase.UNKNOWN else savedPhase,
             autonomousRunning = active,
             arena = ArenaState(
-                robot = robot,
+                robot = null,
                 obstacles = obstacles,
                 selectedObstacleId = selected,
             ),
@@ -678,7 +675,7 @@ class ArenaViewModel(
         savedStateHandle[KEY_OBSTACLES] = ArrayList(
             state.arena.obstacles.toSortedMap().values.map(::encodeObstacle),
         )
-        savedStateHandle[KEY_ROBOT] = state.arena.robot?.takeIf { it.estimate == null }?.let(::encodeRobot)
+        savedStateHandle.remove<String>(KEY_ROBOT)
         savedStateHandle[KEY_SELECTED] = state.arena.selectedObstacleId
         savedStateHandle[KEY_STATUS] = state.status
         savedStateHandle[KEY_TASK1] = state.task1Phase.name
@@ -703,19 +700,6 @@ class ArenaViewModel(
             if (parts[3].isBlank()) null else return null
         }
         return Obstacle(id, position, face, parts[4].takeIf { TargetId.error(it) == null })
-    }
-
-    private fun encodeRobot(robot: RobotPose): String =
-        "${robot.position.x}|${robot.position.y}|${robot.direction.wireValue}"
-
-    private fun decodeRobot(encoded: String): RobotPose? {
-        val parts = encoded.split('|')
-        if (parts.size != 3) return null
-        val position = GridCoordinate(
-            parts[0].toIntOrNull() ?: return null,
-            parts[1].toIntOrNull() ?: return null,
-        ).takeIf(ArenaState().config::contains) ?: return null
-        return RobotPose(position, Direction.fromWire(parts[2]) ?: return null)
     }
 
     class Factory(

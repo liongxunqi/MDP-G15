@@ -41,13 +41,13 @@ class RobotMotionTest {
     private fun state(x: Int, y: Int = 2, direction: Direction = Direction.NORTH) =
         ArenaState(robot = RobotPose(GridCoordinate(x, y), direction))
 
-    @Test fun `rapid reports retarget continuously and settle at latest authoritative pose`() {
+    @Test fun `rapid reports snap to latest authoritative pose`() {
         val motion = RobotMotion()
         motion.retarget(state(2), 0)
         motion.retarget(state(4), 10)
-        assertEquals(3f, motion.sample(100)!!.x, 0.001f)
+        assertEquals(4f, motion.sample(100)!!.x, 0.001f)
         motion.retarget(state(6), 100)
-        assertEquals(3f, motion.sample(100)!!.x, 0.001f)
+        assertEquals(6f, motion.sample(100)!!.x, 0.001f)
         assertEquals(6f, motion.sample(280)!!.x, 0.001f)
         assertFalse(motion.isRunning(280))
     }
@@ -66,7 +66,7 @@ class RobotMotionTest {
         val motion = RobotMotion()
         motion.snap(state(2, direction = Direction.WEST).robot)
         motion.retarget(state(2), 0)
-        assertEquals(315f, motion.sample(90)!!.angle, 0.001f)
+        assertEquals(0f, motion.sample(90)!!.angle, 0.001f)
         motion.snap(null)
         assertNull(motion.sample(100))
         assertFalse(motion.isRunning(100))
