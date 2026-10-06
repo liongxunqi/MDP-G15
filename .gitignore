@@ -45,3 +45,6 @@ __pycache__/
 # The CubeIDE project (.project, .cproject, STM32X.ioc, linker scripts) is
 # tracked under stm/ and governed by stm/.gitignore. Keep those files tracked —
 # teammates need them to reopen/reimport the project.
+# Python virtual environments
+venv/
+.venv/

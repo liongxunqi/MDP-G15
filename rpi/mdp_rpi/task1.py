@@ -618,9 +618,7 @@ class Task1:
                         if self.directions:
                             start_pose = self.directions[0]
                             try:
-                                self.android.send(
-                                    f"STATUS,START,{start_pose['x']},{start_pose['y']},{start_pose['dir']}"
-                                )
+                                self.android.send("STATUS,START,2,2,N")
                             except OSError as exc:
                                 logging.warning(f"Could not notify Android of start position: {exc}")
 
@@ -681,9 +679,7 @@ class Task1:
                             if self.directions:
                                 start_pose = self.directions[0]
                                 try:
-                                    self.android.send(
-                                        f"STATUS,START,{start_pose['x']},{start_pose['y']},{start_pose['dir']}"
-                                    )
+                                    self.android.send("STATUS,START,2,2,N")
                                 except OSError as exc:
                                     logging.warning(f"Could not notify Android of start position: {exc}")
                         if not self._send_next_segment():

@@ -453,6 +453,8 @@ class STM:
                 if not self.serial or not self.serial.is_open:
                     break
                 raw = self.serial.readline()
+                if raw:
+                    logging.info("STM RAW BYTES: %r", raw)
             except (serial.SerialException, OSError) as exc:
                 if not self._stop.is_set():
                     logging.error(f"STM reader: serial error — {exc}")
