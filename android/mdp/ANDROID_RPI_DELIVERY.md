@@ -23,6 +23,22 @@ messages do not echo back as edits. Recognition IDs and physical robot pose rema
 incoming telemetry; the RPi has no API to set these from the tablet. Dragging the
 robot marker is a local placement edit, not a physical movement command.
 
+## Robot coordinate contract
+
+`ROBOT,x,y,dir` and `STATUS,START,x,y,dir` use the robot's **centre cell** on
+the zero-based 20×20 arena, with `(0,0)` at the bottom left. The displayed and
+collision-checked footprint is 3×3: centre `(1,1)` covers cells `(0,0)` through
+`(2,2)`. Android applies the received coordinate without an offset. A reported
+centre anywhere in `0..19` is shown even when the footprint clips the arena edge
+or overlaps an obstacle; locally placed poses must fit fully and avoid obstacles.
+
+Before the first received pose, the robot is hidden. Each valid received pose
+immediately replaces any manual preview. Previews remain labelled estimates and
+are never restored as authoritative positions after a fresh app process starts.
+RPi must send the actual starting centre in `STATUS,START` (the agreed initial
+centre is `(1,1)`); Android trusts the received value. The currently checked-in
+RPi Task 1 sender still hardcodes `(2,2)` and needs its own team update.
+
 ## All outgoing commands
 
 All application messages are newline-delimited, matching the existing RPi stream
@@ -61,7 +77,7 @@ TIGHT radius of 29.1 cm. Verify the bridge's environment overrides and active
 STM profile before hardware use; the app cannot discover calibration values.
 
 Android reserves one movement before transmission and checks the complete swept
-2x2 footprint against arena edges and obstacles. The grid immediately shows a
+3x3 centred footprint against arena edges and obstacles. The grid immediately shows a
 labelled estimate, retaining fractional coordinates and animated arc headings.
 Preview durations (650 ms straight, 1000 ms turning) are visual estimates, not
 measured velocity. The preview must finish before another tap is accepted, and
@@ -71,16 +87,16 @@ The manual bridge sends `STATUS,OK` after STM completion; this releases the
 movement reservation (ordinary `MSG,[OK]` text does not). With a test tool, send `ROBOT,8,8,N` to establish a pose,
 then `STATUS,OK` after each simulated completed movement. Without completion
 feedback, further movement stays locked. Genuine incoming poses correct the
-estimate without releasing the outstanding-command lock; repeated starting-pose
-reports while pending do not roll back the preview. Stop, failure, disconnection,
+estimate without releasing an outstanding command. Repeated starting-pose reports
+also replace the preview. Stop, failure, disconnection,
 and invalid telemetry pause driving until a valid fresh pose is received.
 
 There is still no sequence identifier to distinguish arbitrary delayed or
 duplicated reports/acknowledgements from new ones. This is not guaranteed physical
 synchronization. The separate task1 receiver still lacks these D-pad handlers.
 
-Arena now contains the grid, D-pad, status and Stop. Only editing details scroll;
-the grid and driving pad stay visible in portrait and landscape. Custom messages
+Arena gives the grid 60% of the available pane. The other 40% is one scrolling
+panel with Arena status first and the D-pad below it, in portrait and landscape. Custom messages
 matching movement tokens pass through the same guard. Manual and autonomous
 commands cannot interleave. Raw latest RX is displayed separately from parsed
 feedback, and later valid messages clear stale parsing errors.

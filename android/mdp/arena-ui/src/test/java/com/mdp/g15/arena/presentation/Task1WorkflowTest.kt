@@ -87,7 +87,8 @@ class Task1WorkflowTest {
         val restored = ArenaViewModel(handle, ArenaOutboundSink(sent::add), useRpiMapSync = true)
         restored.connectionChanged(true)
         assertEquals(Task1Phase.COMPLETED, restored.uiState.value.task1Phase)
-        assertEquals(result, restored.uiState.value.arena)
+        assertEquals(result.obstacles, restored.uiState.value.arena.obstacles)
+        assertNull(restored.uiState.value.arena.robot)
         assertTrue(sent.isEmpty())
     }
 

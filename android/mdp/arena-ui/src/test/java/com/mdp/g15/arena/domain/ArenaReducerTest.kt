@@ -163,7 +163,7 @@ class ArenaReducerTest {
 
     @Test
     fun `robot accepts only in-bounds pose`() {
-        // Default footprint is 2x2 anchored bottom-left, so (18,0) is the last column that fits.
+        // Received centre coordinates are accepted even when the 3x3 footprint is clipped.
         val valid = RobotPose(GridCoordinate(18, 0), Direction.SOUTH)
         val validState = reducer.success(ArenaState(), ArenaAction.ApplyRobotPose(valid))
         assertEquals(valid, validState.robot)
@@ -197,29 +197,31 @@ class ArenaReducerTest {
     }
 
     @Test
-    fun `robot pose rejected when its footprint would stick out past the edge`() {
-        // (19,0) is itself a valid single cell, but a 2x2 footprint anchored there needs
-        // column 20, which doesn't exist.
+    fun `reported edge pose is accepted while local placement remains bounded`() {
         val result = reducer.reduce(
             ArenaState(),
             ArenaAction.ApplyRobotPose(RobotPose(GridCoordinate(19, 0), Direction.SOUTH)),
         )
-        assertTrue(result is ArenaReduction.Failure)
+        assertTrue(result is ArenaReduction.Success)
+        assertFalse(reducer.canMoveRobot((result as ArenaReduction.Success).state, GridCoordinate(19, 0)))
     }
 
     @Test
-    fun `all four robot cells reject obstacles and received poses reject collisions`() {
+    fun `all nine robot cells reject local edits but received poses remain authoritative`() {
         val pose = RobotPose(GridCoordinate(5, 5), Direction.NORTH)
         val state = ArenaState(robot = pose, obstacles = mapOf(1 to Obstacle(1, GridCoordinate(0, 0))))
-        assertEquals(2, state.config.robotFootprintCells)
-        for (cell in pose.position.footprint(2)) {
+        assertEquals(3, state.config.robotFootprintCells)
+        assertEquals(9, pose.position.footprint(3).size)
+        for (cell in pose.position.footprint(3)) {
             assertTrue(reducer.reduce(state, ArenaAction.AddObstacle(cell)) is ArenaReduction.Failure)
             assertTrue(reducer.reduce(state, ArenaAction.MoveObstacle(1, cell)) is ArenaReduction.Failure)
             val occupied = ArenaState(obstacles = mapOf(1 to Obstacle(1, cell)))
-            assertTrue(reducer.reduce(occupied, ArenaAction.ApplyRobotPose(pose)) is ArenaReduction.Failure)
+            assertTrue(reducer.reduce(occupied, ArenaAction.ApplyRobotPose(pose)) is ArenaReduction.Success)
             assertFalse(reducer.canMoveRobot(occupied.copy(robot = RobotPose(GridCoordinate(0, 0), Direction.NORTH)), pose.position))
         }
         assertTrue(reducer.reduce(state, ArenaAction.AddObstacle(GridCoordinate(7, 5))) is ArenaReduction.Success)
+        assertEquals((0..2).flatMap { x -> (0..2).map { y -> GridCoordinate(x, y) } }.toSet(),
+            GridCoordinate(1, 1).footprint(3).toSet())
     }
 
     @Test
