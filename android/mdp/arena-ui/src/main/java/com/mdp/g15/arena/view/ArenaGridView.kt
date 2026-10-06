@@ -305,6 +305,7 @@ class ArenaGridView @JvmOverloads constructor(
         val checkpoint = canvas.save()
         canvas.clipRect(geometry.arenaLeft, geometry.arenaTop,
             geometry.arenaLeft + geometry.arenaWidth, geometry.arenaTop + geometry.arenaHeight)
+        clipRobotAroundObstacles(canvas)
         canvas.translate(
             (visual.x - robot.position.x) * geometry.cellSize,
             -(visual.y - robot.position.y) * geometry.cellSize,
@@ -436,6 +437,33 @@ class ArenaGridView @JvmOverloads constructor(
         canvas.restoreToCount(clip)
     }
 
+    /** Keep obstacle cells visible even when a reported robot pose overlaps them. */
+    private fun clipRobotAroundObstacles(canvas: Canvas) {
+        if (state.obstacles.isEmpty()) return
+        val visibleArea = Path().apply {
+            fillType = Path.FillType.EVEN_ODD
+            addRect(
+                geometry.arenaLeft,
+                geometry.arenaTop,
+                geometry.arenaLeft + geometry.arenaWidth,
+                geometry.arenaTop + geometry.arenaHeight,
+                Path.Direction.CW,
+            )
+            state.obstacles.values.forEach { obstacle ->
+                val bounds = geometry.cellBounds(obstacle.position)
+                addRect(bounds.left, bounds.top, bounds.right, bounds.bottom, Path.Direction.CW)
+            }
+        }
+        canvas.clipPath(visibleArea)
+    }
+
+    private fun drawRobotDragImage(canvas: Canvas, center: GridCoordinate, direction: Direction) {
+        val checkpoint = canvas.save()
+        clipRobotAroundObstacles(canvas)
+        drawRobot(canvas, center, direction)
+        canvas.restoreToCount(checkpoint)
+    }
+
     private fun drawDragPreview(canvas: Canvas) {
         val obstacleId = draggingObstacleId
         when {
@@ -479,11 +507,11 @@ class ArenaGridView @JvmOverloads constructor(
         val underFinger = coordinateAtTouch(dragX, dragY)
         val center = underFinger?.let { GridCoordinate(it.x - robotGrabOffsetX, it.y - robotGrabOffsetY) }
         if (center == null || !ArenaReducer().canMoveRobot(state, center)) {
-            state.robot?.let { drawRobot(canvas, it.position, it.direction) }
+            state.robot?.let { drawRobotDragImage(canvas, it.position, it.direction) }
             drawInvalidDropIndicator(canvas, contentX, contentY)
             return
         }
-        drawRobot(canvas, center, direction)
+        drawRobotDragImage(canvas, center, direction)
     }
 
     private fun drawInvalidDropIndicator(canvas: Canvas, x: Float, y: Float) {
