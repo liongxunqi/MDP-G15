@@ -20,6 +20,8 @@ import androidx.compose.ui.test.junit4.StateRestorationTester
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
+import androidx.compose.ui.test.onAllNodesWithText
+import androidx.compose.ui.test.assertCountEquals
 import androidx.compose.ui.test.performTouchInput
 import androidx.compose.ui.test.click
 import androidx.compose.ui.geometry.Offset
@@ -75,7 +77,7 @@ class IntegratedControllerScreenTest {
         composeRule.onNodeWithText("Choose an image face for obstacle(s): 1, 2, 3, 4.").assertIsDisplayed()
         composeRule.runOnIdle { assertTrue(incoming.tryEmit("PLANNER,READY")) }
         composeRule.waitForIdle()
-        composeRule.onNodeWithText("RPi reports path ready — map version unverified").assertIsDisplayed()
+        composeRule.onAllNodesWithText("RPi reports path ready — map version unverified").assertCountEquals(2)
         composeRule.onNodeWithText("Start Task 1").assertIsNotEnabled()
         repeat(4) {
             clickGridCell(it, 0)
@@ -235,7 +237,7 @@ class IntegratedControllerScreenTest {
         composeRule.onNodeWithText("▲ Forward").assertIsNotEnabled()
         composeRule.runOnIdle { assertTrue(incoming.tryEmit("ROBOT,2,2,N")) }
         composeRule.waitForIdle()
-        composeRule.onNodeWithText("▲ Forward").assertIsEnabled().performClick()
+        composeRule.onNodeWithText("▲ Forward").performScrollTo().assertIsEnabled().performClick()
         composeRule.runOnIdle { assertEquals(listOf("f"), movement) }
     }
 
@@ -248,23 +250,23 @@ class IntegratedControllerScreenTest {
         composeRule.runOnIdle { assertEquals(false, appendNewline) }
         composeRule.runOnIdle { assertTrue(incoming.tryEmit("STATUS,DONE\nROBOT,8,8,N")) }
         composeRule.waitForIdle()
-        composeRule.onNodeWithText("◀ Left").assertIsEnabled().performClick()
+        composeRule.onNodeWithText("◀ Left").performScrollTo().assertIsEnabled().performClick()
         composeRule.onNodeWithText("(7.00, 8.00) • W • estimated").performScrollTo().assertIsDisplayed()
         composeRule.waitUntil(5_000) {
             runCatching { composeRule.onNodeWithText("Right ▶").assertIsEnabled() }.isSuccess
         }
         composeRule.runOnIdle {
-            assertTrue(incoming.tryEmit("ROBOT,19,19,N\nSTATUS,START,9999999999999999,8,N\nSTATUS,INVALID"))
+            assertTrue(incoming.tryEmit("ROBOT,20,19,N\nSTATUS,START,9999999999999999,8,N\nSTATUS,INVALID"))
         }
         composeRule.waitForIdle()
-        composeRule.onNodeWithText("Right ▶").assertIsEnabled().performClick()
+        composeRule.onNodeWithText("Right ▶").performScrollTo().assertIsEnabled().performClick()
         composeRule.onNodeWithText("(8.00, 8.00) • E • estimated").performScrollTo().assertIsDisplayed()
         composeRule.waitUntil(5_000) {
             runCatching { composeRule.onNodeWithText("normal").assertIsEnabled() }.isSuccess
         }
         composeRule.onNodeWithText("normal").performScrollTo().performClick()
         composeRule.runOnIdle { assertEquals(true, appendNewline) }
-        composeRule.onNodeWithText("Right ▶").assertIsEnabled().performClick()
+        composeRule.onNodeWithText("Right ▶").performScrollTo().assertIsEnabled().performClick()
         composeRule.onNodeWithText("(10.91, 5.09) • S • estimated").performScrollTo().assertIsDisplayed()
         composeRule.runOnIdle { assertEquals(listOf("tl", "tr", "tr"), movement) }
     }
@@ -390,11 +392,11 @@ class IntegratedControllerScreenTest {
         assertTrue(incoming.tryEmit("ROBOT,7,2,W"))
         composeRule.waitForIdle()
         composeRule.onNodeWithText("Arena").performClick()
-        composeRule.onNodeWithText("(7, 2) • WEST").assertIsDisplayed()
+        composeRule.onNodeWithText("(7, 2) • WEST").performScrollTo().assertIsDisplayed()
         capture("arena")
         assertTrue(incoming.tryEmit("ROBOT,19,2,W"))
         composeRule.waitForIdle()
-        composeRule.onNodeWithText("(7, 2) • WEST").assertIsDisplayed()
+        composeRule.onNodeWithText("(19, 2) • WEST").performScrollTo().assertIsDisplayed()
     }
 
     @Test
@@ -405,10 +407,10 @@ class IntegratedControllerScreenTest {
         composeRule.waitForIdle()
         composeRule.runOnIdle { assertTrue(incoming.tryEmit("MSG," + "A detailed status message from the robot. ".repeat(60))) }
         composeRule.onNodeWithText("Arena").performClick()
-        composeRule.onNodeWithText("■ Stop").assertIsDisplayed().assertIsEnabled()
+        composeRule.onNodeWithText("■ Stop").performScrollTo().assertIsDisplayed().assertIsEnabled()
         composeRule.onNodeWithTag("arena_grid").assertIsDisplayed()
         composeRule.onNodeWithText("Add obstacle").performScrollTo().assertIsDisplayed()
-        composeRule.onNodeWithText("■ Stop").assertIsDisplayed()
+        composeRule.onNodeWithText("■ Stop").performScrollTo().assertIsDisplayed()
         composeRule.onNodeWithTag("arena_grid").assertIsDisplayed()
         capture("checklist-long-status")
     }
@@ -425,7 +427,7 @@ class IntegratedControllerScreenTest {
             composeRule.waitUntil(5_000) {
                 runCatching { composeRule.onNodeWithText(label).assertIsEnabled() }.isSuccess
             }
-            composeRule.onNodeWithText(label).assertIsDisplayed().assertIsEnabled().performClick()
+            composeRule.onNodeWithText(label).performScrollTo().assertIsDisplayed().assertIsEnabled().performClick()
             // Preview completion is time-based; deterministic spam gating is covered by VM tests.
             composeRule.onNodeWithText("■ Stop").assertIsEnabled()
             if (label == "▲ Forward") {
@@ -437,7 +439,7 @@ class IntegratedControllerScreenTest {
             composeRule.waitForIdle()
         }
         assertEquals(listOf("f", "tl", "tr", "r", "fl", "fr", "bl", "br"), movement)
-        composeRule.onNodeWithText("■ Stop").performClick()
+        composeRule.onNodeWithText("■ Stop").performScrollTo().performClick()
         assertTrue(incoming.tryEmit("ROBOT,5,18,N"))
         composeRule.waitForIdle()
         composeRule.onNodeWithText("▲ Forward").assertIsNotEnabled()

@@ -22,12 +22,12 @@ class ManualDriveTest {
     }
 
     @Test fun `AMD steps reject walls and obstacles without rotational overhang`() {
-        for ((command, start) in listOf(ManualCommand.LEFT to DrivePose(0.0,8.0,0.0),
+        for ((command, start) in listOf(ManualCommand.LEFT to DrivePose(1.0,8.0,0.0),
             ManualCommand.RIGHT to DrivePose(18.0,8.0,0.0), ManualCommand.FORWARD to DrivePose(8.0,18.0,0.0),
-            ManualCommand.REVERSE to DrivePose(8.0,0.0,0.0))) {
+            ManualCommand.REVERSE to DrivePose(8.0,1.0,0.0))) {
             assertFalse(DrivePath(start, command, amdToolMode = true).fits(state()))
         }
-        val blocked = state().copy(obstacles = mapOf(1 to Obstacle(1,GridCoordinate(7,8))))
+        val blocked = state().copy(obstacles = mapOf(1 to Obstacle(1,GridCoordinate(6,8))))
         assertFalse(DrivePath(DrivePose(8.0,8.0,0.0), ManualCommand.LEFT, amdToolMode = true).fits(blocked))
         assertTrue(DrivePath(DrivePose(8.0,8.0,0.0), ManualCommand.RIGHT, amdToolMode = true).fits(blocked))
     }
@@ -88,7 +88,7 @@ class ManualDriveTest {
     }
     private fun state(x: Int = 8, y: Int = 8, direction: Direction = Direction.NORTH) = ArenaState(robot = RobotPose(GridCoordinate(x, y), direction))
     @Test fun `all cardinal boundaries account for one cell distance and footprint`() {
-        for ((direction, xy) in listOf(Direction.NORTH to GridCoordinate(8,18), Direction.EAST to GridCoordinate(18,8), Direction.SOUTH to GridCoordinate(8,0), Direction.WEST to GridCoordinate(0,8))) {
+        for ((direction, xy) in listOf(Direction.NORTH to GridCoordinate(8,18), Direction.EAST to GridCoordinate(18,8), Direction.SOUTH to GridCoordinate(8,1), Direction.WEST to GridCoordinate(1,8))) {
             val s = state(xy.x, xy.y, direction)
             assertFalse(DrivePath(DrivePose.from(s.robot!!), ManualCommand.FORWARD).fits(s))
         }
@@ -107,24 +107,24 @@ class ManualDriveTest {
         assertNotNull(gate.reserve(s, ManualCommand.FORWARD))
         repeat(100) { gate.report(s.robot); assertNull(gate.reserve(s, ManualCommand.FORWARD)) }
         gate.complete()
-        assertEquals(9.0, gate.pose!!.y, 0.00001)
+        assertEquals(8.0, gate.pose!!.y, 0.00001)
         assertNotNull(gate.reserve(s, ManualCommand.REVERSE))
         gate.invalidate()
         gate.complete()
         assertNull(gate.reserve(s, ManualCommand.FORWARD))
     }
     @Test fun `turns into the arena are allowed from an edge cell but straight moves stay strict`() {
-        val left = state(0, 8, Direction.NORTH)
+        val left = state(2, 8, Direction.NORTH)
         for (c in listOf(ManualCommand.RIGHT, ManualCommand.FORWARD_RIGHT)) {
             assertTrue(c.name, DrivePath(DrivePose.from(left.robot!!), c).fits(left))
         }
-        val right = state(18, 8, Direction.NORTH)
+        val right = state(17, 8, Direction.NORTH)
         for (c in listOf(ManualCommand.LEFT, ManualCommand.FORWARD_LEFT)) {
             assertTrue(c.name, DrivePath(DrivePose.from(right.robot!!), c).fits(right))
         }
         // Turning out of the arena, or a straight move past the edge, is still rejected.
         assertFalse(DrivePath(DrivePose.from(left.robot!!), ManualCommand.LEFT).fits(left))
-        assertFalse(DrivePath(DrivePose(0.0, 8.0, 270.0), ManualCommand.FORWARD).fits(left))
+        assertFalse(DrivePath(DrivePose(1.0, 8.0, 270.0), ManualCommand.FORWARD).fits(left))
     }
     @Test fun `seeding after an invalidate re-arms driving from the placed pose`() {
         val s = state()

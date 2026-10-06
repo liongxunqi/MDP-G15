@@ -129,7 +129,7 @@ class ArenaViewModelTest {
             advanceUntilIdle()
             viewModel.drive(ManualCommand.RIGHT) {}
             val moving = viewModel.uiState.value
-            viewModel.accept("ROBOT,19,19,N\nSTATUS,START,99,99,N\nSTATUS,FAILED,extra")
+            viewModel.accept("ROBOT,20,19,N\nSTATUS,START,99,99,N\nSTATUS,FAILED,extra")
             runCurrent()
             assertEquals(moving.arena.robot, viewModel.uiState.value.arena.robot)
             assertEquals(moving.manualStatus, viewModel.uiState.value.manualStatus)
@@ -256,9 +256,9 @@ class ArenaViewModelTest {
             viewModel.addObstacle(GridCoordinate(12,12))
             val before = viewModel.uiState.value
             val allowed = ManualCommand.entries.map(viewModel::manualAllowed)
-            for (bad in listOf("ROBOT,8,9", "ROBOT,19,19,N", "ROBOT,-1,8,N",
+            for (bad in listOf("ROBOT,8,9", "ROBOT,20,19,N", "ROBOT,-1,8,N",
                 "ROBOT,8,8,X", "ROBOT,8,8,N,extra", "ROBOT,2147483648,8,N",
-                "ROBOT,12,12,N", "STATUS,START,19,19,N", "STATUS,START,12,12,N",
+                "STATUS,START,20,19,N",
                 "STATUS,START,999999999999999999999,8,N", "STATUS,START,8,8,X",
                 "STATUS,OK,extra", "STATUS", "MSG,[]")) {
                 viewModel.accept(bad)
@@ -289,7 +289,7 @@ class ArenaViewModelTest {
         viewModel.drive(ManualCommand.FORWARD) {}
         viewModel.accept("ROBOT,8,10,N")
         runCurrent()
-        assertFalse(viewModel.manualAllowed(ManualCommand.FORWARD))
+        assertTrue(viewModel.manualAllowed(ManualCommand.FORWARD))
         assertEquals(null, viewModel.uiState.value.arena.robot!!.estimate)
         advanceUntilIdle()
         viewModel.drive(ManualCommand.FORWARD) {}
@@ -507,12 +507,27 @@ class ArenaViewModelTest {
     }
 
     @Test
-    fun `status start that does not fit leaves the robot alone`() = runTest(dispatcher) {
+    fun `status start at arena edge replaces previous pose`() = runTest(dispatcher) {
         viewModel.accept("ROBOT,8,8,N")
         viewModel.accept("STATUS,START,19,19,N")
         advanceUntilIdle()
 
-        assertEquals(GridCoordinate(8, 8), viewModel.uiState.value.arena.robot?.position)
+        assertEquals(GridCoordinate(19, 19), viewModel.uiState.value.arena.robot?.position)
+    }
+
+    @Test
+    fun `received centre replaces an estimate and survives undo`() = runTest(dispatcher) {
+        viewModel.connectionChanged(true)
+        viewModel.accept("ROBOT,8,8,N")
+        advanceUntilIdle()
+        viewModel.addObstacle(GridCoordinate(15, 15))
+        viewModel.drive(ManualCommand.FORWARD) {}
+        viewModel.accept("ROBOT,0,0,E")
+        runCurrent()
+        assertEquals(GridCoordinate(0, 0), viewModel.uiState.value.arena.robot?.position)
+        assertEquals(null, viewModel.uiState.value.arena.robot?.estimate)
+        viewModel.undo()
+        assertEquals(GridCoordinate(0, 0), viewModel.uiState.value.arena.robot?.position)
     }
 
     @Test

@@ -124,15 +124,7 @@ class ArenaReducer {
     }
 
     private fun applyRobotPose(state: ArenaState, pose: RobotPose): ArenaReduction {
-        val cells = pose.position.footprint(state.config.robotFootprintCells)
-        if (cells.any { !state.config.contains(it) }) {
-            return ArenaReduction.Failure(
-                "Robot footprint at (${pose.position.x}, ${pose.position.y}) doesn't fit inside the arena.",
-            )
-        }
-        if (state.obstacles.values.any { it.position in cells }) {
-            return ArenaReduction.Failure("Robot footprint overlaps an obstacle.")
-        }
+        if (!state.config.contains(pose.position)) return ArenaReduction.Failure("Robot centre is outside the arena.")
         return ArenaReduction.Success(state.copy(robot = pose))
     }
 

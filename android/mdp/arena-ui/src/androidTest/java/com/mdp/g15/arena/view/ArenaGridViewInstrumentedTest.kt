@@ -103,6 +103,22 @@ class ArenaGridViewInstrumentedTest {
     }
 
     @Test
+    fun reportedEdgeCentresRemainVisible() {
+        val view = createView(ApplicationProvider.getApplicationContext())
+        onMain {
+            prepare(view, ArenaState(), false)
+            fun capture() = Bitmap.createBitmap(view.width, view.height, Bitmap.Config.ARGB_8888).also {
+                view.draw(Canvas(it))
+            }
+            val empty = capture()
+            for (centre in listOf(GridCoordinate(0, 0), GridCoordinate(19, 19))) {
+                view.render(ArenaState(robot = RobotPose(centre, Direction.NORTH)), false)
+                assertTrue("Robot at $centre must draw even with a clipped footprint", !empty.sameAs(capture()))
+            }
+        }
+    }
+
+    @Test
     fun placementTapReportsBottomLeftGridCoordinate() {
         val context = ApplicationProvider.getApplicationContext<android.content.Context>()
         val view = createView(context)

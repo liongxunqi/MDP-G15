@@ -77,20 +77,21 @@ fun ArenaScreen(
                     state = state,
                     interactions = interactions,
                     modifier = Modifier
-                        .weight(2f)
+                        .weight(3f)
                         .fillMaxHeight(),
                 )
-                Column(Modifier.weight(1.25f).fillMaxHeight(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    taskControls?.invoke()
-                    drivingControls?.invoke()
+                Column(Modifier.weight(2f).fillMaxHeight().verticalScroll(rememberScrollState()),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     ArenaStatusPanel(
                         state = state,
                         robotStatus = robotStatus,
                         viewModel = viewModel,
                         onReset = { confirmReset = true },
+                        taskControls = taskControls,
                         belowResetControls = belowResetControls,
-                        modifier = Modifier.fillMaxWidth().fillMaxHeight(),
+                        modifier = Modifier.fillMaxWidth(),
                     )
+                    drivingControls?.invoke()
                 }
             }
         } else {
@@ -103,18 +104,21 @@ fun ArenaScreen(
                 ArenaCanvas(
                     state = state,
                     interactions = interactions,
-                    modifier = Modifier.fillMaxWidth().weight(1f),
+                    modifier = Modifier.fillMaxWidth().weight(3f),
                 )
-                taskControls?.invoke()
-                drivingControls?.invoke()
-                ArenaStatusPanel(
-                    state = state,
-                    robotStatus = robotStatus,
-                    viewModel = viewModel,
-                    onReset = { confirmReset = true },
-                    belowResetControls = belowResetControls,
-                    modifier = Modifier.fillMaxWidth().weight(0.65f),
-                )
+                Column(Modifier.fillMaxWidth().weight(2f).verticalScroll(rememberScrollState()),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    ArenaStatusPanel(
+                        state = state,
+                        robotStatus = robotStatus,
+                        viewModel = viewModel,
+                        onReset = { confirmReset = true },
+                        taskControls = taskControls,
+                        belowResetControls = belowResetControls,
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                    drivingControls?.invoke()
+                }
             }
         }
     }
@@ -208,6 +212,7 @@ private fun ArenaStatusPanel(
     robotStatus: String?,
     viewModel: ArenaViewModel,
     onReset: () -> Unit,
+    taskControls: (@Composable () -> Unit)? = null,
     belowResetControls: (@Composable () -> Unit)? = null,
     modifier: Modifier = Modifier,
 ) {
@@ -218,9 +223,10 @@ private fun ArenaStatusPanel(
         border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
     ) {
         Column(
-            modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp),
+            modifier = Modifier.fillMaxWidth().padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
+            taskControls?.invoke()
             Text("Arena status", style = MaterialTheme.typography.titleLarge)
             Text("Latest action", style = MaterialTheme.typography.labelLarge)
             Text(

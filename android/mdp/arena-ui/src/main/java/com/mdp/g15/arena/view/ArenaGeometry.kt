@@ -2,7 +2,6 @@ package com.mdp.g15.arena.view
 
 import com.mdp.g15.arena.domain.ArenaConfig
 import com.mdp.g15.arena.domain.GridCoordinate
-import com.mdp.g15.arena.domain.footprint
 import kotlin.math.floor
 import kotlin.math.max
 import kotlin.math.min
@@ -70,19 +69,16 @@ class ArenaGeometry {
     }
 
     /**
-     * Pixel bounds spanning a [size] x [size] footprint anchored (bottom-left, grid space) at
-     * [anchor]. Null if any cell of the footprint falls outside the configured arena.
+     * Pixel bounds spanning a [size] x [size] footprint centred on [center].
+     * Bounds may extend outside the arena for a reported pose.
      */
-    fun footprintBounds(anchor: GridCoordinate, size: Int): CellBounds? {
-        val cells = anchor.footprint(size)
-        if (cells.any { !config.contains(it) }) return null
-        val bottomLeft = cellBounds(anchor)
-        val topRight = cellBounds(GridCoordinate(anchor.x + size - 1, anchor.y + size - 1))
+    fun footprintBounds(center: GridCoordinate, size: Int): CellBounds {
+        val half = size / 2
         return CellBounds(
-            left = bottomLeft.left,
-            top = topRight.top,
-            right = topRight.right,
-            bottom = bottomLeft.bottom,
+            left = arenaLeft + (center.x - half) * cellSize,
+            top = arenaTop + (config.rows - center.y - half - 1) * cellSize,
+            right = arenaLeft + (center.x + half + 1) * cellSize,
+            bottom = arenaTop + (config.rows - center.y + half) * cellSize,
         )
     }
 }
