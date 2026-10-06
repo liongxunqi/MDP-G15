@@ -55,11 +55,9 @@ from communications.stm import (
 )
 from image_capture.camera import Camera
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(threadName)s] %(levelname)s — %(message)s",
-    datefmt="%H:%M:%S",
-)
+import run_log
+
+run_log.setup("task1", "%(asctime)s [%(threadName)s] %(levelname)s — %(message)s")
 
 
 # ── Checklist A.5 ─────────────────────────────────────────────────────────────
@@ -281,7 +279,7 @@ class Task1:
             f"on the {face} face."
         )
         logging.info(
-            f"The annotated still is on the PC under pc_side/runs/predict/, "
+            f"The annotated still is on the PC under pc/runs/predict/, "
             f"named obstacle_{face_id}_*.jpg."
         )
         logging.info("=" * 58)
@@ -882,7 +880,7 @@ class Task1:
                                     "without a valid image. Either the framing is "
                                     "off at this standoff or the obstacle was not "
                                     "where Android said — check the stills the PC "
-                                    "saved under pc_side/received_images/."
+                                    "saved under pc/received_images/."
                                 )
                         logging.info("All segments complete — STITCH sent to PC.")
 

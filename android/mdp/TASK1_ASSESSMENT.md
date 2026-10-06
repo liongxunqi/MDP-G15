@@ -62,11 +62,11 @@ permission for post-run interaction. Preserve it before New attempt or Reset are
 
 The PC team owns the camera montage and must verify automatic display, representative
 full-scene images with bounding boxes, association with Android image IDs, and screenshot
-capture for the supervisor. Current `pc_side/task1_pc.py` saves `stitched_result.jpg`
+capture for the supervisor. Current `pc/task1_pc.py` saves `stitched_result.jpg`
 without opening it. Its detector saves centre-cropped annotations; it should instead
 retain the original scene/background for evidence (inference cropping can be separate).
 The PC also needs to verify its annotation directory: the detector uses an absolute
-path under `pc_side/runs/predict`, while the server currently looks up a relative path.
+path under `pc/runs/predict`, while the server currently looks up a relative path.
 These PC observations are a handoff, not Android changes. No PC/RPi code is modified here.
 
 ## Verification
