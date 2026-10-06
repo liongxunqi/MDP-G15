@@ -126,8 +126,7 @@ _READ_TIMEOUT = float(os.getenv("STM_READ_TIMEOUT_S", "20.0"))
 # Drain whatever is already buffered before we start believing what we read.
 _BANNER_DRAIN_S = float(os.getenv("STM_BANNER_DRAIN_S", "1.0"))
 
-# PROTOCOL.md §2. These caps and the FU limits below are duplicated in
-# algo/stm_tokens.py, which the planner PC imports without pyserial. Change both.
+# PROTOCOL.md §2
 MAX_LINE_BYTES = 128
 MAX_PRIMITIVES = 16
 
@@ -150,7 +149,7 @@ FU_TOL_CM = 2
 # every pass reads through it, so FU20 settles ~18.7 cm from the obstacle.
 # Kept on this side because it is a property of the sensor on the day and
 # changing it must not need a reflash. Re-measure before relying on it; see
-# algo/stm_tokens.fwd_until(compensate=True) for the correction.
+# stm_tokens.fwd_until(compensate=True) for the correction.
 US_BIAS_CM = 1.3
 
 # Minimum firmware protocol version each optional feature needs (§7, §4.1).
@@ -454,6 +453,8 @@ class STM:
                 if not self.serial or not self.serial.is_open:
                     break
                 raw = self.serial.readline()
+                if raw:
+                    logging.info("STM RAW BYTES: %r", raw)
             except (serial.SerialException, OSError) as exc:
                 if not self._stop.is_set():
                     logging.error(f"STM reader: serial error — {exc}")
