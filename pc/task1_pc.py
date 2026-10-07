@@ -61,6 +61,7 @@ run_log.setup("task1_pc", "%(asctime)s [PC] %(levelname)s — %(message)s",
 # It exposes:  detect(image_path) -> (class_name, confidence)
 sys.path.insert(0, PC_DIR)
 from image_recognition.detect import detect as _detect
+from progress_monitor import PlanMonitor
 
 
 def run_detection(image_path: str):
@@ -115,6 +116,21 @@ def stitch_images(image_paths: list, output_path: str) -> None:
 
 # ── Socket helpers ─────────────────────────────────────────────────────────────
 
+# The RPi gives up on a PATH reply after PATH_TIMEOUT_S (30 s, rpi/mdp_rpi/task1.py).
+# A plan slower than this may arrive after the RPi has stopped listening for it.
+RPI_PATH_TIMEOUT_S = float(os.getenv("PATH_TIMEOUT_S", "30.0"))
+
+
+def _connection_lost_msg(doing: str, message, exc: BaseException) -> str:
+    what = f" ({message.split(',', 1)[0]})" if message else ""
+    return (
+        f"Connection to the RPi was lost while {doing}{what}: {exc!r}. "
+        "The RPi side closed or dropped the link - usually task1.py on the RPi "
+        "exited or was restarted, or the hotspot blipped. Restart task1.py on "
+        "the RPi first, then this script."
+    )
+
+
 class RPiConnection:
     """TCP client that connects to the RPi's socket server."""
 
@@ -129,11 +145,23 @@ class RPiConnection:
         self.sock.connect((self.ip, self.port))
         logging.info(f"Connected to RPi at {self.ip}:{self.port}.")
 
-    def send(self, message: str) -> None:
-        """Send a newline-terminated UTF-8 text message to the RPi."""
+    def send(self, message: str) -> bool:
+        """Send a newline-terminated UTF-8 text message to the RPi.
+
+        Returns False (and logs why) if the connection is gone, instead of
+        raising: on Windows a peer that closed while the PC was busy shows up
+        here or in receive_line() as ConnectionAbortedError [WinError 10053] /
+        ConnectionResetError [WinError 10054], and a raw traceback hides what
+        actually happened.
+        """
         payload = (message.rstrip("\n") + "\n").encode("utf-8")
-        self.sock.sendall(payload)
+        try:
+            self.sock.sendall(payload)
+        except OSError as exc:
+            logging.error(_connection_lost_msg("sending", message, exc))
+            return False
         logging.info(f"→ RPi: {message.strip()}")
+        return True
 
     def receive_line(self) -> Optional[str]:
         """
@@ -141,7 +169,11 @@ class RPiConnection:
         one complete line. Returns None if the connection is closed.
         """
         while b"\n" not in self._rx_buf:
-            chunk = self.sock.recv(4096)
+            try:
+                chunk = self.sock.recv(4096)
+            except OSError as exc:
+                logging.error(_connection_lost_msg("waiting for a message", None, exc))
+                return None
             if not chunk:
                 return None
             self._rx_buf += chunk
@@ -215,6 +247,7 @@ def main() -> None:
     rpi.connect()
 
     annotated_images = []
+    monitor = PlanMonitor(None)     # replaced by one built from each PATH we send
 
     logging.info("Waiting for messages from RPi…")
 
@@ -222,7 +255,18 @@ def main() -> None:
         msg = rpi.receive_line()
         if msg is None:
             logging.info("RPi disconnected — exiting.")
+            logging.info(monitor.summary())
             break
+
+        # ── PROGRESS → compare with the plan; answer a feedback wait ──────────
+        # One of these arrives after EVERY instruction (the RPi now sends each
+        # token as its own STM line). With feedback on, the RPi stalls until we
+        # answer, so this must stay quick and never raise.
+        if msg.startswith("PROGRESS,"):
+            reply = monitor.handle(msg.split(",", 1)[1])
+            if reply is not None and not rpi.send(reply):
+                break
+            continue
 
         # ── OBSTACLES → pathfinding → PATH ────────────────────────────────────
         if msg.startswith("OBSTACLES"):
@@ -233,8 +277,26 @@ def main() -> None:
                 continue
 
             logging.info(f"{len(obstacles)} obstacle(s) received — computing path…")
-            path = compute_path(obstacles)
-            rpi.send("PATH," + json.dumps(path))
+            t_plan = time.monotonic()
+            try:
+                path = compute_path(obstacles)
+            except Exception:
+                # One bad layout must not take the whole PC server down. Nothing
+                # is sent, so the RPi's PATH watchdog reports STATUS,FAILED to
+                # Android; fix the layout / planner and press Send Data again.
+                logging.exception(
+                    f"Path planning crashed on obstacles {obstacles} — no PATH sent."
+                )
+                continue
+            took = time.monotonic() - t_plan
+            if took > 0.8 * RPI_PATH_TIMEOUT_S:
+                logging.warning(
+                    f"Planning took {took:.0f}s; the RPi stops waiting for PATH after "
+                    f"{RPI_PATH_TIMEOUT_S:.0f}s, so this plan may arrive too late."
+                )
+            monitor = PlanMonitor(path)
+            if not rpi.send("PATH," + json.dumps(path)):
+                break
 
         # ── DETECT → receive image → YOLO → OBJECT ────────────────────────────
         elif msg.startswith("DETECT"):
@@ -249,7 +311,8 @@ def main() -> None:
             ok = rpi.receive_image(save_path)
             if not ok:
                 logging.error(f"Image receive failed for obstacle {obstacle_id}.")
-                rpi.send(f"OBJECT,{obstacle_id},0.0,NONE")
+                if not rpi.send(f"OBJECT,{obstacle_id},0.0,NONE"):
+                    break
                 continue
 
             # Run YOLO via your detect.py
@@ -257,13 +320,15 @@ def main() -> None:
 
             if class_id is None:
                 logging.warning(f"Nothing detected for obstacle {obstacle_id}.")
-                rpi.send(f"OBJECT,{obstacle_id},0.0,NONE")
+                if not rpi.send(f"OBJECT,{obstacle_id},0.0,NONE"):
+                    break
             else:
                 logging.info(
                     f"Detected '{class_id}' (conf={confidence:.2f}) "
                     f"for obstacle {obstacle_id}."
                 )
-                rpi.send(f"OBJECT,{obstacle_id},{confidence:.4f},{class_id}")
+                if not rpi.send(f"OBJECT,{obstacle_id},{confidence:.4f},{class_id}"):
+                    break
 
                 # Track for stitching
                 annotated_path = os.path.join(
@@ -274,6 +339,7 @@ def main() -> None:
         # ── STITCH → combine all result images ────────────────────────────────
         elif msg.startswith("STITCH"):
             logging.info("STITCH received — creating result image…")
+            logging.info(monitor.summary())
             stitch_images(annotated_images, STITCHED_OUTPUT)
             annotated_images.clear()
             logging.info("Stitching done. Ready for next run (Ctrl-C to quit).")
