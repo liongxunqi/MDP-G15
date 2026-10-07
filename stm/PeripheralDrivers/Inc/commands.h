@@ -166,7 +166,8 @@ typedef enum
      * tests, because this one IS queued and DOES move the robot. Appended
      * after CMD_SET_CAL_TRIM for exactly that reason - do not "tidy" it into
      * the block above. */
-    CMD_FWD_UNTIL_US    /* FU{n}  arg = cm, the gap to stop at     */
+    CMD_FWD_UNTIL_US,   /* FU{n}  arg = cm, the gap to stop at     */
+    CMD_Q_WPOSE        /* ?WPOSE continuous pose since boot     */
 } CmdOpcode_t;
 
 /* Bumped whenever the wire format changes in a way a sender must care about.

@@ -187,6 +187,7 @@ line; there is no separate `OK`.
 | `?IR` | `IR,<left_cm>,<right_cm>` | `65535` = out of range |
 | `?IRR` | `IRR,<left>,<right>` | Raw filtered counts, 0–4095 |
 | `?POSE` | `POSE,<x_mm>,<y_mm>,<hdg_x10>` | Since the last `!ZERO` or move start |
+| `?WPOSE` | `WPOSE,<x_mm>,<y_mm>,<hdg_x10>` | Continuous since boot; unaffected by move starts or `!ZERO` |
 | `?DIST` | `DIST,<mm>` | Travelled in the current or last move |
 | `?TURN` | `TURN,<deg_x10>` | Turned in the current or last arc, signed |
 | `?STAT` | `STAT,<state>,<busy>,<imu_ok>,<profile>` | `busy` is the **line**, not the motor — see below |
@@ -438,3 +439,54 @@ Size the read timeout off the **line**, not a single move: 20 s.
 Senders should use a read timeout **comfortably above** that — 20 s — and treat
 expiry as a lost link rather than a slow move. A sender that blocks forever
 waiting for a reply cannot recover from a dropped connection.
+
+## 12. Task 1 instruction feedback
+
+Task 1 keeps the PC's segment/photo boundaries but sends each instruction as
+its own line. For a segment `FR90,F20,S`, the wire exchange is:
+
+```text
+RPi -> STM: FR90
+STM -> RPi: OK
+RPi -> STM: ?WPOSE
+STM -> RPi: WPOSE,<x_mm>,<y_mm>,<heading_degrees_times_10>
+RPi -> Android: ROBOT,<grid_x>,<grid_y>,<N|E|S|W>
+RPi -> STM: F20
+... repeat for F20, then S ...
+```
+
+Only after the last instruction's OK and pose update does the RPi photograph
+the segment's obstacle. RESEND retries only the outstanding instruction.
+FAIL, missing OK, or missing pose halts execution before another instruction.
+`OK` and `WPOSE` are separate replies, preserving the existing serial parser.
+
+`?WPOSE` is an additive capability and requires updated STM firmware. It uses
+encoder/gyro increments continuously across primitive and FU-pass resets;
+`?POSE`, `?TURN`, and motion control keep their existing local semantics.
+The boot frame has +x forward, +y left, and positive counterclockwise heading
+with the gyro source. The RPi snapshots this frame before the first instruction
+and anchors it to arena (200 mm, 200 mm, North). The arena is 20 x 20 cells,
+each 100 mm (10 cm), for a total of 2000 x 2000 mm. Android receives fractional
+grid coordinates via position_mm / 100 (0 <= coordinate < 20), and the nearest
+cardinal direction. For example, (275 mm, 325 mm) is ROBOT,2.75,3.25,N when
+facing North. Raw WPOSE values stay in logs. Positions outside
+the arena stop execution rather than being clamped to a misleading valid cell.
+These coordinates are dead reckoning and can drift. They are not planner poses
+or external localization. Keep the same physical pose reference when placing
+the robot at the start; firmware integrates displacement at the rear axle.
+
+The checked-in STM source reports protocol 3; the RPi client also supports
+later protocol 4/5 calibration features. Port this additive query and continuous
+accumulator into the firmware actually used on the robot before building and
+flashing it. Do not replace a newer calibrated build with the older tree merely
+to get this query. Task 1 probes WPOSE before sending its first movement.
+
+Host regression checks (no hardware):
+
+```sh
+cc -Istm/tests -Istm/PeripheralDrivers/Inc stm/tests/test_world_pose.c \
+  stm/PeripheralDrivers/Src/odom.c stm/PeripheralDrivers/Src/commands.c \
+  -lm -o /tmp/mdp-test-world-pose
+/tmp/mdp-test-world-pose
+python3 -B -m unittest rpi/mdp_rpi/test_instruction_mission.py -v
+```

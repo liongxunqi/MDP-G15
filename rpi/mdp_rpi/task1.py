@@ -18,12 +18,13 @@ Task 1 message flow
 2. 1s debounce fires  →  RPi sends OBSTACLES,<json> to PC
 3. Android sends PATH or BEGIN  →  RPi (re-)sends OBSTACLES if needed
 4. PC replies  PATH,<json>  →  RPi stores segments, sets path_ready
-5. Android sends BEGIN  →  RPi sends first STM segment
-6. STM replies OK  →  RPi sends DETECT,<obstacle_id> to PC
-                    →  RPi captures image, sends filename + bytes to PC
+5. Android sends BEGIN  →  RPi sends first STM instruction
+6. Each OK → query WPOSE → ROBOT to Android and PROGRESS to PC
+   Optional feedback wait → CONTINUE / REPLACE, or timeout → next instruction
+   At a segment boundary → DETECT and image bytes to PC, if a photo is requested
 7. PC replies  OBJECT,<obstacle_id>,<confidence>,<class_id>
                     →  RPi forwards  TARGET,<obstacle_id>,<class_id>  to Android
-                    →  RPi sends next STM segment (if any left)
+                    →  RPi begins the next segment (if any left)
 8. After last segment  →  RPi sends STITCH,<n> to PC
 
 Thread-safety notes
@@ -37,6 +38,7 @@ import json
 import fcntl
 import logging
 import os
+from collections import Counter
 from threading import Event, Lock, Thread, Timer
 from time import sleep
 
@@ -51,9 +53,10 @@ from communications.stm import (
     FU_MIN_PROTOCOL,
     PROTOCOL_VERSION,
     STM,
-    validate_line,
 )
 from image_capture.camera import Camera
+from instruction_mission import InstructionMission
+from feedback_control import FeedbackControl
 
 import run_log
 
@@ -105,6 +108,8 @@ class Task1:
         self.obstacles: list = []           # list of obstacle dicts from Android
         self.segments: list = []            # movement segments from PC
         self.segments_index: int = 0        # which segment we are up to
+        self.instruction_mission = None
+        self._completed_photo_count = 0
         self.obstacle_order: list = []      # obstacle IDs in visit order
         self.directions: list = []          # direction info per segment (for Android map)
         self.start_pose: dict | None = None # planner's start pose, same shape as a dirs entry
@@ -136,6 +141,12 @@ class Task1:
         # ── Synchronisation primitives ────────────────────────────────────────
         # Mutex for all mutable index / segment state
         self._idx_lock = Lock()
+        self.feedback_control = FeedbackControl(
+            enabled=os.getenv("TASK1_FEEDBACK_WAIT", "0").strip().lower() in ("1", "true", "yes"),
+            timeout=float(os.getenv("TASK1_FEEDBACK_TIMEOUT_S", "30.0")),
+        )
+        logging.info("PC feedback wait mode: %s (timeout %.1fs)",
+                     self.feedback_control.enabled, self.feedback_control.timeout)
         # Set by pc_thread when OBJECT arrives; waited on by stm_thread DETECT logic
         self.image_done = Event()
         # Set by pc_thread when PATH arrives; waited on by android_thread BEGIN logic
@@ -366,53 +377,29 @@ class Task1:
         return None
 
     def _send_next_segment(self) -> bool:
-        """
-        Atomically read-and-advance segments_index, then send the segment to STM.
-        Returns True if a segment was sent, False if we are past the end or the
-        mission is halted.
-
-        Uses stm.send_line(), which validates against PROTOCOL.md §2/§4 and
-        sends nothing if the segment is malformed — catching it here costs
-        nothing, catching it on the wire costs a RESEND round trip.
-        """
+        """Send the next primitive, retaining the planner's photo boundaries."""
         if self.halted:
-            logging.warning("Segment pump is halted — not sending.")
             return False
-
-        malformed = None
-
-        # The index advances ONLY on a successful write. Advancing first and
-        # rolling back on failure would race: three threads can reach this
-        # (Android on BEGIN, PC on PATH, STM on OK/RESEND), and a rolled-back
-        # index could silently skip a segment.
-        with self._idx_lock:
-            if self.segments_index < 0 or self.segments_index >= len(self.segments):
-                return False
-            seg = self.segments[self.segments_index]
-            sent_index = self.segments_index
-
-            ok, reason = validate_line(list(seg))
-            if ok:
-                if not self.stm.send_line(seg):
-                    # Refused by the §2 in-flight guard: a previous line has not
-                    # been answered yet. NOT a halt — the outstanding reply will
-                    # drive the pump forward on its own. Dropping this attempt is
-                    # exactly the right outcome.
-                    logging.warning(
-                        f"Segment {sent_index} not sent — previous line still "
-                        "awaiting its reply (PROTOCOL.md §2). Ignoring this trigger."
-                    )
+        try:
+            with self._idx_lock:
+                if self.halted or self.feedback_control.waiting:
                     return False
-                self.segments_index += 1
-            else:
-                malformed = reason
-
-        if malformed is not None:
-            # A segment the firmware could never parse. Retrying it would just
-            # burn the RESEND budget, so stop here instead.
-            self._halt_mission(
-                f"segment {sent_index} is malformed: {seg} — {malformed}"
-            )
+                if self.instruction_mission is None:
+                    self.instruction_mission = InstructionMission(self.segments)
+                mission = self.instruction_mission
+                if not mission.send_next(self.stm):
+                    return False
+                self.segments_index = mission.segment_index + 1
+                logging.info("STM segment %d/%d instruction %d: %s",
+                             self.segments_index, len(self.segments),
+                             mission.instruction_index + 1, mission.token)
+                if mission.instruction_index == 0:
+                    self.android.send(
+                        f"STATUS,RUNNING,{self.segments_index},{len(self.segments)}"
+                    )
+            return True
+        except (ValueError, OSError) as exc:
+            self._halt_mission(str(exc))
             return False
 
         logging.info(
@@ -443,6 +430,57 @@ class Task1:
 
     # ── Failure handling ───────────────────────────────────────────────────────
 
+    def _apply_replacement(self, payload, mission, just_finished):
+        """Called under _idx_lock; validate everything before swapping state."""
+        candidate = InstructionMission(payload.get("segments"))
+        mapping = payload.get("segment_obstacles")
+        if not isinstance(mapping, list) or len(mapping) != len(candidate.segments):
+            raise ValueError("REPLACE requires segment_obstacles parallel to segments")
+        if any(value is not None and
+               (type(value) not in (str, int) or not str(value).strip()) for value in mapping):
+            raise ValueError("Replacement obstacle IDs must be nonempty strings, integers or null")
+        first = mission.segment_index if just_finished is None else just_finished
+        remaining = [self._obstacle_for_segment(i) for i in range(first, len(mission.segments))]
+        if Counter(str(v) for v in mapping if v is not None) != Counter(v for v in remaining if v is not None):
+            raise ValueError("Replacement must preserve every pending photo assignment")
+        candidate.origin = mission.origin
+        self.instruction_mission = candidate
+        self.segments = candidate.segments
+        self.segment_obstacles = list(mapping)
+        self.obstacle_order = [str(v) for v in mapping if v is not None]
+        self.directions = []
+        self.direction_index = 0
+        self.segments_index = 0
+        self._resend_counts.clear()
+        logging.info("Installed replacement: %d segments; odometry origin retained", len(self.segments))
+
+    def _wait_for_feedback(self, pending, mission, just_finished):
+        """Return continue/replace, or None if cancelled/invalid. Never hold the lock while waiting."""
+        try:
+            logging.info("Waiting for PC decision %s (%.1fs)",
+                         pending["feedback_id"], self.feedback_control.timeout)
+            action, payload = self.feedback_control.wait(pending)
+            with self._idx_lock:
+                if self.halted or self.instruction_mission is not mission:
+                    return None
+                logging.info("PC decision %s for feedback %s", action, pending["feedback_id"])
+                if action == "CONTINUE":
+                    return "continue"
+                if action == "TIMEOUT":
+                    logging.warning(
+                        "No PC decision for feedback %s within %.1fs; continuing existing path",
+                        pending["feedback_id"], self.feedback_control.timeout,
+                    )
+                    return "continue"
+                if action == "REPLACE":
+                    self._apply_replacement(payload, mission, just_finished)
+                    return "replace"
+                raise ValueError(str(payload.get("reason", "Feedback wait cancelled")))
+        except ValueError as exc:
+            if self.instruction_mission is mission:
+                self._halt_mission(str(exc))
+            return None
+
     def _halt_mission(self, reason: str) -> None:
         """
         Stop the segment pump and report.
@@ -455,6 +493,10 @@ class Task1:
         if self.halted:
             return
         self.halted = True
+        self.feedback_control.cancel(reason)
+        if self.feedback_control.enabled:
+            # A remaining-route replacement cannot be replayed from the fixed start.
+            self.path_ready.clear()
         logging.error(f"MISSION HALTED — {reason}")
 
         # Where does the robot actually think it is? Queries bypass the movement
@@ -495,14 +537,11 @@ class Task1:
 
             # ── Signal + send ─────────────────────────────────────────────────
             self.image_done.clear()
-            self.pc.send(f"DETECT,{obstacle_id}\n")
+            self.pc.send_image(image_bytes, header=f"DETECT,{obstacle_id}")
             logging.info(
                 f"DETECT sent for obstacle {obstacle_id} "
                 f"(attempt {attempt}/{total_attempts})."
             )
-
-            # Send actual image bytes
-            self.pc.send_image(image_bytes)
 
             # ── Wait for result ───────────────────────────────────────────────
             if self.image_done.wait(timeout=self.detect_timeout):
@@ -611,12 +650,16 @@ class Task1:
 
                 elif tag == "BEGIN":
                     # ── User pressed Start ────────────────────────────────────
-                    if not self.started:
+                    with self._idx_lock:
+                        if self.started and not self.halted:
+                            logging.info("Ignoring duplicate BEGIN during an active mission.")
+                            continue
                         logging.info("Android: BEGIN received — mission starting.")
                         self.started = True
-
-                    with self._idx_lock:
                         self.segments_index = 0
+                        self.instruction_mission = None
+                        self.feedback_control.cancel("New BEGIN")
+                        self._completed_photo_count = 0
                         # A fresh BEGIN clears a previous halt: the operator has
                         # seen the failure and is restarting deliberately.
                         self.halted = False
@@ -647,12 +690,23 @@ class Task1:
     def pc_receive(self) -> None:
         """
         Runs in pc_thread.
-        Handles: PATH (pathfinding result), OBJECT (detection result).
+        Handles PATH, OBJECT and correlated CONTINUE / REPLACE decisions.
         """
         while True:
             try:
                 msg = self.pc.receive()
                 if not msg:
+                    continue
+
+                tag = msg.split(",", 1)[0]
+                if tag in ("CONTINUE", "REPLACE"):
+                    try:
+                        payload = json.loads(msg.split(",", 1)[1])
+                    except (IndexError, json.JSONDecodeError):
+                        logging.warning("Malformed PC decision; still waiting for a valid response")
+                        continue
+                    if not self.feedback_control.submit(tag, payload):
+                        logging.warning("Ignoring stale, duplicate or unsolicited PC decision")
                     continue
 
                 if msg.startswith("PATH"):
@@ -664,7 +718,11 @@ class Task1:
                         continue
 
                     with self._idx_lock:
+                        if self.started and self.instruction_mission is not None and not self.halted:
+                            logging.warning("Ignoring replacement PATH during execution.")
+                            continue
                         self.segments = payload.get("segments", [])
+                        self.instruction_mission = None
                         self.obstacle_order = payload.get("obstacle_ids", [])
                         # Optional per-segment map; see _obstacle_for_segment().
                         # Present when the planner had to split an approach
@@ -738,9 +796,9 @@ class Task1:
         Handles: OK (command complete), RESEND (error → retransmit last).
 
         When STM says OK:
-          1. Trigger image detection for the obstacle we just reached.
-          2. Send the next movement segment (if any remain).
-          3. When all segments done, tell PC to stitch.
+          1. Read continuous odometry and update Android.
+          2. At a segment boundary, capture its obstacle if requested.
+          3. Send the next instruction, or finish and request stitching.
         """
         while True:
             try:
@@ -764,6 +822,9 @@ class Task1:
 
                 reply = stm_msg.strip().upper()
                 logging.info(f"STM received: '{stm_msg}'")
+
+                if self.halted:
+                    continue
 
                 if reply.startswith("FAIL"):
                     # ── Move did not complete (§3) ─────────────────────────────
@@ -800,11 +861,12 @@ class Task1:
                 if reply == "RESEND":
                     # ── Parse failure: nothing executed, safe to retransmit ────
                     with self._idx_lock:
-                        if not self.segments:
-                            logging.warning("STM RESEND but no segments loaded yet.")
+                        mission = self.instruction_mission
+                        if mission is None or not mission.pending:
+                            logging.warning("STM RESEND without an outstanding instruction.")
                             continue
-                        last_idx = max(self.segments_index - 1, 0)
-                        seg = self.segments[last_idx]
+                        last_idx = mission.key
+                        seg = [mission.token]
 
                     count = self._resend_counts.get(last_idx, 0) + 1
                     self._resend_counts[last_idx] = count
@@ -822,36 +884,55 @@ class Task1:
                         f"STM RESEND: retransmitting segment {last_idx} "
                         f"(attempt {count}/{self.max_resends}): {seg}."
                     )
-                    self.stm.send_line(seg)
+                    if not self.stm.send_line(seg):
+                        self._halt_mission("Could not retransmit outstanding instruction")
 
                 elif reply == "OK":
-                    with self._idx_lock:
-                        just_finished = self.segments_index - 1
-                        more_to_send = self.segments_index < len(self.segments)
-                        # Cleared on success so a later genuine RESEND on this
-                        # index starts counting from zero again.
-                        self._resend_counts.pop(just_finished, None)
-
-                    if self.halted:
-                        logging.warning("OK received but mission is halted — ignoring.")
+                    try:
+                        with self._idx_lock:
+                            mission = self.instruction_mission
+                            if mission is None:
+                                raise ValueError("Unexpected STM OK outside a mission")
+                            key = mission.key
+                            robot_message, just_finished = mission.complete_instruction(self.stm)
+                            self._resend_counts.pop(key, None)
+                            more_to_send = not mission.done
+                            # Publish before releasing the lock or starting another move.
+                            self.android.send(robot_message)
+                            # PROGRESS includes pose and execution context for PC.
+                            pending = None
+                            first_photo_segment = mission.segment_index if just_finished is None else just_finished
+                            mission.progress["remaining_photo_ids"] = [
+                                oid for i in range(first_photo_segment, len(mission.segments))
+                                if (oid := self._obstacle_for_segment(i)) is not None
+                            ]
+                            mission.progress["awaiting_decision"] = self.feedback_control.enabled
+                            if self.feedback_control.enabled:
+                                pending = self.feedback_control.arm(mission.progress)
+                            self.pc.send("PROGRESS," + json.dumps(mission.progress, separators=(",", ":")))
+                    except (ValueError, OSError) as exc:
+                        self._halt_mission(str(exc))
                         continue
 
-                    # Update Android with robot's expected grid position
-                    with self._idx_lock:
-                        if 0 <= just_finished < len(self.directions):
-                            robot_pose = self.directions[just_finished]
-                        else:
-                            robot_pose = None
+                    if pending is not None:
+                        decision = self._wait_for_feedback(pending, mission, just_finished)
+                        if decision is None:
+                            continue
+                        if decision == "replace":
+                            if not self._send_next_segment():
+                                self._halt_mission("Could not send replacement instruction")
+                            continue
 
-                    if robot_pose:
-                        self.android.send(
-                            f"ROBOT,{robot_pose['x']},{robot_pose['y']},{robot_pose['dir']}"
-                        )
+                    if just_finished is None:
+                        if not self._send_next_segment():
+                            self._halt_mission("Could not send next instruction")
+                        continue
                     
                     # ── Capture + detect for the obstacle we just reached ──────
                     obstacle_id = self._obstacle_for_segment(just_finished)
                     if obstacle_id is not None:
                         self._detect_and_send_image(obstacle_id)
+                        self._completed_photo_count += 1
 
                     # ── Send next movement segment (or finish) ─────────────────
                     if more_to_send:
@@ -866,12 +947,10 @@ class Task1:
                         # Counts IMAGES, not segments: with §2 chunking one
                         # obstacle can span several segments, so len(segments)
                         # would over-count.
-                        if self.segment_obstacles:
-                            shots = sum(1 for o in self.segment_obstacles if o is not None)
-                        else:
-                            shots = len(self.obstacle_order) or len(self.segments)
+                        shots = self._completed_photo_count
                         self.pc.send(f"STITCH,{max(shots - 1, 0)}\n")
                         self.android.send("STATUS,DONE")
+                        self.started = False
 
                         if self.a5_mode:
                             if self._a5_found is not None:
@@ -1037,6 +1116,8 @@ class Task1:
         except KeyboardInterrupt:
             logging.info("Interrupted — shutting down.")
         finally:
+            self.halted = True
+            self.feedback_control.cancel("Task 1 shutting down")
             self.camera.stop_camera()
             self.stm.disconnect()
             self.pc.disconnect()

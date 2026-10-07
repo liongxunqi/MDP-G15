@@ -114,7 +114,8 @@ uint8_t Cmd_IsImmediate(CmdOpcode_t op)
     /* A RANGE, not a list - so a new immediate opcode added OUTSIDE it is
      * silently handed to the movement parser instead. Append new ones before
      * this endpoint and move the endpoint with them. */
-    return ((op >= CMD_Q_US) && (op <= CMD_SET_CAL_TRIM)) ? 1U : 0U;
+    return (((op >= CMD_Q_US) && (op <= CMD_SET_CAL_TRIM)) ||
+            op == CMD_Q_WPOSE) ? 1U : 0U;
 }
 
 Command_t Cmd_ParseToken(const char *token)
@@ -140,6 +141,7 @@ Command_t Cmd_ParseToken(const char *token)
         else if (token_is(token, "?ir"))   { cmd.op = CMD_Q_IR;   }
         else if (token_is(token, "?irr"))  { cmd.op = CMD_Q_IRR;  }
         else if (token_is(token, "?pose")) { cmd.op = CMD_Q_POSE; }
+        else if (token_is(token, "?wpose")) { cmd.op = CMD_Q_WPOSE; }
         else if (token_is(token, "?dist")) { cmd.op = CMD_Q_DIST; }
         else if (token_is(token, "?turn")) { cmd.op = CMD_Q_TURN; }
         else if (token_is(token, "?stat")) { cmd.op = CMD_Q_STAT; }

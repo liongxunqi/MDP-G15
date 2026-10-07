@@ -6,6 +6,7 @@
 #include <math.h>
 
 static Odom_Pose_t s_pose;
+static Odom_Pose_t s_worldPose;
 
 static int32_t s_lastCountA;
 static int32_t s_lastCountB;
@@ -245,6 +246,15 @@ void Odom_Update(void)
     /* Path length, always positive, so reversing does not subtract from it. */
     s_pose.distance_mm += (d_centre < 0.0f) ? -d_centre : d_centre;
 
+    /* Use the same measured increments, but retain the mission trajectory
+     * across primitive resets, including all internal FU correction passes. */
+    heading_rad = (s_worldPose.heading_deg + d_theta_deg * 0.5f)
+                  * (3.14159265f / 180.0f);
+    s_worldPose.x_mm += d_centre * cosf(heading_rad);
+    s_worldPose.y_mm += d_centre * sinf(heading_rad);
+    s_worldPose.heading_deg = wrap180(s_worldPose.heading_deg + d_theta_deg);
+    s_worldPose.distance_mm += (d_centre < 0.0f) ? -d_centre : d_centre;
+
     /* ---- heading hold, via the steering servo ---- */
 
     if (s_mode == ODOM_ARC)
@@ -342,6 +352,14 @@ void Odom_GetPose(Odom_Pose_t *out)
     {
         *out = s_pose;
     }
+}
+
+void Odom_GetWorldPose(Odom_Pose_t *out)
+{
+    uint32_t primask = __get_PRIMASK();
+    __disable_irq();
+    if (out != 0) { *out = s_worldPose; }
+    __set_PRIMASK(primask);
 }
 
 float    Odom_GetHeading(void)      { return s_pose.heading_deg; }

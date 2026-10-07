@@ -17,6 +17,7 @@ import os
 import socket
 import struct
 import sys
+from threading import Lock
 from typing import Optional
 
 from dotenv import load_dotenv
@@ -36,6 +37,7 @@ class PC:
         self.server_socket: Optional[socket.socket] = None
         self.client_socket: Optional[socket.socket] = None
         self._rx_buffer: str = ""  # line-buffer for text messages
+        self._send_lock = Lock()
 
     # ── Connection ────────────────────────────────────────────────────────────
 
@@ -80,7 +82,10 @@ class PC:
             return
         payload = (message.rstrip("\n") + "\n").encode("utf-8")
         try:
-            self.client_socket.sendall(payload)
+            with self._send_lock:
+                if not self.client_socket:
+                    return
+                self.client_socket.sendall(payload)
             logging.info(f"PC → pc: {message.strip()}")
         except socket.error as exc:
             logging.error(f"PC: send error — {exc}")
@@ -114,12 +119,14 @@ class PC:
 
     # ── Image transfer ────────────────────────────────────────────────────────
 
-    def send_image(self, image_or_path) -> None:
+    def send_image(self, image_or_path, header: Optional[str] = None) -> None:
         """
         Transfer a JPEG to the PC using the test_camera length-prefix protocol.
 
         `image_or_path` may be in-memory JPEG bytes from Camera.capture_image()
         or a file path for older tests.
+        With `header`, send the text request and binary frame atomically with
+        respect to other senders (e.g. measured-pose telemetry).
         """
         if not self.client_socket:
             logging.warning("PC: send_image called but not connected — skipping.")
@@ -132,8 +139,13 @@ class PC:
                 with open(os.fspath(image_or_path), "rb") as fh:
                     image_bytes = fh.read()
 
-            self.client_socket.sendall(struct.pack(">I", len(image_bytes)))
-            self.client_socket.sendall(image_bytes)
+            with self._send_lock:
+                if not self.client_socket:
+                    return
+                if header is not None:
+                    self.client_socket.sendall((header.rstrip("\n") + "\n").encode("utf-8"))
+                self.client_socket.sendall(struct.pack(">I", len(image_bytes)))
+                self.client_socket.sendall(image_bytes)
             logging.info(f"PC: image sent successfully ({len(image_bytes)} bytes).")
         except FileNotFoundError:
             logging.error(f"PC: image file not found — {image_or_path}")

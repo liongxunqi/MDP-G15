@@ -252,6 +252,17 @@ static void answer_immediate(const Command_t *c)
         snprintf(b, sizeof(b), "DIST,%ld\n", (long)Motion_GetTravelled());
         break;
 
+    case CMD_Q_WPOSE:
+        {
+            Odom_Pose_t p;
+            Odom_GetWorldPose(&p);
+            snprintf(b, sizeof(b), "WPOSE,%ld,%ld,%ld\n",
+                     (long)p.x_mm, (long)p.y_mm,
+                     (long)scaled10(p.heading_deg));
+        }
+        break;
+
+
     case CMD_Q_TURN:
         snprintf(b, sizeof(b), "TURN,%d\n",
                  (int)scaled10(Odom_GetHeadingTotal()));

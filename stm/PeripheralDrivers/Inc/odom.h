@@ -339,6 +339,8 @@ void Odom_Update(void);
 
 /* Current pose. Safe to call from the main loop. */
 void Odom_GetPose(Odom_Pose_t *out);
+/* Continuous encoder/gyro pose, unaffected by move starts and !ZERO. */
+void Odom_GetWorldPose(Odom_Pose_t *out);
 
 float Odom_GetHeading(void);
 

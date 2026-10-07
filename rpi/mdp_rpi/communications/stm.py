@@ -170,7 +170,7 @@ STEER_CAL_MIN_PROTOCOL = 5
 # "CAL,..." answer to the waiting thread instead of discarding it as banner
 # noise. Missing from either place and the query fails silently.
 QUERY_TAGS = {"US", "IR", "IRR", "POSE", "DIST", "TURN", "STAT", "IMU", "XCHK",
-              "VER", "CAL", "HDG"}
+              "VER", "CAL", "HDG", "WPOSE"}
 
 # This client implements protocol 4. Compared against the ?VER reply at startup.
 PROTOCOL_VERSION = 5
