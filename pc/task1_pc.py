@@ -81,6 +81,9 @@ def run_detection(image_path: str):
 #   "dirs"              — robot pose per line, for the Android map
 
 sys.path.insert(0, os.path.join(REPO_ROOT, "algo"))
+os.environ.setdefault("RPI_ANCHOR_X_MM", "0")    # the RPi reports ROBOT as displacement from the start
+os.environ.setdefault("RPI_ANCHOR_Y_MM", "0")
+os.environ.setdefault("RPI_ARENA_GUARD", "0")    # see the caveat below
 from stm_tokens import PROFILE_NAMES, TURN_RADIUS_MM  # noqa: E402
 from path_planner import plan_mission  # noqa: E402
 
