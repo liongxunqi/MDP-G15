@@ -55,7 +55,7 @@ from communications.stm import (
     STM,
 )
 from image_capture.camera import Camera
-from instruction_mission import InstructionMission
+from instruction_mission import InstructionMission, parse_start_pose
 from feedback_control import FeedbackControl
 
 import run_log
@@ -385,7 +385,7 @@ class Task1:
                 if self.halted or self.feedback_control.waiting:
                     return False
                 if self.instruction_mission is None:
-                    self.instruction_mission = InstructionMission(self.segments)
+                    self.instruction_mission = InstructionMission(self.segments, self.start_pose)
                 mission = self.instruction_mission
                 if not mission.send_next(self.stm):
                     return False
@@ -402,27 +402,14 @@ class Task1:
             self._halt_mission(str(exc))
             return False
 
-        logging.info(
-            f"STM segment {self.segments_index}/{len(self.segments)} sent: {seg}"
-        ) 
-        # for individual segments when they start running
-        try:
-            self.android.send(f"STATUS,RUNNING,{self.segments_index},{len(self.segments)}")
-        except OSError as exc:
-            logging.warning(f"Could not notify Android of running status: {exc}")
-        return True
-
     def _send_start_status(self) -> None:
-        """Tell Android where the planner assumes the robot starts. Older PCs
-        send no "start" in PATH; fall back to the old fixed position then."""
+        """Pass the planner's PATH.start coordinates directly to Android."""
         with self._idx_lock:
-            if not self.directions:
-                return
             start = self.start_pose
-        if start:
-            status = f"STATUS,START,{start['x']},{start['y']},{start['dir']}"
-        else:
-            status = "STATUS,START,2,2,N"
+        if start is None:
+            self._halt_mission("Cannot start without planner PATH.start")
+            return
+        status = f"STATUS,START,{start['x']},{start['y']},{start['dir']}"
         try:
             self.android.send(status)
         except OSError as exc:
@@ -432,7 +419,7 @@ class Task1:
 
     def _apply_replacement(self, payload, mission, just_finished):
         """Called under _idx_lock; validate everything before swapping state."""
-        candidate = InstructionMission(payload.get("segments"))
+        candidate = InstructionMission(payload.get("segments"), mission.start_pose)
         mapping = payload.get("segment_obstacles")
         if not isinstance(mapping, list) or len(mapping) != len(candidate.segments):
             raise ValueError("REPLACE requires segment_obstacles parallel to segments")
@@ -721,15 +708,26 @@ class Task1:
                         if self.started and self.instruction_mission is not None and not self.halted:
                             logging.warning("Ignoring replacement PATH during execution.")
                             continue
-                        self.segments = payload.get("segments", [])
-                        self.instruction_mission = None
+                        try:
+                            start = parse_start_pose(payload.get("start"))
+                            candidate = InstructionMission(payload.get("segments", []), start)
+                        except ValueError as exc:
+                            logging.error("PC: invalid PATH — %s", exc)
+                            continue
+                        self.segments = candidate.segments
+                        self.instruction_mission = candidate
                         self.obstacle_order = payload.get("obstacle_ids", [])
                         # Optional per-segment map; see _obstacle_for_segment().
                         # Present when the planner had to split an approach
                         # across several lines to respect the §2 caps.
                         self.segment_obstacles = payload.get("segment_obstacles", [])
                         self.directions = payload.get("dirs", [])
-                        self.start_pose = payload.get("start")
+                        # Keep the planner's wire values for STATUS,START.
+                        self.start_pose = {
+                            "x": payload["start"]["x"],
+                            "y": payload["start"]["y"],
+                            "dir": payload["start"]["dir"],
+                        }
                         self.direction_index = 0
 
                     self.path_requested = False

@@ -445,8 +445,9 @@ Example JSON (transmit on ONE line after `PROGRESS,`):
   already completed. `segment` includes both executed and unexecuted tokens.
 - Coordinates are fractional grid units: one unit = 100 mm; arena `[0,20)` on
   each axis. Heading is degrees, north=0, clockwise positive, `[0,360)`.
-- The reference point is still the rear-axle midpoint anchored at `(2,2)`;
-  the planner must resolve its centre offset before relying on it for geometry.
+- The starting x/y/bearing comes from `PATH.start`; RPi has no fixed `(2,2)`
+  fallback. STM odometry still measures the rear-axle midpoint, so the planner
+  must resolve its centre offset before relying on feedback for geometry.
 - In telemetry-only mode `awaiting_decision` is false and no feedback ID is
   issued. Do not send decisions in that mode.
 - Echo the feedback ID and completed indexes exactly. A fresh feedback ID is

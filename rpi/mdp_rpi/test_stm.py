@@ -55,7 +55,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefm
 
 from communications.stm import STM
 
-DEFAULT_ARC_PROFILE = 1
+DEFAULT_ARC_PROFILE = 0
 
 
 def send_and_report(stm: STM, line: str) -> None:
