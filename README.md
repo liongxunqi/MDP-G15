@@ -26,6 +26,13 @@ python3 pc/task1_pc.py            # on the PC, second
 
 Then connect Android, send the obstacles and press Begin. See `rpi/mdp_rpi/README.md` for setup.
 
+**Placing the robot:** facing up the arena (+y, north), pushed into the start
+zone's bottom-left corner — rear 1 cm above the bottom line, left side 1 cm in
+from the left line. The planner assumes exactly this (`START_*` in
+`algo/path_planner.py`). To fine-tune without editing code, set
+`START_GAP_MM`, or `START_X_MM` / `START_Y_MM` (robot centre, mm), in the
+PC's environment before starting `task1_pc.py`.
+
 Each run writes a log with an end-of-run summary of warnings and errors: `rpi/mdp_rpi/logs/` on the RPi, `pc/logs/` on the PC.
 
 ## Tests (no robot needed)

@@ -10,6 +10,7 @@ from where the photo was taken.
 import itertools
 import logging
 import math
+import os
 import re
 import time
 from collections import namedtuple
@@ -67,13 +68,18 @@ EXHAUSTIVE_LIMIT = 8
 
 FACE_FROM_D = {0: "N", 2: "E", 4: "S", 6: "W"}
 
-# centre of the 40x40cm start zone, not the robot's bare minimum clearance
-START_X_MM = 200.0
-START_Y_MM = 200.0
-START_THETA = math.pi / 2
-
 ROBOT_HALF_LENGTH_MM = ROBOT_LENGTH_CM * 10 / 2.0
 ROBOT_HALF_WIDTH_MM = ROBOT_WIDTH_CM * 10 / 2.0
+
+# Start pose: robot facing N, pushed into the start zone's bottom-left corner -
+# rear on the bottom line, left side on the left line, START_GAP_MM off each so
+# nothing sits on the tape. Two edges are easy to line up by touch; the centre
+# of a 40x40 cm box is not. START_X_MM / START_Y_MM in the PC's environment
+# override the computed centre for fine-tuning on the day.
+START_GAP_MM = float(os.getenv("START_GAP_MM", "10"))
+START_X_MM = float(os.getenv("START_X_MM", ROBOT_HALF_WIDTH_MM + START_GAP_MM))
+START_Y_MM = float(os.getenv("START_Y_MM", ROBOT_HALF_LENGTH_MM + START_GAP_MM))
+START_THETA = math.pi / 2
 
 _STRAIGHT_RE = re.compile(r"^([FR])(\d+)$")
 
@@ -528,4 +534,5 @@ def plan_mission(obstacles: List[dict], arc_profile: int = PROFILE_TIGHT,
         "obstacle_ids": [o["id"] for o in order],
         "segment_obstacles": segment_obstacles,
         "dirs": dirs,
+        "start": _pose_to_dir_entry(start),
     }

@@ -120,7 +120,7 @@ class ArenaGridViewInstrumentedTest {
     }
 
     @Test
-    fun reportedRobotIsClippedOutOfObstacleCells() {
+    fun overlappingReportedRobotRemainsVisibleForDiagnosis() {
         val context = ApplicationProvider.getApplicationContext<android.content.Context>()
         val view = createView(context)
         val obstacleCell = GridCoordinate(8, 8)
@@ -141,8 +141,8 @@ class ArenaGridViewInstrumentedTest {
             val withRobot = capture()
             val (obstacleX, obstacleY) = cellCenter(context, obstacleCell)
             val (robotX, robotY) = cellCenter(context, GridCoordinate(9, 8))
-            assertEquals(
-                "The robot must not cover the obstacle label",
+            assertNotEquals(
+                "The reported robot must remain visible at the overlap",
                 obstacleOnly.getPixel(obstacleX.toInt(), obstacleY.toInt()),
                 withRobot.getPixel(obstacleX.toInt(), obstacleY.toInt()),
             )
@@ -237,10 +237,68 @@ class ArenaGridViewInstrumentedTest {
             onMain {
                 dispatch(view, time, SystemClock.uptimeMillis(), MotionEvent.ACTION_MOVE, -100f, -100f)
                 dispatch(view, time, SystemClock.uptimeMillis(), endAction, -100f, -100f)
-                assertTrue(view.contentDescription.contains("Robot at 5, 5"))
+                assertTrue(view.contentDescription.contains("Robot at 5.0, 5.0"))
             }
             assertTrue(events.isEmpty())
         }
+    }
+
+    @Test
+    fun rotatedFractionalRobotDropSnapsReferenceToIntegerCells() {
+        val context = ApplicationProvider.getApplicationContext<android.content.Context>()
+        val view = createView(context)
+        val moved = AtomicReference<GridCoordinate?>()
+        view.interactionListener = object : ArenaInteractionListener {
+            override fun onAddObstacle(position: GridCoordinate) = Unit
+            override fun onSelectObstacle(obstacleId: Int?) = Unit
+            override fun onMoveObstacle(obstacleId: Int, destination: GridCoordinate) = Unit
+            override fun onRemoveObstacle(obstacleId: Int) = Unit
+            override fun onMoveRobot(destination: GridCoordinate) = moved.set(destination)
+        }
+        val start = cellCenter(context, GridCoordinate(6, 6))
+        val finish = cellCenter(context, GridCoordinate(10, 11))
+        val downTime = SystemClock.uptimeMillis()
+        onMain {
+            prepare(view, ArenaState(robot = RobotPose(5.4, 5.4, 45.0)), false)
+            dispatch(view, downTime, downTime, MotionEvent.ACTION_DOWN, start.first, start.second)
+        }
+        Thread.sleep(ViewConfiguration.getLongPressTimeout().toLong() + 100L)
+        onMain {
+            dispatch(view, downTime, SystemClock.uptimeMillis(), MotionEvent.ACTION_MOVE, finish.first, finish.second)
+            assertEquals(null, moved.get())
+            dispatch(view, downTime, SystemClock.uptimeMillis(), MotionEvent.ACTION_UP, finish.first, finish.second)
+        }
+        assertEquals(GridCoordinate(9, 10), moved.get())
+    }
+
+    @Test
+    fun repeatedSamePoseReportCancelsAnOlderRobotDrag() {
+        val context = ApplicationProvider.getApplicationContext<android.content.Context>()
+        val view = createView(context)
+        val moved = AtomicReference<GridCoordinate?>()
+        view.interactionListener = object : ArenaInteractionListener {
+            override fun onAddObstacle(position: GridCoordinate) = Unit
+            override fun onSelectObstacle(obstacleId: Int?) = Unit
+            override fun onMoveObstacle(obstacleId: Int, destination: GridCoordinate) = Unit
+            override fun onRemoveObstacle(obstacleId: Int) = Unit
+            override fun onMoveRobot(destination: GridCoordinate) = moved.set(destination)
+        }
+        val start = cellCenter(context, GridCoordinate(6, 6))
+        val finish = cellCenter(context, GridCoordinate(10, 11))
+        val downTime = SystemClock.uptimeMillis()
+        val report = RobotPose(5.0, 5.0, 45.0)
+        onMain {
+            prepare(view, ArenaState(robot = report, reportedRobot = report, reportRevision = 1), false)
+            dispatch(view, downTime, downTime, MotionEvent.ACTION_DOWN, start.first, start.second)
+        }
+        Thread.sleep(ViewConfiguration.getLongPressTimeout().toLong() + 100L)
+        onMain {
+            dispatch(view, downTime, SystemClock.uptimeMillis(), MotionEvent.ACTION_MOVE, finish.first, finish.second)
+            view.render(ArenaState(robot = report, reportedRobot = report, reportRevision = 2), false)
+            dispatch(view, downTime, SystemClock.uptimeMillis(), MotionEvent.ACTION_UP, finish.first, finish.second)
+        }
+        assertEquals(null, moved.get())
+        assertTrue(view.contentDescription.contains("Robot at 5.0, 5.0"))
     }
 
     @Test

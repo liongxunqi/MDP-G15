@@ -124,8 +124,9 @@ class ArenaReducer {
     }
 
     private fun applyRobotPose(state: ArenaState, pose: RobotPose): ArenaReduction {
-        if (!state.config.contains(pose.position)) return ArenaReduction.Failure("Robot centre is outside the arena.")
-        return ArenaReduction.Success(state.copy(robot = pose))
+        val reported = pose.withoutPreview().copy(source = PoseSource.REPORTED)
+        return ArenaReduction.Success(state.copy(robot = reported, reportedRobot = reported,
+            reportRevision = state.reportRevision + 1))
     }
 
     /** Read-only check: would moving the robot to [destination] succeed, without applying it. */
@@ -134,17 +135,16 @@ class ArenaReducer {
 
     private fun moveRobot(state: ArenaState, destination: GridCoordinate): ArenaReduction {
         val robot = state.robot ?: return ArenaReduction.Failure("Robot position is not set.")
-        val cells = destination.footprint(state.config.robotFootprintCells)
-        if (cells.any { !state.config.contains(it) }) {
-            return ArenaReduction.Failure("Destination is outside the arena.")
+        val placed = robot.copy(x = destination.x.toDouble(), y = destination.y.toDouble(),
+            estimate = null, commandedPath = null, source = PoseSource.OPERATOR)
+        if (!RobotFootprint.fitsArena(placed, state.config)) return ArenaReduction.Failure("Destination is outside the arena.")
+        if (state.obstacles.values.any { RobotFootprint.overlapsCell(placed, state.config, it.position) }) {
+            return ArenaReduction.Failure("An obstacle already occupies that space.")
         }
-        if (state.obstacles.values.any { obstacle -> cells.any { it == obstacle.position } }) {
-            return ArenaReduction.Failure("An obstacle already occupies that cell.")
-        }
-        if (robot.position == destination) {
+        if (robot == placed) {
             return ArenaReduction.Success(state)
         }
-        return ArenaReduction.Success(state.copy(robot = robot.copy(position = destination, estimate = null, commandedPath = null)))
+        return ArenaReduction.Success(state.copy(robot = placed))
     }
 
     private fun validateFreeCell(
@@ -155,7 +155,7 @@ class ArenaReducer {
         !state.config.contains(position) -> "Selected cell is outside the arena."
         state.obstacles.values.any { it.id != ignoreObstacleId && it.position == position } ->
             "Another obstacle already occupies that cell."
-        state.robot != null && DrivePose.from(state.robot).overlaps(position, state.config.robotFootprintCells) ->
+        state.robot != null && RobotFootprint.overlapsCell(DrivePose.from(state.robot), state.config, position) ->
             "The robot occupies that cell."
         else -> null
     }

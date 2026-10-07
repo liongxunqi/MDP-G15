@@ -2,6 +2,7 @@ package com.mdp.g15.arena.view
 
 import com.mdp.g15.arena.domain.ArenaConfig
 import com.mdp.g15.arena.domain.GridCoordinate
+import com.mdp.g15.arena.domain.RobotPose
 import kotlin.math.floor
 import kotlin.math.max
 import kotlin.math.min
@@ -68,17 +69,13 @@ class ArenaGeometry {
         return CellBounds(left, top, left + cellSize, top + cellSize)
     }
 
-    /**
-     * Pixel bounds spanning a [size] x [size] footprint centred on [center].
-     * Bounds may extend outside the arena for a reported pose.
-     */
-    fun footprintBounds(center: GridCoordinate, size: Int): CellBounds {
-        val half = size / 2
+    /** Unrotated reference rectangle; drawing rotates it about its centre. */
+    fun robotBounds(pose: RobotPose, config: ArenaConfig): CellBounds {
         return CellBounds(
-            left = arenaLeft + (center.x - half) * cellSize,
-            top = arenaTop + (config.rows - center.y - half - 1) * cellSize,
-            right = arenaLeft + (center.x + half + 1) * cellSize,
-            bottom = arenaTop + (config.rows - center.y + half) * cellSize,
+            left = arenaLeft + pose.x.toFloat() * cellSize,
+            top = arenaTop + (config.rows - pose.y - config.robotLengthCells).toFloat() * cellSize,
+            right = arenaLeft + (pose.x + config.robotWidthCells).toFloat() * cellSize,
+            bottom = arenaTop + (config.rows - pose.y).toFloat() * cellSize,
         )
     }
 }

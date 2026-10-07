@@ -29,6 +29,7 @@ data class ArenaUiState(
     val manualPending: Boolean = false,
     val manualAnimating: Boolean = false,
     val manualStatus: String? = null,
+    val lastPoseReceivedAtMillis: Long? = null,
     val autonomousRunning: Boolean = false,
     /** True from a Start tap until STATUS,ACK/START/RUNNING/DONE/FAILED resolves it. Distinct
      *  from [autonomousRunning]: a tap alone must never claim the robot is moving. */

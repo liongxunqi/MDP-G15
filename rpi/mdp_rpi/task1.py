@@ -184,6 +184,7 @@ class Task1:
         self.segments_index: int = 0        # which segment we are up to
         self.obstacle_order: list = []      # obstacle IDs in visit order
         self.directions: list = []          # direction info per segment (for Android map)
+        self.start_pose: dict | None = None # planner's start pose, same shape as a dirs entry
         self.direction_index: int = 0
 
         # Per-segment obstacle mapping. A segment is NOT 1:1 with an obstacle any
@@ -859,6 +860,7 @@ class Task1:
                         # across several lines to respect the §2 caps.
                         self.segment_obstacles = payload.get("segment_obstacles", [])
                         self.directions = payload.get("dirs", [])
+                        self.start_pose = payload.get("start")
                         self.direction_index = 0
 
                     self.path_requested = False

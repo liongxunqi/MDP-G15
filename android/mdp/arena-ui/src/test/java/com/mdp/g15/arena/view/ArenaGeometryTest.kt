@@ -2,6 +2,7 @@ package com.mdp.g15.arena.view
 
 import com.mdp.g15.arena.domain.ArenaConfig
 import com.mdp.g15.arena.domain.GridCoordinate
+import com.mdp.g15.arena.domain.RobotPose
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Test
@@ -39,19 +40,13 @@ class ArenaGeometryTest {
     }
 
     @Test
-    fun `robot bounds use the centre cell and remain available at an edge`() {
-        val centre = geometry.footprintBounds(GridCoordinate(1, 1), 3)
+    fun `robot bounds use bottom left and rectangular dimensions`() {
+        val bounds = geometry.robotBounds(RobotPose(0.0, 0.0, 0.0), ArenaConfig())
         val bottomLeft = geometry.cellBounds(GridCoordinate(0, 0))
-        val topRight = geometry.cellBounds(GridCoordinate(2, 2))
-        assertEquals(bottomLeft.left, centre.left, 0.001f)
-        assertEquals(bottomLeft.bottom, centre.bottom, 0.001f)
-        assertEquals(topRight.right, centre.right, 0.001f)
-        assertEquals(topRight.top, centre.top, 0.001f)
-        assertEquals(geometry.cellBounds(GridCoordinate(1, 1)).centerX, centre.centerX, 0.001f)
-
-        val edge = geometry.footprintBounds(GridCoordinate(0, 0), 3)
-        assertEquals(geometry.arenaLeft - geometry.cellSize, edge.left, 0.001f)
-        assertEquals(geometry.arenaTop + geometry.arenaHeight + geometry.cellSize, edge.bottom, 0.001f)
+        assertEquals(bottomLeft.left, bounds.left, 0.001f)
+        assertEquals(bottomLeft.bottom, bounds.bottom, 0.001f)
+        assertEquals(geometry.arenaLeft + 2f * geometry.cellSize, bounds.right, 0.001f)
+        assertEquals(geometry.arenaTop + (20f - 2.1f) * geometry.cellSize, bounds.top, 0.001f)
     }
 
     @Test
