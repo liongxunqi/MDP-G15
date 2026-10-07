@@ -64,8 +64,8 @@ def handle_client(conn, addr):
         f"({image_size} bytes)"
     )
 
-    # Use the same crop, model, confidence threshold, class mapping, and
-    # annotation behavior as the full Task 1 detector.
+    # Use the same model, confidence threshold, class mapping, and annotation
+    # behavior as the full Task 1 detector.
     result_label, confidence = detect(str(filename))
     result_label = result_label or "none"
     print(

@@ -11,7 +11,7 @@ RUNS_DIR.mkdir(parents=True, exist_ok=True)
 
 model = YOLO(str(MODEL_PATH))
 
-INFERENCE_SIZE = 960
+INFERENCE_SIZE = 640
 YOLO_CONF = 0.25
 
 
@@ -38,9 +38,9 @@ def detect(image_path):
         print(f"Could not read image: {image_path}")
         return None, None
 
-    cropped = centre_crop(image)
+    # cropped = centre_crop(image)
     results = model.predict(
-        source=cropped,
+        source=image,
         imgsz=INFERENCE_SIZE,
         conf=YOLO_CONF,
         save=False,
@@ -49,7 +49,7 @@ def detect(image_path):
 
     result = results[0]
     boxes = result.boxes
-    annotated_image = cropped.copy()
+    annotated_image = image.copy()
 
     if boxes is None or len(boxes) == 0:
         output_path = RUNS_DIR / Path(image_path).name
