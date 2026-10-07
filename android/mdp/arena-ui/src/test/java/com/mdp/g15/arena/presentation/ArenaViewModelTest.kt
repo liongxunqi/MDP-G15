@@ -430,6 +430,40 @@ class ArenaViewModelTest {
         assertEquals(1, viewModel.uiState.value.arena.obstacles.size)
     }
 
+    @Test
+    fun `armed map resync overrides the post-BEGIN suppression exactly once`() = runTest(dispatcher) {
+        val rpiSent = mutableListOf<String>()
+        val vm = ArenaViewModel(SavedStateHandle(), ArenaOutboundSink(rpiSent::add), useRpiMapSync = true)
+        vm.addObstacle(GridCoordinate(3, 3))
+
+        // Disabled before BEGIN: SETUP already auto-resends on its own.
+        assertFalse(vm.uiState.value.forceMapResyncOnReconnect)
+
+        vm.connectionChanged(true)
+        vm.accept("STATUS,START,3,3,N")
+        advanceUntilIdle()
+        rpiSent.clear()
+
+        // Mid-mission: a plain reconnect must NOT resend the map.
+        vm.connectionChanged(false)
+        vm.connectionChanged(true)
+        assertTrue(rpiSent.none { it.startsWith("CLEAR") })
+
+        // Arm it, then reconnect: the map goes out this one time.
+        vm.armMapResyncOnReconnect()
+        assertTrue(vm.uiState.value.forceMapResyncOnReconnect)
+        vm.connectionChanged(false)
+        vm.connectionChanged(true)
+        assertTrue(rpiSent.any { it.startsWith("CLEAR") })
+        assertFalse(vm.uiState.value.forceMapResyncOnReconnect)
+
+        // Consumed: the next reconnect after that is back to normal suppression.
+        rpiSent.clear()
+        vm.connectionChanged(false)
+        vm.connectionChanged(true)
+        assertTrue(rpiSent.none { it.startsWith("CLEAR") })
+    }
+
     private val dispatcher = StandardTestDispatcher()
     private lateinit var sent: MutableList<String>
     private lateinit var viewModel: ArenaViewModel

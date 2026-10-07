@@ -336,8 +336,42 @@ private fun ArenaStatusPanel(
                 Text("Reset arena")
             }
             belowResetControls?.invoke()
+            ResyncOnReconnectControl(
+                phase = state.task1Phase,
+                armed = state.forceMapResyncOnReconnect,
+                onArm = viewModel::armMapResyncOnReconnect,
+                onCancel = viewModel::cancelMapResyncOnReconnect,
+            )
 
         }
+    }
+}
+
+/**
+ * Recovery override for [ArenaViewModel.connectionChanged]'s normal rule: once BEGIN has been
+ * pressed, a reconnect no longer resends CLEAR + the obstacle list on its own (it would wipe
+ * the RPi's mid-mission state for no reason). This lets the operator explicitly ask for that
+ * resend anyway, armed for one connect only. Disabled before BEGIN (phase SETUP/PATH_REQUESTED),
+ * since a reconnect there already resends the map automatically.
+ */
+@Composable
+private fun ResyncOnReconnectControl(phase: Task1Phase, armed: Boolean, onArm: () -> Unit, onCancel: () -> Unit) {
+    val eligible = phase !in setOf(Task1Phase.SETUP, Task1Phase.PATH_REQUESTED)
+    Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+        if (armed) {
+            Button(onClick = onCancel, modifier = Modifier.fillMaxWidth()) {
+                Text("Map resync armed for next connect — tap to cancel")
+            }
+        } else {
+            OutlinedButton(onClick = onArm, enabled = eligible, modifier = Modifier.fillMaxWidth()) {
+                Text("Resend map on next reconnect")
+            }
+        }
+        Text(
+            "Sends CLEAR + every obstacle to the RPi the next time it (re)connects — one time only. " +
+                "Use after BEGIN only if the RPi's map is known to be out of sync; it can disrupt an active mission.",
+            style = MaterialTheme.typography.bodySmall,
+        )
     }
 }
 

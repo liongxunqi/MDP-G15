@@ -34,4 +34,8 @@ data class ArenaUiState(
     val plannerInfo: String = DEFAULT_PLANNER_INFO,
     val task1Phase: Task1Phase = Task1Phase.SETUP,
     val obstacleSyncStatus: String = "Map offline — edits saved locally",
+    /** One-shot: the operator has explicitly asked the next reconnect to resend CLEAR + the
+     *  full obstacle list, overriding the normal post-BEGIN suppression. See
+     *  [ArenaViewModel.armMapResyncOnReconnect]. */
+    val forceMapResyncOnReconnect: Boolean = false,
 )

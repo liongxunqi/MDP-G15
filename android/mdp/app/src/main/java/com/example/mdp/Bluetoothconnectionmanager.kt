@@ -218,10 +218,10 @@ class BluetoothConnectionManager(
      * loops back would be dropped rather than mistaken for a real message).
      */
     private suspend fun heartbeatLoop() {
-        while (currentCoroutineContext().isActive) {
-            delay(HEARTBEAT_INTERVAL_MS)
-            outgoing.submit("")   // writeLoop appends the delimiter -> just "\n"
-        }
+        // while (currentCoroutineContext().isActive) {
+        //     delay(HEARTBEAT_INTERVAL_MS)
+        //     outgoing.submit("")   // writeLoop appends the delimiter -> just "\n"
+        // }
     }
 
     /** Read bytes, accumulate, and emit each complete delimiter-terminated message. */

@@ -216,9 +216,33 @@ class ArenaViewModel(
         this.connected = connected
         persist(transmitMap = false)
         if (!useRpiMapSync) return
-        obstacleSync.connectionChanged(connected, transmit = !_uiState.value.autonomousRunning &&
-            _uiState.value.task1Phase in setOf(Task1Phase.SETUP, Task1Phase.PATH_REQUESTED))
+        val forcedResync = _uiState.value.forceMapResyncOnReconnect
+        obstacleSync.connectionChanged(connected, transmit = forcedResync || (!_uiState.value.autonomousRunning &&
+            _uiState.value.task1Phase in setOf(Task1Phase.SETUP, Task1Phase.PATH_REQUESTED)))
+        // Consumed by the connect it was armed for — left set, it would silently wipe the RPi's
+        // obstacle list again on some later, unrelated reconnect.
+        if (connected && forcedResync) {
+            _uiState.value = _uiState.value.copy(forceMapResyncOnReconnect = false)
+        }
         updateSyncStatus()
+    }
+
+    /**
+     * Operator override for [connectionChanged]'s normal post-BEGIN suppression: arms the NEXT
+     * Bluetooth connect to resend CLEAR + the full obstacle list regardless of mission phase.
+     * One-shot — consumed and cleared by that connect, not left permanently on. Meant for a
+     * deliberate recovery action (the operator knows the RPi's map is out of sync and the
+     * mission can tolerate a replan), not routine use.
+     */
+    fun armMapResyncOnReconnect() {
+        _uiState.value = _uiState.value.copy(forceMapResyncOnReconnect = true)
+        setFeedback("Map will resend (CLEAR + obstacles) on the next Bluetooth connect.", false)
+    }
+
+    fun cancelMapResyncOnReconnect() {
+        if (!_uiState.value.forceMapResyncOnReconnect) return
+        _uiState.value = _uiState.value.copy(forceMapResyncOnReconnect = false)
+        setFeedback("Map resync on reconnect cancelled.", false)
     }
 
     private fun updateSyncStatus() {
