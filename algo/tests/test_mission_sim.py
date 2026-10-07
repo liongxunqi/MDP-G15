@@ -56,6 +56,8 @@ AIM_LATERAL_TOL_MM = 50.0     # camera centre must be over the 10 cm face
 SONAR_HALF_ANGLE_DEG = 10.0   # HC-SR04-style beam, conservatively narrow
 GRAZE_MM = 20.0
 
+NO_ROOM_REASONS = {"no photo spot", "photo spot beyond the RPi arena limit"}
+
 FIXED_LAYOUTS = {
     # The usual 5-obstacle MDP sample shape: spread out, mixed faces.
     "sample-5": [
@@ -296,9 +298,11 @@ def report(name, r):
     flags += r["aim"]
     too_far = r["overhang"] > grid_search.ARENA_OVERHANG_MM + 1
     clean = not r["collisions"] and not r["aim"] and not too_far
-    no_room = set(r["skipped"].values()) == {"no photo spot"}
+    no_room = bool(r["skipped"]) and set(r["skipped"].values()) <= NO_ROOM_REASONS
     # PART: everything planned is clean; the skips are obstacles with no room
-    # in front of the image for a 28-45 cm photo, which no route can fix.
+    # in front of the image for a 28-45 cm photo, which no route can fix - either
+    # no clear spot at all, or one that is only reachable by taking the robot
+    # past where the RPi stops the mission (position outside the arena).
     status = "OK  " if clean and r["complete"] else "PART" if clean and no_room else "FAIL"
     print(f"{status} {name:<18} photos {r['photos']:<5} lines {r['lines']:<3} "
           f"{r['time']:5.1f}s  {'; '.join(flags)}")
