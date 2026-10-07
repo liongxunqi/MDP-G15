@@ -13,7 +13,13 @@ REV_COST_MULT = 1.15
 # Each turn costs this much on top of its arc length: a turn eats floor, takes
 # longer than a straight, and is where odometry error comes from.
 TURN_PENALTY_MM = 100.0
-MAX_EXPANSIONS = 30_000
+# A search that has not found the goal by now is not going to: across 168
+# successful leg searches on 7 layouts the most any used was 2,622 expansions
+# (median 332), while a failing one burns the whole cap. 30,000 cost ~0.35 s per
+# dead end, and a plan with many dead ends (obstacles hugging a wall, with the
+# RPi's arena limit in force) spent its whole 20 s budget on them. 8,000 is 3x
+# the largest success seen.
+MAX_EXPANSIONS = 8_000
 # States closer than this (and on the same heading) count as the same place.
 # Without it, arcs land on fresh sub-millimetre coordinates every time and the
 # search re-explores the same floor over and over.
@@ -32,6 +38,18 @@ _HEADINGS = (0.0, math.pi / 2, math.pi, -math.pi / 2)  # E, N, W, S
 
 class NoPathFound(Exception):
     pass
+
+
+class Boxes(list):
+    """Obstacle boxes, optionally carrying ref_bounds = (lo_x, hi_x, lo_y, hi_y):
+    the robot's REFERENCE POINT (its centre) must stay inside, whatever the heading.
+    It rides on the boxes object so the search functions need no extra argument.
+    The planner uses it to keep the position the RPi will compute from ?WPOSE
+    inside the arena, where it halts the mission (stm/PROTOCOL.md 12). Blocking
+    BODIES with boxes only approximates that: the body's bounding half-extent
+    runs from 94 mm to 148 mm with heading, so a box tight for one heading is
+    wrong for another."""
+    ref_bounds = None
 
 
 @dataclass(frozen=True)
@@ -90,6 +108,9 @@ def _point_blocked(x, y, theta, boxes, arena_mm, half_length_mm, half_width_mm) 
     lo_x, hi_x = half_extent_x - ARENA_OVERHANG_MM, arena_mm - half_extent_x + ARENA_OVERHANG_MM
     lo_y, hi_y = half_extent_y - ARENA_OVERHANG_MM, arena_mm - half_extent_y + ARENA_OVERHANG_MM
     if not (lo_x <= x <= hi_x and lo_y <= y <= hi_y):
+        return True
+    rb = getattr(boxes, "ref_bounds", None)
+    if rb is not None and not (rb[0] <= x <= rb[1] and rb[2] <= y <= rb[3]):
         return True
     for box in boxes:
         if _rect_hits_box(x, y, theta, half_length_mm, half_width_mm, half_extent_x, half_extent_y, box):
