@@ -351,7 +351,7 @@ class RadiusStepTests(unittest.TestCase):
 class StopSummaryTests(unittest.TestCase):
     def test_worst_and_per_direction(self):
         out = calibrate.summarise_stops([("FR90", 0.3), ("RR90", -0.2),
-                                        ("FR90", 0.5), ("FL90", -0.1)])
+                                         ("FR90", 0.5), ("FL90", -0.1)])
         self.assertEqual(out["worst_deg"], 0.5)
         self.assertEqual(out["by_direction"]["FR"], 0.4)
 

@@ -52,3 +52,4 @@ venv/
 
 # Per-run logs written by run_log.py
 rpi/mdp_rpi/logs/
+rpi/mdp_rpi/cal_profiles/
