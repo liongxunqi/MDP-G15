@@ -5,6 +5,18 @@ ultrasonic reading the chosen standoff. Each leg drives onto the straight
 approach line in front of that pose, then FU<n> closes the rest. Legs avoid
 EVERY obstacle, including the one being approached, and the next leg starts
 from where the photo was taken.
+
+The RPi sends every token of a segment to the STM as its own line, reads
+?WPOSE after each OK, and (per PROTOCOL.md 12) STOPS the mission if that
+position is outside the arena. Two things follow, both handled here:
+
+  * the planner's reference point must stay where the RPi will not halt, in the
+    RPi's frame (see RPI_* below) - not just where the body fits; and
+  * the first leg may not leave the arena near the start corner, and may never
+    begin with a reverse (see _start_boxes).
+
+PATH also carries "expected": the pose the RPi should report after every
+instruction, in the RPi's frame, so the PC can compare it with PROGRESS.
 """
 
 import itertools
@@ -81,6 +93,39 @@ START_X_MM = float(os.getenv("START_X_MM", ROBOT_HALF_WIDTH_MM + START_GAP_MM))
 START_Y_MM = float(os.getenv("START_Y_MM", ROBOT_HALF_LENGTH_MM + START_GAP_MM))
 START_THETA = math.pi / 2
 
+# ── The frame the RPi reports positions in ───────────────────────────────────
+# After each instruction the RPi reads ?WPOSE, anchors it so the robot's
+# rear-axle reference started at (RPI_ANCHOR_X_MM, RPI_ANCHOR_Y_MM) facing N,
+# and STOPS the mission if the result is outside the arena (rpi/mdp_rpi/README
+# "Task 1 PC Feedback Contract", stm/PROTOCOL.md 12). Displacements are the same
+# in both frames, so  rpi_position = planner_position + (anchor - planner_start).
+# The planner's arcs use the axle-referenced radius, so its reference point IS
+# what the RPi tracks. If the RPi is changed to anchor at the planner's real
+# start, set RPI_ANCHOR_X_MM / RPI_ANCHOR_Y_MM to START_X_MM / START_Y_MM.
+RPI_ANCHOR_X_MM = float(os.getenv("RPI_ANCHOR_X_MM", "200"))
+RPI_ANCHOR_Y_MM = float(os.getenv("RPI_ANCHOR_Y_MM", "200"))
+# Keep the reference point this far INSIDE the RPi's arena check: dead reckoning
+# drifts, and the check is a hard stop. Set RPI_ARENA_GUARD=0 only if the RPi no
+# longer halts on out-of-arena positions.
+RPI_ARENA_GUARD = os.getenv("RPI_ARENA_GUARD", "1").strip().lower() not in ("0", "false", "no")
+RPI_ARENA_MARGIN_MM = float(os.getenv("RPI_ARENA_MARGIN_MM", "50"))
+
+# The leg that leaves START may not put the body outside the arena within this
+# distance of the start, and may never reverse out of the start pose.
+START_GUARD_MM = float(os.getenv("START_GUARD_MM", "700"))
+# ...but a body 10 mm from the line still sweeps a few mm across it in a normal
+# forward-right arc (6.8 mm at FR90), and a person places it to a few mm. Allow
+# that much; a forward-left arc from the corner (302 mm out) stays forbidden.
+START_GUARD_TOL_MM = float(os.getenv("START_GUARD_TOL_MM", "25"))
+# When NO clean way out of the start exists (obstacles close by, robot against two
+# lines), a leg that reverses or leaves the arena is used rather than returning
+# an empty plan - but only if nothing clean exists for that obstacle, and it is
+# charged this much so any clean alternative wins the tour.
+START_RELAXED_PENALTY_MM = float(os.getenv("START_RELAXED_PENALTY_MM", "2500"))
+_REAR_BLOCK_DEPTH_MM = 600.0     # how far behind the start pose the "no reverse" block reaches
+_REAR_BLOCK_WIDTH_MM = 150.0     # ... and how far it extends past each side of the body
+_BIG_MM = 10_000.0
+
 _STRAIGHT_RE = re.compile(r"^([FR])(\d+)$")
 
 
@@ -130,6 +175,62 @@ def _obstacle_aabb_mm(obstacle: dict) -> Tuple[float, float, float, float]:
     y0 = obstacle["y"] * 100.0 - COLLISION_MARGIN_MM
     size = OBSTACLE_SIZE_MM + 2 * COLLISION_MARGIN_MM
     return (x0, y0, x0 + size, y0 + size)
+
+
+def _frame_shift(start: "Pose") -> Tuple[float, float]:
+    """Add this to a planner-frame position to get the RPi-frame position."""
+    return RPI_ANCHOR_X_MM - start.x, RPI_ANCHOR_Y_MM - start.y
+
+
+def _rpi_ref_bounds(start: "Pose") -> Tuple[float, float, float, float]:
+    """(lo_x, hi_x, lo_y, hi_y) in the PLANNER's frame that keeps the reference
+    point inside the arena as the RPi sees it, RPI_ARENA_MARGIN_MM in from each
+    edge. Applied exactly, at every heading, via grid_search.Boxes.ref_bounds."""
+    sx, sy = _frame_shift(start)
+    m = RPI_ARENA_MARGIN_MM
+    return (m - sx, ARENA_MM - m - sx, m - sy, ARENA_MM - m - sy)
+
+
+def _start_boxes(start: "Pose") -> List[Tuple[float, float, float, float]]:
+    """Extra blockers for the leg that leaves START, and only that leg.
+
+    1. Outside the arena, within START_GUARD_MM of the start: the body must stay
+       on the real floor while leaving the corner. The planner otherwise lets it
+       hang up to ARENA_OVERHANG_MM past an edge (for obstacles near far walls),
+       and from a start 10 mm off the line that meant reversing straight out of
+       the arena.
+    2. A block directly behind the start pose: the robot cannot reverse out of
+       where it was placed, so the first instruction is never a reverse (and
+       neither is anything that drives back through the start line).
+
+    START_THETA is cardinal; "behind" is taken along the nearest cardinal."""
+    g, tol = START_GUARD_MM, START_GUARD_TOL_MM
+    boxes = []
+    if start.y < g:
+        boxes.append((start.x - g, -_BIG_MM, start.x + g, -tol))
+    if start.y > ARENA_MM - g:
+        boxes.append((start.x - g, ARENA_MM + tol, start.x + g, _BIG_MM))
+    if start.x < g:
+        boxes.append((-_BIG_MM, start.y - g, -tol, start.y + g))
+    if start.x > ARENA_MM - g:
+        boxes.append((ARENA_MM + tol, start.y - g, _BIG_MM, start.y + g))
+
+    w = _REAR_BLOCK_WIDTH_MM
+    face = _nearest_cardinal(start.theta)
+    hl, hw = ROBOT_HALF_LENGTH_MM, ROBOT_HALF_WIDTH_MM
+    if face == "N":
+        r = start.y - hl
+        boxes.append((start.x - hw - w, r - _REAR_BLOCK_DEPTH_MM, start.x + hw + w, r))
+    elif face == "S":
+        r = start.y + hl
+        boxes.append((start.x - hw - w, r, start.x + hw + w, r + _REAR_BLOCK_DEPTH_MM))
+    elif face == "E":
+        r = start.x - hl
+        boxes.append((r - _REAR_BLOCK_DEPTH_MM, start.y - hw - w, r, start.y + hw + w))
+    else:
+        r = start.x + hl
+        boxes.append((r, start.y - hw - w, r + _REAR_BLOCK_DEPTH_MM, start.y + hw + w))
+    return boxes
 
 
 def _pose_clear(x, y, theta, boxes) -> bool:
@@ -329,11 +430,28 @@ class _Legs:
     """Every leg searched so far, keyed by which standoff each end uses, so
     switching an obstacle's standoff back and forth never searches twice."""
 
-    def __init__(self, start, options, radius_mm, boxes, deadline):
+    def __init__(self, start, options, radius_mm, boxes, deadline, start_boxes=None):
         self.start, self.options = start, options
         self.radius_mm, self.boxes = radius_mm, boxes
+        # Legs that begin at START are searched against these instead.
+        self.start_boxes = start_boxes if start_boxes is not None else boxes
         self.deadline = deadline
         self.legs = {}
+        self.relaxed = set()     # keys of START legs that had to ignore the start rules
+
+    def _search(self, from_id, choice, to_id, key):
+        from_pose = self._from_pose(from_id, choice)
+        option = self.options[to_id][choice[to_id]]
+        if from_id != "START":
+            return _search_leg(from_pose, option, self.radius_mm, self.boxes)
+        leg = _search_leg(from_pose, option, self.radius_mm, self.start_boxes)
+        if leg is None and self.start_boxes is not self.boxes:
+            leg = _search_leg(from_pose, option, self.radius_mm, self.boxes)
+            if leg is not None:
+                tokens, poses, cost = leg
+                leg = (tokens, poses, cost + START_RELAXED_PENALTY_MM)
+                self.relaxed.add(key)
+        return leg
 
     def _from_pose(self, from_id, choice):
         if from_id == "START":
@@ -356,10 +474,7 @@ class _Legs:
                     cache[(from_id, to_id)] = None
                     continue
                 if key not in self.legs:
-                    self.legs[key] = _search_leg(
-                        self._from_pose(from_id, choice),
-                        self.options[to_id][choice[to_id]], self.radius_mm, self.boxes,
-                    )
+                    self.legs[key] = self._search(from_id, choice, to_id, key)
                 cache[(from_id, to_id)] = self.legs[key]
         return cache
 
@@ -392,16 +507,28 @@ def _pose_to_dir_entry(pose: Pose) -> dict:
     return {"x": int(gx), "y": int(gy), "dir": _nearest_cardinal(pose.theta)}
 
 
+# An obstacle with no way in from ANY source at this many consecutive standoffs is
+# written off. The standoffs differ by centimetres, so the approach line is in
+# the same place at the next one: it is a dead end, not a near miss. Without
+# this, every dead end was retried at all 8 standoffs, each retry re-searching a
+# whole matrix of legs - 20 s of planning spent on obstacles that cannot be shot.
+# (Obstacles that ARE reachable keep every standoff.)
+MAX_DEAD_OPTION_TRIES = 3
+
+
 def _choose_tour(visitable, legs: _Legs, options):
     """Visit order + standoff per obstacle. Starts every obstacle at its most
     preferred standoff; while the tour misses some, moves those (and the dead
     end that cut the tour short) to their next standoff, keeping the best."""
     deadline = legs.deadline
     choice = {o["id"]: 0 for o in visitable}
+    dead_tries = {o["id"]: 0 for o in visitable}   # standoffs tried with no way in
     best = None
     while True:
         cache = legs.view(visitable, choice)
         ok, unreachable = _reachable(visitable, cache)
+        for o in unreachable:
+            dead_tries[o["id"]] += 1
         order = _visit_order(ok, cache, quiet=True) + unreachable
         reached, cost = _prefix_score(order, cache)
         if best is None or (reached, -cost) > (best[0], -best[1]):
@@ -412,7 +539,10 @@ def _choose_tour(visitable, legs: _Legs, options):
             logging.warning(f"Planning budget of {PLAN_TIME_BUDGET_S:.0f}s used — "
                             "sending the best plan so far.")
             break
-        retry = order[reached:] + (order[reached - 1:reached] if reached else [])
+        movers = [o for o in order[reached:] if dead_tries[o["id"]] < MAX_DEAD_OPTION_TRIES]
+        if not movers:
+            break       # everything cut off is a dead end at every standoff tried
+        retry = movers + (order[reached - 1:reached] if reached else [])
         changed = False
         for obs in retry:
             if choice[obs["id"]] + 1 < len(options[obs["id"]]):
@@ -440,7 +570,22 @@ def plan_mission(obstacles: List[dict], arc_profile: int = PROFILE_TIGHT,
     start = Pose(START_X_MM, START_Y_MM, START_THETA)
     # Every obstacle, the one being approached included: even the closest
     # photo pose (28 cm) is far outside its margin, so nothing needs excluding.
-    boxes = [_obstacle_aabb_mm(o) for o in obstacles]
+    obstacle_boxes = [_obstacle_aabb_mm(o) for o in obstacles]
+    boxes = grid_search.Boxes(obstacle_boxes)
+    if RPI_ARENA_GUARD:
+        boxes.ref_bounds = _rpi_ref_bounds(start)
+
+    # Extra blockers for the leg leaving START. If the start pose already breaks
+    # them (START_X_MM / START_Y_MM set so the body is over the line) they would
+    # trap the search at its first step, so drop them and say so.
+    start_boxes = grid_search.Boxes(list(boxes) + _start_boxes(start))
+    start_boxes.ref_bounds = boxes.ref_bounds
+    if not _pose_clear(start.x, start.y, start.theta, start_boxes):
+        logging.warning(
+            "Start pose is already outside the arena or over the start guard "
+            f"({start}); not restricting the first leg. Check START_X_MM / START_Y_MM."
+        )
+        start_boxes = boxes
 
     options: Dict[object, List[PhotoOption]] = {}
     visitable = []
@@ -451,24 +596,38 @@ def plan_mission(obstacles: List[dict], arc_profile: int = PROFILE_TIGHT,
             continue
         opts = _photo_options(obs, boxes, obstacles)
         if not opts:
-            logging.error(
-                f"Obstacle {obs['id']}: no clear photo spot at "
-                f"{min(STANDOFF_CANDIDATES_CM)}-{max(STANDOFF_CANDIDATES_CM)} cm — skipping."
-            )
-            skipped[obs["id"]] = "no photo spot"
+            if boxes.ref_bounds is not None and _photo_options(obs, obstacle_boxes, obstacles):
+                logging.error(
+                    f"Obstacle {obs['id']}: its photo spot is only reachable by taking the robot "
+                    f"past the point where the RPi stops the mission (position outside the "
+                    f"arena, PROTOCOL.md 12) — skipping. RPI_ARENA_GUARD=0 allows it, at the "
+                    f"risk of that stop."
+                )
+                skipped[obs["id"]] = "photo spot beyond the RPi arena limit"
+            else:
+                logging.error(
+                    f"Obstacle {obs['id']}: no clear photo spot at "
+                    f"{min(STANDOFF_CANDIDATES_CM)}-{max(STANDOFF_CANDIDATES_CM)} cm — skipping."
+                )
+                skipped[obs["id"]] = "no photo spot"
             continue
         options[obs["id"]] = opts
         visitable.append(obs)
 
-    legs = _Legs(start, options, radius_mm, boxes, t0 + PLAN_TIME_BUDGET_S)
+    legs = _Legs(start, options, radius_mm, boxes, t0 + PLAN_TIME_BUDGET_S, start_boxes)
     order, choice, cache = _choose_tour(visitable, legs, options)
 
     segments: List[List[str]] = []
     segment_obstacles: List[Optional[str]] = []
     dirs: List[dict] = []
+    # expected[i][j] = [x_mm, y_mm, heading_deg] the RPi should report after
+    # instruction j of segment i: its frame (north = 0, clockwise positive).
+    expected: List[List[List[float]]] = []
+    shift_x, shift_y = _frame_shift(start)
     photo_poses, standoffs = {}, {}
 
     cur_id = "START"
+    start_relaxed = False
     for obs in order:
         option = options[obs["id"]][choice[obs["id"]]]
         leg = cache.get((cur_id, obs["id"]))
@@ -478,6 +637,17 @@ def plan_mission(obstacles: List[dict], arc_profile: int = PROFILE_TIGHT,
             continue
 
         search_tokens, search_poses, _ = leg
+        if cur_id == "START" and ("START", None, obs["id"], choice[obs["id"]]) in legs.relaxed:
+            start_relaxed = True
+            gap = min(start.x - ROBOT_HALF_WIDTH_MM, start.y - ROBOT_HALF_LENGTH_MM)
+            logging.warning(
+                f"First leg (to obstacle {obs['id']}) could not leave the start cleanly: with the "
+                f"robot {gap:.0f} mm from the nearest line, obstacles close to the start leave no "
+                f"route that stays on the floor without reversing. "
+                f"It starts with {search_tokens[0] if search_tokens else '?'} and may put the body "
+                f"over the line. Place the robot further into the zone (START_GAP_MM / "
+                f"START_X_MM / START_Y_MM) to avoid this."
+            )
         tokens, poses = _merge_straights(list(search_tokens), list(search_poses[1:]))
 
         final = option.pose
@@ -514,6 +684,11 @@ def plan_mission(obstacles: List[dict], arc_profile: int = PROFILE_TIGHT,
         lines = chunk_tokens(tokens)
         for i, line in enumerate(lines):
             segments.append(line)
+            expected.append([
+                [round(q.x + shift_x, 1), round(q.y + shift_y, 1),
+                 round((90.0 - math.degrees(q.theta)) % 360.0, 1)]
+                for q in poses[line_start:line_start + len(line)]
+            ])
             line_start += len(line)
             dirs.append(_pose_to_dir_entry(poses[line_start - 1]))
             segment_obstacles.append(str(obs["id"]) if i == len(lines) - 1 else None)
@@ -528,6 +703,8 @@ def plan_mission(obstacles: List[dict], arc_profile: int = PROFILE_TIGHT,
         details["photo_poses"] = photo_poses
         details["standoff_cm"] = standoffs
         details["skipped"] = skipped
+        details["frame_shift_mm"] = (shift_x, shift_y)
+        details["start_relaxed"] = start_relaxed
 
     return {
         "segments": segments,
@@ -535,4 +712,8 @@ def plan_mission(obstacles: List[dict], arc_profile: int = PROFILE_TIGHT,
         "segment_obstacles": segment_obstacles,
         "dirs": dirs,
         "start": _pose_to_dir_entry(start),
+        # The two keys below are extra: the RPi reads only the keys it knows.
+        "start_mm": {"x": round(start.x, 1), "y": round(start.y, 1),
+                     "heading": _nearest_cardinal(start.theta)},
+        "expected": expected,
     }
