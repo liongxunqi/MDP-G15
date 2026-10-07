@@ -1,3 +1,4 @@
+import logging
 from pathlib import Path
 
 import cv2
@@ -11,19 +12,8 @@ RUNS_DIR.mkdir(parents=True, exist_ok=True)
 
 model = YOLO(str(MODEL_PATH))
 
-INFERENCE_SIZE = 960
+INFERENCE_SIZE = 640
 YOLO_CONF = 0.25
-
-
-def centre_crop(image):
-    """Keep the central region where the robot-facing target should appear."""
-    height, width = image.shape[:2]
-    crop_width = int(width * 0.70)
-    crop_height = int(height * 0.80)
-    x1 = (width - crop_width) // 2
-    y1 = (height - crop_height) // 2
-    return image[y1:y1 + crop_height, x1:x1 + crop_width]
-
 
 def detect(image_path):
     """
@@ -35,12 +25,11 @@ def detect(image_path):
     """
     image = cv2.imread(str(image_path))
     if image is None:
-        print(f"Could not read image: {image_path}")
+        logging.error("Detector could not read image: %s", image_path)
         return None, None
 
-    cropped = centre_crop(image)
     results = model.predict(
-        source=cropped,
+        source=image,
         imgsz=INFERENCE_SIZE,
         conf=YOLO_CONF,
         save=False,
@@ -49,18 +38,15 @@ def detect(image_path):
 
     result = results[0]
     boxes = result.boxes
-    annotated_image = cropped.copy()
+    annotated_image = image.copy()
 
     if boxes is None or len(boxes) == 0:
         output_path = RUNS_DIR / Path(image_path).name
         saved = cv2.imwrite(str(output_path), annotated_image)
-        print("\n──── Detection Result ────")
-        print("No detection")
         if saved:
-            print(f"Saved: {output_path}")
+            logging.warning("Detector found no target; saved frame to %s", output_path)
         else:
-            print(f"Could not save: {output_path}")
-        print("──────────────────────────\n")
+            logging.error("Detector found no target and could not save %s", output_path)
         return None, None
 
     confidences = boxes.conf.cpu().numpy()
@@ -85,17 +71,26 @@ def detect(image_path):
 
     output_path = RUNS_DIR / Path(image_path).name
     saved = cv2.imwrite(str(output_path), annotated_image)
-
-    print("\n──── Detection Result ────")
-    print(f"Class: {class_name}")
-    print(f"Confidence: {confidence:.3f}")
-    print(f"Saved: {output_path}" if saved else f"Could not save: {output_path}")
-    print("──────────────────────────\n")
+    if saved:
+        logging.info(
+            "Detector found '%s' (confidence %.3f); saved annotation to %s",
+            class_name,
+            confidence,
+            output_path,
+        )
+    else:
+        logging.error(
+            "Detector found '%s' (confidence %.3f) but could not save %s",
+            class_name,
+            confidence,
+            output_path,
+        )
 
     return class_name, confidence
 
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s — %(message)s")
     test_image = input("Enter path to test image: ")
     class_name, confidence = detect(test_image)
     if class_name is None:
