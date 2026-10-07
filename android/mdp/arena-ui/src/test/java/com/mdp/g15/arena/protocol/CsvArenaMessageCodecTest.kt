@@ -29,8 +29,8 @@ class CsvArenaMessageCodecTest {
             "STATUS", "STATUS,", "STATUS,Exploring", "STATUS,DONE,extra", "STATUS,FAILED,1",
             "STATUS,RUNNING,3", "STATUS,RUNNING,3,12,4", "STATUS,RUNNING,-1,12",
             "STATUS,RUNNING,+3,12", "STATUS,RUNNING,3.0,12", "STATUS,RUNNING,a,12",
-            "STATUS,START,1,2", "STATUS,START,1,2,X", "STATUS,START,1,2,n",
-            "STATUS,START,1,2,NORTH", "STATUS,START,-1,2,N", "STATUS,START,1,2,N,extra",
+            "STATUS,START,1,2", "STATUS,START,1,2,X", "STATUS,START,NaN,2,N",
+            "STATUS,START,1,2,Infinity", "STATUS,START,1,2,N,extra",
             "STATUS,done", "STATUS,CONNECTED  TO RPI", "STATUS, DONE",
         ).forEach {
             assertEquals(it, ArenaDecodeResult.Malformed("Malformed status received"), codec.decode(it))

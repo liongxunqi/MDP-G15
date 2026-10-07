@@ -11,10 +11,12 @@ or manual movement commands.
 - Coordinates use a bottom-left origin: `x` increases left-to-right and `y` increases
   bottom-to-top.
 - An obstacle occupies one cell and keeps a stable positive ID for the arena session.
-- The robot occupies 2×2 cells anchored at its bottom-left coordinate. Placement,
-  dragging and received poses enforce this footprint's bounds and obstacle collisions.
-  Display-only interpolation smooths clear straight segments and turns; it does not
-  predict movement or issue commands.
+- The robot has a 2.0 × 2.1-cell rotated footprint with decimal bottom-left
+  reference coordinates and a north-zero clockwise heading in degrees. Operator
+  dragging snaps the reference to integer coordinates and rejects collisions.
+  Received poses are shown even when off-map/overlapping, with a warning. Later
+  reports animate to their received endpoint; only D-pad commands create an
+  explicitly estimated preview. Animation does not acknowledge a command.
 
 ## Messages
 
@@ -25,7 +27,8 @@ STATUS,<text>
 MSG,<text>
 TARGET,<obstacleId>,<targetId>
 TARGET,<obstacleId>,<targetId>,<N|E|S|W>
-ROBOT,<x>,<y>,<N|E|S|W>
+ROBOT,<decimal-x>,<decimal-y>,<degrees|N|E|S|W>
+STATUS,START,<decimal-x>,<decimal-y>,<degrees|N|E|S|W>
 ```
 
 Target messages also accept the briefing's `B`-prefixed obstacle labels (e.g. `B2`).

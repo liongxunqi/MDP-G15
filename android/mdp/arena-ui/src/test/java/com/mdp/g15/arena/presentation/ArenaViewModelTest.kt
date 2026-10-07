@@ -105,7 +105,7 @@ class ArenaViewModelTest {
             var sends = 0
             for (command in ManualCommand.entries) viewModel.drive(command) { sends++ }
             assertEquals(0, sends)
-            viewModel.accept("ROBOT,99,99,N")
+            viewModel.accept("ROBOT,NaN,99,N")
             advanceUntilIdle()
             assertTrue(ManualCommand.entries.none(viewModel::manualAllowed))
             viewModel.accept("ROBOT,2,2,N")
@@ -129,7 +129,7 @@ class ArenaViewModelTest {
             advanceUntilIdle()
             viewModel.drive(ManualCommand.RIGHT) {}
             val moving = viewModel.uiState.value
-            viewModel.accept("ROBOT,20,19,N\nSTATUS,START,99,99,N\nSTATUS,FAILED,extra")
+            viewModel.accept("ROBOT,NaN,19,N\nSTATUS,START,NaN,99,N\nSTATUS,FAILED,extra")
             runCurrent()
             assertEquals(moving.arena.robot, viewModel.uiState.value.arena.robot)
             assertEquals(moving.manualStatus, viewModel.uiState.value.manualStatus)
@@ -144,7 +144,7 @@ class ArenaViewModelTest {
         for (amd in listOf(false, true)) {
             viewModel.setAmdToolMode(amd)
             viewModel.connectionChanged(true)
-            viewModel.accept("ROBOT,99,99,N")
+            viewModel.accept("ROBOT,NaN,99,N")
             advanceUntilIdle()
             assertTrue(ManualCommand.entries.none(viewModel::manualAllowed))
             assertEquals(null, viewModel.uiState.value.arena.robot)
@@ -152,7 +152,7 @@ class ArenaViewModelTest {
             advanceUntilIdle()
             viewModel.drive(ManualCommand.RIGHT) { error("transport failed") }
             assertTrue(ManualCommand.entries.none(viewModel::manualAllowed))
-            viewModel.accept("ROBOT,99,99,N\nSTATUS,OK")
+            viewModel.accept("ROBOT,NaN,99,N\nSTATUS,OK")
             advanceUntilIdle()
             assertTrue(ManualCommand.entries.none(viewModel::manualAllowed))
             viewModel.connectionChanged(false)
@@ -243,7 +243,7 @@ class ArenaViewModelTest {
             viewModel.drive(ManualCommand.FORWARD) { sends++ }
             advanceUntilIdle()
             assertEquals(2, sends)
-            assertEquals(GridCoordinate(8,10), viewModel.uiState.value.arena.robot!!.position)
+            assertEquals(GridCoordinate(8, if (amd) 10 else 12), viewModel.uiState.value.arena.robot!!.position)
         }
     }
 
@@ -256,10 +256,10 @@ class ArenaViewModelTest {
             viewModel.addObstacle(GridCoordinate(12,12))
             val before = viewModel.uiState.value
             val allowed = ManualCommand.entries.map(viewModel::manualAllowed)
-            for (bad in listOf("ROBOT,8,9", "ROBOT,20,19,N", "ROBOT,-1,8,N",
-                "ROBOT,8,8,X", "ROBOT,8,8,N,extra", "ROBOT,2147483648,8,N",
-                "STATUS,START,20,19,N",
-                "STATUS,START,999999999999999999999,8,N", "STATUS,START,8,8,X",
+            for (bad in listOf("ROBOT,8,9", "ROBOT,NaN,19,N", "ROBOT,Infinity,8,N",
+                "ROBOT,8,8,X", "ROBOT,8,8,N,extra", "ROBOT,1e400,8,N",
+                "STATUS,START,NaN,19,N",
+                "STATUS,START,Infinity,8,N", "STATUS,START,8,8,X",
                 "STATUS,OK,extra", "STATUS", "MSG,[]")) {
                 viewModel.accept(bad)
                 advanceUntilIdle()
@@ -278,7 +278,7 @@ class ArenaViewModelTest {
             viewModel.moveRobot(GridCoordinate(5,5))
             viewModel.drive(ManualCommand.FORWARD) {}
             advanceUntilIdle()
-            assertEquals(GridCoordinate(5,6), viewModel.uiState.value.arena.robot!!.position)
+            assertEquals(GridCoordinate(5, if (amd) 6 else 7), viewModel.uiState.value.arena.robot!!.position)
         }
     }
 
@@ -293,7 +293,7 @@ class ArenaViewModelTest {
         assertEquals(null, viewModel.uiState.value.arena.robot!!.estimate)
         advanceUntilIdle()
         viewModel.drive(ManualCommand.FORWARD) {}
-        assertEquals(11.0, viewModel.uiState.value.arena.robot!!.estimate!!.y, 0.0001)
+        assertEquals(12.0, viewModel.uiState.value.arena.robot!!.estimate!!.y, 0.0001)
     }
 
     @Test fun `manual and autonomous commands cannot interleave`() = runTest(dispatcher) {
@@ -347,14 +347,14 @@ class ArenaViewModelTest {
             var transmissions = 0
             repeat(100) { viewModel.drive(ManualCommand.FORWARD) { transmissions++ } }
             viewModel.resetArena()
-            assertEquals(GridCoordinate(8,18), viewModel.uiState.value.arena.robot!!.position)
+            assertEquals(null, viewModel.uiState.value.arena.robot)
             advanceUntilIdle()
             viewModel.drive(ManualCommand.FORWARD) { transmissions++ }
-            assertEquals(1, transmissions)
-            assertTrue(viewModel.manualAllowed(ManualCommand.REVERSE))
+            assertEquals(0, transmissions)
+            assertFalse(viewModel.manualAllowed(ManualCommand.REVERSE))
             viewModel.connectionChanged(false)
             viewModel.drive(ManualCommand.REVERSE) { transmissions++ }
-            assertEquals(1, transmissions)
+            assertEquals(0, transmissions)
         }
     }
 
@@ -489,7 +489,7 @@ class ArenaViewModelTest {
         advanceUntilIdle()
 
         assertEquals("CONNECTED TO RPI", viewModel.uiState.value.status)
-        assertEquals("Robot position updated to (7, 2), facing west.", viewModel.uiState.value.feedback)
+        assertEquals("Robot position updated to (7.0, 2.0), facing 270° · West.", viewModel.uiState.value.feedback)
         assertTrue(viewModel.uiState.value.placementMode)
         assertEquals(GridCoordinate(7, 2), viewModel.uiState.value.arena.robot?.position)
     }

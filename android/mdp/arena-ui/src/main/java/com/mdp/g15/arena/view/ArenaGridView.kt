@@ -24,7 +24,10 @@ import com.mdp.g15.arena.domain.ArenaState
 import com.mdp.g15.arena.domain.Direction
 import com.mdp.g15.arena.domain.GridCoordinate
 import com.mdp.g15.arena.domain.Obstacle
-import com.mdp.g15.arena.domain.footprint
+import com.mdp.g15.arena.domain.PoseSource
+import com.mdp.g15.arena.domain.RobotFootprint
+import com.mdp.g15.arena.domain.RobotPose
+import com.mdp.g15.arena.domain.readableHeading
 import kotlin.math.hypot
 import kotlin.math.min
 
@@ -104,9 +107,9 @@ class ArenaGridView @JvmOverloads constructor(
     private var draggingObstacleId: Int? = null
     private var robotPressed = false
     private var draggingRobot = false
-    /** Offset, in cells, of the pressed point from the robot's centre cell. */
-    private var robotGrabOffsetX = 0
-    private var robotGrabOffsetY = 0
+    /** Offset, in cells, of the pressed point from the robot's bottom-left reference. */
+    private var robotGrabOffsetX = 0.0
+    private var robotGrabOffsetY = 0.0
     private var longPressTriggered = false
     private var multiTouchOccurred = false
     private var tapMoved = false
@@ -135,8 +138,14 @@ class ArenaGridView @JvmOverloads constructor(
     }
 
     fun render(state: ArenaState, placementMode: Boolean) {
+        if ((robotPressed || draggingRobot) && this.state.reportRevision != state.reportRevision) {
+            handler.removeCallbacks(longPressRunnable)
+            clearGesture()
+            multiTouchOccurred = true // Consume the release without committing the old drag.
+        }
         if (draggingRobot || this.state.config != state.config || this.state.obstacles != state.obstacles ||
-            (this.state.robot?.estimate != null && state.robot?.estimate == null)) {
+            state.robot == null || (this.state.reportedRobot == null && state.reportedRobot != null) ||
+            this.state.robot?.source == PoseSource.OPERATOR) {
             robotMotion.snap(state.robot)
         } else if (this.state.robot != state.robot) {
             robotMotion.retarget(state, SystemClock.uptimeMillis())
@@ -190,13 +199,16 @@ class ArenaGridView @JvmOverloads constructor(
                 tapMoved = false
                 val coordinate = coordinateAtTouch(event.x, event.y)
                 val robot = state.robot
-                val robotHere = coordinate != null && robot != null &&
-                    coordinate in robot.position.footprint(state.config.robotFootprintCells)
+                val touchPoint = pointAtTouch(event.x, event.y)
+                val visual = robotMotion.sample(SystemClock.uptimeMillis())
+                val hitPose = visual?.let { RobotPose(it.x.toDouble(), it.y.toDouble(), it.angle.toDouble()) } ?: robot
+                val robotHere = touchPoint != null && hitPose != null &&
+                    RobotFootprint.contains(hitPose, state.config, touchPoint)
                 pressedObstacleId = if (placementMode || robotHere) null else coordinate?.let(::obstacleAt)?.id
                 robotPressed = robotHere && !placementMode
                 if (robotHere) {
-                    robotGrabOffsetX = coordinate!!.x - robot!!.position.x
-                    robotGrabOffsetY = coordinate.y - robot.position.y
+                    robotGrabOffsetX = touchPoint!!.x - hitPose!!.x
+                    robotGrabOffsetY = touchPoint.y - hitPose.y
                 }
                 if (pressedObstacleId != null || robotPressed) {
                     handler.postDelayed(longPressRunnable, ViewConfiguration.getLongPressTimeout().toLong())
@@ -248,10 +260,7 @@ class ArenaGridView @JvmOverloads constructor(
                         }
                     }
                     draggingRobot -> {
-                        val underFinger = coordinateAtTouch(event.x, event.y)
-                        val destination = underFinger?.let {
-                            GridCoordinate(it.x - robotGrabOffsetX, it.y - robotGrabOffsetY)
-                        }
+                        val destination = robotDropAt(event.x, event.y)
                         if (destination != null && ArenaReducer().canMoveRobot(state, destination)) {
                             interactionListener?.onMoveRobot(destination)
                         }
@@ -298,20 +307,13 @@ class ArenaGridView @JvmOverloads constructor(
     }
 
     private fun drawAnimatedRobot(canvas: Canvas) {
-        val robot = state.robot ?: return
+        state.robot ?: return
         val now = SystemClock.uptimeMillis()
         val visual = robotMotion.sample(now) ?: return
-        val bounds = geometry.footprintBounds(robot.position, state.config.robotFootprintCells)
         val checkpoint = canvas.save()
         canvas.clipRect(geometry.arenaLeft, geometry.arenaTop,
             geometry.arenaLeft + geometry.arenaWidth, geometry.arenaTop + geometry.arenaHeight)
-        clipRobotAroundObstacles(canvas)
-        canvas.translate(
-            (visual.x - robot.position.x) * geometry.cellSize,
-            -(visual.y - robot.position.y) * geometry.cellSize,
-        )
-        canvas.rotate(visual.angle - robot.direction.ordinal * 90f, bounds.centerX, bounds.centerY)
-        drawRobot(canvas, robot.position, robot.direction)
+        drawRobot(canvas, RobotPose(visual.x.toDouble(), visual.y.toDouble(), visual.angle.toDouble()))
         canvas.restoreToCount(checkpoint)
         if (robotMotion.isRunning(now)) postInvalidateOnAnimation()
     }
@@ -399,68 +401,28 @@ class ArenaGridView @JvmOverloads constructor(
         }
     }
 
-    /** [center] is the centre cell of the robot footprint. */
-    private fun drawRobot(canvas: Canvas, center: GridCoordinate, direction: Direction) {
-        val bounds = geometry.footprintBounds(center, state.config.robotFootprintCells)
-        val clip = canvas.save()
+    private fun drawRobot(canvas: Canvas, pose: RobotPose) {
+        val bounds = geometry.robotBounds(pose, state.config)
+        val checkpoint = canvas.save()
+        canvas.rotate(pose.heading.toFloat(), bounds.centerX, bounds.centerY)
+        val inset = geometry.cellSize * 0.08f
+        canvas.drawRoundRect(RectF(bounds.left + inset, bounds.top + inset,
+            bounds.right - inset, bounds.bottom - inset), inset, inset, robotPaint)
+        val nose = Path().apply {
+            moveTo(bounds.centerX, bounds.top + inset * 1.2f)
+            lineTo(bounds.centerX - geometry.cellSize * 0.3f, bounds.top + geometry.cellSize * 0.55f)
+            lineTo(bounds.centerX + geometry.cellSize * 0.3f, bounds.top + geometry.cellSize * 0.55f)
+            close()
+        }
+        canvas.drawPath(nose, robotDirectionPaint)
+        canvas.restoreToCount(checkpoint)
+    }
+
+    private fun drawRobotDragImage(canvas: Canvas, pose: RobotPose) {
+        val checkpoint = canvas.save()
         canvas.clipRect(geometry.arenaLeft, geometry.arenaTop,
             geometry.arenaLeft + geometry.arenaWidth, geometry.arenaTop + geometry.arenaHeight)
-        val radius = (bounds.right - bounds.left) * 0.38f
-        canvas.drawCircle(bounds.centerX, bounds.centerY, radius, robotPaint)
-
-        val nose = Path()
-        val halfBase = radius * 0.42f
-        when (direction) {
-            Direction.NORTH -> nose.apply {
-                moveTo(bounds.centerX, bounds.centerY - radius * 1.28f)
-                lineTo(bounds.centerX - halfBase, bounds.centerY - radius * 0.2f)
-                lineTo(bounds.centerX + halfBase, bounds.centerY - radius * 0.2f)
-            }
-            Direction.EAST -> nose.apply {
-                moveTo(bounds.centerX + radius * 1.28f, bounds.centerY)
-                lineTo(bounds.centerX + radius * 0.2f, bounds.centerY - halfBase)
-                lineTo(bounds.centerX + radius * 0.2f, bounds.centerY + halfBase)
-            }
-            Direction.SOUTH -> nose.apply {
-                moveTo(bounds.centerX, bounds.centerY + radius * 1.28f)
-                lineTo(bounds.centerX - halfBase, bounds.centerY + radius * 0.2f)
-                lineTo(bounds.centerX + halfBase, bounds.centerY + radius * 0.2f)
-            }
-            Direction.WEST -> nose.apply {
-                moveTo(bounds.centerX - radius * 1.28f, bounds.centerY)
-                lineTo(bounds.centerX - radius * 0.2f, bounds.centerY - halfBase)
-                lineTo(bounds.centerX - radius * 0.2f, bounds.centerY + halfBase)
-            }
-        }
-        nose.close()
-        canvas.drawPath(nose, robotDirectionPaint)
-        canvas.restoreToCount(clip)
-    }
-
-    /** Keep obstacle cells visible even when a reported robot pose overlaps them. */
-    private fun clipRobotAroundObstacles(canvas: Canvas) {
-        if (state.obstacles.isEmpty()) return
-        val visibleArea = Path().apply {
-            fillType = Path.FillType.EVEN_ODD
-            addRect(
-                geometry.arenaLeft,
-                geometry.arenaTop,
-                geometry.arenaLeft + geometry.arenaWidth,
-                geometry.arenaTop + geometry.arenaHeight,
-                Path.Direction.CW,
-            )
-            state.obstacles.values.forEach { obstacle ->
-                val bounds = geometry.cellBounds(obstacle.position)
-                addRect(bounds.left, bounds.top, bounds.right, bounds.bottom, Path.Direction.CW)
-            }
-        }
-        canvas.clipPath(visibleArea)
-    }
-
-    private fun drawRobotDragImage(canvas: Canvas, center: GridCoordinate, direction: Direction) {
-        val checkpoint = canvas.save()
-        clipRobotAroundObstacles(canvas)
-        drawRobot(canvas, center, direction)
+        drawRobot(canvas, pose)
         canvas.restoreToCount(checkpoint)
     }
 
@@ -501,17 +463,16 @@ class ArenaGridView @JvmOverloads constructor(
     }
 
     private fun drawRobotDragPreview(canvas: Canvas) {
-        val direction = state.robot?.direction ?: return
+        val robot = state.robot ?: return
         val contentX = toContentX(dragX)
         val contentY = toContentY(dragY)
-        val underFinger = coordinateAtTouch(dragX, dragY)
-        val center = underFinger?.let { GridCoordinate(it.x - robotGrabOffsetX, it.y - robotGrabOffsetY) }
-        if (center == null || !ArenaReducer().canMoveRobot(state, center)) {
-            state.robot?.let { drawRobotDragImage(canvas, it.position, it.direction) }
+        val destination = robotDropAt(dragX, dragY)
+        if (destination == null || !ArenaReducer().canMoveRobot(state, destination)) {
+            drawRobotDragImage(canvas, robot)
             drawInvalidDropIndicator(canvas, contentX, contentY)
             return
         }
-        drawRobotDragImage(canvas, center, direction)
+        drawRobotDragImage(canvas, robot.copy(x = destination.x.toDouble(), y = destination.y.toDouble()))
     }
 
     private fun drawInvalidDropIndicator(canvas: Canvas, x: Float, y: Float) {
@@ -546,6 +507,19 @@ class ArenaGridView @JvmOverloads constructor(
     private fun coordinateAtTouch(x: Float, y: Float): GridCoordinate? =
         if (x < 0f || y < 0f || x >= width || y >= height) null
         else geometry.coordinateAt(toContentX(x), toContentY(y))
+
+    private fun pointAtTouch(x: Float, y: Float): RobotFootprint.Point? {
+        if (coordinateAtTouch(x, y) == null) return null
+        return RobotFootprint.Point(
+            ((toContentX(x) - geometry.arenaLeft) / geometry.cellSize).toDouble(),
+            (state.config.rows - (toContentY(y) - geometry.arenaTop) / geometry.cellSize).toDouble(),
+        )
+    }
+
+    private fun robotDropAt(x: Float, y: Float): GridCoordinate? = pointAtTouch(x, y)?.let {
+        GridCoordinate(kotlin.math.round(it.x - robotGrabOffsetX).toInt(),
+            kotlin.math.round(it.y - robotGrabOffsetY).toInt())
+    }
 
     private fun clampPan() {
         val minPanX = (width - width * scale).coerceAtMost(0f)
@@ -589,7 +563,12 @@ class ArenaGridView @JvmOverloads constructor(
 
     private fun buildContentDescription(state: ArenaState): String {
         val robot = state.robot?.let {
-            "Robot at ${it.position.x}, ${it.position.y}, facing ${it.direction.name.lowercase()}."
+            "Robot at ${it.x}, ${it.y}, facing ${it.readableHeading()}. " +
+                when (it.source) {
+                    PoseSource.REPORTED -> "RPi reported."
+                    PoseSource.OPERATOR -> "Operator placed."
+                    PoseSource.ESTIMATED -> "Estimated movement."
+                }
         } ?: "Robot position unavailable."
         return "${state.config.columns} by ${state.config.rows} exploration arena. " +
             "${state.obstacles.size} obstacles. $robot"

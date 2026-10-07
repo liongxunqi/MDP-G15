@@ -31,7 +31,7 @@ class ArenaReducerTest {
         while (reducer.firstFreeObstacleCell(state) != null) {
             state = reducer.success(state, ArenaAction.SpawnObstacle)
             val obstacle = state.selectedObstacle!!
-            assertFalse(DrivePose.from(pose).overlaps(obstacle.position, 2))
+            assertFalse(RobotFootprint.overlapsCell(DrivePose.from(pose), state.config, obstacle.position))
             assertTrue(state.config.contains(obstacle.position))
         }
         assertEquals(state.obstacles.size, state.obstacles.values.map { it.position }.toSet().size)
@@ -162,8 +162,7 @@ class ArenaReducerTest {
     }
 
     @Test
-    fun `robot accepts only in-bounds pose`() {
-        // Received centre coordinates are accepted even when the 3x3 footprint is clipped.
+    fun `robot keeps reported off-map pose for diagnostics`() {
         val valid = RobotPose(GridCoordinate(18, 0), Direction.SOUTH)
         val validState = reducer.success(ArenaState(), ArenaAction.ApplyRobotPose(valid))
         assertEquals(valid, validState.robot)
@@ -172,8 +171,8 @@ class ArenaReducerTest {
             validState,
             ArenaAction.ApplyRobotPose(RobotPose(GridCoordinate(20, 0), Direction.NORTH)),
         )
-        assertTrue(invalid is ArenaReduction.Failure)
-        assertFalse((invalid as ArenaReduction.Failure).reason.isBlank())
+        assertTrue(invalid is ArenaReduction.Success)
+        assertEquals(20.0, (invalid as ArenaReduction.Success).state.robot!!.x, 0.0)
     }
 
     @Test
@@ -207,12 +206,14 @@ class ArenaReducerTest {
     }
 
     @Test
-    fun `all nine robot cells reject local edits but received poses remain authoritative`() {
+    fun `rectangular robot blocks occupied cells but received poses remain authoritative`() {
         val pose = RobotPose(GridCoordinate(5, 5), Direction.NORTH)
         val state = ArenaState(robot = pose, obstacles = mapOf(1 to Obstacle(1, GridCoordinate(0, 0))))
-        assertEquals(3, state.config.robotFootprintCells)
-        assertEquals(9, pose.position.footprint(3).size)
-        for (cell in pose.position.footprint(3)) {
+        assertEquals(2.0, state.config.robotWidthCells, 0.0)
+        assertEquals(2.1, state.config.robotLengthCells, 0.0)
+        val occupiedCells = listOf(GridCoordinate(5,5), GridCoordinate(6,5),
+            GridCoordinate(5,6), GridCoordinate(6,6), GridCoordinate(5,7), GridCoordinate(6,7))
+        for (cell in occupiedCells) {
             assertTrue(reducer.reduce(state, ArenaAction.AddObstacle(cell)) is ArenaReduction.Failure)
             assertTrue(reducer.reduce(state, ArenaAction.MoveObstacle(1, cell)) is ArenaReduction.Failure)
             val occupied = ArenaState(obstacles = mapOf(1 to Obstacle(1, cell)))
@@ -220,8 +221,6 @@ class ArenaReducerTest {
             assertFalse(reducer.canMoveRobot(occupied.copy(robot = RobotPose(GridCoordinate(0, 0), Direction.NORTH)), pose.position))
         }
         assertTrue(reducer.reduce(state, ArenaAction.AddObstacle(GridCoordinate(7, 5))) is ArenaReduction.Success)
-        assertEquals((0..2).flatMap { x -> (0..2).map { y -> GridCoordinate(x, y) } }.toSet(),
-            GridCoordinate(1, 1).footprint(3).toSet())
     }
 
     @Test
@@ -232,7 +231,7 @@ class ArenaReducerTest {
             assertTrue(reducer.reduce(state, ArenaAction.MoveRobot(destination)) is ArenaReduction.Failure)
             assertEquals(pose, state.robot)
         }
-        assertTrue(reducer.canMoveRobot(state, GridCoordinate(18, 18)))
+        assertTrue(reducer.canMoveRobot(state, GridCoordinate(17, 17)))
     }
 
     private fun ArenaReducer.success(state: ArenaState, action: ArenaAction): ArenaState =

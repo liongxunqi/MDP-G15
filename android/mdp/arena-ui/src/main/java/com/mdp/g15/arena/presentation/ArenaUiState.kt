@@ -29,6 +29,7 @@ data class ArenaUiState(
     val manualPending: Boolean = false,
     val manualAnimating: Boolean = false,
     val manualStatus: String? = null,
+    val lastPoseReceivedAtMillis: Long? = null,
     val autonomousRunning: Boolean = false,
     val plannerInfo: String = DEFAULT_PLANNER_INFO,
     val task1Phase: Task1Phase = Task1Phase.SETUP,

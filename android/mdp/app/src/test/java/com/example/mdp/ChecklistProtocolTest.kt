@@ -39,7 +39,7 @@ class ChecklistProtocolTest {
         assertEquals(RobotMessage.Status("Moving"), RobotMessageParser.parse("MSG,[Moving]"))
         assertEquals(RobotMessage.Target(1, "11"), RobotMessageParser.parse("TARGET,1,11"))
         assertEquals(RobotMessage.Target(2, "11"), RobotMessageParser.parse("TARGET,B2,11,N"))
-        assertEquals(RobotMessage.Position(7, 2, "W"), RobotMessageParser.parse("ROBOT,7,2,W"))
+        assertEquals(RobotMessage.Position(7.0, 2.0, 270.0), RobotMessageParser.parse("ROBOT,7,2,W"))
         assertTrue(RobotMessageParser.parse("ROBOT,bad,2,W") is RobotMessage.Unknown)
     }
 

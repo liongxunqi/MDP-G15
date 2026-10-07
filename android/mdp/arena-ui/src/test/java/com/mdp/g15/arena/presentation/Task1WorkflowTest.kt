@@ -77,7 +77,7 @@ class Task1WorkflowTest {
         advanceUntilIdle()
         val result = vm.uiState.value.arena
         sent.clear()
-        vm.accept("STATUS,RUNNING,1,3\nSTATUS,FAILED\nMSG,Connected\nROBOT,99,99,N")
+        vm.accept("STATUS,RUNNING,1,3\nSTATUS,FAILED\nMSG,Connected\nROBOT,NaN,99,N")
         advanceUntilIdle()
         vm.connectionChanged(false)
         vm.connectionChanged(true)
@@ -162,7 +162,7 @@ class Task1WorkflowTest {
         vm.moveObstacle(1, GridCoordinate(3,3))
         vm.connectionChanged(true)
         vm.startRun {}
-        vm.accept("TARGET,1,20\nSTATUS,START,99,99,N\nSTATUS,DONE,extra")
+        vm.accept("TARGET,1,20\nSTATUS,START,NaN,99,N\nSTATUS,DONE,extra")
         advanceUntilIdle()
         assertEquals(Task1Phase.START_REQUESTED, vm.uiState.value.task1Phase)
         vm.newAttempt()

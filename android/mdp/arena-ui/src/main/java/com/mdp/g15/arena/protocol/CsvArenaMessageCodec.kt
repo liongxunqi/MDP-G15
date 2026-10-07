@@ -2,8 +2,6 @@ package com.mdp.g15.arena.protocol
 
 import com.mdp.g15.arena.domain.ArenaOutboundEvent
 import com.mdp.g15.arena.domain.Direction
-import com.mdp.g15.arena.domain.GridCoordinate
-import com.mdp.g15.arena.domain.RobotPose
 import com.mdp.g15.arena.domain.TargetId
 
 class CsvArenaMessageCodec : ArenaMessageCodec {
@@ -83,16 +81,12 @@ class CsvArenaMessageCodec : ArenaMessageCodec {
     private fun decodeRobot(message: String): ArenaDecodeResult {
         val parts = message.split(',').map(String::trim)
         if (parts.size != 4) {
-            return ArenaDecodeResult.Malformed("ROBOT must be ROBOT,<x>,<y>,<direction>.")
+            return ArenaDecodeResult.Malformed("ROBOT must be ROBOT,<x>,<y>,<bearing>.")
         }
-        val x = parts[1].toIntOrNull()
-            ?: return ArenaDecodeResult.Malformed("ROBOT x-coordinate must be an integer.")
-        val y = parts[2].toIntOrNull()
-            ?: return ArenaDecodeResult.Malformed("ROBOT y-coordinate must be an integer.")
-        val direction = Direction.fromWire(parts[3])
-            ?: return ArenaDecodeResult.Malformed("ROBOT direction must be N, E, S, or W.")
+        val pose = RobotPoseFields.parse(parts[1], parts[2], parts[3])
+            ?: return ArenaDecodeResult.Malformed("ROBOT coordinates and bearing must be finite numbers (or N/E/S/W).")
         return ArenaDecodeResult.Decoded(
-            ArenaInboundEvent.Robot(RobotPose(GridCoordinate(x, y), direction)),
+            ArenaInboundEvent.Robot(pose),
         )
     }
     companion object {

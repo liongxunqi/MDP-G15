@@ -16,6 +16,8 @@ import com.mdp.g15.arena.domain.Direction
 import com.mdp.g15.arena.domain.GridCoordinate
 import com.mdp.g15.arena.domain.Obstacle
 import com.mdp.g15.arena.domain.RobotPose
+import com.mdp.g15.arena.domain.PoseSource
+import com.mdp.g15.arena.domain.readableHeading
 import com.mdp.g15.arena.domain.TargetId
 import com.mdp.g15.arena.domain.ManualCommand
 import com.mdp.g15.arena.domain.ManualDriveGuard
@@ -26,6 +28,7 @@ import com.mdp.g15.arena.protocol.ArenaInboundEvent
 import com.mdp.g15.arena.protocol.ArenaMessageCodec
 import com.mdp.g15.arena.protocol.CsvArenaMessageCodec
 import com.mdp.g15.arena.protocol.ObstacleSync
+import com.mdp.g15.arena.protocol.RobotPoseFields
 import java.util.ArrayDeque
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -158,7 +161,8 @@ class ArenaViewModel(
             manualAnimating = true,
             manualStatus = "Moving (estimated)",
             arena = _uiState.value.arena.copy(
-                robot = path.at(1.0).asRobotPose().copy(commandedPath = path),
+                robot = path.at(1.0).asRobotPose().copy(source = PoseSource.ESTIMATED,
+                    estimate = path.at(1.0), commandedPath = path),
             ),
         )
         setFeedback("Sent ${command.wire} — previewing movement.", false)
@@ -204,7 +208,8 @@ class ArenaViewModel(
             _uiState.value = _uiState.value.copy(manualPending = false,
                 task1Phase = if (_uiState.value.autonomousRunning) Task1Phase.UNKNOWN else _uiState.value.task1Phase,
                 // A Bluetooth connection is not a pose report, including after reconnect.
-                arena = if (connected && _uiState.value.task1Phase == Task1Phase.SETUP) _uiState.value.arena.copy(robot = null) else _uiState.value.arena,
+                arena = if (connected && _uiState.value.task1Phase == Task1Phase.SETUP)
+                    _uiState.value.arena.copy(robot = null, reportedRobot = null) else _uiState.value.arena,
                 manualStatus = if (_uiState.value.autonomousRunning) "Connection interrupted — run status unknown"
                     else if (connected) "Awaiting initial robot position" else "Disconnected — pose unconfirmed")
         }
@@ -434,14 +439,11 @@ class ArenaViewModel(
                 val controlStatus = rawMessage.startsWith("STATUS,")
                 val startPose = if (controlStatus && event.text.startsWith("START,")) {
                     val parts = event.text.split(',')
-                    val x = parts.getOrNull(1)?.toIntOrNull()
-                    val y = parts.getOrNull(2)?.toIntOrNull()
-                    val direction = parts.getOrNull(3)?.let(Direction::fromWire)
-                    if (x == null || y == null || direction == null) {
+                    val pose = if (parts.size == 4) RobotPoseFields.parse(parts[1], parts[2], parts[3]) else null
+                    if (pose == null) {
                         setFeedback("Invalid start position.", true)
                         return
                     }
-                    val pose = RobotPose(GridCoordinate(x, y), direction)
                     val validation = reducer.reduce(_uiState.value.arena, ArenaAction.ApplyRobotPose(pose))
                     if (validation is ArenaReduction.Failure) {
                         setFeedback(validation.reason, true)
@@ -501,6 +503,7 @@ class ArenaViewModel(
                     redoHistory.clear()
                     _uiState.value = _uiState.value.copy(
                         arena = state,
+                        lastPoseReceivedAtMillis = System.currentTimeMillis(),
                         status = "Target ${event.targetId} found at obstacle ${event.obstacleId}",
                         canUndo = false,
                         canRedo = false,
@@ -527,7 +530,7 @@ class ArenaViewModel(
                         },
                     )
                     if (!rawMessage.startsWith("STATUS,")) {
-                        setFeedback("Robot position updated to (${event.pose.position.x}, ${event.pose.position.y}), facing ${event.pose.direction.name.lowercase()}.", false)
+                        setFeedback("Robot position updated to (${event.pose.x}, ${event.pose.y}), facing ${event.pose.readableHeading()}.", false)
                     }
                     persist()
                 }

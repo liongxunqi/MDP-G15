@@ -25,19 +25,49 @@ robot marker is a local placement edit, not a physical movement command.
 
 ## Robot coordinate contract
 
-`ROBOT,x,y,dir` and `STATUS,START,x,y,dir` use the robot's **centre cell** on
-the zero-based 20×20 arena, with `(0,0)` at the bottom left. The displayed and
-collision-checked footprint is 3×3: centre `(1,1)` covers cells `(0,0)` through
-`(2,2)`. Android applies the received coordinate without an offset. A reported
-centre anywhere in `0..19` is shown even when the footprint clips the arena edge
-or overlaps an obstacle; locally placed poses must fit fully and avoid obstacles.
+`ROBOT,x,y,bearing` and `STATUS,START,x,y,bearing` use decimal cell coordinates
+and a north-zero, clockwise bearing in degrees. Legacy N/E/S/W (and full names)
+are accepted as 0/90/180/270 degrees. `(0,0)` is the bottom-left reference of
+the north-facing 2.0 × 2.1-cell footprint (20 × 21 cm). The robot rotates about
+its centre, `(x+1.0,y+1.05)`, while x/y keep the same fixed reference. Obstacles
+remain integer cells. Android shows a finite reported pose even when the rotated
+footprint is off-map or overlaps an obstacle, with a warning; local placements
+and proposed manual paths must fit and avoid obstacles. Coordinates outside
+±1000 cells are rejected to keep rendering safe.
 
-Before the first received pose, the robot is hidden. Each valid received pose
-immediately replaces any manual preview. Previews remain labelled estimates and
-are never restored as authoritative positions after a fresh app process starts.
-RPi must send the actual starting centre in `STATUS,START` (the agreed initial
-centre is `(1,1)`); Android trusts the received value. The currently checked-in
-RPi Task 1 sender still hardcodes `(2,2)` and needs its own team update.
+One arena cell is 10 cm. The origin is the arena's bottom-left corner; x grows
+right and y grows up. The pose reference remains the bottom-left of the robot's
+north-facing rectangle at every heading, even as that rectangle rotates about
+its centre. Android retains decimal precision internally. It normalizes numeric
+bearings to [0, 360), rejects non-finite values, and shows the angle with the
+nearest of eight compass labels (for example, `3° · North` or
+`46° · Northeast`). Diagonal headings use this same pose path; they require no
+separate live-location mode. Obstacle faces remain cardinal.
+
+The latest received pose, operator placement, manual D-pad estimate and currently
+drawn animation sample have distinct meanings. A setup reference at `(0,0)` or
+an operator drop does not establish the robot's physical position. Robot dragging
+snaps the reference x/y to integers, keeps its heading, and accepts the drop only
+if the rotated rectangle fits inside the arena without overlapping an obstacle.
+The same rotated footprint is checked along a proposed manual movement path.
+Incoming reports are retained for diagnosis even when they would fail these
+local placement checks. A fresh report cancels an active drag or manual preview;
+it does not acknowledge a pending movement command. Undo, restoration and
+reconnection must not turn an old estimate into fresh telemetry.
+
+Before the first received pose, the robot is hidden unless the operator has
+explicitly placed it. The first received pose appears immediately; later reports
+animate briefly from the currently displayed location to the new report, stopping
+there. A repeated report refreshes receipt information without restarting motion.
+The display rotates through the shortest angular difference. If interpolation
+would draw the robot through an obstacle or arena edge, it snaps to the reported
+pose and keeps the warning. Animation between reports only smooths the display;
+it is not a measured route or speed. A report supersedes a manual preview without
+acknowledging a command.
+Previews remain labelled estimates and are never restored as fresh telemetry.
+The current RPi Task 1 sender must be checked for matching bottom-left units,
+numeric heading and actual start location before hardware use; old sender branches
+used centre-cell/cardinal messages.
 
 ## All outgoing commands
 
@@ -62,13 +92,18 @@ rejected and failed messages are logged alongside QUEUED, TX and RX events.
 - There are no command IDs, map acknowledgements/readback, or execution IDs in
   the task1 interface. Guaranteed convergence and exactly-once execution
   require those receiver capabilities and cannot be provided by Android alone.
-- Protocol v3 sends `ROBOT,x,y,dir` after STM OK only if the completed segment has
-  a planner `dirs` entry. Android accepts integer cell coordinates and N/E/S/W (or
-  full direction names). This reports expected segment-end pose, not measured
-  continuous movement. The branch's PC stub currently returns `dirs: []`, so it
-  produces no robot-position updates until a planner supplies those entries.
+- Obstacle IDs can be reused after deletion. Without a map generation or attempt
+  identifier, a delayed `TARGET` for an old obstacle can be indistinguishable
+  from a result for the new obstacle with the same ID. Clear or drain prior robot
+  results before starting another assessment attempt.
+- The checked-in protocol-v3 sender only emits a position after STM OK when the
+  planner supplies a `dirs` entry, and that older format is a planned endpoint,
+  not measured continuous telemetry. Android now accepts decimal cell coordinates
+  and numeric bearings, but the RPi/algorithm implementation must send the agreed
+  reference and headings to use the new precision. The PC stub's `dirs: []` yields
+  no robot-position updates.
 
-## Manual driving checklist repair
+## Manual driving
 
 The current checked-in `rpi/mdp_rpi/test_bluetooth_stm.py` is a separate manual
 bridge. Its defaults are 20 cm straight moves, 90-degree left/right arcs and
@@ -76,9 +111,14 @@ bridge. Its defaults are 20 cm straight moves, 90-degree left/right arcs and
 TIGHT radius of 29.1 cm. Verify the bridge's environment overrides and active
 STM profile before hardware use; the app cannot discover calibration values.
 
-Android reserves one movement before transmission and checks the complete swept
-3x3 centred footprint against arena edges and obstacles. The grid immediately shows a
+Android reserves one movement before transmission and checks the swept rotated
+2.0 × 2.1-cell footprint against arena edges and obstacles. The grid immediately shows a
 labelled estimate, retaining fractional coordinates and animated arc headings.
+Normal-mode straight preview uses the manual bridge's default 20 cm (2 cells);
+45-degree arcs finish at 45-degree heading changes, without cardinal snapping.
+Forward/reverse travel at a diagonal changes both coordinates while reverse
+travel preserves the robot's heading. The modeled turn path is an approximation
+until the robot's steering pivot and bridge calibration are checked on hardware.
 Preview durations (650 ms straight, 1000 ms turning) are visual estimates, not
 measured velocity. The preview must finish before another tap is accepted, and
 the timer alone never authorizes the next physical command.

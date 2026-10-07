@@ -4,6 +4,7 @@ import com.mdp.g15.arena.protocol.ArenaDecodeResult
 import com.mdp.g15.arena.protocol.ArenaInboundEvent
 import com.mdp.g15.arena.protocol.CsvArenaMessageCodec
 import com.mdp.g15.arena.protocol.StatusMessage
+import com.mdp.g15.arena.protocol.RobotPoseFields
 
 /**
  * Parsed form of an incoming Bluetooth line. Both this controller (for the C.4
@@ -11,7 +12,8 @@ import com.mdp.g15.arena.protocol.StatusMessage
  * share this one parser — so there's a single place that knows the wire format.
  *
  * Incoming formats (agree these with the RPi / algorithm team on day one):
- *   ROBOT, <x>, <y>, <dir>       -> Position   (fixed by spec, C.10)
+ *   ROBOT,<decimal-x>,<decimal-y>,<bearing> -> Position; degrees clockwise from north,
+ *                                               with legacy N/E/S/W accepted.
  *   TARGET,<obstacleId>,<id>[,<face>] -> Target, or TargetRejected if malformed or the
  *                                  obstacle is unknown (same rules as CsvArenaMessageCodec
  *                                  / ArenaReducer.applyTarget)
@@ -19,7 +21,7 @@ import com.mdp.g15.arena.protocol.StatusMessage
  *   anything else                -> Unknown
  */
 sealed interface RobotMessage {
-    data class Position(val x: Int, val y: Int, val direction: String) : RobotMessage
+    data class Position(val x: Double, val y: Double, val headingDeg: Double) : RobotMessage
     data class Target(val obstacle: Int, val targetId: String) : RobotMessage
     /** TARGET was malformed, or named an obstacle that doesn't exist on the arena. */
     data class TargetRejected(val reason: String) : RobotMessage
@@ -48,14 +50,10 @@ object RobotMessageParser {
         val parts = line.split(",").map { it.trim() }
         return when (parts.firstOrNull()?.uppercase()) {
             "ROBOT" -> {
-                val x = parts.getOrNull(1)?.toIntOrNull()
-                val y = parts.getOrNull(2)?.toIntOrNull()
-                val dir = parts.getOrNull(3)?.uppercase()
-                if (x != null && y != null && dir != null) {
-                    RobotMessage.Position(x, y, dir)
-                } else {
-                    RobotMessage.Unknown(line)
-                }
+                if (parts.size != 4) RobotMessage.Unknown(line)
+                else RobotPoseFields.parse(parts[1], parts[2], parts[3])?.let {
+                    RobotMessage.Position(it.x, it.y, it.heading)
+                } ?: RobotMessage.Unknown(line)
             }
 
             "TARGET" -> parseTarget(line, obstacleExists)

@@ -14,22 +14,32 @@ class ManualDriveTest {
                 assertEquals(8.0 + offset.second, end.y, 0.0)
                 assertEquals(8.0 + offset.first / 2.0, path.at(0.5).x, 0.0)
                 assertEquals(8.0 + offset.second / 2.0, path.at(0.5).y, 0.0)
-                assertEquals(if (offset.first < 0) Direction.WEST else if (offset.first > 0) Direction.EAST
-                    else if (offset.second > 0) Direction.NORTH else Direction.SOUTH, end.asRobotPose().direction)
+                val expectedHeading = when (offset) {
+                    0 to 1 -> 0.0
+                    0 to -1 -> 180.0
+                    -1 to 0 -> 270.0
+                    1 to 0 -> 90.0
+                    -1 to 1 -> 315.0
+                    1 to 1 -> 45.0
+                    -1 to -1 -> 225.0
+                    else -> 135.0
+                }
+                assertEquals(expectedHeading, end.normalizedHeading, 0.0001)
                 assertTrue(path.fits(state()))
             }
         }
     }
 
     @Test fun `AMD steps reject walls and obstacles without rotational overhang`() {
-        for ((command, start) in listOf(ManualCommand.LEFT to DrivePose(1.0,8.0,0.0),
+        for ((command, start) in listOf(ManualCommand.LEFT to DrivePose(0.0,8.0,0.0),
             ManualCommand.RIGHT to DrivePose(18.0,8.0,0.0), ManualCommand.FORWARD to DrivePose(8.0,18.0,0.0),
-            ManualCommand.REVERSE to DrivePose(8.0,1.0,0.0))) {
+            ManualCommand.REVERSE to DrivePose(8.0,0.0,0.0))) {
             assertFalse(DrivePath(start, command, amdToolMode = true).fits(state()))
         }
-        val blocked = state().copy(obstacles = mapOf(1 to Obstacle(1,GridCoordinate(6,8))))
+        val blocked = state().copy(obstacles = mapOf(1 to Obstacle(1,GridCoordinate(7,8))))
         assertFalse(DrivePath(DrivePose(8.0,8.0,0.0), ManualCommand.LEFT, amdToolMode = true).fits(blocked))
-        assertTrue(DrivePath(DrivePose(8.0,8.0,0.0), ManualCommand.RIGHT, amdToolMode = true).fits(blocked))
+        val right = DrivePath(DrivePose(8.0,8.0,0.0), ManualCommand.RIGHT, amdToolMode = true)
+        assertTrue("rightward move should clear the left obstacle", right.fits(blocked))
     }
 
     @Test fun `heading wraparound represents the same physical pose`() {
@@ -48,43 +58,25 @@ class ManualDriveTest {
         assertEquals(180.0, uturn.heading, 0.0001)
         val reverseLeft = DrivePath(start, ManualCommand.BACK_LEFT).at(1.0)
         assertTrue(reverseLeft.x < start.x && reverseLeft.y < start.y)
-        assertEquals(90.0, reverseLeft.heading, 0.0001)
+        assertEquals(45.0, reverseLeft.heading, 0.0001)
         assertEquals(reverseLeft, DrivePose.from(reverseLeft.asRobotPose()))
     }
-    @Test fun `forward left and right end on a cardinal direction a quarter turn away`() {
-        val left = listOf(Direction.NORTH to Direction.WEST, Direction.WEST to Direction.SOUTH,
-            Direction.SOUTH to Direction.EAST, Direction.EAST to Direction.NORTH)
-        val right = listOf(Direction.NORTH to Direction.EAST, Direction.EAST to Direction.SOUTH,
-            Direction.SOUTH to Direction.WEST, Direction.WEST to Direction.NORTH)
-        for ((command, cases) in listOf(ManualCommand.FORWARD_LEFT to left, ManualCommand.FORWARD_RIGHT to right)) {
-            for ((from, to) in cases) {
-                val start = DrivePose(8.0, 8.0, from.ordinal * 90.0)
+    @Test fun `diagonal arcs preserve their actual forty five degree endpoints`() {
+        for (from in listOf(0.0, 45.0, 90.0, 270.0)) {
+            for (command in listOf(ManualCommand.FORWARD_LEFT, ManualCommand.FORWARD_RIGHT,
+                ManualCommand.BACK_LEFT, ManualCommand.BACK_RIGHT)) {
+                val start = DrivePose(8.0, 8.0, from)
                 val end = DrivePath(start, command).at(1.0)
-                assertEquals("$command $from", 0.0, end.heading % 90.0, 0.0)
-                assertEquals("$command $from", to, end.asRobotPose().direction)
-                // Chained turns start from the stored cardinal heading, so nothing drifts.
-                assertEquals(0.0, DrivePath(end, command).at(1.0).heading % 90.0, 0.0)
+                assertEquals((from + command.turn + 360.0) % 360.0, end.normalizedHeading, 0.0001)
+                assertEquals((from + command.turn * 2 + 720.0) % 360.0,
+                    DrivePath(end, command).at(1.0).normalizedHeading, 0.0001)
             }
         }
-    }
-    @Test fun `back left and right end on a cardinal direction a quarter turn away`() {
-        // Same heading sense as before: back-left rotates clockwise (+), back-right anticlockwise (-).
-        val backLeft = listOf(Direction.NORTH to Direction.EAST, Direction.EAST to Direction.SOUTH,
-            Direction.SOUTH to Direction.WEST, Direction.WEST to Direction.NORTH)
-        val backRight = listOf(Direction.NORTH to Direction.WEST, Direction.WEST to Direction.SOUTH,
-            Direction.SOUTH to Direction.EAST, Direction.EAST to Direction.NORTH)
-        for ((command, cases) in listOf(ManualCommand.BACK_LEFT to backLeft, ManualCommand.BACK_RIGHT to backRight)) {
-            for ((from, to) in cases) {
-                val end = DrivePath(DrivePose(8.0, 8.0, from.ordinal * 90.0), command).at(1.0)
-                assertEquals("$command $from", 0.0, end.heading % 90.0, 0.0)
-                assertEquals("$command $from", to, end.asRobotPose().direction)
-            }
-        }
-        assertEquals(45.0, DrivePath(DrivePose(8.0, 8.0, 0.0), ManualCommand.BACK_LEFT).at(0.5).heading, 0.0001)
+        assertEquals(22.5, DrivePath(DrivePose(8.0, 8.0, 0.0), ManualCommand.BACK_LEFT).at(0.5).heading, 0.0001)
     }
     @Test fun `forward left sweeps through intermediate headings`() {
         val path = DrivePath(DrivePose(8.0, 8.0, 0.0), ManualCommand.FORWARD_LEFT)
-        assertEquals(-45.0, path.at(0.5).heading, 0.0001)
+        assertEquals(-22.5, path.at(0.5).heading, 0.0001)
     }
     private fun state(x: Int = 8, y: Int = 8, direction: Direction = Direction.NORTH) = ArenaState(robot = RobotPose(GridCoordinate(x, y), direction))
     @Test fun `all cardinal boundaries account for one cell distance and footprint`() {

@@ -37,6 +37,9 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.unit.dp
+import com.mdp.g15.arena.domain.PoseSource
+import com.mdp.g15.arena.domain.readableHeading
+import com.mdp.g15.arena.domain.RobotFootprint
 import com.mdp.g15.arena.domain.Direction
 import com.mdp.g15.arena.domain.GridCoordinate
 import com.mdp.g15.arena.view.ArenaGridView
@@ -250,11 +253,20 @@ private fun ArenaStatusPanel(
                 StatusValue(
                     "Robot pose",
                     state.arena.robot?.let {
-                        it.estimate?.let { pose ->
-                            val headings = listOf("N", "NE", "E", "SE", "S", "SW", "W", "NW")
-                            val heading = headings[((kotlin.math.round(pose.heading / 45).toInt() % 8) + 8) % 8]
-                            String.format(java.util.Locale.US, "(%.2f, %.2f) • %s • estimated", pose.x, pose.y, heading)
-                        } ?: "(${it.position.x}, ${it.position.y}) • ${it.direction.name}"
+                        val source = when (it.source) {
+                            PoseSource.REPORTED -> "RPi reported"
+                            PoseSource.OPERATOR -> "operator placed"
+                            PoseSource.ESTIMATED -> "estimated"
+                        }
+                        val warning = when {
+                            !RobotFootprint.fitsArena(it, state.arena.config) -> " · outside arena"
+                            state.arena.obstacles.values.any { obstacle ->
+                                RobotFootprint.overlapsCell(it, state.arena.config, obstacle.position)
+                            } -> " · overlaps obstacle"
+                            else -> ""
+                        }
+                        String.format(java.util.Locale.US, "(%.2f, %.2f) • %s • %s",
+                            it.x, it.y, it.readableHeading(), source) + warning
                     } ?: "Not available",
                     Modifier.weight(1f),
                 )

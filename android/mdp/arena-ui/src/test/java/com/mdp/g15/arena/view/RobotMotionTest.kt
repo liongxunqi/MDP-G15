@@ -5,70 +5,56 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class RobotMotionTest {
-    @Test fun `AMD lateral preview translates directly with its new heading`() {
+    private fun state(x: Double, y: Double = 8.0, heading: Double = 0.0) =
+        ArenaState(robot = RobotPose(x, y, heading))
+
+    @Test fun `first report appears immediately and next report animates only to its target`() {
         val motion = RobotMotion()
-        val path = DrivePath(DrivePose(8.0,8.0,0.0), ManualCommand.LEFT, amdToolMode = true)
-        motion.snap(state(8,8).robot)
-        motion.retarget(ArenaState(robot = path.at(1.0).asRobotPose().copy(commandedPath = path)), 0)
-        assertEquals(7.5f, motion.sample(90)!!.x, 0.001f)
-        assertEquals(8f, motion.sample(90)!!.y, 0.001f)
-        assertEquals(270f, motion.sample(90)!!.angle, 0.001f)
-        assertEquals(7f, motion.sample(180)!!.x, 0.001f)
-        assertFalse(motion.isRunning(180))
+        motion.retarget(state(4.0), 0)
+        assertEquals(4f, motion.sample(0)!!.x, 0f)
+        motion.retarget(state(6.0), 10)
+        assertEquals(4f, motion.sample(10)!!.x, 0f)
+        assertEquals(5f, motion.sample(85)!!.x, 0.001f)
+        assertEquals(6f, motion.sample(160)!!.x, 0.001f)
+        assertEquals(6f, motion.sample(1000)!!.x, 0.001f)
+        assertFalse(motion.isRunning(1000))
     }
 
-    @Test fun `manual turn follows an arc with intermediate diagonal heading`() {
+    @Test fun `rapid reports retarget from current display sample`() {
         val motion = RobotMotion()
-        val path = DrivePath(DrivePose(8.0, 8.0, 0.0), ManualCommand.RIGHT)
-        motion.snap(state(8, 8).robot)
-        motion.retarget(ArenaState(robot = path.at(1.0).asRobotPose().copy(commandedPath = path)), 0)
-        val halfway = motion.sample(500)!!
-        assertEquals(45f, halfway.angle, 0.001f)
-        assertEquals(path.at(0.5).x.toFloat(), halfway.x, 0.001f)
-        assertTrue(halfway.x < (8f + 2.91f / 2)) // curved rather than a diagonal chord
-        assertEquals(10.91f, motion.sample(1000)!!.x, 0.001f)
-        assertEquals(10.91f, motion.sample(1000)!!.y, 0.001f)
-    }
-    @Test fun `straight preview moves smoothly and snaps cleanly on reset`() {
-        val motion = RobotMotion()
-        val path = DrivePath(DrivePose(8.0, 8.0, 0.0), ManualCommand.FORWARD)
-        motion.snap(state(8, 8).robot)
-        motion.retarget(ArenaState(robot = path.at(1.0).asRobotPose().copy(commandedPath = path)), 0)
-        assertEquals(8.5f, motion.sample(325)!!.y, 0.001f)
-        motion.snap(null)
-        assertNull(motion.sample(650))
-    }
-    private fun state(x: Int, y: Int = 2, direction: Direction = Direction.NORTH) =
-        ArenaState(robot = RobotPose(GridCoordinate(x, y), direction))
-
-    @Test fun `rapid reports snap to latest authoritative pose`() {
-        val motion = RobotMotion()
-        motion.retarget(state(2), 0)
-        motion.retarget(state(4), 10)
-        assertEquals(4f, motion.sample(100)!!.x, 0.001f)
-        motion.retarget(state(6), 100)
-        assertEquals(6f, motion.sample(100)!!.x, 0.001f)
-        assertEquals(6f, motion.sample(280)!!.x, 0.001f)
-        assertFalse(motion.isRunning(280))
+        motion.snap(state(4.0).robot)
+        motion.retarget(state(6.0), 0)
+        motion.retarget(state(8.0), 75)
+        assertEquals(5f, motion.sample(75)!!.x, 0.001f)
+        assertEquals(8f, motion.sample(225)!!.x, 0.001f)
     }
 
-    @Test fun `obstacles and ambiguous corners are never crossed by interpolation`() {
+    @Test fun `reported heading rotates through shortest wraparound`() {
         val motion = RobotMotion()
-        motion.snap(state(2).robot)
-        motion.retarget(state(8).copy(obstacles = mapOf(1 to Obstacle(1, GridCoordinate(5, 2)))), 0)
+        motion.snap(state(8.0, heading = 359.0).robot)
+        motion.retarget(state(8.0, heading = 1.0), 0)
+        assertEquals(0f, motion.sample(75)!!.angle, 0.001f)
+        assertEquals(1f, motion.sample(150)!!.angle, 0.001f)
+    }
+
+    @Test fun `blocked visual chord snaps to actual report`() {
+        val motion = RobotMotion()
+        motion.snap(state(2.0).robot)
+        motion.retarget(state(8.0).copy(obstacles = mapOf(1 to Obstacle(1, GridCoordinate(5, 8)))), 0)
         assertEquals(8f, motion.sample(0)!!.x, 0f)
-        motion.retarget(state(10, 4), 0)
-        assertEquals(4f, motion.sample(0)!!.y, 0f)
         assertFalse(motion.isRunning(0))
     }
 
-    @Test fun `rotation takes shortest arc and reset clears animation`() {
+    @Test fun `manual preview follows configured path and report supersedes it`() {
         val motion = RobotMotion()
-        motion.snap(state(2, direction = Direction.WEST).robot)
-        motion.retarget(state(2), 0)
-        assertEquals(0f, motion.sample(90)!!.angle, 0.001f)
+        val path = DrivePath(DrivePose(8.0, 8.0, 0.0), ManualCommand.FORWARD_RIGHT)
+        motion.snap(state(8.0).robot)
+        motion.retarget(ArenaState(robot = path.at(1.0).copy(source = PoseSource.ESTIMATED,
+            estimate = path.at(1.0), commandedPath = path)), 0)
+        assertEquals(22.5f, motion.sample(500)!!.angle, 0.001f)
+        motion.retarget(state(9.0, 9.0, 40.0), 500)
+        assertEquals(9f, motion.sample(650)!!.x, 0.001f)
         motion.snap(null)
-        assertNull(motion.sample(100))
-        assertFalse(motion.isRunning(100))
+        assertNull(motion.sample(700))
     }
 }
