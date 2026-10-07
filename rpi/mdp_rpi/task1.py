@@ -107,6 +107,7 @@ class Task1:
         self.segments_index: int = 0        # which segment we are up to
         self.obstacle_order: list = []      # obstacle IDs in visit order
         self.directions: list = []          # direction info per segment (for Android map)
+        self.start_pose: dict | None = None # planner's start pose, same shape as a dirs entry
         self.direction_index: int = 0
 
         # Per-segment obstacle mapping. A segment is NOT 1:1 with an obstacle any
@@ -424,6 +425,22 @@ class Task1:
             logging.warning(f"Could not notify Android of running status: {exc}")
         return True
 
+    def _send_start_status(self) -> None:
+        """Tell Android where the planner assumes the robot starts. Older PCs
+        send no "start" in PATH; fall back to the old fixed position then."""
+        with self._idx_lock:
+            if not self.directions:
+                return
+            start = self.start_pose
+        if start:
+            status = f"STATUS,START,{start['x']},{start['y']},{start['dir']}"
+        else:
+            status = "STATUS,START,2,2,N"
+        try:
+            self.android.send(status)
+        except OSError as exc:
+            logging.warning(f"Could not notify Android of start position: {exc}")
+
     # ── Failure handling ───────────────────────────────────────────────────────
 
     def _halt_mission(self, reason: str) -> None:
@@ -612,13 +629,7 @@ class Task1:
                         )
                         continue
 
-                    with self._idx_lock:
-                        if self.directions:
-                            start_pose = self.directions[0]
-                            try:
-                                self.android.send("STATUS,START,2,2,N")
-                            except OSError as exc:
-                                logging.warning(f"Could not notify Android of start position: {exc}")
+                    self._send_start_status()
 
                     if not self._send_next_segment():
                         logging.warning("Android: BEGIN received but no segments to send.")
@@ -660,6 +671,7 @@ class Task1:
                         # across several lines to respect the §2 caps.
                         self.segment_obstacles = payload.get("segment_obstacles", [])
                         self.directions = payload.get("dirs", [])
+                        self.start_pose = payload.get("start")
                         self.direction_index = 0
 
                     self.path_requested = False
@@ -673,13 +685,7 @@ class Task1:
                     # If Android already sent BEGIN but PATH hadn't arrived yet,
                     # kick off the first segment now
                     if self.started and self.segments_index == 0:
-                        with self._idx_lock:
-                            if self.directions:
-                                start_pose = self.directions[0]
-                                try:
-                                    self.android.send("STATUS,START,2,2,N")
-                                except OSError as exc:
-                                    logging.warning(f"Could not notify Android of start position: {exc}")
+                        self._send_start_status()
                         if not self._send_next_segment():
                             logging.warning("PC: PATH arrived but no segments to send.")
 
