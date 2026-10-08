@@ -66,8 +66,11 @@ def parse_start_pose(start_pose):
 def arena_grid_position(position_mm):
     # Remove floating-point rotation noise at exact cell boundaries.
     position_mm = round(position_mm, 6)
-    if not math.isfinite(position_mm) or not 0 <= position_mm < GRID_CELLS * CELL_SIZE_MM:
-        raise ValueError(f"Measured arena position {position_mm} mm is outside the 20x20 grid")
+    if not math.isfinite(position_mm):
+        raise ValueError("Measured arena position must be finite")
+    # The arena has no boundary boards during assessment. The planner may allow
+    # a collision-checked body overhang while turning at an edge, so preserve
+    # the true fractional coordinate instead of halting or clamping it to 0..20.
     return position_mm / CELL_SIZE_MM
 
 
@@ -90,6 +93,10 @@ class InstructionMission:
         self.instruction_index = 0
         self.pending = False
         self.origin = None
+        # Every segment is checked immediately before its first primitive.
+        # Keeping the set on the mission also means a replacement route starts
+        # with no inherited clearance decisions from the route it replaced.
+        self.preflighted_segments = set()
         self.progress = None
         self.start_pose = parse_start_pose(start_pose)
 

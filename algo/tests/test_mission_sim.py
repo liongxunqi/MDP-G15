@@ -19,13 +19,13 @@ images have no room in front of them for a 28-45 cm photo), or FAIL. Then:
               grid_search.ARENA_OVERHANG_MM is by design (open arena); more
               than that is a planner bug
   aim         at each photo: facing the image, centred on it, and the
-              ultrasonic actually sees the target when FU starts
+              ultrasonic sees the intended target when range correction is safe
   time        planning time — the PC must answer before the run clock hurts
 
 Model assumptions (kept deliberately simple — this checks the PLAN, not the
 motors): arcs turn about the robot centre at the profile's radius, as the
-planner assumes; FU<n> drives straight until the front bumper is n cm from
-the nearest obstacle inside a +/-SONAR_HALF_ANGLE_DEG cone.
+planner assumes; ?US observes the nearest obstacle inside a
++/-SONAR_HALF_ANGLE_DEG cone but does not itself move the robot.
 
 After each photo the replay snaps back to the pose the planner intended, so
 one bad approach is reported once instead of throwing off every leg after it.
@@ -185,11 +185,6 @@ class Replay:
         t = token.upper()
         if t in ("S", "RST"):
             return
-        if t.startswith("FU"):
-            dist, _ = self.ahead_distance()
-            if math.isfinite(dist):
-                self.straight(dist - int(t[2:]) * 10.0)
-            return
         for op in ("FR", "FL", "RR", "RL"):
             if t.startswith(op):
                 self.arc(op[0] == "F", op[1] == "R", int(t[2:]))
@@ -240,19 +235,19 @@ def evaluate(obstacles, profile=PROFILE_TIGHT):
     by_id = {str(o["id"]): o for o in obstacles}
     photographed, aim = [], []
     for line, target in zip(plan["segments"], plan["segment_obstacles"]):
-        fu_problems = []
         for tok in line:
-            if tok.upper().startswith("FU") and target is not None:
-                _, hit = sim.ahead_distance()
-                if not same_block(sim, hit, by_id[target]):
-                    seen = "nothing" if hit is None else f"obstacle {hit}"
-                    fu_problems.append(f"FU starts seeing {seen}")
             sim.run(tok)
         if target is not None:
             obs = by_id[target]
             problems, _ = aim_problems(sim, obs)
             photographed.append(obs["id"])
-            problems = fu_problems + [p for p in problems if not p.startswith("camera")]
+            us_problems = []
+            if plan.get("ultrasonic_adjustments", {}).get(str(target), False):
+                _, hit = sim.ahead_distance()
+                if not same_block(sim, hit, obs):
+                    seen = "nothing" if hit is None else f"obstacle {hit}"
+                    us_problems.append(f"?US sees {seen}")
+            problems = us_problems + [p for p in problems if not p.startswith("camera")]
             if problems:
                 aim.append(f"obs {obs['id']}: " + ", ".join(problems))
             # Snap to where the planner meant to be, so one miss isn't counted

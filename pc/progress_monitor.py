@@ -12,7 +12,7 @@ each OK it reads ?WPOSE and sends the PC one line:
 things with it.
 
 1. DECIDE.  When "awaiting_decision" is true the RPi stops and waits up to
-   TASK1_FEEDBACK_TIMEOUT_S (30 s) for a reply - per instruction. If measured
+   TASK1_FEEDBACK_TIMEOUT_S (7 s by default) for a reply - per instruction. If measured
    error crosses either limit, a supplied recovery planner returns to the
    current segment's original endpoint and preserves the later segments. The PC
    then sends REPLACE; otherwise it answers CONTINUE immediately.
@@ -37,6 +37,9 @@ from typing import Optional
 POS_WARN_MM = float(os.getenv("PROGRESS_POS_WARN_MM", "80"))
 HDG_WARN_DEG = float(os.getenv("PROGRESS_HDG_WARN_DEG", "6"))
 MAX_REPLACEMENTS = int(os.getenv("PROGRESS_MAX_REPLACEMENTS", "12"))
+IR_TURN_CLEARANCE_CM = float(os.getenv("PROGRESS_IR_TURN_CLEARANCE_CM", "20"))
+IR_LEFT_NEAR_RAW = int(os.getenv("PROGRESS_IR_LEFT_NEAR_RAW", "1816"))
+IR_RIGHT_NEAR_RAW = int(os.getenv("PROGRESS_IR_RIGHT_NEAR_RAW", "1555"))
 ARENA_SIZE_MM = 2000.0
 # Keep the next reported reference point this far from an arena edge. The
 # planner normally provides this clearance; this second check carries the
@@ -50,9 +53,11 @@ def _wrap180(deg: float) -> float:
 
 
 class PlanMonitor:
-    def __init__(self, plan: Optional[dict] = None, recovery_planner=None):
+    def __init__(self, plan: Optional[dict] = None, recovery_planner=None,
+                 safety_checker=None):
         self.plan = plan if isinstance(plan, dict) else None
         self.recovery_planner = recovery_planner
+        self.safety_checker = safety_checker
         exp = plan.get("expected") if isinstance(plan, dict) else None
         self.expected = exp if isinstance(exp, list) else None
         self.count = 0
@@ -86,25 +91,30 @@ class PlanMonitor:
 
         self.count += 1
         token = p.get("token", "?")
-        deviation = self._compare(seg, ins, token, x_mm, y_mm, hdg)
+        preflight = p.get("event") == "instruction_preflight"
+        deviation = None if preflight else self._compare(
+            seg, ins, token, x_mm, y_mm, hdg
+        )
 
         if p.get("awaiting_decision"):
             if "feedback_id" not in p:
                 logging.error(f"PROGRESS awaits a decision but has no feedback_id: {payload_text[:200]}")
                 return None
             self.decisions += 1
-            boundary_risk = self._next_boundary_risk(seg, ins, x_mm, y_mm, hdg)
+            boundary_risk = self._sensor_risk(p)
+            if boundary_risk is None and preflight:
+                boundary_risk = self._preflight_safety_risk(p)
+            elif boundary_risk is None:
+                boundary_risk = self._next_boundary_risk(seg, ins, x_mm, y_mm, hdg, p)
             deviation_requires_recovery = (
                 deviation is not None and
                 (deviation[0] > POS_WARN_MM or abs(deviation[1]) > HDG_WARN_DEG)
             )
             if (self.recovery_planner is not None and
                     (deviation_requires_recovery or boundary_risk is not None)):
-                # The replacement cap prevents noisy odometry from endlessly
-                # rewriting an otherwise safe route. A predicted boundary
-                # crossing is different: continuing the old primitive is not
-                # a safe fallback, so always give recovery planning a chance.
-                if self.replacements >= MAX_REPLACEMENTS and boundary_risk is None:
+                # The replacement cap prevents noisy odometry or a persistent
+                # sensor return from endlessly rewriting the route.
+                if self.replacements >= MAX_REPLACEMENTS:
                     logging.error(
                         "Automatic replacement limit (%d) reached; continuing existing route.",
                         MAX_REPLACEMENTS,
@@ -112,7 +122,7 @@ class PlanMonitor:
                 else:
                     try:
                         replacement = self._plan_replacement(p, boundary_risk)
-                    except Exception:  # a planner bug must not consume the RPi's 30 s wait
+                    except Exception:  # a planner bug must not consume the RPi's decision wait
                         logging.exception("Recovery planner crashed; continuing existing route.")
                         replacement = None
                     if self._install_replacement(replacement):
@@ -142,43 +152,42 @@ class PlanMonitor:
             )
         return None
 
-    def _plan_replacement(self, progress, boundary_risk):
-        """Call recovery planning, preserving a photo at a segment boundary.
-
-        When look-ahead crosses into the first instruction of the next segment,
-        that next segment is what must be replanned. The RPi has not taken the
-        current segment's photo yet, so prepend a stationary S segment carrying
-        its obstacle assignment before the recovered route.
-        """
-        report = progress
-        current_target = None
-        next_segment = None if boundary_risk is None else boundary_risk.get("next_segment_index")
-        current_segment = int(progress["segment_index"])
-        if next_segment is not None and next_segment != current_segment:
-            mappings = self.plan["segment_obstacles"]
-            current_target = mappings[current_segment]
-            report = dict(progress)
-            report["segment_index"] = next_segment
-            report["instruction_index"] = -1
-            report["remaining_photo_ids"] = [
-                str(value) for value in mappings[next_segment:] if value is not None
-            ]
-
-        replacement = self.recovery_planner(self.plan, report)
-        if replacement is None or current_target is None:
-            return replacement
-        pose = [[
-            round(float(progress["x_grid"]) * 100.0, 1),
-            round(float(progress["y_grid"]) * 100.0, 1),
-            round(float(progress["heading_deg"]) % 360.0, 1),
-        ]]
-        replacement = dict(replacement)
-        replacement["segments"] = [["S"]] + list(replacement["segments"])
-        replacement["segment_obstacles"] = [current_target] + list(
-            replacement["segment_obstacles"]
+    def _preflight_safety_risk(self, progress):
+        if self.safety_checker is None:
+            return None
+        token = str(progress.get("token", "")).strip().upper()
+        try:
+            risk = self.safety_checker(self.plan, progress, token)
+        except Exception:
+            logging.exception("Preflight swept-footprint safety check crashed.")
+            risk = {"reason": "safety checker crashed", "next_token": token}
+        if risk is None:
+            return None
+        risk = dict(risk)
+        risk.update(
+            next_segment_index=int(progress["segment_index"]),
+            next_instruction_index=0,
         )
-        replacement["expected"] = [pose] + list(replacement["expected"])
-        return replacement
+        logging.warning(
+            "Preflight blocks %s: %s at (%s,%s) mm.",
+            token, risk.get("reason", "unsafe"),
+            risk.get("x_mm", "?"), risk.get("y_mm", "?"),
+        )
+        return risk
+
+    def _plan_replacement(self, progress, boundary_risk):
+        """Replan from the live pose for the current, not a future, segment.
+
+        The RPi preflights every new segment after the preceding photo has been
+        taken. Consequently no synthetic stationary photo segment is needed,
+        and a replacement cannot cause the same segment-boundary decision to
+        repeat indefinitely.
+        """
+        report = dict(progress)
+        if boundary_risk is not None:
+            report["blocked_token"] = boundary_risk.get("next_token")
+            report["recovery_reason"] = boundary_risk.get("reason")
+        return self.recovery_planner(self.plan, report)
 
     def summary(self) -> str:
         if not self.count:
@@ -252,7 +261,7 @@ class PlanMonitor:
                             f"{HDG_WARN_DEG:.0f} deg).")
         return pos, dh
 
-    def _next_boundary_risk(self, seg, ins, x_mm, y_mm, hdg):
+    def _next_boundary_risk(self, seg, ins, x_mm, y_mm, hdg, progress=None):
         """Predict the next endpoint after applying the measured pose error.
 
         This is intentionally a one-instruction look-ahead. It runs while the
@@ -272,6 +281,10 @@ class PlanMonitor:
                     next_seg += 1
                 if next_seg >= len(lines):
                     return None
+                # The RPi takes the current segment's photo first, then sends a
+                # fresh pose/IR preflight for this next segment. Do not recover
+                # across that boundary using stale pre-photo sensor data.
+                return None
             next_token = str(lines[next_seg][next_ins]).strip().upper()
             # S has no displacement and therefore cannot create a new overrun.
             if next_token == "S":
@@ -280,6 +293,29 @@ class PlanMonitor:
             nx, ny, _ = (float(value) for value in self.expected[next_seg][next_ins])
         except (KeyError, IndexError, TypeError, ValueError):
             return None
+
+        if self.safety_checker is not None:
+            report = dict(progress or {})
+            report.update(x_grid=x_mm / 100.0, y_grid=y_mm / 100.0,
+                          heading_deg=hdg)
+            try:
+                risk = self.safety_checker(self.plan, report, next_token)
+            except Exception:
+                logging.exception("Swept-footprint safety check crashed.")
+                risk = {"reason": "safety checker crashed", "next_token": next_token}
+            if risk is None:
+                return None
+            risk = dict(risk)
+            risk.update(next_segment_index=next_seg,
+                        next_instruction_index=next_ins)
+            logging.warning(
+                "Swept-footprint look-ahead blocks segment %d instruction %d %s: %s "
+                "at (%s,%s) mm (open-floor allowance %s mm).",
+                next_seg, next_ins, next_token, risk.get("reason", "unsafe"),
+                risk.get("x_mm", "?"), risk.get("y_mm", "?"),
+                risk.get("arena_overhang_mm", "?"),
+            )
+            return risk
 
         # Rotate the planner's next displacement by the measured heading error,
         # then apply it at the measured position. Bearings are north-zero and
@@ -308,3 +344,61 @@ class PlanMonitor:
             seg, ins, next_token, projected_x, projected_y, low, high,
         )
         return risk
+
+    def _sensor_risk(self, progress):
+        """Use live left/right IR as a conservative arc veto."""
+        seg = int(progress["segment_index"])
+        ins = int(progress["instruction_index"])
+        next_seg, next_ins, next_token = self._next_instruction(seg, ins)
+
+        if next_token and next_token[:2] in ("FR", "FL", "RR", "RL"):
+            left_cm = self._number(progress.get("ir_left_cm"))
+            right_cm = self._number(progress.get("ir_right_cm"))
+            left_raw = self._number(progress.get("ir_left_raw"))
+            right_raw = self._number(progress.get("ir_right_raw"))
+            close = []
+            if ((left_cm is not None and left_cm != 65535 and
+                 left_cm <= IR_TURN_CLEARANCE_CM) or
+                    (left_raw is not None and left_raw >= IR_LEFT_NEAR_RAW)):
+                close.append("left")
+            if ((right_cm is not None and right_cm != 65535 and
+                 right_cm <= IR_TURN_CLEARANCE_CM) or
+                    (right_raw is not None and right_raw >= IR_RIGHT_NEAR_RAW)):
+                close.append("right")
+            if close:
+                logging.warning(
+                    "IR veto before %s: close return on %s (L=%s cm/%s raw, "
+                    "R=%s cm/%s raw).",
+                    next_token, "/".join(close), left_cm, left_raw,
+                    right_cm, right_raw,
+                )
+                return {
+                    "reason": "IR side clearance too small",
+                    "next_token": next_token,
+                    "next_segment_index": next_seg,
+                    "next_instruction_index": next_ins,
+                }
+
+        return None
+
+    def _next_instruction(self, seg, ins):
+        try:
+            lines = self.plan["segments"]
+            next_seg, next_ins = seg, ins + 1
+            if next_ins >= len(lines[seg]):
+                next_seg, next_ins = seg + 1, 0
+            while next_seg < len(lines) and next_ins >= len(lines[next_seg]):
+                next_seg, next_ins = next_seg + 1, 0
+            if next_seg >= len(lines):
+                return None, None, None
+            return next_seg, next_ins, str(lines[next_seg][next_ins]).strip().upper()
+        except (KeyError, IndexError, TypeError):
+            return None, None, None
+
+    @staticmethod
+    def _number(value):
+        try:
+            number = float(value)
+            return number if math.isfinite(number) else None
+        except (TypeError, ValueError):
+            return None

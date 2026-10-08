@@ -94,6 +94,7 @@ from path_planner import (  # noqa: E402
     REAR_AXLE_TO_SENSOR_MM,
     RPI_ANCHOR_X_MM,
     RPI_ANCHOR_Y_MM,
+    assess_primitive_safety,
     plan_mission,
     plan_segment_recovery,
 )
@@ -331,11 +332,14 @@ def main() -> None:
             try:
                 report = json.loads(msg.split(",", 1)[1])
                 logging.info(
-                    "Photo adjustment: obstacle %s %s -> (%.2f, %.2f) @ %.1f deg, US=%s cm.",
-                    report.get("obstacle_id", "?"), report.get("token", "?"),
+                    "Photo adjustment: obstacle %s attempt %s used %s from US=%s cm "
+                    "-> (%.2f, %.2f) @ %.1f deg.",
+                    report.get("obstacle_id", "?"),
+                    report.get("correction_attempt", "?"),
+                    report.get("token", "?"),
+                    report.get("measured_us_cm_before", "?"),
                     float(report.get("x_grid")), float(report.get("y_grid")),
                     float(report.get("heading_deg")),
-                    report.get("measured_us_cm", "?"),
                 )
             except (ValueError, TypeError, json.JSONDecodeError):
                 logging.warning("Malformed PHOTO_PROGRESS from RPi: %s", msg[:300])
@@ -382,6 +386,10 @@ def main() -> None:
                     plan_segment_recovery(
                         current_plan, obs, progress, arc_profile=ARC_PROFILE,
                     )
+                ),
+                safety_checker=lambda current_plan, progress, token,
+                                      obs=obstacle_snapshot: assess_primitive_safety(
+                    current_plan, obs, progress, token, arc_profile=ARC_PROFILE,
                 ),
             )
             if not rpi.send("PATH," + json.dumps(path)):

@@ -19,7 +19,7 @@ E2E    A fake RPi walks a REAL plan from the REAL planner, instruction by
 
 What it checks end to end: no "Unrecognised message" warnings for PROGRESS, one
 CONTINUE per decision with the right ids, every instruction compared with the
-plan, no stall (the RPi would wait 30 s per instruction otherwise), and that PROGRESS
+plan, no stall (the RPi would wait 7 s per instruction otherwise), and that PROGRESS
 interleaved with image frames doesn't corrupt either.
 
 Note: rpi/mdp_rpi/instruction_mission.py is not in the repo snapshot this was
@@ -122,7 +122,7 @@ class MonitorUnit(unittest.TestCase):
             ],
         }
         plan = {
-            "segments": [["FU30", "S"], ["F10", "S"]],
+            "segments": [["F15", "S"], ["F10", "S"]],
             "segment_obstacles": ["1", "2"],
             "expected": [
                 [[830.0, 1650.0, 270.0], [830.0, 1650.0, 270.0]],
@@ -137,13 +137,13 @@ class MonitorUnit(unittest.TestCase):
 
         m = pm.PlanMonitor(plan, recover)
         reply = m.handle(progress(
-            0, 0, "FU30", 6.61, 16.58, 270.2, fid="bad-fu",
+            0, 0, "F15", 6.61, 16.58, 270.2, fid="large-error",
             remaining_photo_ids=["1", "2"],
         ))
         tag, body = reply.split(",", 1)
         payload = json.loads(body)
         self.assertEqual(tag, "REPLACE")
-        self.assertEqual(payload["feedback_id"], "bad-fu")
+        self.assertEqual(payload["feedback_id"], "large-error")
         self.assertEqual(payload["segments"], replacement["segments"])
         self.assertEqual(payload["segment_obstacles"], ["1", "2"])
         self.assertEqual(len(calls), 1)
@@ -215,7 +215,61 @@ class MonitorUnit(unittest.TestCase):
         self.assertEqual(reply.split(",", 1)[0], "CONTINUE")
         self.assertEqual(calls, [])
 
-    def test_boundary_lookahead_preserves_photo_before_replacing_next_segment(self):
+    def test_ir_vetoes_a_45_degree_arc_and_requests_recovery(self):
+        plan = {
+            "segments": [["F10", "FR45", "S"]],
+            "segment_obstacles": ["4"],
+            "expected": [[
+                [500.0, 500.0, 0.0],
+                [708.0, 414.0, 45.0],
+                [708.0, 414.0, 45.0],
+            ]],
+        }
+        replacement = {
+            "segments": [["R10", "FL45", "S"]],
+            "segment_obstacles": ["4"],
+            "expected": [[
+                [500.0, 400.0, 0.0],
+                [292.0, 314.0, 315.0],
+                [292.0, 314.0, 315.0],
+            ]],
+        }
+        calls = []
+        m = pm.PlanMonitor(
+            plan,
+            lambda current, report: calls.append(report) or replacement,
+        )
+        reply = m.handle(progress(
+            0, 0, "F10", 5.0, 5.0, 0.0, fid="ir-close",
+            remaining_photo_ids=["4"], ir_left_cm=18, ir_right_cm=65535,
+            ir_left_raw=1900, ir_right_raw=100,
+        ))
+        self.assertEqual(reply.split(",", 1)[0], "REPLACE")
+        self.assertEqual(len(calls), 1)
+        self.assertTrue(any("IR veto" in message
+                            for message in self.cap.messages(logging.WARNING)))
+
+    def test_ir_no_reading_with_low_raw_count_does_not_false_veto(self):
+        plan = {
+            "segments": [["F10", "FR45", "S"]],
+            "segment_obstacles": ["4"],
+            "expected": [[
+                [500.0, 500.0, 0.0],
+                [708.0, 414.0, 45.0],
+                [708.0, 414.0, 45.0],
+            ]],
+        }
+        calls = []
+        m = pm.PlanMonitor(plan, lambda current, report: calls.append(report))
+        reply = m.handle(progress(
+            0, 0, "F10", 5.0, 5.0, 0.0, fid="ir-far",
+            ir_left_cm=65535, ir_right_cm=65535,
+            ir_left_raw=100, ir_right_raw=100,
+        ))
+        self.assertEqual(reply.split(",", 1)[0], "CONTINUE")
+        self.assertEqual(calls, [])
+
+    def test_boundary_lookahead_defers_next_segment_to_its_preflight(self):
         plan = {
             "segments": [["S"], ["FL90", "S"]],
             "segment_obstacles": ["2", "4"],
@@ -224,34 +278,54 @@ class MonitorUnit(unittest.TestCase):
                 [[1944.0, 836.0, 90.0], [1944.0, 836.0, 90.0]],
             ],
         }
-        recovered = {
-            "segments": [["R20", "RR90", "S"]],
-            "segment_obstacles": ["4"],
-            "expected": [[
-                [1716.0, 1302.0, 180.0],
-                [1422.0, 1008.0, 270.0],
-                [1422.0, 1008.0, 270.0],
-            ]],
-        }
         reports = []
 
         def recover(current_plan, report):
             reports.append(report)
-            return recovered
+            return None
 
         m = pm.PlanMonitor(plan, recover)
         reply = m.handle(progress(
             0, 0, "S", 17.16, 11.02, 179.8, fid="between-segments",
             remaining_photo_ids=["2", "4"],
         ))
-        tag, body = reply.split(",", 1)
-        payload = json.loads(body)
-        self.assertEqual(tag, "REPLACE")
+        self.assertEqual(reply.split(",", 1)[0], "CONTINUE")
+        self.assertEqual(reports, [])
+
+    def test_new_segment_preflight_uses_live_ir_and_replaces_current_segment(self):
+        plan = {
+            "segments": [["S"], ["FR45", "S"]],
+            "segment_obstacles": ["2", "4"],
+            "expected": [
+                [[1650.0, 1130.0, 180.0]],
+                [[1858.0, 1044.0, 225.0], [1858.0, 1044.0, 225.0]],
+            ],
+        }
+        recovered = {
+            "segments": [["R10", "FL45", "S"]],
+            "segment_obstacles": ["4"],
+            "expected": [[
+                [1650.0, 1230.0, 180.0],
+                [1442.0, 1316.0, 135.0],
+                [1442.0, 1316.0, 135.0],
+            ]],
+        }
+        reports = []
+        m = pm.PlanMonitor(
+            plan,
+            lambda current_plan, report: reports.append(report) or recovered,
+        )
+        payload = json.loads(progress(
+            1, -1, "FR45", 16.5, 11.3, 180.0, fid="new-segment",
+            remaining_photo_ids=["4"], ir_left_cm=18, ir_right_cm=65535,
+            ir_left_raw=1900, ir_right_raw=100,
+        ))
+        payload["event"] = "instruction_preflight"
+        reply = m.handle(json.dumps(payload))
+        self.assertEqual(reply.split(",", 1)[0], "REPLACE")
         self.assertEqual(reports[0]["segment_index"], 1)
-        self.assertEqual(reports[0]["remaining_photo_ids"], ["4"])
-        self.assertEqual(payload["segments"][0], ["S"])
-        self.assertEqual(payload["segment_obstacles"], ["2", "4"])
-        self.assertEqual(m.expected[0][0], [1716.0, 1102.0, 179.8])
+        self.assertEqual(reports[0]["blocked_token"], "FR45")
+        self.assertEqual(json.loads(reply.split(",", 1)[1])["segment_obstacles"], ["4"])
 
     def test_garbage_never_raises_and_never_replies(self):
         m = pm.PlanMonitor(self.PLAN)

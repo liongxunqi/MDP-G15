@@ -7,7 +7,7 @@ from uuid import uuid4
 
 
 class FeedbackControl:
-    def __init__(self, enabled=False, timeout=30.0):
+    def __init__(self, enabled=False, timeout=7.0):
         if not math.isfinite(timeout) or timeout <= 0:
             raise ValueError("TASK1_FEEDBACK_TIMEOUT_S must be finite and positive")
         self.enabled = enabled

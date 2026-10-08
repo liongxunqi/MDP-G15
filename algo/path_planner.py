@@ -2,7 +2,8 @@
 
 Per obstacle the planner picks a photo pose: nose toward the image, the
 ultrasonic reading the chosen standoff. Each leg drives onto the straight
-approach line in front of that pose, then FU<n> closes the rest. Legs avoid
+approach line in front of that pose, then an ordinary F<n> closes the rest.
+The RPi verifies the range with ?US and applies bounded F/R corrections. Legs avoid
 EVERY obstacle, including the one being approached, and the next leg starts
 from where the photo was taken.
 
@@ -30,8 +31,6 @@ from typing import Dict, List, Optional, Tuple
 
 from stm_tokens import (
     ARENA_CM,
-    FU_MAX_CM,
-    FU_MIN_CM,
     PROFILE_TIGHT,
     ROBOT_LENGTH_CM,
     ROBOT_WIDTH_CM,
@@ -39,7 +38,6 @@ from stm_tokens import (
     TURN_RADIUS_MM,
     chunk_tokens,
     fwd,
-    fwd_until,
     rev,
     stop,
 )
@@ -53,14 +51,13 @@ OBSTACLE_SIZE_MM = 100.0
 # of the 23 x 18.8 cm footprint itself. Covers odometry drift and turn slop.
 COLLISION_MARGIN_MM = 30.0
 
-# Ultrasonic reading at the photo, cm - the FU<n> target - tried in this order.
+# Ultrasonic reading at the photo, cm, tried in this order.
 # 30 is where YOLO is most confident; further out is next best. The camera is
 # usable down to 20 cm, but that close pose is reserved for a face near an arena
 # edge where the normal distances would put the rear axle beyond the boundary.
 STANDOFF_PREFERENCE_CM = (30, 32, 33, 35, 38, 40, 42, 45)
 STANDOFF_LAST_RESORT_CM = (28, 20)
 STANDOFF_CANDIDATES_CM = STANDOFF_PREFERENCE_CM + STANDOFF_LAST_RESORT_CM
-FU_COMPENSATE = False
 
 # Closed-loop recovery. A replacement returns to the endpoint of the segment
 # that was already being executed, then reuses the untouched later segments.
@@ -79,13 +76,18 @@ RECOVERY_MAX_HEADING_SNAP_DEG = float(os.getenv(
 # 10 cm image, or the ultrasonic locks onto a neighbouring obstacle.
 APPROACH_LINE_MAX_MM = 600.0
 APPROACH_LATERAL_TOL_MM = 25.0
-# FU is slow and its beam spreads (PROTOCOL.md 4.1), so F<n> covers most of
-# the approach line and FU only the last stretch - at most FU_RUNIN_MM, and
-# less if a neighbouring obstacle sits inside the beam from further back.
-# FU stops at the NEAREST echo: a neighbour closer than the image would stop
-# the robot short, or make it reverse to reach the standoff.
-FU_RUNIN_MM = 150.0
+# The Pi validates the final camera range with ?US. Check that the intended
+# image remains the nearest echo over the last part of the approach rather
+# than correcting toward a neighbouring obstacle.
+US_VERIFY_RUNIN_MM = 150.0
 SONAR_HALF_ANGLE_DEG = 10.0
+
+# Head-on is preferred. A diagonal fallback lets the 45-degree lattice view a
+# face in a tight corridor, but only after the complete chassis pose and camera
+# ray have passed the same collision/visibility checks as a normal photo pose.
+PHOTO_VIEW_ANGLES_DEG = tuple(float(value) for value in os.getenv(
+    "PHOTO_VIEW_ANGLES_DEG", "0,45,-45"
+).split(",") if value.strip())
 
 # The RPi gives up on PATH after PATH_TIMEOUT_S (30 s). Stop trying other
 # standoffs once this much time has gone and send the best plan so far.
@@ -97,7 +99,7 @@ FACE_FROM_D = {0: "N", 2: "E", 4: "S", 6: "W"}
 
 ROBOT_HALF_LENGTH_MM = ROBOT_LENGTH_CM * 10 / 2.0
 ROBOT_HALF_WIDTH_MM = ROBOT_WIDTH_CM * 10 / 2.0
-# FU<n> measures from the front sensor, but the path and STM WPOSE both track
+# ?US measures from the front sensor, but the path and STM WPOSE both track
 # the rear axle. This measured offset is therefore part of every photo pose.
 REAR_AXLE_TO_SENSOR_MM = float(os.getenv(
     "REAR_AXLE_TO_SENSOR_CM", str(REAR_AXLE_TO_SENSOR_CM)
@@ -122,10 +124,10 @@ START_THETA = math.pi / 2
 # rpi_position = planner_position + (anchor - planner_start).
 RPI_ANCHOR_X_MM = float(os.getenv("RPI_ANCHOR_X_MM", str(START_X_MM)))
 RPI_ANCHOR_Y_MM = float(os.getenv("RPI_ANCHOR_Y_MM", str(START_Y_MM)))
-# Keep the reference point this far INSIDE the RPi's arena check: dead reckoning
-# drifts, and the check is a hard stop. Set RPI_ARENA_GUARD=0 only if the RPi no
-# longer halts on out-of-arena positions.
-RPI_ARENA_GUARD = os.getenv("RPI_ARENA_GUARD", "1").strip().lower() not in ("0", "false", "no")
+# Optional stricter reference-point boundary. It is disabled by default because
+# the RPi reports finite overhang coordinates instead of halting; the full body
+# remains bounded by grid_search.ARENA_OVERHANG_MM throughout every primitive.
+RPI_ARENA_GUARD = os.getenv("RPI_ARENA_GUARD", "0").strip().lower() not in ("0", "false", "no")
 RPI_ARENA_MARGIN_MM = float(os.getenv("RPI_ARENA_MARGIN_MM", "50"))
 
 # The leg that leaves START may not put the body outside the arena within this
@@ -144,7 +146,7 @@ _REAR_BLOCK_DEPTH_MM = 600.0     # how far behind the start pose the "no reverse
 _REAR_BLOCK_WIDTH_MM = 150.0     # ... and how far it extends past each side of the body
 _BIG_MM = 10_000.0
 
-_MERGEABLE_RE = re.compile(r"^(FR|FL|RR|RL|F|R)(\d+)$")
+_MERGEABLE_RE = re.compile(r"^(F|R)(\d+)$")
 
 
 class Pose:
@@ -157,18 +159,24 @@ class Pose:
         return f"Pose({self.x:.1f}, {self.y:.1f}, {math.degrees(self.theta):.1f}deg)"
 
 
-# fu_runin_mm: how far before the photo pose FU may start with only the
-# target in its beam; None when even FU from the photo pose itself would hear
-# a neighbour first, and the approach has to be F<n> alone.
-PhotoOption = namedtuple("PhotoOption", "standoff_cm pose line fu_runin_mm")
+# us_runin_mm: how far before the photo pose the target remains the nearest
+# ultrasonic echo. None means ?US cannot safely identify this target.
+PhotoOption = namedtuple(
+    "PhotoOption", "standoff_cm pose line us_runin_mm view_angle_deg"
+)
 
 
 def _wrap(theta):
     return math.atan2(math.sin(theta), math.cos(theta))
 
 
-def _viewing_pose(obstacle: dict, standoff_mm: float) -> Optional[Pose]:
-    """Rear-axle pose when the front sensor reads standoff_mm to the face."""
+def _viewing_pose(obstacle: dict, standoff_mm: float,
+                  view_angle_deg: float = 0.0) -> Optional[Pose]:
+    """Rear-axle pose whose camera ray reaches the centre of the image face.
+
+    view_angle_deg is measured from the outward face normal. Zero is head-on;
+    +/-45 degrees are diagonal fallbacks supported by the motion lattice.
+    """
     d = obstacle.get("d")
     if d not in FACE_FROM_D:
         return None
@@ -176,15 +184,24 @@ def _viewing_pose(obstacle: dict, standoff_mm: float) -> Optional[Pose]:
 
     cx = obstacle["x"] * 100.0 + OBSTACLE_SIZE_MM / 2.0
     cy = obstacle["y"] * 100.0 + OBSTACLE_SIZE_MM / 2.0
-    dist = OBSTACLE_SIZE_MM / 2.0 + standoff_mm + REAR_AXLE_TO_SENSOR_MM
-
-    if face == "N":
-        return Pose(cx, cy + dist, -math.pi / 2)
-    if face == "S":
-        return Pose(cx, cy - dist, math.pi / 2)
-    if face == "E":
-        return Pose(cx + dist, cy, math.pi)
-    return Pose(cx - dist, cy, 0.0)
+    outward = {
+        "N": math.pi / 2,
+        "S": -math.pi / 2,
+        "E": 0.0,
+        "W": math.pi,
+    }[face]
+    # Start the viewing ray at the centre of the selected face, not at the
+    # obstacle centre. This keeps an oblique standoff equal to the real camera
+    # distance from that face instead of shortening and laterally shifting it.
+    face_x = cx + OBSTACLE_SIZE_MM / 2.0 * math.cos(outward)
+    face_y = cy + OBSTACLE_SIZE_MM / 2.0 * math.sin(outward)
+    ray = outward + math.radians(view_angle_deg)
+    dist = standoff_mm + REAR_AXLE_TO_SENSOR_MM
+    return Pose(
+        face_x + dist * math.cos(ray),
+        face_y + dist * math.sin(ray),
+        ray + math.pi,
+    )
 
 
 def _obstacle_aabb_mm(obstacle: dict) -> Tuple[float, float, float, float]:
@@ -282,10 +299,10 @@ def _sonar_sees_target_first(pose: Pose, back_mm: float, standoff_mm: float,
     return True
 
 
-def _fu_runin(pose: Pose, standoff_mm: float, others: List[dict]) -> Optional[float]:
+def _us_runin(pose: Pose, standoff_mm: float, others: List[dict]) -> Optional[float]:
     runin = None
     back = 0.0
-    while back <= FU_RUNIN_MM:
+    while back <= US_VERIFY_RUNIN_MM:
         if not _sonar_sees_target_first(pose, back, standoff_mm, others):
             break
         runin = back
@@ -293,26 +310,35 @@ def _fu_runin(pose: Pose, standoff_mm: float, others: List[dict]) -> Optional[fl
     return runin
 
 
-def _photo_options(obstacle: dict, boxes, obstacles: List[dict]) -> List[PhotoOption]:
+def _photo_options(obstacle: dict, boxes, obstacles: List[dict],
+                   allow_oblique: bool = False) -> List[PhotoOption]:
     """Every standoff in STANDOFF_CANDIDATES_CM whose photo pose is clear, in
     preference order, each with the stretch of approach line that is clear."""
     options = []
+    angles = PHOTO_VIEW_ANGLES_DEG if allow_oblique else (0.0,)
     for standoff_cm in STANDOFF_CANDIDATES_CM:
-        pose = _viewing_pose(obstacle, standoff_cm * 10.0)
-        if pose is None or not _pose_clear(pose.x, pose.y, pose.theta, boxes):
-            continue
-        length = 0.0
-        while length + 10.0 <= APPROACH_LINE_MAX_MM:
-            back = length + 10.0
-            if not _pose_clear(pose.x - back * math.cos(pose.theta),
-                               pose.y - back * math.sin(pose.theta), pose.theta, boxes):
-                break
-            length = back
-        line = grid_search.ApproachLine(pose.x, pose.y, pose.theta, length, APPROACH_LATERAL_TOL_MM)
-        others = [o for o in obstacles if o is not obstacle
-                  and (o["x"], o["y"]) != (obstacle["x"], obstacle["y"])]
-        runin = _fu_runin(pose, standoff_cm * 10.0, others)
-        options.append(PhotoOption(standoff_cm, pose, line, runin))
+        for view_angle_deg in angles:
+            pose = _viewing_pose(obstacle, standoff_cm * 10.0, view_angle_deg)
+            if pose is None or not _pose_clear(pose.x, pose.y, pose.theta, boxes):
+                continue
+            length = 0.0
+            while length + 10.0 <= APPROACH_LINE_MAX_MM:
+                back = length + 10.0
+                if not _pose_clear(pose.x - back * math.cos(pose.theta),
+                                   pose.y - back * math.sin(pose.theta), pose.theta, boxes):
+                    break
+                length = back
+            line = grid_search.ApproachLine(
+                pose.x, pose.y, pose.theta, length, APPROACH_LATERAL_TOL_MM
+            )
+            others = [o for o in obstacles if o is not obstacle
+                      and (o["x"], o["y"]) != (obstacle["x"], obstacle["y"])]
+            runin = _us_runin(pose, standoff_cm * 10.0, others)
+            if runin is None and view_angle_deg:
+                continue
+            options.append(PhotoOption(
+                standoff_cm, pose, line, runin, view_angle_deg
+            ))
     return options
 
 
@@ -332,9 +358,12 @@ def _search_leg(from_pose: Pose, option: PhotoOption, radius_mm, boxes):
 
 
 def _merge_runs(tokens: List[str], poses: List[Pose]):
-    """F5,F5,F5 -> F15 and FR45,FR45 -> FR90: one primitive instead of several
-    saves the STM a brake-and-align stop each. poses[i] is the pose AFTER
-    tokens[i]."""
+    """Merge straights, but preserve every 45-degree arc checkpoint.
+
+    Keeping each searched arc separate gives the RPi an OK, WPOSE and IR sample
+    before the next half of a larger manoeuvre. poses[i] is the pose AFTER
+    tokens[i].
+    """
     out_t, out_p = [], []
     for tok, pose in zip(tokens, poses):
         m = _MERGEABLE_RE.match(tok)
@@ -346,6 +375,14 @@ def _merge_runs(tokens: List[str], poses: List[Pose]):
             out_t.append(tok)
             out_p.append(pose)
     return out_t, out_p
+
+
+def _contains_fu(segments: List[List[str]]) -> bool:
+    """Task 1 contract: neither initial nor recovery paths may contain FU."""
+    return any(
+        isinstance(token, str) and token.strip().upper().startswith("FU")
+        for segment in segments for token in segment
+    )
 
 
 def _edge_cost(cache, from_id, to_id) -> float:
@@ -533,7 +570,10 @@ def _pose_to_dir_entry(pose: Pose) -> dict:
 # this, every dead end was retried at all 8 standoffs, each retry re-searching a
 # whole matrix of legs - 20 s of planning spent on obstacles that cannot be shot.
 # (Obstacles that ARE reachable keep every standoff.)
-MAX_DEAD_OPTION_TRIES = 3
+# Three camera angles are considered at each range. Try three complete range
+# bands before declaring a target unreachable; the previous value of 3 would
+# now test only 30 cm (head-on, +45, -45) and never reach another distance.
+MAX_DEAD_OPTION_TRIES = 9
 
 
 def _choose_tour(visitable, legs: _Legs, options):
@@ -609,6 +649,81 @@ def _straight_distance_clear(x: float, y: float, theta: float, distance_mm: floa
     return True
 
 
+def assess_primitive_safety(plan: dict, obstacles: List[dict], progress: dict,
+                            token: str, arc_profile: int = PROFILE_TIGHT):
+    """Check a primitive from the measured pose using the planner's full body.
+
+    Returns None when every sampled footprint is clear, otherwise a diagnostic
+    dict suitable for PlanMonitor. Unlike the old endpoint-only guard, this
+    checks the complete 45/90-degree sweep and uses PATH.frame_shift_mm before
+    applying the configured open-floor overhang.
+    """
+    try:
+        wire_x = float(progress["x_grid"]) * 100.0
+        wire_y = float(progress["y_grid"]) * 100.0
+        bearing = float(progress["heading_deg"]) % 360.0
+        shift_x, shift_y = _plan_frame_shift(plan)
+        x, y = wire_x - shift_x, wire_y - shift_y
+        theta = math.radians(90.0 - bearing)
+        command = str(token).strip().upper()
+    except (KeyError, TypeError, ValueError):
+        return {"reason": "invalid measured pose", "next_token": str(token)}
+
+    boxes = grid_search.Boxes([_obstacle_aabb_mm(o) for o in obstacles])
+    if RPI_ARENA_GUARD:
+        boxes.ref_bounds = _rpi_ref_bounds(Pose(
+            float(plan.get("start_mm", {}).get("x", START_X_MM)),
+            float(plan.get("start_mm", {}).get("y", START_Y_MM)),
+            START_THETA,
+        ))
+
+    samples = [(x, y, theta)]
+    match = re.fullmatch(r"(FR|FL|RR|RL|F|R)(\d+)", command)
+    if command == "S":
+        return None
+    if match is None:
+        return {"reason": "unsupported primitive", "next_token": command}
+
+    op, magnitude_text = match.groups()
+    magnitude = int(magnitude_text)
+    if op in ("F", "R"):
+        distance = magnitude * 10.0 * (1.0 if op == "F" else -1.0)
+        count = max(1, int(math.ceil(abs(distance) / 20.0)))
+        samples.extend(
+            (x + distance * i / count * math.cos(theta),
+             y + distance * i / count * math.sin(theta), theta)
+            for i in range(1, count + 1)
+        )
+    else:
+        direction = 1 if op[0] == "F" else -1
+        curvature = 1 if op[1] == "L" else -1
+        total = math.radians(magnitude)
+        count = max(1, int(math.ceil(magnitude / 7.5)))
+        radius = TURN_RADIUS_MM[arc_profile]
+        for i in range(1, count + 1):
+            dx, dy, sample_theta = grid_search._arc_delta(
+                theta, direction, curvature, total * i / count, radius
+            )
+            samples.append((x + dx, y + dy, sample_theta))
+
+    for sample_x, sample_y, sample_theta in samples:
+        if grid_search._point_blocked(
+            sample_x, sample_y, sample_theta, boxes, ARENA_MM,
+            ROBOT_HALF_LENGTH_MM, ROBOT_HALF_WIDTH_MM,
+        ):
+            return {
+                "reason": "swept footprint intersects obstacle/arena envelope",
+                "next_token": command,
+                "x_mm": round(sample_x + shift_x, 1),
+                "y_mm": round(sample_y + shift_y, 1),
+                "heading_deg": round(
+                    (90.0 - math.degrees(sample_theta)) % 360.0, 1
+                ),
+                "arena_overhang_mm": grid_search.ARENA_OVERHANG_MM,
+            }
+    return None
+
+
 def plan_segment_recovery(plan: dict, obstacles: List[dict], progress: dict,
                           arc_profile: int = PROFILE_TIGHT) -> Optional[dict]:
     """Return a replacement that recovers the current segment endpoint.
@@ -634,6 +749,9 @@ def plan_segment_recovery(plan: dict, obstacles: List[dict], progress: dict,
 
     if not (len(segments) == len(mappings) == len(expected)):
         logging.error("Cannot build recovery: PATH arrays are not parallel.")
+        return None
+    if _contains_fu(segments):
+        logging.error("Cannot build recovery from a legacy Task 1 path containing FU.")
         return None
 
     reported_remaining = progress.get("remaining_photo_ids")
@@ -679,17 +797,41 @@ def plan_segment_recovery(plan: dict, obstacles: List[dict], progress: dict,
 
     tokens, poses = [], []
     terminal = Pose(ax, ay, actual_lattice)
+    blocked = str(progress.get("blocked_token", "")).strip().upper()
+    blocked_match = re.fullmatch(r"(FR|FL|RR|RL|F|R)(\d+)", blocked)
+    forbidden_first = set()
+    recovery_reason = str(progress.get("recovery_reason", ""))
+    if recovery_reason.startswith("IR "):
+        # A close side return does not identify one exact steering primitive.
+        # Force one straight clearing move before any arc; the RPi will sample
+        # IR again after that move and may permit or replan the turn then.
+        forbidden_first.update(
+            f"{op}{grid_search.TURN_STEP_DEG}"
+            for op in ("FR", "FL", "RR", "RL")
+        )
+    elif blocked_match:
+        blocked_op = blocked_match.group(1)
+        if blocked_op in ("FR", "FL", "RR", "RL"):
+            forbidden_first.add(f"{blocked_op}{grid_search.TURN_STEP_DEG}")
+        elif blocked_op == "F":
+            forbidden_first.add(grid_search._straight_forward_token())
+        else:
+            forbidden_first.add(grid_search._straight_reverse_token())
 
-    # Most drift is longitudinal (the FU failure in the physical logs was
-    # 169 mm). Correct that directly instead of making the 50 mm search grid
-    # overshoot and then drive back a few centimetres.
+    # Most measured drift is longitudinal. Correct that directly instead of
+    # making the 50 mm search grid overshoot and then drive back a few centimetres.
     dx, dy = tx - ax, ty - ay
     along = dx * math.cos(target_theta) + dy * math.sin(target_theta)
     lateral = -dx * math.sin(target_theta) + dy * math.cos(target_theta)
     same_heading = grid_search._heading_index(actual_lattice) == grid_search._heading_index(target_theta)
     direct_cm = int(round(abs(along) / 10.0))
     direct_mm = math.copysign(direct_cm * 10.0, along) if direct_cm else 0.0
+    direct_op_blocked = (
+        (direct_mm > 0 and blocked_match and blocked_match.group(1) == "F") or
+        (direct_mm < 0 and blocked_match and blocked_match.group(1) == "R")
+    )
     if (same_heading and abs(lateral) <= RECOVERY_LATERAL_TOL_MM and direct_cm and
+            not direct_op_blocked and
             _straight_distance_clear(ax, ay, target_theta, direct_mm, boxes)):
         tokens = [fwd(direct_cm) if direct_mm > 0 else rev(direct_cm)]
         terminal = Pose(
@@ -718,6 +860,7 @@ def plan_segment_recovery(plan: dict, obstacles: List[dict], progress: dict,
                 raw_tokens, raw_poses, _ = grid_search.search_leg(
                     ax, ay, actual_lattice, goal, TURN_RADIUS_MM[arc_profile], boxes,
                     ARENA_MM, ROBOT_HALF_LENGTH_MM, ROBOT_HALF_WIDTH_MM,
+                    forbidden_first_tokens=forbidden_first,
                 )
             except grid_search.NoPathFound as exc:
                 last_error = exc
@@ -791,6 +934,9 @@ def plan_segment_recovery(plan: dict, obstacles: List[dict], progress: dict,
         "frame_shift_mm": {"x": shift_x, "y": shift_y},
         "start_mm": dict(plan.get("start_mm", {})),
     }
+    if _contains_fu(replacement["segments"]):
+        logging.error("Recovery planner produced a forbidden FU token; refusing replacement.")
+        return None
     logging.warning(
         "Recovery for segment %d: measured (%.0f,%.0f) @ %.1f deg -> original endpoint "
         "(%.0f,%.0f) @ %.1f deg using %s; preserving %d later segment(s).",
@@ -833,9 +979,10 @@ def plan_mission(obstacles: List[dict], arc_profile: int = PROFILE_TIGHT,
         if obs.get("d") not in FACE_FROM_D:
             logging.info(f"Obstacle {obs.get('id')}: SKIP (d={obs.get('d')}).")
             continue
-        opts = _photo_options(obs, boxes, obstacles)
+        opts = _photo_options(obs, boxes, obstacles, allow_oblique=True)
         if not opts:
-            if boxes.ref_bounds is not None and _photo_options(obs, obstacle_boxes, obstacles):
+            if (boxes.ref_bounds is not None and
+                    _photo_options(obs, obstacle_boxes, obstacles, allow_oblique=True)):
                 logging.error(
                     f"Obstacle {obs['id']}: its photo spot is only reachable by taking the robot "
                     f"past the point where the RPi stops the mission (position outside the "
@@ -864,10 +1011,9 @@ def plan_mission(obstacles: List[dict], arc_profile: int = PROFILE_TIGHT,
     expected: List[List[List[float]]] = []
     shift_x, shift_y = _frame_shift(start)
     photo_poses, standoffs = {}, {}
-    safe_standoffs = {
-        str(obstacle_id): [option.standoff_cm for option in obstacle_options]
-        for obstacle_id, obstacle_options in options.items()
-    }
+    safe_standoffs = {}
+    ultrasonic_adjustments = {}
+    view_angles = {}
 
     cur_id = "START"
     start_relaxed = False
@@ -895,33 +1041,34 @@ def plan_mission(obstacles: List[dict], arc_profile: int = PROFILE_TIGHT,
 
         final = option.pose
         back, _ = option.line.offsets(search_poses[-1].x, search_poses[-1].y)
-        runin = option.fu_runin_mm
-        # F<n> up to where FU may start (all the way, if FU can't be trusted).
-        # Rounded UP before FU, so it never starts further out than the beam
-        # was checked; to the nearest cm without FU, so F can't overshoot.
-        if runin is None:
-            run_cm = round(back / 10.0)
-        else:
-            run_cm = math.ceil((back - runin) / 10.0 - 1e-6)
+        # Reach the selected camera pose using ordinary odometry. Since STM
+        # distances are whole centimetres, record the rounded endpoint as the
+        # expected pose; the Pi's ?US loop removes the small residual error.
+        run_cm = round(back / 10.0)
         if run_cm > 0:
-            rest = back - run_cm * 10.0
+            run_mm = run_cm * 10.0
             tokens.append(fwd(run_cm))
-            poses.append(Pose(final.x - rest * math.cos(final.theta),
-                              final.y - rest * math.sin(final.theta), final.theta))
-        if runin is None:
-            logging.warning(f"Obstacle {obs['id']}: a neighbour is inside the ultrasonic "
-                            f"beam — final approach on odometry only, no FU.")
+            terminal = Pose(
+                search_poses[-1].x + run_mm * math.cos(final.theta),
+                search_poses[-1].y + run_mm * math.sin(final.theta),
+                final.theta,
+            )
+            poses.append(terminal)
         else:
-            assert FU_MIN_CM <= option.standoff_cm <= FU_MAX_CM
-            tokens.append(fwd_until(option.standoff_cm, compensate=FU_COMPENSATE))
-            poses.append(final)
+            terminal = Pose(search_poses[-1].x, search_poses[-1].y, final.theta)
         tokens.append(stop())
-        poses.append(final)
+        poses.append(terminal)
 
         if option.standoff_cm != STANDOFF_CANDIDATES_CM[0]:
             level = logging.WARNING if option.standoff_cm in STANDOFF_LAST_RESORT_CM else logging.INFO
             logging.log(level, f"Obstacle {obs['id']}: photo at {option.standoff_cm} cm"
                                f"{' (last resort)' if level == logging.WARNING else ''}.")
+        if option.view_angle_deg:
+            logging.warning(
+                "Obstacle %s: using a %+.0f degree diagonal camera view because "
+                "the head-on route is more constrained.",
+                obs["id"], option.view_angle_deg,
+            )
 
         line_start = 0
         lines = chunk_tokens(tokens)
@@ -936,8 +1083,16 @@ def plan_mission(obstacles: List[dict], arc_profile: int = PROFILE_TIGHT,
             dirs.append(_pose_to_dir_entry(poses[line_start - 1]))
             segment_obstacles.append(str(obs["id"]) if i == len(lines) - 1 else None)
 
-        photo_poses[obs["id"]] = (final.x, final.y, final.theta)
+        photo_poses[obs["id"]] = (terminal.x, terminal.y, terminal.theta)
         standoffs[obs["id"]] = option.standoff_cm
+        view_angles[obs["id"]] = option.view_angle_deg
+        ultrasonic_adjustments[str(obs["id"])] = option.us_runin_mm is not None
+        safe_standoffs[str(obs["id"])] = sorted({
+            candidate.standoff_cm for candidate in options[obs["id"]]
+            if (option.us_runin_mm is not None and
+                candidate.us_runin_mm is not None and
+                candidate.view_angle_deg == option.view_angle_deg)
+        })
         cur_id = obs["id"]
 
     logging.info(f"Planned {len(photo_poses)}/{len(obstacles)} photo(s) in "
@@ -945,11 +1100,12 @@ def plan_mission(obstacles: List[dict], arc_profile: int = PROFILE_TIGHT,
     if details is not None:
         details["photo_poses"] = photo_poses
         details["standoff_cm"] = standoffs
+        details["view_angle_deg"] = view_angles
         details["skipped"] = skipped
         details["frame_shift_mm"] = (shift_x, shift_y)
         details["start_relaxed"] = start_relaxed
 
-    return {
+    result = {
         "segments": segments,
         "obstacle_ids": [o["id"] for o in order],
         "segment_obstacles": segment_obstacles,
@@ -972,5 +1128,13 @@ def plan_mission(obstacles: List[dict], arc_profile: int = PROFILE_TIGHT,
             str(obstacle_id): standoff
             for obstacle_id, standoff in standoffs.items()
         },
+        "ultrasonic_adjustments": ultrasonic_adjustments,
+        "selected_view_angles": {
+            str(obstacle_id): angle
+            for obstacle_id, angle in view_angles.items()
+        },
         "expected": expected,
     }
+    if _contains_fu(result["segments"]):
+        raise RuntimeError("Task 1 planner produced a forbidden FU token")
+    return result

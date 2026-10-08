@@ -3,6 +3,7 @@
 import heapq
 import logging
 import math
+import os
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
@@ -12,8 +13,8 @@ STEP_MM = 50.0
 REV_COST_MULT = 1.15
 # Each 90 degrees of turning costs this much on top of its arc length: a turn
 # eats floor, takes longer than a straight, and is where odometry error comes
-# from. Charged pro rata per TURN_STEP, so two 45s that merge into one 90 cost
-# what a single 90 used to.
+# from. Charged pro rata per TURN_STEP, so two consecutive 45-degree checkpoints
+# cost what a single 90-degree primitive used to.
 TURN_PENALTY_MM = 100.0
 # A search that has not found the goal by now is not going to, and a failing
 # one burns the whole cap - a plan with many dead ends (obstacles hugging a
@@ -34,12 +35,12 @@ HEURISTIC_WEIGHT = 1.5
 # this far past the 2 m line. Without it, a face pointing at a nearby edge has
 # nowhere to back out and turn, and that obstacle is a dead end. Set 0 to
 # treat the edge as a wall again.
-ARENA_OVERHANG_MM = 250.0
+ARENA_OVERHANG_MM = float(os.getenv("ARENA_OVERHANG_MM", "250"))
 
 # Every arc turns the body 45 degrees, so the lattice has 8 headings: the four
 # cardinals plus the diagonals, counter-clockwise from E. Straights run on the
-# diagonals too. path_planner merges back-to-back arcs of the same kind, so
-# FR45,FR45 still goes to the STM as one FR90.
+# diagonals too. path_planner keeps each arc separate so pose and IR feedback
+# can be checked halfway through what would otherwise be a blind 90-degree arc.
 TURN_STEP_DEG = 45
 TURN_STEP = math.radians(TURN_STEP_DEG)
 _HEADINGS = tuple(math.atan2(math.sin(i * TURN_STEP), math.cos(i * TURN_STEP)) for i in range(8))
@@ -212,8 +213,8 @@ class ApproachLine:
     along, nose first, to reach its photo pose.
 
     (x, y, theta) is the photo pose itself. The line runs `length_mm` back from
-    it, opposite to theta. The leg may stop anywhere on it - FU<n> then closes
-    the rest in a straight line - so long as it is within `lateral_tol_mm` of
+    it, opposite to theta. The leg may stop anywhere on it; the planner closes
+    the rest with an ordinary straight instruction, so long as it is within `lateral_tol_mm` of
     the line and already on the photo heading. That keeps the camera on the
     image, where a single goal point with a loose tolerance did not.
     """
@@ -246,8 +247,11 @@ class ApproachLine:
 
 
 def _astar(start_x, start_y, start_theta, goal: ApproachLine,
-           radius_mm, boxes, arena_mm, half_length_mm, half_width_mm):
+           radius_mm, boxes, arena_mm, half_length_mm, half_width_mm,
+           forbidden_first_tokens=()):
     start = _State(round(start_x), round(start_y), _heading_index(start_theta))
+    forbidden_first = {str(token).strip().upper()
+                       for token in forbidden_first_tokens}
 
     def cell(st: _State):
         return (round(st.x / DEDUP_CELL_MM), round(st.y / DEDUP_CELL_MM), st.h)
@@ -277,6 +281,8 @@ def _astar(start_x, start_y, start_theta, goal: ApproachLine,
             return tokens, states, cost_so_far[current]
 
         for nxt, token, step_cost in _neighbours(current, radius_mm, boxes, arena_mm, half_length_mm, half_width_mm):
+            if came_from[current] is None and token.upper() in forbidden_first:
+                continue
             new_cost = cost_so_far[current] + step_cost
             nkey = cell(nxt)
             if nkey in closed or new_cost >= best_in_cell.get(nkey, math.inf):
@@ -297,9 +303,11 @@ def search_leg(
     goal: ApproachLine,
     radius_mm: float, boxes, arena_mm: float,
     half_length_mm: float, half_width_mm: float,
+    forbidden_first_tokens=(),
 ) -> Tuple[List[str], List[Tuple[float, float, float]], float]:
     result = _astar(start_x, start_y, start_theta, goal,
-                    radius_mm, boxes, arena_mm, half_length_mm, half_width_mm)
+                    radius_mm, boxes, arena_mm, half_length_mm, half_width_mm,
+                    forbidden_first_tokens)
     if result is None:
         raise NoPathFound(
             f"No path from ({start_x:.0f},{start_y:.0f}) to the approach line "

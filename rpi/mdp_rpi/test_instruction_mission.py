@@ -69,8 +69,11 @@ class InstructionTests(unittest.TestCase):
                 self.assertAlmostEqual(arena_grid_position(mm), expected)
         self.assertEqual(arena_grid_position(200 - 1e-12), 2)
 
-    def test_outside_arena_is_not_clamped_to_a_valid_cell(self):
-        for mm in (-1, 2000, 2100, float("nan"), float("inf")):
+    def test_open_floor_overhang_is_reported_not_clamped(self):
+        for mm, expected in [(-1, -.01), (2000, 20), (2100, 21)]:
+            with self.subTest(mm=mm):
+                self.assertEqual(arena_grid_position(mm), expected)
+        for mm in (float("nan"), float("inf")):
             with self.subTest(mm=mm), self.assertRaises(ValueError):
                 arena_grid_position(mm)
 
@@ -158,11 +161,11 @@ class InstructionTests(unittest.TestCase):
         self.assertTrue(mission.done)
         self.assertFalse(mission.send_next(stm))
 
-    def test_turn_wrap_and_full_fu_displacement(self):
+    def test_turn_wrap_and_forward_displacement(self):
         stm = FakeSTM([["0", "0", "0"], ["300", "-300", "-900"],
                        ["300", "-500", "-900"], ["300", "-500", "-900"]],
                       ["OK"] * 3)
-        mission = InstructionMission([["FR90", "FU30", "S"]], START)
+        mission = InstructionMission([["FR90", "F20", "S"]], START)
         expected = [("ROBOT,5,5,90", None), ("ROBOT,7,5,90", None),
                     ("ROBOT,7,5,90", 0)]
         for result in expected:
@@ -232,6 +235,7 @@ class InstructionTests(unittest.TestCase):
         task.halted = False
         task.started = True
         task.a5_mode = False
+        task._read_ultrasonic_cm = Mock(return_value=30)
         task.stm = FakeSTM([["0", "0", "0"]] + [["300", "-300", "-900"]] * 5,
                            ["OK", "RESEND", "OK", "OK", "OK", "OK"])
         events = task.stm.events
@@ -393,6 +397,7 @@ class PCTransferTests(unittest.TestCase):
         task.a5_mode = False
         task.photo_standoffs = {"3": [20, 30, 33, 35, 40, 45]}
         task.selected_standoffs = {"3": 30}
+        task.ultrasonic_adjustments = {"3": True}
         task.photo_retry_standoffs = [40, 45, 35, 33, 20]
         task.photo_retry_limit = 5
         task.capture_settle = 0
@@ -409,7 +414,7 @@ class PCTransferTests(unittest.TestCase):
         self.assertEqual(result["class_id"], "C")
         self.assertEqual(
             [call.args[2] for call in task._move_for_photo.call_args_list],
-            [40, 45, 30],
+            [30, 40, 45, 30],
         )
         self.assertEqual(task._detect_and_send_image.call_count, 3)
         self.assertEqual(
@@ -422,8 +427,10 @@ class PCTransferTests(unittest.TestCase):
         task.a5_mode = False
         task.photo_standoffs = {"1": [20]}
         task.selected_standoffs = {"1": 20}
+        task.ultrasonic_adjustments = {"1": False}
         task.photo_retry_standoffs = [40, 45, 35, 33, 20]
         task.photo_retry_limit = 5
+        task.capture_settle = 0
         task._detect_and_send_image = Mock(return_value={
             "obstacle_id": "1", "confidence": 0.0, "class_id": "NONE",
         })
@@ -439,12 +446,16 @@ class PCTransferTests(unittest.TestCase):
         stm = Mock()
         stm.send_line.return_value = True
         stm.wait_reply.return_value = "OK"
-        stm.query_fields.side_effect = [["0", "0", "0"], ["40"]]
+        stm.query_fields.side_effect = [["50"], ["0", "0", "0"], ["40"]]
         task = Task1.__new__(Task1)
         task.stm = stm
         task.android = Mock()
         task.pc = Mock()
         task.max_resends = 3
+        task.us_adjust_retries = 3
+        task.us_adjust_tolerance_cm = 3.0
+        task.us_adjust_max_step_cm = 30
+        task.us_settle_s = 0
         task.halted = False
         task._halt_mission = Mock()
 
@@ -452,12 +463,62 @@ class PCTransferTests(unittest.TestCase):
 
         self.assertEqual(mission.key, (0, 0))
         self.assertFalse(mission.pending)
+        stm.send_line.assert_called_once_with(["F10"])
         task.android.send.assert_called_once_with("ROBOT,2,2,0")
         photo_progress = task.pc.send.call_args.args[0]
         self.assertTrue(photo_progress.startswith("PHOTO_PROGRESS,"))
         payload = json.loads(photo_progress.split(",", 1)[1])
         self.assertEqual(payload["target_standoff_cm"], 40)
-        self.assertEqual(payload["measured_us_cm"], 40)
+        self.assertEqual(payload["measured_us_cm_before"], 50)
+
+    def test_photo_adjustment_reverses_when_too_close(self):
+        mission = InstructionMission([["S"]], START)
+        mission.origin = (0, 0, 0)
+        task = Task1.__new__(Task1)
+        task.stm = Mock()
+        task.stm.send_line.return_value = True
+        task.stm.wait_reply.return_value = "OK"
+        task.stm.query_fields.side_effect = [["30"], ["0", "0", "0"], ["40"]]
+        task.android = Mock()
+        task.pc = Mock()
+        task.max_resends = 3
+        task.us_adjust_retries = 3
+        task.us_adjust_tolerance_cm = 3.0
+        task.us_adjust_max_step_cm = 30
+        task.us_settle_s = 0
+        task.halted = False
+        task._halt_mission = Mock()
+
+        self.assertTrue(task._move_for_photo(mission, "3", 40))
+        task.stm.send_line.assert_called_once_with(["R10"])
+
+    def test_photo_adjustment_refuses_implausible_echo_without_moving(self):
+        task = Task1.__new__(Task1)
+        task.stm = Mock()
+        task.stm.query_fields.return_value = ["120"]
+        task.android = Mock()
+        task.pc = Mock()
+        task.max_resends = 3
+        task.us_adjust_retries = 3
+        task.us_adjust_tolerance_cm = 3.0
+        task.us_adjust_max_step_cm = 30
+        task.us_settle_s = 0
+        task.halted = False
+        task._halt_mission = Mock()
+
+        self.assertFalse(task._move_for_photo(Mock(), "3", 40))
+        task.stm.send_line.assert_not_called()
+        task._halt_mission.assert_not_called()
+
+    def test_task1_rejects_fu_in_initial_or_replacement_mission(self):
+        task = Task1.__new__(Task1)
+        task.a5_mode = False
+        with self.assertRaisesRegex(ValueError, "may not contain FU"):
+            task._validate_task1_mission(InstructionMission([["FU30", "S"]], START))
+
+        task.a5_mode = True
+        mission = InstructionMission([["FU30", "S"]], START)
+        self.assertIs(task._validate_task1_mission(mission), mission)
 
 
 if __name__ == "__main__":

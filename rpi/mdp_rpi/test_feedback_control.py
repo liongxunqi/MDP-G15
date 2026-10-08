@@ -142,6 +142,66 @@ class TaskFeedbackTests(unittest.TestCase):
         task.pc.send.assert_called_with("STITCH,2\n")
         task.android.send.assert_called_with("STATUS,DONE")
 
+    def test_ir_snapshot_contains_ranges_and_filtered_raw_counts(self):
+        task = bare_task()
+        task.ir_feedback_enabled = True
+        task.stm.query_fields = Mock(side_effect=lambda command: {
+            "?IR": ["18", "65535"],
+            "?IRR": ["1900", "100"],
+        }[command])
+        self.assertEqual(task._read_ir_snapshot(), {
+            "ir_left_cm": 18,
+            "ir_right_cm": 65535,
+            "ir_left_raw": 1900,
+            "ir_right_raw": 100,
+        })
+
+    def test_gyro_settle_accepts_three_stationary_samples_after_fr45(self):
+        task = bare_task()
+        task.gyro_settle_enabled = True
+        task.gyro_settle_timeout = 1.0
+        task.gyro_settle_rate_dps = 1.0
+        task.gyro_settle_samples = 3
+        task.stm.query_fields = Mock(side_effect=[
+            ["1", "450", "18", "0", "0"],
+            ["1", "450", "8", "0", "0"],
+            ["1", "450", "6", "0", "0"],
+            ["1", "450", "4", "0", "0"],
+        ])
+        with patch("task1.sleep"):
+            task._wait_for_gyro_settle("FR45")
+        self.assertEqual(task.stm.query_fields.call_count, 4)
+
+    def test_each_new_segment_is_preflighted_after_the_previous_photo(self):
+        task = bare_task()
+        task.ir_feedback_enabled = True
+        task.preflight_enabled = True
+        wposes = iter(
+            [["100", "0", "0"]] * 2 +
+            [["225", "-75", "-26"]] * 5
+        )
+
+        def query_fields(command):
+            if command == "?WPOSE":
+                return next(wposes)
+            if command == "?IR":
+                return ["65535", "65535"]
+            if command == "?IRR":
+                return ["100", "100"]
+            raise AssertionError(command)
+
+        task.stm.query_fields = Mock(side_effect=query_fields)
+        reports = self.responder(task)
+        run_task(task)
+        preflights = [p for p in reports if p["event"] == "instruction_preflight"]
+        self.assertEqual(
+            [(p["segment_index"], p["instruction_index"], p["token"])
+             for p in preflights],
+            [(0, -1, "F10"), (1, -1, "F10")],
+        )
+        self.assertEqual(task._detect_and_send_image.call_count, 2)
+        self.assertFalse(task.halted)
+
     def test_replace_mid_segment_preserves_origin_and_photo_count(self):
         task = bare_task()
         reports = self.responder(task, "REPLACE", {

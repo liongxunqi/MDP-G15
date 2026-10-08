@@ -204,9 +204,8 @@ class ExpectedPoses(unittest.TestCase):
                         self.assertTrue(0.0 <= h < 360.0)
 
     def test_they_match_a_perfect_robot(self):
-        """Snap to the planned pose after each photo (FU stops where the SONAR says,
-        so the replay and the plan legitimately part company there - the team's
-        test_mission_sim does the same). Within a segment the gap is the 25 mm
+        """Snap to the planned pose after each photo, as test_mission_sim does.
+        Within a segment the gap is the 25 mm
         approach-line tolerance: the search may end a leg up to that far off the
         line, while "expected" assumes it ends exactly on it. Measured: median
         0.0 mm, max 24 mm, heading 0.000 deg."""
@@ -218,7 +217,7 @@ class ExpectedPoses(unittest.TestCase):
                 for si, (seg, target) in enumerate(zip(plan["segments"], plan["segment_obstacles"])):
                     for ii, tok in enumerate(seg):
                         rep.run(tok)
-                        if tok.upper().startswith("FU") or tok.upper() == "S":
+                        if tok.upper() == "S":
                             continue
                         ex, ey, eh = plan["expected"][si][ii]
                         self.assertLess(math.hypot(rep.x + sx - ex, rep.y + sy - ey), tol, (si, ii, tok))
