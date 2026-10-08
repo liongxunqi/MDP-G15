@@ -60,6 +60,9 @@ ROBOT_LENGTH_CM = 23.0
 # ?WPOSE integrates the driven rear axle, while FU measures from the front
 # ultrasonic sensor. Photo-pose geometry must bridge those two references.
 REAR_AXLE_TO_SENSOR_CM = 23.0
+# Measured: rear axle to the camera lens. The camera sits 10.5 cm behind the ultrasonic sensor, so the
+# camera-to-face distance at a photo is the ?US standoff + (SENSOR - CAMERA).
+REAR_AXLE_TO_CAMERA_CM = 12.5
 ARENA_CM = 200.0
 
 # FU before F, exactly as the firmware's own parser orders its prefixes — "fu"
