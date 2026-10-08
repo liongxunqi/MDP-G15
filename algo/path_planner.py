@@ -67,7 +67,7 @@ FU_COMPENSATE = False
 # The grid search may join this much of the endpoint's final straight line.
 RECOVERY_APPROACH_LINE_MM = 600.0
 RECOVERY_LATERAL_TOL_MM = 25.0
-# grid_search has cardinal states. Small measured heading errors are normal and
+# grid_search has 45-degree heading states. Small measured heading errors are normal and
 # may be snapped for recovery planning; larger errors need a planner that models
 # arbitrary headings and are deliberately not guessed here.
 RECOVERY_MAX_HEADING_SNAP_DEG = float(os.getenv(
@@ -144,7 +144,7 @@ _REAR_BLOCK_DEPTH_MM = 600.0     # how far behind the start pose the "no reverse
 _REAR_BLOCK_WIDTH_MM = 150.0     # ... and how far it extends past each side of the body
 _BIG_MM = 10_000.0
 
-_STRAIGHT_RE = re.compile(r"^([FR])(\d+)$")
+_MERGEABLE_RE = re.compile(r"^(FR|FL|RR|RL|F|R)(\d+)$")
 
 
 class Pose:
@@ -331,12 +331,14 @@ def _search_leg(from_pose: Pose, option: PhotoOption, radius_mm, boxes):
     return tokens, poses, cost + max(back, 0.0)
 
 
-def _merge_straights(tokens: List[str], poses: List[Pose]):
-    """F5,F5,F5 -> F15. poses[i] is the pose AFTER tokens[i]."""
+def _merge_runs(tokens: List[str], poses: List[Pose]):
+    """F5,F5,F5 -> F15 and FR45,FR45 -> FR90: one primitive instead of several
+    saves the STM a brake-and-align stop each. poses[i] is the pose AFTER
+    tokens[i]."""
     out_t, out_p = [], []
     for tok, pose in zip(tokens, poses):
-        m = _STRAIGHT_RE.match(tok)
-        prev = _STRAIGHT_RE.match(out_t[-1]) if out_t else None
+        m = _MERGEABLE_RE.match(tok)
+        prev = _MERGEABLE_RE.match(out_t[-1]) if out_t else None
         if m and prev and m.group(1) == prev.group(1):
             out_t[-1] = f"{m.group(1)}{int(prev.group(2)) + int(m.group(2))}"
             out_p[-1] = pose
@@ -648,12 +650,12 @@ def plan_segment_recovery(plan: dict, obstacles: List[dict], progress: dict,
     ax, ay = actual_x - shift_x, actual_y - shift_y
     tx, ty = target_x - shift_x, target_y - shift_y
     actual_theta = math.radians(90.0 - actual_hdg)
-    actual_cardinal = grid_search._HEADINGS[grid_search._heading_index(actual_theta)]
-    snap_error = abs(math.degrees(_wrap(actual_theta - actual_cardinal)))
+    actual_lattice = grid_search._HEADINGS[grid_search._heading_index(actual_theta)]
+    snap_error = abs(math.degrees(_wrap(actual_theta - actual_lattice)))
     if snap_error > RECOVERY_MAX_HEADING_SNAP_DEG:
         logging.error(
             "Cannot safely recover segment %d: measured heading %.1f deg is %.1f deg "
-            "from the nearest cardinal heading (limit %.1f deg).",
+            "from the nearest 45-degree heading (limit %.1f deg).",
             seg, actual_hdg, snap_error, RECOVERY_MAX_HEADING_SNAP_DEG,
         )
         return None
@@ -668,7 +670,7 @@ def plan_segment_recovery(plan: dict, obstacles: List[dict], progress: dict,
             m - shift_y, ARENA_MM - m - shift_y,
         )
 
-    if not _pose_clear(ax, ay, actual_cardinal, boxes):
+    if not _pose_clear(ax, ay, actual_lattice, boxes):
         logging.error("Cannot safely recover segment %d: measured pose intersects a boundary/obstacle.", seg)
         return None
     if not _pose_clear(tx, ty, target_theta, boxes):
@@ -676,7 +678,7 @@ def plan_segment_recovery(plan: dict, obstacles: List[dict], progress: dict,
         return None
 
     tokens, poses = [], []
-    terminal = Pose(ax, ay, actual_cardinal)
+    terminal = Pose(ax, ay, actual_lattice)
 
     # Most drift is longitudinal (the FU failure in the physical logs was
     # 169 mm). Correct that directly instead of making the 50 mm search grid
@@ -684,7 +686,7 @@ def plan_segment_recovery(plan: dict, obstacles: List[dict], progress: dict,
     dx, dy = tx - ax, ty - ay
     along = dx * math.cos(target_theta) + dy * math.sin(target_theta)
     lateral = -dx * math.sin(target_theta) + dy * math.cos(target_theta)
-    same_heading = grid_search._heading_index(actual_cardinal) == grid_search._heading_index(target_theta)
+    same_heading = grid_search._heading_index(actual_lattice) == grid_search._heading_index(target_theta)
     direct_cm = int(round(abs(along) / 10.0))
     direct_mm = math.copysign(direct_cm * 10.0, along) if direct_cm else 0.0
     if (same_heading and abs(lateral) <= RECOVERY_LATERAL_TOL_MM and direct_cm and
@@ -714,7 +716,7 @@ def plan_segment_recovery(plan: dict, obstacles: List[dict], progress: dict,
             )
             try:
                 raw_tokens, raw_poses, _ = grid_search.search_leg(
-                    ax, ay, actual_cardinal, goal, TURN_RADIUS_MM[arc_profile], boxes,
+                    ax, ay, actual_lattice, goal, TURN_RADIUS_MM[arc_profile], boxes,
                     ARENA_MM, ROBOT_HALF_LENGTH_MM, ROBOT_HALF_WIDTH_MM,
                 )
             except grid_search.NoPathFound as exc:
@@ -722,11 +724,11 @@ def plan_segment_recovery(plan: dict, obstacles: List[dict], progress: dict,
                 continue
 
             candidate_poses = [Pose(x, y, theta) for x, y, theta in raw_poses[1:]]
-            candidate_tokens, candidate_poses = _merge_straights(
+            candidate_tokens, candidate_poses = _merge_runs(
                 list(raw_tokens), candidate_poses
             )
             candidate_terminal = (
-                Pose(ax, ay, actual_cardinal) if not candidate_poses
+                Pose(ax, ay, actual_lattice) if not candidate_poses
                 else candidate_poses[-1]
             )
             back, _ = goal.offsets(candidate_terminal.x, candidate_terminal.y)
@@ -760,7 +762,7 @@ def plan_segment_recovery(plan: dict, obstacles: List[dict], progress: dict,
 
     if not tokens:
         logging.warning(
-            "Recovery requested for segment %d, but the cardinal planner produced no corrective movement.",
+            "Recovery requested for segment %d, but the grid planner produced no corrective movement.",
             seg,
         )
         return None
@@ -889,7 +891,7 @@ def plan_mission(obstacles: List[dict], arc_profile: int = PROFILE_TIGHT,
                 f"over the line. Place the robot further into the zone (START_GAP_MM / "
                 f"START_X_MM / START_Y_MM) to avoid this."
             )
-        tokens, poses = _merge_straights(list(search_tokens), list(search_poses[1:]))
+        tokens, poses = _merge_runs(list(search_tokens), list(search_poses[1:]))
 
         final = option.pose
         back, _ = option.line.offsets(search_poses[-1].x, search_poses[-1].y)

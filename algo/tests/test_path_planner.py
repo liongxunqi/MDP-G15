@@ -191,9 +191,23 @@ class LegOutputTests(unittest.TestCase):
 
     def test_straights_are_merged(self):
         poses = [pp.Pose(i, 0, 0) for i in range(5)]
-        tokens, merged = pp._merge_straights(["F5", "F5", "FR90", "R5", "R5"], poses)
+        tokens, merged = pp._merge_runs(["F5", "F5", "FR90", "R5", "R5"], poses)
         self.assertEqual(tokens, ["F10", "FR90", "R10"])
         self.assertIs(merged[0], poses[1])   # pose after the LAST merged token
+
+    def test_same_kind_arcs_are_merged_and_mixed_ones_are_not(self):
+        poses = [pp.Pose(i, 0, 0) for i in range(6)]
+        tokens, merged = pp._merge_runs(["FR45", "FR45", "RL45", "FL45", "FL45", "FU30"], poses)
+        self.assertEqual(tokens, ["FR90", "RL45", "FL90", "FU30"])
+        self.assertIs(merged[2], poses[4])
+
+    def test_the_search_only_emits_45_degree_arcs(self):
+        details = {}
+        plan = pp.plan_mission([{"id": 1, "x": 15, "y": 3, "d": 6},
+                                {"id": 2, "x": 5, "y": 15, "d": 4}], details=details)
+        arcs = [t for line in plan["segments"] for t in line if t[:2] in ("FR", "FL", "RR", "RL")]
+        self.assertTrue(arcs)
+        self.assertTrue(all(int(t[2:]) % 45 == 0 for t in arcs), arcs)
 
     def test_a_simple_plan_ends_each_photo_with_fu_at_the_chosen_distance(self):
         details = {}

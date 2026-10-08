@@ -1,4 +1,4 @@
-"""Hybrid A* motion planner: grid + quarter-turn primitives, collision-checked."""
+"""Hybrid A* motion planner: grid + 45-degree arc primitives, collision-checked."""
 
 import heapq
 import logging
@@ -10,21 +10,24 @@ from stm_tokens import TokenError, arc, fwd, rev
 
 STEP_MM = 50.0
 REV_COST_MULT = 1.15
-# Each turn costs this much on top of its arc length: a turn eats floor, takes
-# longer than a straight, and is where odometry error comes from.
+# Each 90 degrees of turning costs this much on top of its arc length: a turn
+# eats floor, takes longer than a straight, and is where odometry error comes
+# from. Charged pro rata per TURN_STEP, so two 45s that merge into one 90 cost
+# what a single 90 used to.
 TURN_PENALTY_MM = 100.0
-# A search that has not found the goal by now is not going to: across 168
-# successful leg searches on 7 layouts the most any used was 2,622 expansions
-# (median 332), while a failing one burns the whole cap. 30,000 cost ~0.35 s per
-# dead end, and a plan with many dead ends (obstacles hugging a wall, with the
-# RPi's arena limit in force) spent its whole 20 s budget on them. 8,000 is 3x
-# the largest success seen.
-MAX_EXPANSIONS = 8_000
+# A search that has not found the goal by now is not going to, and a failing
+# one burns the whole cap - a plan with many dead ends (obstacles hugging a
+# wall, with the RPi's arena limit in force) can spend its whole 20 s budget on
+# them. With 4 headings the most any of 168 successful leg searches used was
+# 2,622, so this was 8,000. The 45-degree lattice has 8 headings: across 766
+# successful searches on 35 layouts the median was 656 and the most 15,837, so
+# 24,000 is 1.5x that.
+MAX_EXPANSIONS = 24_000
 # States closer than this (and on the same heading) count as the same place.
 # Without it, arcs land on fresh sub-millimetre coordinates every time and the
 # search re-explores the same floor over and over.
 DEDUP_CELL_MM = 25.0
-ARC_SAMPLES = 12   # collision checks per quarter turn: one every 7.5 degrees
+ARC_SAMPLES = 6    # collision checks per 45 degree arc: one every 7.5 degrees
 # >1 trades a little path length for a much faster search (weighted A*).
 HEURISTIC_WEIGHT = 1.5
 # The assessment arena is open - no boundary boards - so the body may hang
@@ -33,7 +36,13 @@ HEURISTIC_WEIGHT = 1.5
 # treat the edge as a wall again.
 ARENA_OVERHANG_MM = 250.0
 
-_HEADINGS = (0.0, math.pi / 2, math.pi, -math.pi / 2)  # E, N, W, S
+# Every arc turns the body 45 degrees, so the lattice has 8 headings: the four
+# cardinals plus the diagonals, counter-clockwise from E. Straights run on the
+# diagonals too. path_planner merges back-to-back arcs of the same kind, so
+# FR45,FR45 still goes to the STM as one FR90.
+TURN_STEP_DEG = 45
+TURN_STEP = math.radians(TURN_STEP_DEG)
+_HEADINGS = tuple(math.atan2(math.sin(i * TURN_STEP), math.cos(i * TURN_STEP)) for i in range(8))
 
 
 class NoPathFound(Exception):
@@ -61,7 +70,7 @@ class _State:
 
 def _heading_index(theta: float) -> int:
     theta = math.atan2(math.sin(theta), math.cos(theta))
-    return min(range(4), key=lambda i: abs(math.atan2(
+    return min(range(len(_HEADINGS)), key=lambda i: abs(math.atan2(
         math.sin(theta - _HEADINGS[i]), math.cos(theta - _HEADINGS[i])
     )))
 
@@ -88,8 +97,6 @@ _ARC_PRIMITIVES = [
     ("RL", -1, +1, lambda deg: arc(False, False, deg)),
     ("RR", -1, -1, lambda deg: arc(False, True, deg)),
 ]
-
-_QUARTER_TURN = math.pi / 2
 
 
 def _obstacle_aabb_mm(obstacle: dict, virtual_half_mm: float) -> Tuple[float, float, float, float]:
@@ -138,7 +145,7 @@ def _rect_hits_box(x, y, theta, hl, hw, ext_x, ext_y, box) -> bool:
 def _arc_clear(x0, y0, theta0, dir_sign, kappa_sign, radius, boxes, arena_mm,
                 half_length_mm, half_width_mm, samples=ARC_SAMPLES) -> bool:
     for i in range(1, samples + 1):
-        phi = _QUARTER_TURN * i / samples
+        phi = TURN_STEP * i / samples
         dx, dy, theta_i = _arc_delta(theta0, dir_sign, kappa_sign, phi, radius)
         if _point_blocked(x0 + dx, y0 + dy, theta_i, boxes, arena_mm, half_length_mm, half_width_mm):
             return False
@@ -174,14 +181,15 @@ def _neighbours(state: _State, radius_mm, boxes, arena_mm, half_length_mm, half_
 
     for name, dir_sign, kappa_sign, token_fn in _ARC_PRIMITIVES:
         if _arc_clear(state.x, state.y, theta, dir_sign, kappa_sign, radius_mm, boxes, arena_mm, half_length_mm, half_width_mm):
-            dx, dy, theta_f = _arc_delta(theta, dir_sign, kappa_sign, _QUARTER_TURN, radius_mm)
+            dx, dy, theta_f = _arc_delta(theta, dir_sign, kappa_sign, TURN_STEP, radius_mm)
             nx, ny = state.x + dx, state.y + dy
             try:
-                token = token_fn(90)
+                token = token_fn(TURN_STEP_DEG)
             except TokenError:
                 continue
-            arc_len = radius_mm * _QUARTER_TURN
-            cost = arc_len * (1.0 if dir_sign == 1 else REV_COST_MULT) + TURN_PENALTY_MM
+            arc_len = radius_mm * TURN_STEP
+            cost = (arc_len * (1.0 if dir_sign == 1 else REV_COST_MULT)
+                    + TURN_PENALTY_MM * TURN_STEP / (math.pi / 2))
             yield _State(round(nx), round(ny), _heading_index(theta_f)), token, cost
 
 
