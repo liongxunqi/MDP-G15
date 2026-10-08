@@ -163,6 +163,13 @@ FU_MIN_PROTOCOL = 3
 FROZEN_CAL_MIN_PROTOCOL = 4
 # Protocol 5: per-side arc deflection (!CALSL / !CALSR), two more ?CAL fields.
 STEER_CAL_MIN_PROTOCOL = 5
+# Protocol 6: FIR / FIL / FIRO / FILO, forward until a side IR edge (§4.2).
+IR_EDGE_MIN_PROTOCOL = 6
+
+# PROTOCOL.md §4.2 — the optional cap on an IR edge run, cm. Mirrors
+# CMD_IR_CAP_* in commands.h. A bare FIR takes the firmware default.
+IR_CAP_MIN_CM = 10
+IR_CAP_MAX_CM = 200
 
 # PROTOCOL.md §5 — every tag the firmware can answer a query with.
 # CAL is protocol 2. It must appear here twice over: once so validate_token()
@@ -172,13 +179,16 @@ STEER_CAL_MIN_PROTOCOL = 5
 QUERY_TAGS = {"US", "IR", "IRR", "POSE", "DIST", "TURN", "STAT", "IMU", "XCHK",
               "VER", "CAL", "HDG", "WPOSE"}
 
-# This client implements protocol 4. Compared against the ?VER reply at startup.
-PROTOCOL_VERSION = 5
+# This client implements protocol 6. Compared against the ?VER reply at startup.
+PROTOCOL_VERSION = 6
 
 # FU before F, exactly as the firmware's own parser orders its prefixes: "fu"
 # would otherwise be eaten by "f" and FU20 read as F with an argument of
 # "U20", which does not parse at all.
 _MOVE_RE = re.compile(r"^(FR|FL|FU|RR|RL|F|R)(\d+)$", re.IGNORECASE)
+# PROTOCOL.md §4.2, protocol 6. The four-letter forms first, as in the firmware,
+# so FIRO is not read as FIR with an argument of "O". The cap is optional.
+_IR_EDGE_RE = re.compile(r"^(FIRO|FILO|FIR|FIL)(\d*)$", re.IGNORECASE)
 _QUERY_RE = re.compile(r"^\?([A-Z]+)$", re.IGNORECASE)
 _CONFIG_RE = re.compile(r"^!(PROF[012]|ZERO|LEARN[01])$", re.IGNORECASE)
 
@@ -213,8 +223,9 @@ CAL_LIMITS = {
 # FU is NOT in this list any more — it is implemented as of protocol 3 (§4.1)
 # and is matched by _MOVE_RE above. Leaving it here would have this client
 # refuse to send a token the firmware now understands, which is precisely the
-# failure this validator exists to prevent, only inverted.
-_RESERVED_RE = re.compile(r"^(FIRO|FILO|FIR|FIL|SR|SL)(\d*)$", re.IGNORECASE)
+# failure this validator exists to prevent, only inverted. The same went for
+# FIR / FIL / FIRO / FILO in protocol 6 (§4.2) — see _IR_EDGE_RE.
+_RESERVED_RE = re.compile(r"^(SR|SL)(\d*)$", re.IGNORECASE)
 
 # The superseded 4-character dialect (W050/S050/D100/A100). Worth naming
 # explicitly: S050 used to mean reverse, and S now means STOP.
@@ -236,8 +247,22 @@ def validate_token(token: str) -> Tuple[bool, str]:
     if upper in ("S", "RST"):
         return True, ""
 
+    # PROTOCOL.md §4.2: IR edge runs, checked before the movement regex because
+    # FIR/FIL look nothing like F<n>. The cap is optional; when present it is a
+    # range-checked magnitude, refused rather than clamped like every other.
+    m = _IR_EDGE_RE.match(tok)
+    if m:
+        digits = m.group(2)
+        if digits and not (IR_CAP_MIN_CM <= int(digits) <= IR_CAP_MAX_CM):
+            return False, (
+                f"'{tok}': cap {int(digits)} cm is outside "
+                f"{IR_CAP_MIN_CM}..{IR_CAP_MAX_CM} (PROTOCOL.md §4.2). Out of "
+                "range is a parse failure, not a clamp"
+            )
+        return True, ""
+
     # Reserved is checked before the movement regex: SR/SL would otherwise be
-    # rejected with a confusing message, and FIR/FIL look nothing like F<n>.
+    # rejected with a confusing message.
     if _RESERVED_RE.match(tok):
         return False, (
             f"'{tok}' is reserved but not implemented (PROTOCOL.md §9) — "

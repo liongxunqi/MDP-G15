@@ -109,6 +109,28 @@
  * forward command to silently undo. */
 #define RPILINK_FU_MAX_BACK_MM  200
 
+/* ---------------------------------------------------------------------------
+ * FIR / FIL / FIRO / FILO{n} - FORWARD UNTIL A SIDE IR CHANGES STATE
+ *
+ * Run like F0: a straight move capped at n cm (CMD_IR_CAP_* in commands.h)
+ * that RpiLink_Poll() cuts short when the watched side sensor sees the edge.
+ * FIR/FIL stop when the wall is LOST, FIRO/FILO when one is FOUND. Reaching
+ * the cap still replies OK - the sender checks ?WPOSE to tell "edge found"
+ * from "ran out of cap".
+ *
+ * The Sharp reports SENSOR_NO_READING both beyond IR_MAX_VALID_CM and inside
+ * IR_MIN_VALID_CM (10 cm), so a wall closer than 10 cm looks LOST. Keep the
+ * robot 15-20 cm off any wall it is following.
+ * ------------------------------------------------------------------------- */
+
+/* A side reading at or under this counts as "wall present", cm. */
+#define RPILINK_IR_WALL_CM      30U
+
+/* The new state must hold this long before the move is stopped, ms. Rejects
+ * single-sample twitches on top of the IR median filter. Each ms is about
+ * 0.35 mm of extra travel at cruise, so keep it short. */
+#define RPILINK_IR_HOLD_MS      40U
+
 void RpiLink_Init(UART_HandleTypeDef *huart);
 
 /* Call from the main loop as often as possible. Never blocks for long. */

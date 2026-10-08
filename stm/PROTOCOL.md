@@ -8,7 +8,11 @@ Queries, config and the `FAIL,*` replies are implemented in firmware but have
 and the `FAIL,*` rows of §3 as a proposal until that happens — the firmware can
 change if the RPi side wants different names or fields.
 
-**Protocol version: 5** — ask for it with `?VER`.
+**Protocol version: 6** — ask for it with `?VER`.
+
+Version 6 adds `FIR` / `FIL` / `FIRO` / `FILO`, forward until a side IR loses
+or finds a wall (§4.2), for Task 2. Purely additive movement: a protocol 5
+sender is unaffected, and the replies are the ordinary `OK` / `FAIL,*`.
 
 Version 5 adds `!CALSL` / `!CALSR`, a separate arc steering deflection for
 each side (§7.1), and appends the two values in force to `?CAL`. Additive.
@@ -104,6 +108,8 @@ Queued and executed in order. The reply comes when the **last** one finishes.
 | `F<n>` | cm | Forward n cm |
 | `F0` | — | Forward until an obstacle stops it (ultrasonic, 15 cm). Blunt — see §4.1 |
 | `FU<n>` | cm | Forward until the ultrasound reads **n** cm. **n is yours to choose**, 5–200 |
+| `FIR[n]` / `FIL[n]` | cm, optional | Forward until the right / left IR **loses** the wall. n caps the run, 10–200, default 150. See §4.2 |
+| `FIRO[n]` / `FILO[n]` | cm, optional | Forward until the right / left IR **finds** a wall. Same cap. See §4.2 |
 | `R<n>` | cm | Reverse n cm |
 | `FR<n>` | degrees | Arc forward-right |
 | `FL<n>` | degrees | Arc forward-left |
@@ -174,6 +180,36 @@ wide enough that the nearest thing it hears is often not the thing you meant.
 Send `F<n>` for the bulk of the travel and `FU<n>` for the last stretch —
 `F150,FU20` rather than `FU20` from across the arena. Values outside 5–200 cm
 are a parse failure, not a clamp.
+
+### 4.2 `FIR` / `FIL` / `FIRO` / `FILO` — drive to a wall edge
+
+Forward in a straight line until the side IR on that side changes state:
+
+| Token | Stops when |
+|---|---|
+| `FIR` / `FIL` | the right / left IR **loses** the wall (wall → no wall) |
+| `FIRO` / `FILO` | the right / left IR **finds** a wall (no wall → wall) |
+
+A reading of **30 cm or less** counts as "wall" (`RPILINK_IR_WALL_CM`), and the
+new state must hold for **40 ms** (`RPILINK_IR_HOLD_MS`) before the robot
+brakes, so one twitch of the sensor does not end the move. It is run exactly
+like `F0`: a capped straight that the executor cuts short, so the watchdog
+still covers it and the straight's heading hold still applies.
+
+The number is a **cap**, not a target: `FIR60` stops at the edge or after
+60 cm, whichever comes first. With no number the cap is **150 cm**. Caps
+outside 10–200 cm are a parse failure, not a clamp.
+
+| Situation | What happens |
+|---|---|
+| Edge found | Brakes, line continues, `OK` at the end |
+| Cap reached first | Stops at the cap and still replies `OK` — compare `?WPOSE` before and after to tell the two apart |
+| Already in the stop state at the start (`FIR` with no wall beside it) | Stops after about 40 ms, almost no travel |
+| Wall closer than 10 cm | **Reads as no wall.** The sensor saturates below `IR_MIN_VALID_CM`, so `FIR` stops early and `FIRO` never fires. Plan paths that keep the side 15–20 cm off the wall |
+
+Measure the edge position, not the wall: the robot stops a little **past** the
+edge, by the sensor's offset from the rear axle plus the braking distance.
+Calibrate that once against a box and correct for it on the Pi side.
 
 ### Note the collision
 
@@ -439,8 +475,9 @@ Robot footprint is roughly **18.8 cm wide by 23 cm long**.
 The parser returns a parse failure for these, so a line containing one gets
 `RESEND`.
 
-**Task 2 movement:** `FIR` / `FIL` forward until the right/left IR loses the
-wall, `FIRO` / `FILO` forward until it gains one, `SR` / `SL` diagonal slide.
+**Task 2 movement:** `SR` / `SL` diagonal slide. Build the same S-curve from
+arcs instead (`FL50,FR50`). `FIR` / `FIL` / `FIRO` / `FILO` are no longer
+reserved — implemented in protocol 6, see §4.2.
 
 `FU<n>` is no longer reserved — it is implemented, see §4.1. The reserved
 `us{d1},{d2}` reply was **not** adopted with it: one reply per line is the rule

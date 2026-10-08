@@ -237,6 +237,24 @@ Command_t Cmd_ParseToken(const char *token)
     if (token_is(token, "rst")) { cmd.op = CMD_RESET; return cmd; }
     if (token_is(token, "s"))   { cmd.op = CMD_STOP;  return cmd; }
 
+    /* IR edge tokens before every "f" prefix, and the four-letter forms before
+     * the three-letter ones, so "firo" is not read as "fir" with an argument
+     * of "o". The cap is optional - a bare FIR takes the default. */
+    if      ((n = token_starts(token, "firo")) != 0U) { op = CMD_FWD_IR_R_FOUND; }
+    else if ((n = token_starts(token, "filo")) != 0U) { op = CMD_FWD_IR_L_FOUND; }
+    else if ((n = token_starts(token, "fir"))  != 0U) { op = CMD_FWD_IR_R_LOST;  }
+    else if ((n = token_starts(token, "fil"))  != 0U) { op = CMD_FWD_IR_L_LOST;  }
+
+    if (op != CMD_INVALID)          /* one of the four IR tokens */
+    {
+        if (token[n] == '\0') { arg = CMD_IR_CAP_DEFAULT_CM; }
+        else if (!parse_uint(&token[n], &arg)) { return cmd; }
+        if ((arg < CMD_IR_CAP_MIN_CM) || (arg > CMD_IR_CAP_MAX_CM)) { return cmd; }
+        cmd.op  = op;
+        cmd.arg = arg;
+        return cmd;
+    }
+
     /* Two-letter prefixes before the one-letter drive prefixes, so "fr" and
      * "fu" are not eaten by "f". */
     if      ((n = token_starts(token, "fr")) != 0U) { op = CMD_ARC_FWD_RIGHT; }

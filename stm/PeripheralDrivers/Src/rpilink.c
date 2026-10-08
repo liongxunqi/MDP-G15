@@ -22,6 +22,8 @@ static volatile uint8_t s_overrun;
 /* Executor --------------------------------------------------------- */
 static uint8_t     s_lineActive;   /* a line is in flight, owes a reply */
 static uint8_t     s_f0Active;     /* F0 running, poll the ultrasound   */
+static CmdOpcode_t s_irOp;         /* FIR/FIL/FIRO/FILO running, or NONE */
+static uint32_t    s_irSince;      /* tick the edge condition began, 0 = not */
 static CmdOpcode_t s_lastOp = CMD_NONE;
 
 /* FU{n} approach. See the long note in rpilink.h for why this MEASURES and
@@ -138,6 +140,8 @@ void RpiLink_Init(UART_HandleTypeDef *huart)
     s_overrun    = 0U;
     s_lineActive = 0U;
     s_f0Active   = 0U;
+    s_irOp       = CMD_NONE;
+    s_irSince    = 0U;
     s_fuState    = FU_OFF;
     s_lastOp     = CMD_NONE;
     s_quiet      = 0U;
@@ -444,6 +448,7 @@ static void abort_everything(void)
     Motion_ResyncHeading();   /* whatever was planned no longer applies */
     s_lineActive = 0U;
     s_f0Active   = 0U;
+    s_irOp       = CMD_NONE;
     s_fuState    = FU_OFF;
     s_lineFailed = 0U;
 }
@@ -562,6 +567,7 @@ static uint8_t dispatch(Command_t c)
 {
     s_lastOp   = c.op;
     s_f0Active = 0U;
+    s_irOp     = CMD_NONE;
     s_fuState  = FU_OFF;
 
     switch (c.op)
@@ -623,6 +629,13 @@ static uint8_t dispatch(Command_t c)
          * but handle it defensively rather than fall through to default. */
         abort_everything();
         return 0U;
+
+    case CMD_FWD_IR_R_LOST: case CMD_FWD_IR_L_LOST:
+    case CMD_FWD_IR_R_FOUND: case CMD_FWD_IR_L_FOUND:
+        s_irOp    = c.op;
+        s_irSince = 0U;
+        Motion_DriveDistance((int32_t)c.arg * 10);   /* the cap */
+        return 1U;
 
     default:
         return 0U;
@@ -746,6 +759,31 @@ void RpiLink_Poll(void)
         }
     }
 
+    /* ---- 3a. FIR/FIL/FIRO/FILO side-IR edge check ----
+     *
+     * Same shape as F0: the motion layer runs a capped straight and this cuts
+     * it short. The new state has to hold for RPILINK_IR_HOLD_MS so a single
+     * twitch of the Sharp does not end the move. s_irSince is never 0 while
+     * timing - the |1 keeps a tick count of 0 from reading as "not timing". */
+    if ((s_irOp != CMD_NONE) && Motion_IsBusy())
+    {
+        uint8_t  right = (s_irOp == CMD_FWD_IR_R_LOST) || (s_irOp == CMD_FWD_IR_R_FOUND);
+        uint8_t  found = (s_irOp == CMD_FWD_IR_R_FOUND) || (s_irOp == CMD_FWD_IR_L_FOUND);
+        uint16_t cm    = right ? IR_RightCm() : IR_LeftCm();
+        uint8_t  wall  = (cm != SENSOR_NO_READING) && (cm <= RPILINK_IR_WALL_CM);
+
+        if (found ? wall : !wall)
+        {
+            if (s_irSince == 0U) { s_irSince = HAL_GetTick() | 1U; }
+            else if ((HAL_GetTick() - s_irSince) >= RPILINK_IR_HOLD_MS)
+            {
+                Motion_Stop();
+                s_irOp = CMD_NONE;
+            }
+        }
+        else { s_irSince = 0U; }
+    }
+
     /* ---- 3b. FU approach ----
      *
      * BEFORE the line advances, and gated on its own state rather than on
@@ -788,6 +826,7 @@ void RpiLink_Poll(void)
 
         s_lineActive = 0U;
         s_f0Active   = 0U;
+        s_irOp       = CMD_NONE;
         s_fuState    = FU_OFF;
         s_lineFailed = 0U;
 

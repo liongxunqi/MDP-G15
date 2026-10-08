@@ -184,7 +184,15 @@ typedef enum
     /* --- Continuous pose, protocol 5 -------------------------------------
      * Inside the second immediate range: keep CMD_Q_WPOSE last, or move the
      * endpoint in Cmd_IsImmediate() with it. */
-    CMD_Q_WPOSE          /* ?WPOSE x, y, heading since boot         */
+    CMD_Q_WPOSE,         /* ?WPOSE x, y, heading since boot         */
+
+    /* --- IR edge-terminated movement, protocol 6 --------------------------
+     * QUEUED movement. Must stay outside both Cmd_IsImmediate() ranges, so
+     * keep these after CMD_Q_WPOSE. arg = cap in cm. */
+    CMD_FWD_IR_R_LOST,   /* FIR{n}  forward until right IR loses the wall */
+    CMD_FWD_IR_L_LOST,   /* FIL{n}  forward until left IR loses the wall  */
+    CMD_FWD_IR_R_FOUND,  /* FIRO{n} forward until right IR finds a wall   */
+    CMD_FWD_IR_L_FOUND   /* FILO{n} forward until left IR finds a wall    */
 } CmdOpcode_t;
 
 /* Bumped whenever the wire format changes in a way a sender must care about.
@@ -205,7 +213,9 @@ typedef enum
  * Later added ?WPOSE (continuous pose) without a bump, matching the
  * instruction-segmentation RPi, which probes for it directly: a protocol 5
  * board without it answers RESEND and Task 1 stops before moving. */
-#define CMD_PROTOCOL_VERSION    5
+/* 6: added FIR/FIL/FIRO/FILO{n} (forward until a side IR loses or finds a
+ * wall, n = cap in cm). Additive: a protocol 5 sender is unaffected. */
+#define CMD_PROTOCOL_VERSION    6
 #define CMD_FIRMWARE_NAME       "MDPG15-STM32"
 
 /* Replies for a primitive that did not complete. Previously a timed-out move
@@ -238,6 +248,9 @@ typedef enum
  * stretch. */
 #define CMD_FU_MIN_CM            5
 #define CMD_FU_MAX_CM            200
+#define CMD_IR_CAP_DEFAULT_CM    150
+#define CMD_IR_CAP_MIN_CM        10
+#define CMD_IR_CAP_MAX_CM        200
 
 /* How close to n counts as arrived, cm. One cm is below what the sensor
  * resolves repeatably, so a tolerance of 1 would have the robot chase its own
