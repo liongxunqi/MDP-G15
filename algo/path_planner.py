@@ -50,6 +50,12 @@ OBSTACLE_SIZE_MM = 100.0
 # Clearance kept between the robot's real outline and every obstacle, on top
 # of the 23 x 18.8 cm footprint itself. Covers odometry drift and turn slop.
 COLLISION_MARGIN_MM = 30.0
+# Extra clearance on EVERY side of the robot, against obstacles only (padding the robot and growing the
+# obstacle are the same thing against an obstacle, so it is added to the margin). It is the tolerance for
+# execution error: the plan is open loop between photos, and a real log measured 41 mm mean / 176 mm worst
+# position error against a 30 mm margin. Deliberately not added to the robot's own size, which also sets
+# how far the body may overhang an arena edge and where the sensor sits.
+ROBOT_PADDING_MM = float(os.getenv("ROBOT_PADDING_MM", "0"))
 
 # Ultrasonic reading at the photo, cm, tried in this order.
 # 30 is where YOLO is most confident; further out is next best. The camera is
@@ -104,6 +110,20 @@ ROBOT_HALF_WIDTH_MM = ROBOT_WIDTH_CM * 10 / 2.0
 REAR_AXLE_TO_SENSOR_MM = float(os.getenv(
     "REAR_AXLE_TO_SENSOR_CM", str(REAR_AXLE_TO_SENSOR_CM)
 )) * 10.0
+
+# Where the body is, relative to that same rear-axle reference, for COLLISION checks. Measured from the
+# rear axle midpoint:
+#   FRONT: to the front-most point of the robot (the sensor tip). Defaults to the sensor offset.
+#   REAR:  to the back edge. NOT MEASURED - 40 mm is an assumption (a 23 cm chassis with a 17 cm wheelbase
+#          leaves ~60 mm for both overhangs). Measure it and set ROBOT_REAR_FROM_AXLE_MM.
+# ROBOT_FOOTPRINT_LEGACY=1 restores the old rectangle centred on the axle, for comparison only.
+ROBOT_FRONT_FROM_AXLE_MM = float(os.getenv("ROBOT_FRONT_FROM_AXLE_MM", str(REAR_AXLE_TO_SENSOR_MM)))
+ROBOT_REAR_FROM_AXLE_MM = float(os.getenv("ROBOT_REAR_FROM_AXLE_MM", "40"))
+if os.getenv("ROBOT_FOOTPRINT_LEGACY", "0").strip().lower() in ("1", "true", "yes"):
+    ROBOT_FRONT_FROM_AXLE_MM = ROBOT_REAR_FROM_AXLE_MM = ROBOT_HALF_LENGTH_MM
+BODY_HALF_LENGTH_MM = (ROBOT_FRONT_FROM_AXLE_MM + ROBOT_REAR_FROM_AXLE_MM) / 2.0
+BODY_CENTRE_AHEAD_MM = (ROBOT_FRONT_FROM_AXLE_MM - ROBOT_REAR_FROM_AXLE_MM) / 2.0
+grid_search.BODY_CENTRE_AHEAD_MM = BODY_CENTRE_AHEAD_MM
 
 # Start pose: robot facing N, pushed into the start zone's bottom-left corner -
 # rear on the bottom line, left side on the left line, START_GAP_MM off each so
@@ -205,10 +225,11 @@ def _viewing_pose(obstacle: dict, standoff_mm: float,
 
 
 def _obstacle_aabb_mm(obstacle: dict) -> Tuple[float, float, float, float]:
-    """The obstacle grown by COLLISION_MARGIN_MM on every side."""
-    x0 = obstacle["x"] * 100.0 - COLLISION_MARGIN_MM
-    y0 = obstacle["y"] * 100.0 - COLLISION_MARGIN_MM
-    size = OBSTACLE_SIZE_MM + 2 * COLLISION_MARGIN_MM
+    """The obstacle grown by COLLISION_MARGIN_MM + ROBOT_PADDING_MM on every side."""
+    m = COLLISION_MARGIN_MM + ROBOT_PADDING_MM
+    x0 = obstacle["x"] * 100.0 - m
+    y0 = obstacle["y"] * 100.0 - m
+    size = OBSTACLE_SIZE_MM + 2 * m
     return (x0, y0, x0 + size, y0 + size)
 
 
@@ -239,7 +260,9 @@ def _start_boxes(start: "Pose") -> List[Tuple[float, float, float, float]]:
        neither is anything that drives back through the start line).
 
     START_THETA is cardinal; "behind" is taken along the nearest cardinal."""
-    g, tol = START_GUARD_MM, START_GUARD_TOL_MM
+    # The window is measured to the BODY, not the reference point: the sensor tip is ROBOT_FRONT_FROM_AXLE_MM
+    # ahead of the axle, so a body part can be that much further along an edge than the point being tracked.
+    g, tol = START_GUARD_MM + ROBOT_FRONT_FROM_AXLE_MM, START_GUARD_TOL_MM
     boxes = []
     if start.y < g:
         boxes.append((start.x - g, -_BIG_MM, start.x + g, -tol))
@@ -252,7 +275,7 @@ def _start_boxes(start: "Pose") -> List[Tuple[float, float, float, float]]:
 
     w = _REAR_BLOCK_WIDTH_MM
     face = _nearest_cardinal(start.theta)
-    hl, hw = ROBOT_HALF_LENGTH_MM, ROBOT_HALF_WIDTH_MM
+    hl, hw = ROBOT_REAR_FROM_AXLE_MM, ROBOT_HALF_WIDTH_MM          # hl: the body's reach BEHIND the axle
     if face == "N":
         r = start.y - hl
         boxes.append((start.x - hw - w, r - _REAR_BLOCK_DEPTH_MM, start.x + hw + w, r))
@@ -270,7 +293,7 @@ def _start_boxes(start: "Pose") -> List[Tuple[float, float, float, float]]:
 
 def _pose_clear(x, y, theta, boxes) -> bool:
     return not grid_search._point_blocked(
-        x, y, theta, boxes, ARENA_MM, ROBOT_HALF_LENGTH_MM, ROBOT_HALF_WIDTH_MM,
+        x, y, theta, boxes, ARENA_MM, BODY_HALF_LENGTH_MM, ROBOT_HALF_WIDTH_MM,
     )
 
 
@@ -348,7 +371,7 @@ def _search_leg(from_pose: Pose, option: PhotoOption, radius_mm, boxes):
     try:
         tokens, raw_poses, cost = grid_search.search_leg(
             from_pose.x, from_pose.y, from_pose.theta, option.line,
-            radius_mm, boxes, ARENA_MM, ROBOT_HALF_LENGTH_MM, ROBOT_HALF_WIDTH_MM,
+            radius_mm, boxes, ARENA_MM, BODY_HALF_LENGTH_MM, ROBOT_HALF_WIDTH_MM,
         )
     except grid_search.NoPathFound:
         return None
@@ -709,7 +732,7 @@ def assess_primitive_safety(plan: dict, obstacles: List[dict], progress: dict,
     for sample_x, sample_y, sample_theta in samples:
         if grid_search._point_blocked(
             sample_x, sample_y, sample_theta, boxes, ARENA_MM,
-            ROBOT_HALF_LENGTH_MM, ROBOT_HALF_WIDTH_MM,
+            BODY_HALF_LENGTH_MM, ROBOT_HALF_WIDTH_MM,
         ):
             return {
                 "reason": "swept footprint intersects obstacle/arena envelope",
@@ -859,7 +882,7 @@ def plan_segment_recovery(plan: dict, obstacles: List[dict], progress: dict,
             try:
                 raw_tokens, raw_poses, _ = grid_search.search_leg(
                     ax, ay, actual_lattice, goal, TURN_RADIUS_MM[arc_profile], boxes,
-                    ARENA_MM, ROBOT_HALF_LENGTH_MM, ROBOT_HALF_WIDTH_MM,
+                    ARENA_MM, BODY_HALF_LENGTH_MM, ROBOT_HALF_WIDTH_MM,
                     forbidden_first_tokens=forbidden_first,
                 )
             except grid_search.NoPathFound as exc:
