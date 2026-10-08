@@ -26,7 +26,7 @@
  * ------------------------------------------------------------------------- */
 
 /* Cruise speed, RPM. Same value Phase 3 was tuned at. */
-#define MOTION_CRUISE_RPM       100
+#define MOTION_CRUISE_RPM 90
 
 /* Approach speed for the last stretch. Slowing before the target cuts the
  * spread in stopping distance, which is what +/-6% actually depends on -
@@ -36,8 +36,8 @@
  * want never differed from s_lastRpm, so the speed change was never issued
  * and every run braked from full cruise. 40 RPM is a starting point; raise
  * it if the approach crawls for too long. */
-#define MOTION_APPROACH_RPM     40
-#define MOTION_APPROACH_MM      150.0f
+#define MOTION_APPROACH_RPM 40
+#define MOTION_APPROACH_MM 150.0f
 
 /* Coast after braking, mm. Subtracted from the target so the robot ends up
  * on the mark rather than past it. See the procedure in motion.c.
@@ -50,14 +50,14 @@
  * Coast grows with speed and with battery voltage, so re-measure after any
  * change to MOTION_CRUISE_RPM or MOTION_APPROACH_RPM - both of which are
  * candidates for the run-time tuning in TURNING.md section 6. */
-#define MOTION_BRAKE_MM         8.0f
+#define MOTION_BRAKE_MM 8.0f
 
 /* Brake settling time before declaring the move finished, in 10 ms ticks. */
-#define MOTION_BRAKE_TICKS      40U
+#define MOTION_BRAKE_TICKS 40U
 
 /* Watchdog. A stalled wheel must not hang the primitive forever, or it hangs
  * the RPi link with no reply and nothing to explain it. */
-#define MOTION_TIMEOUT_TICKS    1500U   /* 15 s */
+#define MOTION_TIMEOUT_TICKS 1500U /* 15 s */
 
 /* ---------------------------------------------------------------------------
  * ARCS  (checklist A.4: rotate through an angle between 90 and 360 degrees)
@@ -93,7 +93,7 @@
  * while the gyro was clipping and under-reading by about 1.8x, every R was
  * inflated by the same factor. Nothing measured before that fix says anything
  * reliable about what the steering is doing. */
-#define MOTION_ARC_STEER_US     575U
+#define MOTION_ARC_STEER_US 575U
 
 /* Slow down for the last part of the turn, degrees remaining. Same reasoning
  * as MOTION_APPROACH_MM on a straight run: a slow approach makes the stopping
@@ -120,7 +120,7 @@
  * If a commanded turn runs away, or aborts as TIMEOUT having gone the wrong
  * way, flip this. But check IMU_IsReady() first - see the note in odom.c
  * about the encoder fallback, which used to invert the sign all by itself. */
-#define MOTION_ARC_SIGN         (+1)
+#define MOTION_ARC_SIGN (+1)
 
 /* Abort if the turn goes the WRONG WAY by this many degrees.
  *
@@ -176,7 +176,7 @@
  * that problem. A measured alpha does not.
  *
  * Set MOTION_ARC_ADAPTIVE_BRAKE to 0 to go back to the fixed brake_deg. */
-#define MOTION_ARC_ADAPTIVE_BRAKE   1
+#define MOTION_ARC_ADAPTIVE_BRAKE 1
 
 /* Starting guess for angular deceleration, deg/s^2. Refined from the first
  * turn onwards, so only the first run or two use it directly.
@@ -193,12 +193,12 @@
  * session behave like the fifth. Both learned values reset at power-off, so
  * this constant is the only thing standing between a cold start and that
  * four-run warm-up. */
-#define MOTION_ARC_DECEL_DPS2       636.0f
+#define MOTION_ARC_DECEL_DPS2 636.0f
 
 /* How fast alpha is learned. 0.25 means a quarter of the way to the new
  * measurement each turn - converged in three or four, slow enough that one
  * odd run cannot throw it. */
-#define MOTION_ARC_LEARN_GAIN       0.25f
+#define MOTION_ARC_LEARN_GAIN 0.25f
 
 /* 1 - the FIRST valid arc of a power-on replaces the compiled seed outright,
  *     and MOTION_ARC_LEARN_GAIN / MOTION_ARC_LAG_GAIN only damp the arcs
@@ -213,7 +213,7 @@
  *
  * A value restored with !CALD / !CALL counts as seeded: that one IS a real
  * prior, and the next arc must not throw it away. See Motion_SetArcDecel(). */
-#define MOTION_ARC_SEED_FIRST       1
+#define MOTION_ARC_SEED_FIRST 1
 
 /* Brake engagement lag, seconds. LEARNED, like alpha.
  *
@@ -241,19 +241,19 @@
  * latency. Kept as a seeded constant anyway so a cold start matches a warm
  * one, and because the term is what absorbs any residual constant error once
  * alpha has converged. */
-#define MOTION_ARC_LAG_S            0.003f
-#define MOTION_ARC_LAG_GAIN         0.30f
-#define MOTION_ARC_LAG_MAX_S        0.25f
+#define MOTION_ARC_LAG_S 0.003f
+#define MOTION_ARC_LAG_GAIN 0.30f
+#define MOTION_ARC_LAG_MAX_S 0.25f
 
 /* Never brake later than this many degrees out, whatever the maths says.
  * Guards against a bad rate reading braking so late it sails past. */
-#define MOTION_ARC_MIN_LEAD_DEG     2.0f
+#define MOTION_ARC_MIN_LEAD_DEG 2.0f
 
 /* Sanity bounds on the learned alpha. Outside these the measurement is
  * rejected rather than believed - a turn cut short by hand, or a wheel
  * slipping, produces nonsense that would otherwise poison the estimate. */
-#define MOTION_ARC_DECEL_MIN        50.0f
-#define MOTION_ARC_DECEL_MAX        3000.0f
+#define MOTION_ARC_DECEL_MIN 50.0f
+#define MOTION_ARC_DECEL_MAX 3000.0f
 
 /* ---------------------------------------------------------------------------
  * INDEPENDENT ANGLE CROSS-CHECK
@@ -284,16 +284,16 @@
  * It is a diagnostic, not a safety interlock: it reports, it does not abort.
  * A disagreement means go and measure something with a tape, not that the
  * move was dangerous. */
-#define MOTION_XCHECK_ENABLE      1
-#define MOTION_XCHECK_MAX_BOOST   1.05f
-#define MOTION_XCHECK_TOL_PCT     20.0f
+#define MOTION_XCHECK_ENABLE 1
+#define MOTION_XCHECK_MAX_BOOST 1.05f
+#define MOTION_XCHECK_TOL_PCT 20.0f
 
 /* Encoder-derived angle for the last arc, degrees. 0 if the check did not
  * run - wrong profile, or too short a move to mean anything. */
-float   Motion_GetXCheckDeg(void);
+float Motion_GetXCheckDeg(void);
 
 /* Percentage the two witnesses disagreed by on the last arc. */
-float   Motion_GetXCheckErrPct(void);
+float Motion_GetXCheckErrPct(void);
 
 /* 1 if the last arc's two angle estimates disagreed beyond tolerance. */
 uint8_t Motion_XCheckFailed(void);
@@ -323,12 +323,12 @@ float Motion_GetArcLag(void);
  *
  * 200 ms is generous, unnoticeable, and paid only when the steering actually
  * has to move (see MOTION_ALIGN_SKIP_US). */
-#define MOTION_ALIGN_TICKS      20U
+#define MOTION_ALIGN_TICKS 20U
 
 /* If the servo is already within this many microseconds of where the move
  * wants it, skip the settle entirely. Back-to-back straight commands from the
  * RPi would otherwise each pay 200 ms for a servo that is not going to move. */
-#define MOTION_ALIGN_SKIP_US    20U
+#define MOTION_ALIGN_SKIP_US 20U
 
 /* ---------------------------------------------------------------------------
  * ARC PROFILES
@@ -353,27 +353,27 @@ float Motion_GetArcLag(void);
  * ------------------------------------------------------------------------- */
 typedef struct
 {
-    const char *name;          /* shown on the OLED, keep it short   */
-    uint16_t    steer_us;      /* deflection from SERVO_CENTER_US    */
-    int16_t     rpm;           /* cruise speed                       */
-    int16_t     approach_rpm;  /* speed for the last approach_deg    */
-    float       approach_deg;  /* how much of the turn is slowed     */
-    float       brake_deg;     /* MEASURED coast                     */
-    float       radius_mm;     /* MEASURED radius                    */
-    float       diff_boost;    /* 1.0 = pure geometry, no assist     */
+    const char *name;     /* shown on the OLED, keep it short   */
+    uint16_t steer_us;    /* deflection from SERVO_CENTER_US    */
+    int16_t rpm;          /* cruise speed                       */
+    int16_t approach_rpm; /* speed for the last approach_deg    */
+    float approach_deg;   /* how much of the turn is slowed     */
+    float brake_deg;      /* MEASURED coast                     */
+    float radius_mm;      /* MEASURED radius                    */
+    float diff_boost;     /* 1.0 = pure geometry, no assist     */
 } ArcProfile_t;
 
-#define MOTION_ARC_PROFILE_COUNT  3
+#define MOTION_ARC_PROFILE_COUNT 3
 
 /* Select the active profile. Out-of-range values are ignored. */
-void        Motion_SetArcProfile(uint8_t idx);
-uint8_t     Motion_GetArcProfile(void);
+void Motion_SetArcProfile(uint8_t idx);
+uint8_t Motion_GetArcProfile(void);
 const ArcProfile_t *Motion_GetArcProfileInfo(uint8_t idx);
 
 /* The deflection actually used, after clamping to whatever the servo limits
  * allow symmetrically. Lets the UI show what will really happen rather than
  * what was asked for. */
-uint16_t    Motion_GetArcSteerUs(void);
+uint16_t Motion_GetArcSteerUs(void);
 
 typedef enum
 {

@@ -5,22 +5,26 @@
 #include "encoders.h"
 #include <math.h>
 
-typedef enum { MOVE_STRAIGHT = 0, MOVE_ARC } MoveKind_t;
+typedef enum
+{
+    MOVE_STRAIGHT = 0,
+    MOVE_ARC
+} MoveKind_t;
 
 static MotionState_t s_state;
 static MoveKind_t s_kind;
-static float    s_targetMm;      /* absolute, brake compensation applied */
-static float    s_holdHeading;   /* heading latched at the start of a straight */
-static int8_t   s_dir;           /* +1 forward, -1 reverse                   */
-static uint8_t  s_arcRight;      /* which way the arc curves                 */
-static uint16_t s_arcServoUs;    /* servo pulse held for the whole arc       */
-static int16_t  s_lastRpm;       /* last speed issued to the odom layer      */
+static float s_targetMm;      /* absolute, brake compensation applied */
+static float s_holdHeading;   /* heading latched at the start of a straight */
+static int8_t s_dir;          /* +1 forward, -1 reverse                   */
+static uint8_t s_arcRight;    /* which way the arc curves                 */
+static uint16_t s_arcServoUs; /* servo pulse held for the whole arc       */
+static int16_t s_lastRpm;     /* last speed issued to the odom layer      */
 static uint32_t s_ticks;
 static uint32_t s_brakeTicks;
 static uint32_t s_alignTicks;
 static uint16_t s_startServoUs;
-static float    s_arcTargetDeg;   /* signed, unwrapped, relative to launch */
-static uint16_t s_settleTarget;   /* servo angle being settled onto        */
+static float s_arcTargetDeg;    /* signed, unwrapped, relative to launch */
+static uint16_t s_settleTarget; /* servo angle being settled onto        */
 
 /* ---------------------------------------------------------------------------
  * Arc profiles.
@@ -40,31 +44,30 @@ static uint16_t s_settleTarget;   /* servo angle being settled onto        */
  * fallback still compiles.
  * ------------------------------------------------------------------------- */
 static const ArcProfile_t s_profiles[MOTION_ARC_PROFILE_COUNT] =
-{
-    /* 0: the calibrated one. Tight and quick.                              */
-    { "TIGHT", 575U, 150, 100, 20.0f,   8.0f, 291.0f, 2.0f },
+    {
+        /* 0: the calibrated one. Tight and quick.                              */
+        {"TIGHT", 575U, 110, 100, 20.0f, 8.0f, 291.0f, 2.0f},
 
-    /* 1: no differential assist. Wider, but the rear tyres are not scrubbed
-     *    so the path should be a cleaner circle - which matters more than
-     *    radius if the planner needs the robot to finish where it predicted.
-     *
-     *    radius_mm MEASURED at 318 by floor chord, three runs, all 45 cm.
-     *    Replaces a 340 guess. This one has to be right: the encoder-vs-gyro
-     *    cross-check only runs at boost <= 1.05, so CLEAN is the only profile
-     *    it can use, and radius_mm is its denominator. A guessed radius makes
-     *    the second witness agree with nothing in particular. */
-    { "CLEAN", 575U, 150, 100, 20.0f,   8.0f, 318.0f, 1.0f },
+        /* 1: no differential assist. Wider, but the rear tyres are not scrubbed
+         *    so the path should be a cleaner circle - which matters more than
+         *    radius if the planner needs the robot to finish where it predicted.
+         *
+         *    radius_mm MEASURED at 318 by floor chord, three runs, all 45 cm.
+         *    Replaces a 340 guess. This one has to be right: the encoder-vs-gyro
+         *    cross-check only runs at boost <= 1.05, so CLEAN is the only profile
+         *    it can use, and radius_mm is its denominator. A guessed radius makes
+         *    the second witness agree with nothing in particular. */
+        {"CLEAN", 575U, 150, 100, 20.0f, 8.0f, 318.0f, 1.0f},
 
-    /* 2: slow. Longer to execute, but the coast is much smaller so the stop
-     *    is more repeatable, and the inner wheel has plenty of margin above
-     *    the deadband. MEASURE brake_deg and radius_mm. */
-    { "SLOW",  575U,  70,  70, 15.0f,   3.0f, 306.0f, 1.5f }
-};
+        /* 2: slow. Longer to execute, but the coast is much smaller so the stop
+         *    is more repeatable, and the inner wheel has plenty of margin above
+         *    the deadband. MEASURE brake_deg and radius_mm. */
+        {"SLOW", 575U, 70, 70, 15.0f, 3.0f, 306.0f, 1.5f}};
 
 static uint8_t s_profileIdx = 0U;
 
 /* Learned angular deceleration and the state needed to measure it. */
-static float s_arcDecel   = MOTION_ARC_DECEL_DPS2;
+static float s_arcDecel = MOTION_ARC_DECEL_DPS2;
 
 /* Has anything better than the compiled constant been put into s_arcDecel /
  * s_arcLag yet this power-on? Until it has, the first valid measurement is
@@ -75,23 +78,23 @@ static float s_arcDecel   = MOTION_ARC_DECEL_DPS2;
  * Declared here rather than beside the learner so they sit with the values
  * whose provenance they describe. */
 static uint8_t s_decelSeeded = 0U;
-static float s_brakeRate  = 0.0f;   /* |yaw rate| when braking started */
-static float s_brakeAngle = 0.0f;   /* |heading| when braking started  */
-static float s_arcLag     = MOTION_ARC_LAG_S;
-static uint8_t s_lagSeeded   = 0U;
+static float s_brakeRate = 0.0f;  /* |yaw rate| when braking started */
+static float s_brakeAngle = 0.0f; /* |heading| when braking started  */
+static float s_arcLag = MOTION_ARC_LAG_S;
+static uint8_t s_lagSeeded = 0U;
 
 /* Cross-check results for the last arc. */
-static float   s_xcheckDeg    = 0.0f;
-static float   s_xcheckErrPct = 0.0f;
+static float s_xcheckDeg = 0.0f;
+static float s_xcheckErrPct = 0.0f;
 static uint8_t s_xcheckFailed = 0U;
-static float   s_arcStartDist = 0.0f;
+static float s_arcStartDist = 0.0f;
 
-float   Motion_GetXCheckDeg(void)    { return s_xcheckDeg; }
-float   Motion_GetXCheckErrPct(void) { return s_xcheckErrPct; }
-uint8_t Motion_XCheckFailed(void)    { return s_xcheckFailed; }
+float Motion_GetXCheckDeg(void) { return s_xcheckDeg; }
+float Motion_GetXCheckErrPct(void) { return s_xcheckErrPct; }
+uint8_t Motion_XCheckFailed(void) { return s_xcheckFailed; }
 
 float Motion_GetArcDecel(void) { return s_arcDecel; }
-float Motion_GetArcLag(void)   { return s_arcLag; }
+float Motion_GetArcLag(void) { return s_arcLag; }
 
 /* Restore a previously learned value. Both REJECT rather than clamp: a
  * sender that asks for something impossible has a bug, and clamping would
@@ -104,16 +107,19 @@ uint8_t Motion_SetArcDecel(float dps2)
         return 0U;
     }
 
-    s_arcDecel    = dps2;
-    s_decelSeeded = 1U;   /* a restored value is a prior worth keeping */
+    s_arcDecel = dps2;
+    s_decelSeeded = 1U; /* a restored value is a prior worth keeping */
     return 1U;
 }
 
 uint8_t Motion_SetArcLag(float secs)
 {
-    if ((secs < 0.0f) || (secs > MOTION_ARC_LAG_MAX_S)) { return 0U; }
+    if ((secs < 0.0f) || (secs > MOTION_ARC_LAG_MAX_S))
+    {
+        return 0U;
+    }
 
-    s_arcLag    = secs;
+    s_arcLag = secs;
     s_lagSeeded = 1U;
     return 1U;
 }
@@ -137,11 +143,14 @@ static uint16_t arc_steer_us(void)
 
 void Motion_SetArcProfile(uint8_t idx)
 {
-    if (idx < MOTION_ARC_PROFILE_COUNT) { s_profileIdx = idx; }
+    if (idx < MOTION_ARC_PROFILE_COUNT)
+    {
+        s_profileIdx = idx;
+    }
 }
 
-uint8_t  Motion_GetArcProfile(void)  { return s_profileIdx; }
-uint16_t Motion_GetArcSteerUs(void)  { return arc_steer_us(); }
+uint8_t Motion_GetArcProfile(void) { return s_profileIdx; }
+uint16_t Motion_GetArcSteerUs(void) { return arc_steer_us(); }
 
 const ArcProfile_t *Motion_GetArcProfileInfo(uint8_t idx)
 {
@@ -153,10 +162,10 @@ const ArcProfile_t *Motion_GetArcProfileInfo(uint8_t idx)
  * MOTION_TIMEOUT, but they mean completely different things - a stalled wheel
  * versus a sign inversion or a lying gyro - and the command layer reports them
  * separately so the fix is obvious from the reply alone. */
-static uint8_t  s_wrongWay;
+static uint8_t s_wrongWay;
 
-static int16_t  s_arcCommandDeg;  /* what the caller ASKED for, uncompensated */
-static uint8_t  s_recentreStep;   /* 0 waiting to stop, 1 preloaded, 2 done */
+static int16_t s_arcCommandDeg; /* what the caller ASKED for, uncompensated */
+static uint8_t s_recentreStep;  /* 0 waiting to stop, 1 preloaded, 2 done */
 static uint16_t s_recentreTick;
 
 /* ---------------------------------------------------------------------------
@@ -211,12 +220,11 @@ static inline void crit_exit(uint32_t primask)
  * ------------------------------------------------------------------------- */
 static void motion_halt(void)
 {
-    Odom_Stop();        /* recentres steering, drops the odom drive mode */
-    PID_Enable(0);      /* stop the loop writing duty - MUST precede brake */
+    Odom_Stop();   /* recentres steering, drops the odom drive mode */
+    PID_Enable(0); /* stop the loop writing duty - MUST precede brake */
     Motors_Brake();
     s_lastRpm = 0;
 }
-
 
 /* Park the steering where the move needs it and hold everything still while
  * it gets there. The odometry is NOT zeroed here - that happens when the
@@ -248,8 +256,8 @@ static void motion_begin_align(uint16_t servo_us)
      * steering at the end of every move, so the next straight run starts with
      * diff of precisely zero. Zero now means never skip. */
     s_alignTicks = ((MOTION_ALIGN_SKIP_US > 0U) && (diff <= MOTION_ALIGN_SKIP_US))
-                 ? MOTION_ALIGN_TICKS
-                 : 0U;
+                       ? MOTION_ALIGN_TICKS
+                       : 0U;
 
     s_ticks = 0U;
     s_state = MOTION_ALIGN;
@@ -262,14 +270,14 @@ static void motion_launch(void)
 
     Odom_Reset();
 
-    s_arcStartDist = Odom_GetDistance();   /* zero, just after the reset */
+    s_arcStartDist = Odom_GetDistance(); /* zero, just after the reset */
 
-    s_ticks      = 0U;
+    s_ticks = 0U;
     s_brakeTicks = 0U;
-    s_lastRpm    = (s_kind == MOVE_ARC)
-                 ? (int16_t)(s_dir * prof()->rpm)
-                 : (int16_t)(s_dir * MOTION_CRUISE_RPM);
-    s_state      = MOTION_RUN;
+    s_lastRpm = (s_kind == MOVE_ARC)
+                    ? (int16_t)(s_dir * prof()->rpm)
+                    : (int16_t)(s_dir * MOTION_CRUISE_RPM);
+    s_state = MOTION_RUN;
 
     PID_Enable(1);
 
@@ -280,47 +288,53 @@ static void motion_launch(void)
     }
     else
     {
-        s_holdHeading = Odom_GetHeading();   /* zero, just after the reset */
+        s_holdHeading = Odom_GetHeading(); /* zero, just after the reset */
         Odom_DriveHeading(s_lastRpm, s_holdHeading);
     }
 }
 
 void Motion_Init(void)
 {
-    s_state       = MOTION_IDLE;
-    s_kind        = MOVE_STRAIGHT;
-    s_targetMm    = 0.0f;
+    s_state = MOTION_IDLE;
+    s_kind = MOVE_STRAIGHT;
+    s_targetMm = 0.0f;
     s_holdHeading = 0.0f;
-    s_dir         = 1;
-    s_arcRight    = 0U;
-    s_arcServoUs  = SERVO_CENTER_US;
-    s_lastRpm     = 0;
-    s_ticks       = 0U;
-    s_brakeTicks  = 0U;
-    s_alignTicks  = 0U;
+    s_dir = 1;
+    s_arcRight = 0U;
+    s_arcServoUs = SERVO_CENTER_US;
+    s_lastRpm = 0;
+    s_ticks = 0U;
+    s_brakeTicks = 0U;
+    s_alignTicks = 0U;
     s_startServoUs = SERVO_CENTER_US;
     s_recentreStep = 0U;
     s_recentreTick = 0U;
     s_arcTargetDeg = 0.0f;
     s_arcCommandDeg = 0;
-    s_decelSeeded   = 0U;
-    s_lagSeeded     = 0U;
+    s_decelSeeded = 0U;
+    s_lagSeeded = 0U;
 }
 
 void Motion_DriveDistance(int32_t mm)
 {
-    float    target;
+    float target;
     uint32_t pm;
 
-    if (mm == 0) { return; }
+    if (mm == 0)
+    {
+        return;
+    }
 
     pm = crit_enter();
 
     s_kind = MOVE_STRAIGHT;
-    s_dir  = (mm < 0) ? -1 : 1;
+    s_dir = (mm < 0) ? -1 : 1;
 
     target = (float)((mm < 0) ? -mm : mm) - MOTION_BRAKE_MM;
-    if (target < 0.0f) { target = 0.0f; }
+    if (target < 0.0f)
+    {
+        target = 0.0f;
+    }
     s_targetMm = target;
 
     motion_begin_align(SERVO_CENTER_US);
@@ -330,21 +344,24 @@ void Motion_DriveDistance(int32_t mm)
 
 void Motion_DriveArc(int16_t degrees, uint8_t forward, uint8_t right)
 {
-    float    rad;
-    float    arc_mm;
+    float rad;
+    float arc_mm;
     uint32_t pm;
 
-    if (degrees <= 0) { return; }
+    if (degrees <= 0)
+    {
+        return;
+    }
 
     pm = crit_enter();
 
-    s_kind     = MOVE_ARC;
-    s_dir      = forward ? 1 : -1;
+    s_kind = MOVE_ARC;
+    s_dir = forward ? 1 : -1;
     s_arcRight = right ? 1U : 0U;
 
     s_arcServoUs = right
-                 ? (uint16_t)(SERVO_CENTER_US + arc_steer_us())
-                 : (uint16_t)(SERVO_CENTER_US - arc_steer_us());
+                       ? (uint16_t)(SERVO_CENTER_US + arc_steer_us())
+                       : (uint16_t)(SERVO_CENTER_US - arc_steer_us());
 
     /* Which way the BODY rotates.
      *
@@ -368,7 +385,10 @@ void Motion_DriveArc(int16_t degrees, uint8_t forward, uint8_t right)
 #else
     rad = (float)degrees - prof()->brake_deg;
 #endif
-    if (rad < 0.0f) { rad = 0.0f; }
+    if (rad < 0.0f)
+    {
+        rad = 0.0f;
+    }
 
     /* Keep the commanded angle so the result screen can report error against
      * what was ASKED for. Reporting against s_arcTargetDeg instead compares
@@ -376,19 +396,31 @@ void Motion_DriveArc(int16_t degrees, uint8_t forward, uint8_t right)
      * target is short by the profile's brake_deg - so a perfectly executed
      * turn would show that as a permanent error. */
     s_arcCommandDeg = degrees;
-    if (right)    { s_arcCommandDeg = (int16_t)(-s_arcCommandDeg); }
-    if (!forward) { s_arcCommandDeg = (int16_t)(-s_arcCommandDeg); }
+    if (right)
+    {
+        s_arcCommandDeg = (int16_t)(-s_arcCommandDeg);
+    }
+    if (!forward)
+    {
+        s_arcCommandDeg = (int16_t)(-s_arcCommandDeg);
+    }
     s_arcCommandDeg = (int16_t)(s_arcCommandDeg * MOTION_ARC_SIGN);
 
     s_arcTargetDeg = rad;
-    if (right)    { s_arcTargetDeg = -s_arcTargetDeg; }
-    if (!forward) { s_arcTargetDeg = -s_arcTargetDeg; }
+    if (right)
+    {
+        s_arcTargetDeg = -s_arcTargetDeg;
+    }
+    if (!forward)
+    {
+        s_arcTargetDeg = -s_arcTargetDeg;
+    }
     s_arcTargetDeg *= (float)MOTION_ARC_SIGN;
 
     /* Distance is not the termination condition any more, but keep a
      * generous arc-length estimate so Motion_GetRemaining() and the OLED
      * still show something sensible. */
-    arc_mm     = prof()->radius_mm * ((float)degrees * (3.14159265f / 180.0f));
+    arc_mm = prof()->radius_mm * ((float)degrees * (3.14159265f / 180.0f));
     s_targetMm = arc_mm;
 
     /* An arc needs a much bigger steering movement than a straight line, so
@@ -431,8 +463,8 @@ static void motion_issue(int16_t rpm)
 
 void Motion_Tick(void)
 {
-    float   travelled;
-    float   remaining;
+    float travelled;
+    float remaining;
     int16_t want;
 
     if (s_state == MOTION_ALIGN)
@@ -467,7 +499,7 @@ void Motion_Tick(void)
         return;
     }
 
-    travelled = Odom_GetDistance();     /* always positive */
+    travelled = Odom_GetDistance(); /* always positive */
     remaining = s_targetMm - travelled;
 
     if (s_state == MOTION_RUN)
@@ -476,9 +508,9 @@ void Motion_Tick(void)
         if (s_kind == MOVE_ARC)
         {
             float turned = Odom_GetHeadingTotal();
-            float togo   = (s_arcTargetDeg >= 0.0f)
-                         ? (s_arcTargetDeg - turned)
-                         : (turned - s_arcTargetDeg);
+            float togo = (s_arcTargetDeg >= 0.0f)
+                             ? (s_arcTargetDeg - turned)
+                             : (turned - s_arcTargetDeg);
 
             {
                 float lead = 0.0f;
@@ -487,7 +519,10 @@ void Motion_Tick(void)
                  * A faster profile has a larger w and so brakes earlier, with
                  * nothing to retune. */
                 float w = Odom_GetRateDps();
-                if (w < 0.0f) { w = -w; }
+                if (w < 0.0f)
+                {
+                    w = -w;
+                }
 
                 /* Quadratic term is the coast once braking; linear term is
                  * the distance covered during the engagement lag. */
@@ -501,13 +536,14 @@ void Motion_Tick(void)
                 {
                     /* Remember what we were doing at brake onset - this is
                      * what makes the coast measurable afterwards. */
-                    s_brakeRate  = (Odom_GetRateDps() < 0.0f)
-                                 ? -Odom_GetRateDps() : Odom_GetRateDps();
+                    s_brakeRate = (Odom_GetRateDps() < 0.0f)
+                                      ? -Odom_GetRateDps()
+                                      : Odom_GetRateDps();
                     s_brakeAngle = (turned < 0.0f) ? -turned : turned;
 
                     motion_halt();
                     s_brakeTicks = 0U;
-                    s_state      = MOTION_BRAKE;
+                    s_state = MOTION_BRAKE;
                     return;
                 }
             }
@@ -518,20 +554,21 @@ void Motion_Tick(void)
              * Stop now rather than let the watchdog run the full 15 s. */
             {
                 float target_mag = (s_arcTargetDeg >= 0.0f)
-                                 ? s_arcTargetDeg : -s_arcTargetDeg;
+                                       ? s_arcTargetDeg
+                                       : -s_arcTargetDeg;
 
                 if (togo > (target_mag + MOTION_ARC_WRONGWAY_DEG))
                 {
                     motion_halt();
                     s_wrongWay = 1U;
-                    s_state    = MOTION_TIMEOUT;
+                    s_state = MOTION_TIMEOUT;
                     return;
                 }
             }
 
             want = (togo <= prof()->approach_deg)
-                 ? (int16_t)(s_dir * prof()->approach_rpm)
-                 : (int16_t)(s_dir * prof()->rpm);
+                       ? (int16_t)(s_dir * prof()->approach_rpm)
+                       : (int16_t)(s_dir * prof()->rpm);
 
             if (want != s_lastRpm)
             {
@@ -547,13 +584,13 @@ void Motion_Tick(void)
              * reading the distance mid-coast would give a short answer. */
             motion_halt();
             s_brakeTicks = 0U;
-            s_state      = MOTION_BRAKE;
+            s_state = MOTION_BRAKE;
             return;
         }
 
         want = (remaining <= MOTION_APPROACH_MM)
-             ? (int16_t)(s_dir * MOTION_APPROACH_RPM)
-             : (int16_t)(s_dir * MOTION_CRUISE_RPM);
+                   ? (int16_t)(s_dir * MOTION_APPROACH_RPM)
+                   : (int16_t)(s_dir * MOTION_CRUISE_RPM);
 
         /* Only re-issue when the speed actually changes.
          *
@@ -594,7 +631,7 @@ void Motion_Tick(void)
         else if (s_recentreStep == 1U)
         {
             s_recentreTick++;
-            if (s_recentreTick >= 15U)          /* 150 ms to travel 60 us */
+            if (s_recentreTick >= 15U) /* 150 ms to travel 60 us */
             {
                 Servo_SetMicroseconds(SERVO_CENTER_US);
                 s_recentreStep = 2U;
@@ -617,30 +654,35 @@ void Motion_Tick(void)
              * that owes the gyro nothing. */
             if (s_kind == MOVE_ARC)
             {
-                s_xcheckDeg    = 0.0f;
+                s_xcheckDeg = 0.0f;
                 s_xcheckErrPct = 0.0f;
                 s_xcheckFailed = 0U;
 
                 if (prof()->diff_boost <= MOTION_XCHECK_MAX_BOOST)
                 {
-                    float arc  = Odom_GetDistance() - s_arcStartDist;
+                    float arc = Odom_GetDistance() - s_arcStartDist;
                     float gyro = Odom_GetHeadingTotal();
 
-                    if (gyro < 0.0f) { gyro = -gyro; }
+                    if (gyro < 0.0f)
+                    {
+                        gyro = -gyro;
+                    }
 
                     /* Below about 20 degrees the two agree to within their
                      * own noise, so a comparison says nothing useful. */
                     if ((arc > 1.0f) && (gyro > 20.0f) &&
                         (prof()->radius_mm > 1.0f))
                     {
-                        s_xcheckDeg = (arc / prof()->radius_mm)
-                                    * (180.0f / 3.14159265f);
+                        s_xcheckDeg = (arc / prof()->radius_mm) * (180.0f / 3.14159265f);
 
                         s_xcheckErrPct = ((s_xcheckDeg - gyro) / gyro) * 100.0f;
 
                         {
                             float m = s_xcheckErrPct;
-                            if (m < 0.0f) { m = -m; }
+                            if (m < 0.0f)
+                            {
+                                m = -m;
+                            }
                             s_xcheckFailed = (m > MOTION_XCHECK_TOL_PCT) ? 1U : 0U;
                         }
                     }
@@ -664,7 +706,10 @@ void Motion_Tick(void)
                 float ended = Odom_GetHeadingTotal();
                 float coast;
 
-                if (ended < 0.0f) { ended = -ended; }
+                if (ended < 0.0f)
+                {
+                    ended = -ended;
+                }
                 coast = ended - s_brakeAngle;
 
                 if ((coast > 0.5f) && (s_brakeRate > 5.0f))
@@ -691,14 +736,13 @@ void Motion_Tick(void)
                          * numbers nobody had measured here. */
                         if (!s_decelSeeded)
                         {
-                            s_arcDecel    = meas;
+                            s_arcDecel = meas;
                             s_decelSeeded = 1U;
                         }
                         else
 #endif
                         {
-                            s_arcDecel += MOTION_ARC_LEARN_GAIN
-                                        * (meas - s_arcDecel);
+                            s_arcDecel += MOTION_ARC_LEARN_GAIN * (meas - s_arcDecel);
                         }
                     }
 
@@ -709,8 +753,8 @@ void Motion_Tick(void)
                      * which is why this stays correct at other speeds. */
                     {
                         float want = (s_arcCommandDeg < 0)
-                                   ? (float)(-s_arcCommandDeg)
-                                   : (float)s_arcCommandDeg;
+                                         ? (float)(-s_arcCommandDeg)
+                                         : (float)s_arcCommandDeg;
                         float over = ended - want;
 
                         /* over / rate IS the lag error in seconds, not a
@@ -722,23 +766,28 @@ void Motion_Tick(void)
 #if MOTION_ARC_SEED_FIRST
                         if (!s_lagSeeded)
                         {
-                            s_arcLag  += (over / s_brakeRate);
+                            s_arcLag += (over / s_brakeRate);
                             s_lagSeeded = 1U;
                         }
                         else
 #endif
                         {
-                            s_arcLag += MOTION_ARC_LAG_GAIN
-                                      * (over / s_brakeRate);
+                            s_arcLag += MOTION_ARC_LAG_GAIN * (over / s_brakeRate);
                         }
 
-                        if (s_arcLag < 0.0f)                { s_arcLag = 0.0f; }
-                        if (s_arcLag > MOTION_ARC_LAG_MAX_S) { s_arcLag = MOTION_ARC_LAG_MAX_S; }
+                        if (s_arcLag < 0.0f)
+                        {
+                            s_arcLag = 0.0f;
+                        }
+                        if (s_arcLag > MOTION_ARC_LAG_MAX_S)
+                        {
+                            s_arcLag = MOTION_ARC_LAG_MAX_S;
+                        }
                     }
                 }
             }
 #endif
-            s_state        = MOTION_DONE;
+            s_state = MOTION_DONE;
         }
     }
 }
@@ -748,8 +797,10 @@ uint8_t Motion_WrongWayAborted(void) { return s_wrongWay; }
 uint8_t Motion_IsBusy(void)
 {
     return ((s_state == MOTION_ALIGN) ||
-            (s_state == MOTION_RUN)   ||
-            (s_state == MOTION_BRAKE)) ? 1U : 0U;
+            (s_state == MOTION_RUN) ||
+            (s_state == MOTION_BRAKE))
+               ? 1U
+               : 0U;
 }
 
 MotionState_t Motion_GetState(void) { return s_state; }
