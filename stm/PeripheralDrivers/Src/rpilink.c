@@ -257,11 +257,9 @@ static void answer_immediate(const Command_t *c)
             Odom_Pose_t p;
             Odom_GetWorldPose(&p);
             snprintf(b, sizeof(b), "WPOSE,%ld,%ld,%ld\n",
-                     (long)p.x_mm, (long)p.y_mm,
-                     (long)scaled10(p.heading_deg));
+                     (long)p.x_mm, (long)p.y_mm, (long)scaled10(p.heading_deg));
         }
         break;
-
 
     case CMD_Q_TURN:
         snprintf(b, sizeof(b), "TURN,%d\n",
@@ -311,12 +309,39 @@ static void answer_immediate(const Command_t *c)
         break;
 
     case CMD_SET_PROFILE:
+        /* Locked to TIGHT (MOTION_PROFILE_LOCK_TIGHT). Refused rather than
+           OK'd and ignored: a sender asking for CLEAN believes the robot
+           will turn at 318 mm, and an OK would let it go on believing it. */
         Motion_SetArcProfile((uint8_t)c->arg);
-        snprintf(b, sizeof(b), "%s", CMD_REPLY_OK);
+        snprintf(b, sizeof(b), "%s",
+                 (Motion_GetArcProfile() == (uint8_t)c->arg)
+                 ? CMD_REPLY_OK : CMD_REPLY_RESEND);
         break;
 
     case CMD_SET_ZERO:
-        Odom_Reset();
+        /* Zeroes the heading carry-over too: the pose the robot is in now
+           becomes heading 0, commanded and actual alike. */
+        Motion_ZeroHeading();
+        snprintf(b, sizeof(b), "%s", CMD_REPLY_OK);
+        break;
+
+    case CMD_Q_HDG:
+        /* HDG,<commanded x10>,<actual x10>,<last arc aim x10>,
+               <last arc turned x10>,<corrections capped since !ZERO>
+           commanded - actual is the error the next move will correct.
+           turned - aim is how precisely the last arc stopped. */
+        snprintf(b, sizeof(b), "HDG,%d,%d,%d,%d,%u\n",
+                 (int)scaled10(Motion_GetCommandedHeading()),
+                 (int)scaled10(Motion_GetActualHeading()),
+                 (int)scaled10(Motion_GetLastArcAimDeg()),
+                 (int)scaled10(Motion_GetLastArcTurnedDeg()),
+                 (unsigned)Motion_GetCarryClampCount());
+        break;
+
+    case CMD_SET_LEARN:
+        /* Takes effect at the END of the move in flight, which is where the
+           learners run - so unlike the setters there is nothing to guard. */
+        Motion_SetLearning((uint8_t)c->arg);
         snprintf(b, sizeof(b), "%s", CMD_REPLY_OK);
         break;
 
@@ -325,15 +350,25 @@ static void answer_immediate(const Command_t *c)
            like any other query - it only reads. Lag is x10 MILLISECONDS, not
            x10 seconds: MOTION_ARC_LAG_MAX_S is 0.25, so seconds x10 would
            quantise the whole usable range into three steps. */
-        snprintf(b, sizeof(b), "CAL,%d,%d,%d\n",
+        /* Protocol 4 appends gyro scale x10000 and the learning switch;
+           protocol 5 the left and right arc deflections in force. Appended,
+           not inserted, so older readers still read the right fields. */
+        snprintf(b, sizeof(b), "CAL,%d,%d,%d,%d,%u,%u,%u\n",
                  (int)scaled10(Motion_GetArcDecel()),
                  (int)scaled10(Motion_GetArcLag() * 1000.0f),
-                 (int)Odom_GetHeadingTrim());
+                 (int)Odom_GetHeadingTrim(),
+                 (int)((IMU_GetGyroScale() * 10000.0f) + 0.5f),
+                 (unsigned)Motion_LearningEnabled(),
+                 (unsigned)Motion_GetArcSteerSideUs(0U),
+                 (unsigned)Motion_GetArcSteerSideUs(1U));
         break;
 
     case CMD_SET_CAL_DECEL:
     case CMD_SET_CAL_LAG:
     case CMD_SET_CAL_TRIM:
+    case CMD_SET_CAL_GYRO:
+    case CMD_SET_CAL_STEER_L:
+    case CMD_SET_CAL_STEER_R:
         /* THE INTERFERENCE GUARD.
          *
          * These are the only immediate commands that write state a move in
@@ -362,6 +397,20 @@ static void answer_immediate(const Command_t *c)
             else if (c->op == CMD_SET_CAL_LAG)
             {
                 ok = Motion_SetArcLag((float)c->arg / 10000.0f);
+            }
+            else if (c->op == CMD_SET_CAL_GYRO)
+            {
+                ok = IMU_SetGyroScale((float)c->arg / 10000.0f);
+            }
+            else if ((c->op == CMD_SET_CAL_STEER_L) ||
+                     (c->op == CMD_SET_CAL_STEER_R))
+            {
+                /* Busy-guarded with the rest: the deflection is latched
+                   when an arc is queued, and changing it under a turn in
+                   its steering settle would split the difference. */
+                ok = Motion_SetArcSteerSideUs(
+                         (c->op == CMD_SET_CAL_STEER_R) ? 1U : 0U,
+                         (uint16_t)c->arg);
             }
             else
             {
@@ -392,6 +441,7 @@ static void abort_everything(void)
     Motion_Stop();
     Motion_ClearState();
     Motors_Coast();
+    Motion_ResyncHeading();   /* whatever was planned no longer applies */
     s_lineActive = 0U;
     s_f0Active   = 0U;
     s_fuState    = FU_OFF;

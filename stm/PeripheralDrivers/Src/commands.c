@@ -114,8 +114,8 @@ uint8_t Cmd_IsImmediate(CmdOpcode_t op)
     /* A RANGE, not a list - so a new immediate opcode added OUTSIDE it is
      * silently handed to the movement parser instead. Append new ones before
      * this endpoint and move the endpoint with them. */
-    return (((op >= CMD_Q_US) && (op <= CMD_SET_CAL_TRIM)) ||
-            op == CMD_Q_WPOSE) ? 1U : 0U;
+    return (((op >= CMD_Q_US)  && (op <= CMD_SET_CAL_TRIM)) ||
+            ((op >= CMD_Q_HDG) && (op <= CMD_Q_WPOSE))) ? 1U : 0U;
 }
 
 Command_t Cmd_ParseToken(const char *token)
@@ -149,6 +149,7 @@ Command_t Cmd_ParseToken(const char *token)
         else if (token_is(token, "?xchk")) { cmd.op = CMD_Q_XCHK; }
         else if (token_is(token, "?ver"))  { cmd.op = CMD_Q_VER;  }
         else if (token_is(token, "?cal"))  { cmd.op = CMD_Q_CAL;  }
+        else if (token_is(token, "?hdg"))  { cmd.op = CMD_Q_HDG;  }
         return cmd;
     }
 
@@ -181,6 +182,41 @@ Command_t Cmd_ParseToken(const char *token)
         {
             if (!parse_uint(&token[n], &arg)) { return cmd; }
             cmd.op  = CMD_SET_CAL_LAG;
+            cmd.arg = arg;
+            return cmd;
+        }
+
+        /* "!calsl" / "!calsr" share no prefix with "!call" past the fourth
+         * character, so the order against the others does not matter. */
+        if ((n = token_starts(token, "!calsl")) != 0U)
+        {
+            if (!parse_uint(&token[n], &arg)) { return cmd; }
+            cmd.op  = CMD_SET_CAL_STEER_L;
+            cmd.arg = arg;
+            return cmd;
+        }
+
+        if ((n = token_starts(token, "!calsr")) != 0U)
+        {
+            if (!parse_uint(&token[n], &arg)) { return cmd; }
+            cmd.op  = CMD_SET_CAL_STEER_R;
+            cmd.arg = arg;
+            return cmd;
+        }
+
+        if ((n = token_starts(token, "!calg")) != 0U)
+        {
+            if (!parse_uint(&token[n], &arg)) { return cmd; }
+            cmd.op  = CMD_SET_CAL_GYRO;
+            cmd.arg = arg;
+            return cmd;
+        }
+
+        if ((n = token_starts(token, "!learn")) != 0U)
+        {
+            if (!parse_uint(&token[n], &arg)) { return cmd; }
+            if (arg > 1)                      { return cmd; }
+            cmd.op  = CMD_SET_LEARN;
             cmd.arg = arg;
             return cmd;
         }
