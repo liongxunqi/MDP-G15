@@ -35,7 +35,6 @@ import sys
 import time
 from pathlib import Path
 from typing import Optional
-from uuid import uuid4
 
 import cv2
 
@@ -89,12 +88,9 @@ def run_detection(image_path: str):
 sys.path.insert(0, os.path.join(REPO_ROOT, "algo"))
 os.environ.setdefault("RPI_ANCHOR_X_MM", "0") # the RPi reports ROBOT as displacement from the start
 os.environ.setdefault("RPI_ANCHOR_Y_MM", "0")
-os.environ.setdefault("ARENA_OVERHANG_MM", "0")
-os.environ.setdefault("RPI_ARENA_GUARD", "0")
+os.environ.setdefault("RPI_ARENA_GUARD", "0") # see the caveat below
 from stm_tokens import PROFILE_NAMES, TURN_RADIUS_MM  # noqa: E402
 from path_planner import (  # noqa: E402
-    CAMERA_TO_SENSOR_MM,
-    REAR_AXLE_TO_CAMERA_MM,
     REAR_AXLE_TO_SENSOR_MM,
     RPI_ANCHOR_X_MM,
     RPI_ANCHOR_Y_MM,
@@ -114,9 +110,8 @@ def compute_path(obstacles: list) -> dict:
         f"{TURN_RADIUS_MM.get(ARC_PROFILE, '?')}mm)."
     )
     logging.info(
-        f"Planner geometry: rear axle to US {REAR_AXLE_TO_SENSOR_MM:.0f}mm, "
-        f"rear axle to camera {REAR_AXLE_TO_CAMERA_MM:.0f}mm, camera to US "
-        f"{CAMERA_TO_SENSOR_MM:.0f}mm; odometry start "
+        f"Planner geometry: rear axle to front sensor "
+        f"{REAR_AXLE_TO_SENSOR_MM:.0f}mm; odometry start "
         f"({RPI_ANCHOR_X_MM:.0f},{RPI_ANCHOR_Y_MM:.0f})mm."
     )
     return plan_mission(obstacles, arc_profile=ARC_PROFILE)
@@ -312,9 +307,7 @@ def main() -> None:
     rpi.connect()
 
     annotated_images = []
-    monitor = PlanMonitor(None)     # most recently generated plan
-    active_monitor = monitor        # plan identified by the latest PROGRESS
-    monitors = {}                   # retained by plan_id until the run disconnects
+    monitor = PlanMonitor(None)     # replaced by one built from each PATH we send
 
     logging.info("Waiting for messages from RPi…")
 
@@ -322,7 +315,7 @@ def main() -> None:
         msg = rpi.receive_line()
         if msg is None:
             logging.info("RPi disconnected — exiting.")
-            logging.info(active_monitor.summary())
+            logging.info(monitor.summary())
             break
 
         # ── PROGRESS → compare with the plan; answer a feedback wait ──────────
@@ -330,23 +323,7 @@ def main() -> None:
         # token as its own STM line). With feedback on, the RPi stalls until we
         # answer, so this must stay quick and never raise.
         if msg.startswith("PROGRESS,"):
-            payload_text = msg.split(",", 1)[1]
-            selected_monitor = monitor
-            try:
-                progress_plan_id = json.loads(payload_text).get("plan_id")
-            except (json.JSONDecodeError, AttributeError):
-                progress_plan_id = None
-            if progress_plan_id is not None:
-                selected_monitor = monitors.get(str(progress_plan_id))
-                if selected_monitor is None:
-                    logging.error(
-                        "PROGRESS references unknown plan_id %s; refusing to make "
-                        "a movement decision against the wrong PATH.",
-                        progress_plan_id,
-                    )
-                    continue
-            active_monitor = selected_monitor
-            reply = selected_monitor.handle(payload_text)
+            reply = monitor.handle(msg.split(",", 1)[1])
             if reply is not None and not rpi.send(reply):
                 break
             continue
@@ -403,7 +380,6 @@ def main() -> None:
                     f"{RPI_PATH_TIMEOUT_S:.0f}s, so this plan may arrive too late."
                 )
             obstacle_snapshot = [dict(obstacle) for obstacle in obstacles]
-            path["plan_id"] = uuid4().hex
             monitor = PlanMonitor(
                 path,
                 recovery_planner=lambda current_plan, progress, obs=obstacle_snapshot: (
@@ -416,7 +392,6 @@ def main() -> None:
                     current_plan, obs, progress, token, arc_profile=ARC_PROFILE,
                 ),
             )
-            monitors[path["plan_id"]] = monitor
             if not rpi.send("PATH," + json.dumps(path)):
                 break
 
@@ -488,7 +463,7 @@ def main() -> None:
         # ── STITCH → combine all result images ────────────────────────────────
         elif msg.startswith("STITCH"):
             logging.info("STITCH received — creating result image…")
-            logging.info(active_monitor.summary())
+            logging.info(monitor.summary())
             stitch_images(annotated_images, STITCHED_OUTPUT)
             annotated_images.clear()
             logging.info("Stitching done. Ready for next run (Ctrl-C to quit).")

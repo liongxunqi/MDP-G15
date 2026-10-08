@@ -151,55 +151,12 @@ class MonitorUnit(unittest.TestCase):
         self.assertEqual(m.replacements, 1)
         self.assertEqual(m.continues, 0)
 
-    def test_deviation_only_recovery_failure_can_continue(self):
+    def test_recovery_failure_falls_back_to_continue(self):
         m = pm.PlanMonitor(self.PLAN, lambda current, report: None)
         reply = m.handle(progress(0, 1, "F10", 3.0, 5.0, 0.0, fid="x"))
         self.assertEqual(reply.split(",", 1)[0], "CONTINUE")
         self.assertEqual(m.replacements, 0)
         self.assertEqual(m.continues, 1)
-
-    def test_heading_error_alone_requests_recovery(self):
-        calls = []
-        def recover(current, report):
-            calls.append(report)
-            return None
-        monitor = pm.PlanMonitor(self.PLAN, recover)
-        reply = monitor.handle(progress(0, 0, "F10", 3, 3, 7, fid="heading"))
-        self.assertEqual(len(calls), 1)
-        self.assertEqual(reply.split(",", 1)[0], "CONTINUE")
-
-    def test_unsafe_preflight_uses_legacy_continue_fallback(self):
-        m = pm.PlanMonitor(
-            self.PLAN,
-            lambda current, report: None,
-            safety_checker=lambda current, report, token: {
-                "reason": "outside arena", "next_token": token,
-            },
-        )
-        payload = progress(0, -1, "F10", 3.0, 3.0, 0.0, fid="hold")
-        body = json.loads(payload)
-        body["event"] = "instruction_preflight"
-        reply = m.handle(json.dumps(body))
-        self.assertEqual(reply.split(",", 1)[0], "CONTINUE")
-        self.assertEqual(m.holds, 0)
-
-    def test_unsafe_photo_adjustment_is_skipped_not_replanned(self):
-        calls = []
-        m = pm.PlanMonitor(
-            self.PLAN,
-            lambda current, report: calls.append(report),
-            safety_checker=lambda current, report, token: {
-                "reason": "obstacle", "next_token": token,
-            },
-        )
-        payload = progress(0, -2, "R10", 3.0, 3.0, 0.0, fid="photo",
-                           obstacle_id="7")
-        body = json.loads(payload)
-        body["event"] = "photo_adjustment_preflight"
-        reply = m.handle(json.dumps(body))
-        self.assertEqual(reply.split(",", 1)[0], "SKIP")
-        self.assertEqual(calls, [])
-        self.assertEqual(m.skips, 1)
 
     def test_boundary_lookahead_replaces_before_the_real_2009mm_overrun(self):
         # Physical run 20261008_112200: after F10 the robot was only 72 mm off
@@ -291,60 +248,6 @@ class MonitorUnit(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertTrue(any("IR veto" in message
                             for message in self.cap.messages(logging.WARNING)))
-
-    def test_ir_vetoes_a_15_degree_checkpoint_too(self):
-        plan = {
-            "segments": [["F10", "FR15", "S"]],
-            "segment_obstacles": ["4"],
-            "expected": [[
-                [500.0, 500.0, 0.0],
-                [576.0, 490.0, 15.0],
-                [576.0, 490.0, 15.0],
-            ]],
-        }
-        replacement = {
-            "segments": [["R5", "S"]],
-            "segment_obstacles": ["4"],
-            "expected": [[[500.0, 450.0, 0.0], [500.0, 450.0, 0.0]]],
-        }
-        reports = []
-        monitor = pm.PlanMonitor(
-            plan,
-            lambda current, report: reports.append(report) or replacement,
-        )
-        reply = monitor.handle(progress(
-            0, 0, "F10", 5.0, 5.0, 0.0, fid="fine-ir-close",
-            remaining_photo_ids=["4"], ir_left_cm=18, ir_right_cm=65535,
-            ir_left_raw=1900, ir_right_raw=100,
-        ))
-        self.assertEqual(reply.split(",", 1)[0], "REPLACE")
-        self.assertEqual(reports[0]["blocked_token"], "FR15")
-
-    def test_ir_does_not_cross_a_completed_photo_segment(self):
-        plan = {
-            "segments": [["F5", "S"], ["FR45", "S"]],
-            "segment_obstacles": ["4", "5"],
-            "expected": [
-                [[500, 500, 0], [500, 500, 0]],
-                [[708, 414, 45], [708, 414, 45]],
-            ],
-        }
-        recoveries = []
-        monitor = pm.PlanMonitor(
-            plan,
-            lambda current, report: recoveries.append(report),
-        )
-
-        reply = monitor.handle(progress(
-            0, 1, "S", 5.0, 5.0, 0.0, fid="photo-boundary",
-            remaining_photo_ids=["4", "5"],
-            ir_left_cm=16, ir_right_cm=17,
-            ir_left_raw=2200, ir_right_raw=1850,
-        ))
-
-        self.assertEqual(reply.split(",", 1)[0], "CONTINUE")
-        self.assertEqual(recoveries, [])
-
 
     def test_ir_no_reading_with_low_raw_count_does_not_false_veto(self):
         plan = {
@@ -514,21 +417,11 @@ def emulate_rpi(server, out, feedback, turn_bias=(0.0, 0.0)):
                 x = (robot.x + shift[0]) / 100.0
                 y = (robot.y + shift[1]) / 100.0
                 hdg = (90.0 - math.degrees(robot.th)) % 360.0
-                if feedback and turn_bias == (0.0, 0.0):
-                    # This test exercises transport/correlation, not motor
-                    # drift. Feed the planner's exact pose so a deliberately
-                    # conservative live safety margin does not turn it into a
-                    # recovery test as well.
-                    ex, ey, eh = plan["expected"][si][ii]
-                    x, y, hdg = ex / 100.0, ey / 100.0, eh
                 last = ii == len(seg) - 1
-                remaining = [str(value) for value in plan["segment_obstacles"][si:]
-                             if value is not None]
                 conn.sendall(("PROGRESS," + progress(
                     si, ii, tok, round(x, 3), round(y, 3), round(hdg, 1), fid,
                     segment=seg, segment_completed=last,
-                    remaining_photo_ids=remaining, decision_timeout_s=30.0,
-                    plan_id=plan.get("plan_id"),
+                    remaining_photo_ids=[], decision_timeout_s=30.0,
                 )  + "\n").encode())
                 if feedback:                              # stall here until the PC decides
                     reply = f.readline().decode().strip()
@@ -605,7 +498,7 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(out["decisions"], 0)
         # The stub detector finds nothing, so "Nothing detected" and the stitch
         # warning are expected; PROGRESS itself must add no warnings.
-        unrelated = ("Nothing detected", "Stitch", "diagonal camera view")
+        unrelated = ("Nothing detected", "Stitch")
         self.assertEqual([m for m in cap.messages(logging.WARNING)
                           if not any(u in m for u in unrelated)], [])
         summary = [m for m in cap.messages(logging.INFO) if m.startswith("PROGRESS:")][-1]

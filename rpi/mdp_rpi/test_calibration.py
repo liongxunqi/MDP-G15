@@ -173,19 +173,6 @@ class PrepareForTaskTests(ProfileStoreMixin, unittest.TestCase):
         self.assertFalse(cal_profile.prepare_for_task(fw, name="nowhere", required=True))
         self.assertEqual(fw.zeroed, 0)
 
-    def test_can_defer_zero_for_orchestrator(self):
-        self.saved_arena()
-        fw = FakeFirmware()
-
-        self.assertTrue(cal_profile.prepare_for_task(
-            fw, name="arena", required=True, zero_at_end=False,
-        ))
-
-        self.assertEqual(fw.zeroed, 0)
-        self.assertNotIn("!ZERO", fw.sent)
-        self.assertTrue(cal_profile.zero_heading(fw))
-        self.assertEqual(fw.zeroed, 1)
-
     def test_no_profile_named_refuses_unless_not_required(self):
         fw = FakeFirmware()
         self.assertFalse(cal_profile.prepare_for_task(fw, name="", required=True))

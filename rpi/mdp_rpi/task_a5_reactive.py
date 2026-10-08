@@ -125,7 +125,7 @@ MAX_FACES = int(os.getenv("A5_MAX_FACES", "4"))
 # measure, and it deserves a robot that has stopped rocking.
 SETTLE_S = float(os.getenv("A5_SETTLE_S", "0.3"))
 
-# The arc profile ORBIT_LINE was traced for. 0 TIGHT (r=293.5mm) is the firmware
+# The arc profile ORBIT_LINE was traced for. 0 TIGHT (r=291mm) is the firmware
 # default and nothing here sends !PROF, so this is a check rather than a
 # setting: planning for one radius and driving another puts every turn wide,
 # and across four arcs that is the difference between facing the next face and

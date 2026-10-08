@@ -31,7 +31,6 @@ class FeedbackControl:
                 "deadline": time.monotonic() + self.timeout,
                 "event": Event(),
                 "response": None,
-                "kind": progress.get("event"),
             }
             self._pending = pending
             progress.update({k: pending[k] for k in
@@ -43,7 +42,7 @@ class FeedbackControl:
     def submit(self, action, payload):
         with self._lock:
             pending = self._pending
-            if (action not in ("CONTINUE", "REPLACE", "SKIP", "HOLD") or
+            if (action not in ("CONTINUE", "REPLACE") or
                     not isinstance(payload, dict) or pending is None or
                     payload.get("feedback_id") != pending["feedback_id"] or
                     pending["response"] is not None or

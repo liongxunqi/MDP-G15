@@ -81,15 +81,10 @@ def detect(image_path):
     if best_index is None:
         output_path = RUNS_DIR / Path(image_path).name
         saved = cv2.imwrite(str(output_path), annotated_image)
-        candidate_summary = ", ".join(
-            f"{name}:{float(confidence):.3f}"
-            for name, confidence in zip(class_names, confidences)
-        ) or "none"
         logging.warning(
             "Detector candidates were all below target confidence %.2f; "
-            "candidates=[%s]; saved frame to %s%s",
+            "saved frame to %s%s",
             YOLO_TARGET_CONFIDENCE,
-            candidate_summary,
             output_path,
             "" if saved else " (save failed)",
         )

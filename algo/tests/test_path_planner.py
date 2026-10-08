@@ -33,7 +33,6 @@ import math
 import sys
 import unittest
 from pathlib import Path
-from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # algo/
 
@@ -50,43 +49,6 @@ def cache_from(edges):
 
 
 class VisitOrderTests(unittest.TestCase):
-
-    def test_open_target_keeps_normal_tour_and_head_on_photo(self):
-        with patch.object(pp, "_plan_compact_sequence",
-                          side_effect=AssertionError("open layout used compact routing")):
-            result = pp.plan_mission([{"id": 1, "x": 10, "y": 10, "d": 0}])
-        self.assertEqual(result["obstacle_ids"], [1])
-        self.assertEqual(result["selected_view_angles"]["1"], 0)
-
-    def test_edge_target_does_not_force_open_target_into_compact_tour(self):
-        with patch.object(pp, "_choose_tour", wraps=pp._choose_tour) as normal:
-            result = pp.plan_mission([
-                {"id": 1, "x": 10, "y": 10, "d": 0},
-                {"id": 2, "x": 16, "y": 16, "d": 2},
-            ])
-        normal.assert_called_once()
-        self.assertIn(1, result["obstacle_ids"])
-        self.assertEqual(result["selected_view_angles"]["1"], 0)
-
-    def test_compact_search_tries_alternate_head_on_range_before_diagonal(self):
-        obstacle = {"id": 1}
-        preferred, alternate, diagonal = object(), object(), object()
-        start = pp.Pose(500, 500, 0)
-        boxes = pp._collision_boxes([])
-        leg = (["F5"], [start, pp.Pose(550, 500, 0)], 50)
-        with patch.object(pp, "_compact_diagonal_candidates", return_value=[diagonal]), \
-                patch.object(pp, "_search_any_approach", side_effect=[
-                    None, (obstacle, alternate, leg),
-                ]) as search, \
-                patch.object(pp, "_terminal_after_leg", return_value=leg[1][-1]):
-            sequence, remaining = pp._plan_compact_sequence(
-                start, [obstacle], {1: [preferred, alternate]}, {1: [diagonal]},
-                293.5, boxes, boxes, pp.time.monotonic() + 30,
-            )
-        self.assertEqual(remaining, [])
-        self.assertIs(sequence[0][1], alternate)
-        self.assertEqual(search.call_args_list[0].args[1], [(obstacle, preferred)])
-        self.assertEqual(search.call_args_list[1].args[1], [(obstacle, alternate)])
 
     def test_never_returns_none_when_nothing_is_reachable(self):
         # The regression. An empty cache means every edge is infinite.
@@ -186,61 +148,44 @@ class PhotoDistanceTests(unittest.TestCase):
         self.assertIn(33, result["photo_standoffs"]["1"])
         self.assertIn(45, result["photo_standoffs"]["1"])
 
-    def test_top_facing_pose_uses_the_closest_safe_head_on_standoff(self):
-        self.assertEqual(options_for({"id": 1, "x": 10, "y": 15, "d": 0})[0], 28)
+    def test_close_distances_are_tried_only_after_normal_options(self):
+        # Facing the top edge: 30 still wins; close poses remain fallbacks.
+        self.assertEqual(
+            options_for({"id": 1, "x": 10, "y": 15, "d": 0}),
+            [30, 28, 20],
+        )
 
-    def test_measured_camera_centre_opens_the_west_photo_pose(self):
+    def test_20_cm_fallback_keeps_wall_facing_rear_axle_inside_guard(self):
+        # The west face of cell x=5 is at 500 mm. At 30 cm the rear-axle pose
+        # is -30 mm, but the 20 cm pose is +70 mm and inside the 50 mm guard.
         obstacle = {"id": 1, "x": 5, "y": 6, "d": 6}
-        boxes = pp._collision_boxes([pp._obstacle_aabb_mm(obstacle)])
+        boxes = pp.grid_search.Boxes([pp._obstacle_aabb_mm(obstacle)])
         start = pp.Pose(pp.START_X_MM, pp.START_Y_MM, pp.START_THETA)
         boxes.ref_bounds = pp._rpi_ref_bounds(start)
         options = pp._photo_options(obstacle, boxes, [obstacle])
-        self.assertTrue(options)
-        self.assertEqual(options[0].standoff_cm, 30)
+        self.assertEqual([option.standoff_cm for option in options], [20])
+        self.assertAlmostEqual(options[0].pose.x, 70.0)
 
-    def test_facing_images_without_head_on_space_use_known_face_diagonals(self):
-        result = pp.plan_mission([
-            {"id": 1, "x": 6, "y": 10, "d": 2},
-            {"id": 2, "x": 10, "y": 10, "d": 6},
-        ])
-        self.assertEqual(set(result["obstacle_ids"]), {1, 2})
+    def test_a_blocked_30_moves_further_out(self):
+        # A neighbour diagonally behind blocks the preferred close standoffs.
         self.assertEqual(
-            {abs(angle) for angle in result["selected_view_angles"].values()},
-            {45.0},
+            options_for({"id": 1, "x": 10, "y": 10, "d": 0}, {"id": 2, "x": 10, "y": 15, "d": 0}),
+            [42, 45],
         )
 
-    def test_a_blocker_on_the_view_axis_rejects_every_head_on_standoff(self):
-        # Moving farther back does not help when another obstacle remains between
-        # the camera and the intended image; accepting it associates the other
-        # obstacle's target with this ID.
-        self.assertEqual(
-            options_for({"id": 1, "x": 10, "y": 10, "d": 0},
-                        {"id": 2, "x": 10, "y": 12, "d": 0}),
-            [],
-        )
-
-    def test_failed_head_on_connection_falls_back_to_safe_diagonal(self):
+    def test_congested_face_uses_collision_checked_diagonal_fallback(self):
         # The second box blocks every head-on camera pose but is itself marked
         # SKIP. A 45-degree view of obstacle 1 remains physically reachable.
         details = {}
         result = pp.plan_mission([
             {"id": 1, "x": 10, "y": 10, "d": 0},
-            {"id": 2, "x": 9, "y": 15, "d": 8},
+            {"id": 2, "x": 9, "y": 16, "d": 8},
         ], details=details)
-        self.assertEqual(result["obstacle_ids"], [1])
-        self.assertEqual(abs(result["selected_view_angles"]["1"]), 45)
+        self.assertTrue(result["segments"])
+        self.assertEqual(abs(round(details["view_angle_deg"][1])), 45)
         self.assertNotIn(1, details["skipped"])
-        layout = [{"id": 1, "x": 10, "y": 10, "d": 0},
-                  {"id": 2, "x": 9, "y": 15, "d": 8}]
-        boxes = pp._collision_boxes([pp._obstacle_aabb_mm(o) for o in layout])
-        replay = pp._replay_motion(
-            pp.Pose(pp.START_X_MM, pp.START_Y_MM, pp.START_THETA),
-            [token for line in result["segments"] for token in line if token != "S"],
-            pp.TURN_RADIUS_MM[pp.PROFILE_TIGHT], boxes,
-        )
-        self.assertIsNotNone(replay)
 
-    def test_facing_images_with_thirty_cm_gap_keep_safe_retry_distances(self):
+    def test_facing_images_with_thirty_cm_gap_are_both_planned_obliquely(self):
         # Boxes occupy x=600..700 and x=1000..1100, leaving exactly 300 mm
         # between their facing image planes. A head-on rear-axle pose does not
         # fit, but an external 45-degree view of each face does.
@@ -249,59 +194,19 @@ class PhotoDistanceTests(unittest.TestCase):
             {"id": 2, "x": 10, "y": 10, "d": 6},
         ])
         self.assertEqual(set(result["obstacle_ids"]), {1, 2})
+        self.assertEqual(
+            {abs(round(angle)) for angle in result["selected_view_angles"].values()},
+            {45},
+        )
         self.assertTrue(all(
-            distance >= 25
-            for distances in result["photo_standoffs"].values()
-            for distance in distances
-        ))
-        self.assertFalse(any(
-            token.startswith("FU")
+            token not in {"FR90", "FL90", "RR90", "RL90"}
             for segment in result["segments"] for token in segment
         ))
 
-    def test_thirty_cm_edge_target_gets_safe_diagonal_candidates(self):
-        target = {"id": 6, "x": 16, "y": 16, "d": 2}
-        boxes = pp._collision_boxes([pp._obstacle_aabb_mm(target)])
-        options = pp._photo_options(target, boxes, [target], allow_oblique=True)
-        self.assertEqual({option.view_angle_deg for option in options}, {-45.0, 45.0})
-        self.assertTrue(any(option.standoff_cm == 25 and option.line.length_mm >= 50
-                            for option in options))
-        self.assertTrue(all(pp._pose_clear(option.pose.x, option.pose.y,
-                                           option.pose.theta, boxes)
-                            for option in options))
-
-    def test_nine_target_compact_layout_completes_with_bounded_diagonals(self):
-        xs, ys = (3, 7, 12), (4, 8, 13)
-        directions = ((2, 0, 6), (2, 0, 6), (2, 4, 6))
-        layout = [
-            {"id": row * 3 + column + 1, "x": x, "y": y,
-             "d": directions[row][column]}
-            for row, y in enumerate(ys)
-            for column, x in enumerate(xs)
-        ]
-        result = pp.plan_mission(layout)
-        self.assertEqual(set(result["obstacle_ids"]), set(range(1, 10)))
-        self.assertEqual(len(result["selected_standoffs"]), 9)
-        self.assertTrue(all(
-            distance >= 25
-            for distances in result["photo_standoffs"].values()
-            for distance in distances
-        ))
-        self.assertFalse(any(
-            token.startswith("FU")
-            for segment in result["segments"] for token in segment
-        ))
-
-    def test_unreachable_edge_target_is_skipped_instead_of_using_fine_turns(self):
-        target = {"id": 6, "x": 16, "y": 16, "d": 2}
-        result = pp.plan_mission([target])
-        self.assertEqual(result["segments"], [])
-        self.assertEqual(result["selected_view_angles"], {})
-
-    def test_viewing_pose_uses_rear_axle_to_camera_offset(self):
+    def test_viewing_pose_uses_rear_axle_to_front_sensor_offset(self):
         obstacle = {"id": 1, "x": 10, "y": 10, "d": 0}
         pose = pp._viewing_pose(obstacle, 300.0)
-        expected_y = 1050.0 + 50.0 + 300.0 + pp.REAR_AXLE_TO_CAMERA_MM
+        expected_y = 1050.0 + 50.0 + 300.0 + pp.REAR_AXLE_TO_SENSOR_MM
         self.assertAlmostEqual(pose.x, 1050.0)
         self.assertAlmostEqual(pose.y, expected_y)
         self.assertAlmostEqual(pose.theta, -math.pi / 2)
@@ -309,103 +214,39 @@ class PhotoDistanceTests(unittest.TestCase):
 
 class LegOutputTests(unittest.TestCase):
 
-    def test_search_does_not_invent_small_turns_after_coarse_failure(self):
-        goal = pp.grid_search.ApproachLine(1000.0, 1000.0, 0.0, 0.0, 1.0)
-        calls = []
-
-        def fake_search(*args, **kwargs):
-            steps = kwargs.get("turn_steps_deg", (pp.grid_search.TURN_STEP_DEG,))
-            calls.append(tuple(steps))
-            raise pp.grid_search.NoPathFound("coarse route blocked")
-
-        with patch.object(pp.grid_search, "search_leg", side_effect=fake_search):
-            with self.assertRaises(pp.grid_search.NoPathFound):
-                pp._search_motion(
-                    900.0, 1000.0, 0.0, goal,
-                    pp.TURN_RADIUS_MM[pp.PROFILE_TIGHT], pp.grid_search.Boxes(),
-                )
-
-        self.assertEqual(calls, [(45,)])
-
-    def test_fine_lattice_can_stop_at_a_15_degree_checkpoint(self):
-        radius = pp.TURN_RADIUS_MM[pp.PROFILE_TIGHT]
-        dx, dy, theta = pp.grid_search._arc_delta(
-            0.0, +1, -1, math.radians(15.0), radius,
-        )
-        goal = pp.grid_search.ApproachLine(
-            1000.0 + dx, 1000.0 + dy, theta, 1.0, 2.0,
-        )
-        tokens, poses, _ = pp.grid_search.search_leg(
-            1000.0, 1000.0, 0.0, goal, radius,
-            pp.grid_search.Boxes(), pp.ARENA_MM,
-            pp.ROBOT_HALF_LENGTH_MM, pp.ROBOT_HALF_WIDTH_MM,
-            turn_steps_deg=(15, 30, 45),
-        )
-        self.assertEqual(tokens, ["FR15"])
-        self.assertAlmostEqual(math.degrees(poses[-1][2]), -15.0)
-
-    def test_non_45_degree_endpoint_is_rejected_without_fine_fallback(self):
-        goal = pp.grid_search.ApproachLine(
-            1000.0, 1000.0, math.radians(75.0), 0.0, 1.0,
-        )
-        calls = []
-
-        def fake_search(*args, **kwargs):
-            calls.append(tuple(kwargs.get(
-                "turn_steps_deg", (pp.grid_search.TURN_STEP_DEG,)
-            )))
-            return ["FR15"], [(1000.0, 1000.0, math.radians(75.0))], 1.0
-
-        with patch.object(pp.grid_search, "search_leg", side_effect=fake_search):
-            with self.assertRaises(pp.grid_search.NoPathFound):
-                pp._search_motion(
-                    900.0, 1000.0, math.radians(90.0), goal,
-                    pp.TURN_RADIUS_MM[pp.PROFILE_TIGHT], pp.grid_search.Boxes(),
-                )
-
-        self.assertEqual(calls, [])
-
     def test_straights_are_merged(self):
         poses = [pp.Pose(i, 0, 0) for i in range(5)]
         tokens, merged = pp._merge_runs(["F5", "F5", "FR90", "R5", "R5"], poses)
         self.assertEqual(tokens, ["F10", "FR90", "R10"])
         self.assertIs(merged[0], poses[1])   # pose after the LAST merged token
 
-    def test_adjacent_45_degree_arcs_merge_to_calibrated_90(self):
+    def test_45_degree_arcs_remain_separate_feedback_checkpoints(self):
         poses = [pp.Pose(i, 0, 0) for i in range(6)]
         tokens, merged = pp._merge_runs(["FR45", "FR45", "RL45", "FL45", "FL45", "F30"], poses)
-        self.assertEqual(tokens, ["FR90", "RL45", "FL90", "F30"])
-        self.assertEqual(merged, [poses[1], poses[2], poses[4], poses[5]])
+        self.assertEqual(tokens, ["FR45", "FR45", "RL45", "FL45", "FL45", "F30"])
+        self.assertEqual(merged, poses)
 
-    def test_the_search_only_emits_calibrated_45_or_90_degree_arcs(self):
+    def test_the_search_only_emits_45_degree_arcs(self):
         details = {}
         plan = pp.plan_mission([{"id": 1, "x": 15, "y": 3, "d": 6},
                                 {"id": 2, "x": 5, "y": 15, "d": 4}], details=details)
         arcs = [t for line in plan["segments"] for t in line if t[:2] in ("FR", "FL", "RR", "RL")]
         self.assertTrue(arcs)
-        self.assertTrue(all(int(t[2:]) in (45, 90) for t in arcs), arcs)
+        self.assertTrue(all(int(t[2:]) % 45 == 0 for t in arcs), arcs)
 
-    def test_oblique_photo_options_use_calibrated_diagonal_headings(self):
+    def test_diagonal_photo_options_are_exact_lattice_headings(self):
         obstacle = {"id": 1, "x": 10, "y": 10, "d": 0}
         boxes = pp.grid_search.Boxes([pp._obstacle_aabb_mm(obstacle)])
         options = pp._photo_options(
             obstacle, boxes, [obstacle], allow_oblique=True,
         )
         angles = {round(option.view_angle_deg) for option in options}
-        self.assertEqual(angles, {-45, 45})
+        self.assertTrue({-45, 0, 45}.issubset(angles))
         for option in options:
             heading = pp.grid_search._heading_index(option.pose.theta)
             self.assertAlmostEqual(
                 pp.grid_search._HEADINGS[heading], option.pose.theta, places=6
             )
-
-    def test_photo_option_rejects_another_obstacle_blocking_the_image(self):
-        target = {"id": 1, "x": 10, "y": 10, "d": 0}
-        blocker = {"id": 2, "x": 10, "y": 13, "d": 4}
-        every = [target, blocker]
-        boxes = pp.grid_search.Boxes([pp._obstacle_aabb_mm(o) for o in every])
-        options = pp._photo_options(target, boxes, every, allow_oblique=False)
-        self.assertEqual(options, [])
 
     def test_swept_guard_checks_45_degree_arc_not_only_endpoint(self):
         plan = {

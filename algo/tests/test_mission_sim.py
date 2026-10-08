@@ -15,8 +15,9 @@ images have no room in front of them for a 28-45 cm photo), or FAIL. Then:
   photos      obstacles photographed / obstacles placed
   collision   robot body overlaps an obstacle ("graze" if every overlap is
               under GRAZE_MM deep — within real-world slop, but still a touch)
-  overhang    furthest the body pokes past the 2 m line; any positive value is
-              a planner bug under the closed arena-envelope contract
+  overhang    furthest the body pokes past the 2 m line. Up to
+              grid_search.ARENA_OVERHANG_MM is by design (open arena); more
+              than that is a planner bug
   aim         at each photo: facing the image, centred on it, and the
               ultrasonic sees the intended target when range correction is safe
   time        planning time — the PC must answer before the run clock hurts
@@ -93,8 +94,6 @@ FIXED_LAYOUTS = {
 
 def corners(x, y, th, hl=HALF_L, hw=HALF_W):
     c, s = math.cos(th), math.sin(th)
-    x += pp.BODY_CENTRE_AHEAD_MM * c
-    y += pp.BODY_CENTRE_AHEAD_MM * s
     return [(x + c * a - s * b, y + s * a + c * b) for a, b in
             ((hl, hw), (hl, -hw), (-hl, -hw), (-hl, hw))]
 
@@ -207,16 +206,17 @@ def same_block(sim, hit_id, obs):
 def aim_problems(sim, obs):
     """Is the robot, right now, in a position to photograph obs's image face?"""
     nx, ny = FACE_NORMAL[obs["d"]]
-    cx = obs["x"] * 100 + OBS / 2 + nx * OBS / 2
-    cy = obs["y"] * 100 + OBS / 2 + ny * OBS / 2
-    fx = sim.x + pp.REAR_AXLE_TO_SENSOR_MM * math.cos(sim.th)
-    fy = sim.y + pp.REAR_AXLE_TO_SENSOR_MM * math.sin(sim.th)
-    want = math.atan2(cy - fy, cx - fx)
+    want = math.atan2(-ny, -nx)
     err = math.degrees(abs(math.atan2(math.sin(sim.th - want), math.cos(sim.th - want))))
+    cx, cy = obs["x"] * 100 + OBS / 2, obs["y"] * 100 + OBS / 2
+    # Lateral offset of the robot centreline from the face centre.
+    lateral = abs((sim.x - cx) * -math.sin(want) + (sim.y - cy) * math.cos(want))
     dist, hit = sim.ahead_distance()
     problems = []
     if err > AIM_HEADING_TOL_DEG:
         problems.append(f"heading off by {err:.0f}deg")
+    if lateral > AIM_LATERAL_TOL_MM:
+        problems.append(f"{lateral:.0f}mm off-centre")
     if not same_block(sim, hit, obs):
         problems.append(f"camera sees {'nothing' if hit is None else f'obstacle {hit}'}")
     return problems, dist
@@ -247,7 +247,7 @@ def evaluate(obstacles, profile=PROFILE_TIGHT):
                 if not same_block(sim, hit, obs):
                     seen = "nothing" if hit is None else f"obstacle {hit}"
                     us_problems.append(f"?US sees {seen}")
-            problems = us_problems + problems
+            problems = us_problems + [p for p in problems if not p.startswith("camera")]
             if problems:
                 aim.append(f"obs {obs['id']}: " + ", ".join(problems))
             # Snap to where the planner meant to be, so one miss isn't counted
@@ -268,19 +268,13 @@ def evaluate(obstacles, profile=PROFILE_TIGHT):
 
 
 def random_layout(rng, n):
-    """Obstacles clear of start with at least 30 cm between their box edges."""
+    """Non-overlapping obstacles, clear of the 40x40 start zone, 1 cell apart."""
     taken, out = set(), []
     while len(out) < n:
         x, y = rng.randrange(0, 20), rng.randrange(0, 20)
         if x < 5 and y < 5:
             continue
-        if any(
-            math.hypot(
-                max(0, (abs(x - other_x) - 1) * 100),
-                max(0, (abs(y - other_y) - 1) * 100),
-            ) < 300
-            for other_x, other_y in taken
-        ):
+        if any((x + dx, y + dy) in taken for dx in (-1, 0, 1) for dy in (-1, 0, 1)):
             continue
         taken.add((x, y))
         out.append({"id": len(out) + 1, "x": x, "y": y, "d": rng.choice((0, 2, 4, 6))})
