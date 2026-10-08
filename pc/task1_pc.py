@@ -45,6 +45,9 @@ RPI_PORT = 5000              # must match RPI_PORT in .env
 RECEIVED_DIR    = "received_images"   # incoming JPEGs saved here
 ANNOTATED_DIR   = "runs/predict"      # YOLO-annotated outputs saved here
 STITCHED_OUTPUT = "stitched_result.jpg"
+STITCH_COLUMNS = max(1, int(os.getenv("STITCH_COLUMNS", "3")))
+STITCH_TILE_WIDTH = max(160, int(os.getenv("STITCH_TILE_WIDTH", "960")))
+STITCH_TILE_HEIGHT = max(90, int(os.getenv("STITCH_TILE_HEIGHT", "540")))
 
 # ── Logging ────────────────────────────────────────────────────────────────────
 # Shared with the RPi side, so it lives in rpi/mdp_rpi/. Logs go to pc/logs/.
@@ -79,10 +82,18 @@ def run_detection(image_path: str):
 #   "segment_obstacles" — parallel to "segments": obstacle to photograph after
 #                         that line, or None for pure travel
 #   "dirs"              — robot pose per line, for the Android map
+#   "start"             — bottom-left cell of Android's 2x2 robot drawing
+#   "odometry_start"    — planner-owned origin for RPi ROBOT/PROGRESS feedback
 
 sys.path.insert(0, os.path.join(REPO_ROOT, "algo"))
 from stm_tokens import PROFILE_NAMES, TURN_RADIUS_MM  # noqa: E402
-from path_planner import plan_mission  # noqa: E402
+from path_planner import (  # noqa: E402
+    REAR_AXLE_TO_SENSOR_MM,
+    RPI_ANCHOR_X_MM,
+    RPI_ANCHOR_Y_MM,
+    plan_mission,
+    plan_segment_recovery,
+)
 
 # Must match whatever profile is actually running on the STM (?STAT).
 ARC_PROFILE = int(os.getenv("STM_ARC_PROFILE", "0"))
@@ -94,24 +105,65 @@ def compute_path(obstacles: list) -> dict:
         f"({PROFILE_NAMES.get(ARC_PROFILE, '?')}, radius "
         f"{TURN_RADIUS_MM.get(ARC_PROFILE, '?')}mm)."
     )
+    logging.info(
+        f"Planner geometry: rear axle to front sensor "
+        f"{REAR_AXLE_TO_SENSOR_MM:.0f}mm; odometry start "
+        f"({RPI_ANCHOR_X_MM:.0f},{RPI_ANCHOR_Y_MM:.0f})mm."
+    )
     return plan_mission(obstacles, arc_profile=ARC_PROFILE)
 
 
 # ── Image stitching ────────────────────────────────────────────────────────────
 
 def stitch_images(image_paths: list, output_path: str) -> None:
-    """Concatenate a list of images horizontally and save."""
+    """Save a readable, multi-row contact sheet of this run's images."""
     imgs = [cv2.imread(p) for p in image_paths if os.path.exists(p)]
+    imgs = [img for img in imgs if img is not None]
     if not imgs:
         logging.warning("Stitch: no valid images found — skipping.")
         return
-    min_h = min(img.shape[0] for img in imgs)
-    resized = [
-        cv2.resize(img, (int(img.shape[1] * min_h / img.shape[0]), min_h))
-        for img in imgs
-    ]
-    cv2.imwrite(output_path, cv2.hconcat(resized))
-    logging.info(f"Stitch: saved → {output_path}.")
+
+    tiles = []
+    for img in imgs:
+        height, width = img.shape[:2]
+        scale = min(STITCH_TILE_WIDTH / width, STITCH_TILE_HEIGHT / height)
+        resized = cv2.resize(
+            img,
+            (max(1, round(width * scale)), max(1, round(height * scale))),
+            interpolation=cv2.INTER_AREA,
+        )
+        vertical = STITCH_TILE_HEIGHT - resized.shape[0]
+        horizontal = STITCH_TILE_WIDTH - resized.shape[1]
+        tile = cv2.copyMakeBorder(
+            resized,
+            vertical // 2,
+            vertical - vertical // 2,
+            horizontal // 2,
+            horizontal - horizontal // 2,
+            cv2.BORDER_CONSTANT,
+            value=(0, 0, 0),
+        )
+        tiles.append(tile)
+
+    blank = tiles[0].copy()
+    blank[:] = 0
+    rows = []
+    for offset in range(0, len(tiles), STITCH_COLUMNS):
+        row = tiles[offset:offset + STITCH_COLUMNS]
+        row += [blank.copy() for _ in range(STITCH_COLUMNS - len(row))]
+        rows.append(cv2.hconcat(row))
+
+    sheet = cv2.vconcat(rows)
+    root, extension = os.path.splitext(output_path)
+    temporary_path = root + ".tmp" + (extension or ".jpg")
+    if not cv2.imwrite(temporary_path, sheet):
+        logging.error(f"Stitch: could not save {output_path}.")
+        return
+    os.replace(temporary_path, output_path)
+    logging.info(
+        "Stitch: updated %s with %d image(s) in a %d-column grid.",
+        output_path, len(imgs), STITCH_COLUMNS,
+    )
 
 
 # ── Socket helpers ─────────────────────────────────────────────────────────────
@@ -242,6 +294,7 @@ def main() -> None:
     # Run relative to this file so all relative paths work correctly
     os.chdir(Path(__file__).parent)
     os.makedirs(RECEIVED_DIR, exist_ok=True)
+    logging.info("Live stitch viewer: %s", Path("stitched_live.html").resolve())
 
     rpi = RPiConnection(RPI_IP, RPI_PORT)
     rpi.connect()
@@ -276,6 +329,14 @@ def main() -> None:
                 logging.error(f"Bad OBSTACLES message: {exc}")
                 continue
 
+            # A new obstacle list starts a new contact sheet. This also drops
+            # images left in memory when a previous mission ended early.
+            annotated_images.clear()
+            try:
+                os.remove(STITCHED_OUTPUT)
+            except FileNotFoundError:
+                pass
+
             logging.info(f"{len(obstacles)} obstacle(s) received — computing path…")
             t_plan = time.monotonic()
             try:
@@ -294,7 +355,15 @@ def main() -> None:
                     f"Planning took {took:.0f}s; the RPi stops waiting for PATH after "
                     f"{RPI_PATH_TIMEOUT_S:.0f}s, so this plan may arrive too late."
                 )
-            monitor = PlanMonitor(path)
+            obstacle_snapshot = [dict(obstacle) for obstacle in obstacles]
+            monitor = PlanMonitor(
+                path,
+                recovery_planner=lambda current_plan, progress, obs=obstacle_snapshot: (
+                    plan_segment_recovery(
+                        current_plan, obs, progress, arc_profile=ARC_PROFILE,
+                    )
+                ),
+            )
             if not rpi.send("PATH," + json.dumps(path)):
                 break
 
@@ -318,6 +387,21 @@ def main() -> None:
             # Run YOLO via your detect.py
             class_id, confidence = run_detection(save_path)
 
+            # detect.py saves an annotated frame even when no trustworthy box
+            # is found. Include every attempt in the live contact sheet so it
+            # can be inspected while the mission is still running.
+            annotated_path = os.path.join(
+                ANNOTATED_DIR, os.path.basename(save_path)
+            )
+            if os.path.exists(annotated_path):
+                annotated_images.append(annotated_path)
+                stitch_images(annotated_images, STITCHED_OUTPUT)
+            else:
+                logging.warning(
+                    "Detector did not create the expected annotation %s.",
+                    annotated_path,
+                )
+
             if class_id is None:
                 logging.warning(f"Nothing detected for obstacle {obstacle_id}.")
                 if not rpi.send(f"OBJECT,{obstacle_id},0.0,NONE"):
@@ -329,12 +413,6 @@ def main() -> None:
                 )
                 if not rpi.send(f"OBJECT,{obstacle_id},{confidence:.4f},{class_id}"):
                     break
-
-                # Track for stitching
-                annotated_path = os.path.join(
-                    ANNOTATED_DIR, os.path.basename(save_path)
-                )
-                annotated_images.append(annotated_path)
 
         # ── STITCH → combine all result images ────────────────────────────────
         elif msg.startswith("STITCH"):

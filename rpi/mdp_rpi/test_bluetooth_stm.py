@@ -35,6 +35,7 @@ import logging
 import os
 from threading import Event, Thread
 from time import sleep
+from typing import List, Optional
 
 from dotenv import load_dotenv
 
@@ -80,13 +81,13 @@ class ManualControl:
         self.android = Android()
         self.stm = STM()
 
-        self.android_thread: Thread | None = None
-        self.stm_thread: Thread | None = None
+        self.android_thread: Optional[Thread] = None
+        self.stm_thread: Optional[Thread] = None
 
         # Pending command queue — android_thread writes, stm_thread reads.
         # We use a simple list + Event rather than queue.Queue so the stm_thread
         # can drain it itself and apply the §2 one-outstanding-line rule.
-        self._pending: list[list[str]] = []
+        self._pending: List[List[str]] = []
         self._pending_event = Event()
         self._busy = False          # True while STM is executing a line
 

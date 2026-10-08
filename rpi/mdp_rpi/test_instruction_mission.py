@@ -221,12 +221,14 @@ class InstructionTests(unittest.TestCase):
         task.segments_index = 0
         task.instruction_mission = None
         task.start_pose = dict(START)
+        task.odometry_start = dict(START)
         task.feedback_control = FeedbackControl()
         task._completed_photo_count = 0
         task._idx_lock = Lock()
         task._resend_counts = {}
         task.max_resends = 3
         task.segment_delay = 0
+        task.capture_settle = 0
         task.halted = False
         task.started = True
         task.a5_mode = False
@@ -277,6 +279,39 @@ class InstructionTests(unittest.TestCase):
         task._send_start_status()
         task.android.send.assert_called_once_with("STATUS,START,0.25,0.5,12.5")
         task._halt_mission.assert_not_called()
+
+    def test_android_display_start_does_not_control_odometry_origin(self):
+        task = Task1.__new__(Task1)
+        task.segments = [["FR90"]]
+        task.segments_index = 0
+        task.instruction_mission = None
+        task.start_pose = {"x": 0, "y": 0, "dir": "N"}
+        task.odometry_start = {"x": 2, "y": 2, "dir": "N"}
+        task.feedback_control = FeedbackControl()
+        task._idx_lock = Lock()
+        task.halted = False
+        task.stm = FakeSTM([["0", "0", "0"]], [])
+        task.android = Mock()
+
+        self.assertTrue(task._send_next_segment())
+        self.assertEqual(task.instruction_mission.start_pose["x"], 2)
+        self.assertEqual(task.instruction_mission.start_pose["y"], 2)
+        self.assertEqual(task.stm.events, ["?WPOSE", ("FR90",)])
+
+    def test_android_lowercase_stop_aborts_active_mission(self):
+        task = Task1.__new__(Task1)
+        task.started = True
+        task.halted = False
+        task.android = Mock()
+        task.android.receive.side_effect = ["s", EndLoop()]
+        task.stm = Mock()
+        task._halt_mission = Mock()
+
+        with self.assertRaises(EndLoop):
+            task.android_receive()
+
+        task.stm.abort.assert_called_once_with()
+        task._halt_mission.assert_called_once_with("operator requested emergency stop")
 
     def test_task1_refuses_to_invent_a_start_pose(self):
         task = Task1.__new__(Task1)

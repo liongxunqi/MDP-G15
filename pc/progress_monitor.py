@@ -12,13 +12,10 @@ each OK it reads ?WPOSE and sends the PC one line:
 things with it.
 
 1. DECIDE.  When "awaiting_decision" is true the RPi stops and waits up to
-   TASK1_FEEDBACK_TIMEOUT_S (30 s) for a reply - per instruction. So the PC must
-   answer at once. It always answers CONTINUE, echoing feedback_id and both
-   indexes exactly. REPLACE is deliberately NOT sent: the planner works in
-   cardinal headings only, so a re-plan from a measured pose would correct
-   position but not the heading error, which is the dominant one (see
-   algo/tests/test_drift.py). Add it here once the planner can start from a
-   non-cardinal heading.
+   TASK1_FEEDBACK_TIMEOUT_S (30 s) for a reply - per instruction. If measured
+   error crosses either limit, a supplied recovery planner returns to the
+   current segment's original endpoint and preserves the later segments. The PC
+   then sends REPLACE; otherwise it answers CONTINUE immediately.
 
 2. WATCH.  The planner puts "expected" in PATH: the pose the RPi should report
    after each instruction, in the RPi's own frame (mm, heading north = 0,
@@ -39,6 +36,7 @@ from typing import Optional
 
 POS_WARN_MM = float(os.getenv("PROGRESS_POS_WARN_MM", "80"))
 HDG_WARN_DEG = float(os.getenv("PROGRESS_HDG_WARN_DEG", "6"))
+MAX_REPLACEMENTS = int(os.getenv("PROGRESS_MAX_REPLACEMENTS", "12"))
 
 
 def _wrap180(deg: float) -> float:
@@ -46,7 +44,9 @@ def _wrap180(deg: float) -> float:
 
 
 class PlanMonitor:
-    def __init__(self, plan: Optional[dict] = None):
+    def __init__(self, plan: Optional[dict] = None, recovery_planner=None):
+        self.plan = plan if isinstance(plan, dict) else None
+        self.recovery_planner = recovery_planner
         exp = plan.get("expected") if isinstance(plan, dict) else None
         self.expected = exp if isinstance(exp, list) else None
         self.count = 0
@@ -56,6 +56,8 @@ class PlanMonitor:
         self.max_hdg = 0.0
         self.sum_pos = 0.0
         self.worst = None                      # (pos_mm, seg, ins, token)
+        self.replacements = 0
+        self.continues = 0
         self._warned_segments = set()
         self._warned_no_plan = False
         self._warned_bad = False
@@ -78,13 +80,42 @@ class PlanMonitor:
 
         self.count += 1
         token = p.get("token", "?")
-        self._compare(seg, ins, token, x_mm, y_mm, hdg)
+        deviation = self._compare(seg, ins, token, x_mm, y_mm, hdg)
 
         if p.get("awaiting_decision"):
             if "feedback_id" not in p:
                 logging.error(f"PROGRESS awaits a decision but has no feedback_id: {payload_text[:200]}")
                 return None
             self.decisions += 1
+            if (deviation is not None and self.recovery_planner is not None and
+                    (deviation[0] > POS_WARN_MM or abs(deviation[1]) > HDG_WARN_DEG)):
+                if self.replacements >= MAX_REPLACEMENTS:
+                    logging.error(
+                        "Automatic replacement limit (%d) reached; continuing existing route.",
+                        MAX_REPLACEMENTS,
+                    )
+                else:
+                    try:
+                        replacement = self.recovery_planner(self.plan, p)
+                    except Exception:  # a planner bug must not consume the RPi's 30 s wait
+                        logging.exception("Recovery planner crashed; continuing existing route.")
+                        replacement = None
+                    if self._install_replacement(replacement):
+                        self.replacements += 1
+                        body = {
+                            "feedback_id": p["feedback_id"],
+                            "segment_index": seg,
+                            "instruction_index": ins,
+                            "segments": replacement["segments"],
+                            "segment_obstacles": replacement["segment_obstacles"],
+                        }
+                        logging.warning(
+                            "Replacing remaining route after segment %d instruction %d; "
+                            "%d segment(s) in the replacement (automatic replacement #%d).",
+                            seg, ins, len(replacement["segments"]), self.replacements,
+                        )
+                        return "REPLACE," + json.dumps(body, separators=(",", ":"))
+            self.continues += 1
             return "CONTINUE," + json.dumps(
                 {"feedback_id": p["feedback_id"], "segment_index": seg, "instruction_index": ins},
                 separators=(",", ":"),
@@ -102,22 +133,48 @@ class PlanMonitor:
                 f"position off by {self.sum_pos / self.compared:.0f} mm on average, "
                 f"{self.max_pos:.0f} mm at worst (segment {w[1]} instruction {w[2]} '{w[3]}'); "
                 f"heading off by up to {self.max_hdg:.1f} deg. "
-                f"{self.decisions} decision(s) answered CONTINUE.")
+                f"{self.decisions} decision(s): {self.continues} CONTINUE, "
+                f"{self.replacements} REPLACE.")
 
     # ── internals ─────────────────────────────────────────────────────────────
 
-    def _compare(self, seg, ins, token, x_mm, y_mm, hdg) -> None:
+    def _install_replacement(self, replacement) -> bool:
+        if replacement is None:
+            return False
+        try:
+            segments = replacement["segments"]
+            mappings = replacement["segment_obstacles"]
+            expected = replacement["expected"]
+            valid = (
+                isinstance(segments, list) and bool(segments) and
+                isinstance(mappings, list) and isinstance(expected, list) and
+                len(segments) == len(mappings) == len(expected) and
+                all(isinstance(line, list) and bool(line) for line in segments) and
+                all(len(line) == len(poses) for line, poses in zip(segments, expected))
+            )
+        except (KeyError, TypeError):
+            valid = False
+        if not valid:
+            logging.error("Recovery planner returned an invalid replacement; continuing existing route.")
+            return False
+        self.plan = replacement
+        self.expected = expected
+        self._warned_segments.clear()
+        self._warned_no_plan = False
+        return True
+
+    def _compare(self, seg, ins, token, x_mm, y_mm, hdg):
         if self.expected is None:
             if not self._warned_no_plan:
                 self._warned_no_plan = True
                 logging.info("PROGRESS received but this plan has no 'expected' poses "
                              "(PC restarted mid-run?) - not comparing.")
-            return
+            return None
         try:
             ex, ey, eh = self.expected[seg][ins]
         except (IndexError, TypeError, ValueError):
             logging.warning(f"PROGRESS for segment {seg} instruction {ins} is outside the plan.")
-            return
+            return None
 
         dx, dy = x_mm - ex, y_mm - ey
         pos, dh = math.hypot(dx, dy), _wrap180(hdg - eh)
@@ -135,3 +192,4 @@ class PlanMonitor:
             logging.warning(f"Robot is off the plan in segment {seg} at instruction {ins} '{token}': "
                             f"{pos:.0f} mm / {dh:+.1f} deg (limits {POS_WARN_MM:.0f} mm / "
                             f"{HDG_WARN_DEG:.0f} deg).")
+        return pos, dh

@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Task 1 Detections</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: #0b0d10;
+      color: #f4f6f8;
+      font-family: Arial, sans-serif;
+    }
+    header {
+      align-items: center;
+      border-bottom: 1px solid #303640;
+      display: flex;
+      justify-content: space-between;
+      min-height: 56px;
+      padding: 12px 20px;
+    }
+    h1 {
+      font-size: 18px;
+      font-weight: 600;
+      letter-spacing: 0;
+      margin: 0;
+    }
+    #status { color: #8ee6c1; font-size: 13px; }
+    main { padding: 20px; }
+    img {
+      display: block;
+      height: auto;
+      margin: 0 auto;
+      max-width: 100%;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Task 1 Detections</h1>
+    <span id="status">Waiting for images</span>
+  </header>
+  <main>
+    <img id="sheet" alt="Task 1 detection contact sheet">
+  </main>
+  <script>
+    const sheet = document.getElementById("sheet");
+    const status = document.getElementById("status");
+
+    function refresh() {
+      const next = new Image();
+      const source = `stitched_result.jpg?t=${Date.now()}`;
+      next.onload = () => {
+        sheet.src = source;
+        status.textContent = `Updated ${new Date().toLocaleTimeString()}`;
+      };
+      next.onerror = () => {
+        status.textContent = "Waiting for images";
+      };
+      next.src = source;
+    }
+
+    refresh();
+    setInterval(refresh, 1000);
+  </script>
+</body>
+</html>

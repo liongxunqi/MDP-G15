@@ -71,6 +71,7 @@ def bare_task(segments=None, mapping=None):
     task = Task1.__new__(Task1)
     task.segments = segments or [["F10", "S"], ["F10", "S"]]
     task.start_pose = dict(START)
+    task.odometry_start = dict(START)
     task.segment_obstacles = mapping if mapping is not None else ["7", "8"]
     task.obstacle_order = [v for v in task.segment_obstacles if v is not None]
     task.segments_index = 0
@@ -83,6 +84,7 @@ def bare_task(segments=None, mapping=None):
     task._resend_counts = {}
     task.max_resends = 3
     task.segment_delay = 0
+    task.capture_settle = 0
     task.halted = False
     task.started = True
     task.a5_mode = False
@@ -239,6 +241,35 @@ class TaskFeedbackTests(unittest.TestCase):
         with self.assertRaises(EndLoop):
             task.pc_receive()
         self.assertEqual(task.feedback_control.wait(pending)[0], "CONTINUE")
+
+    def test_task1_forwards_detector_selection_to_android(self):
+        task = bare_task()
+        task.image_done = Event()
+        task.pc.receive.side_effect = ["OBJECT,7,0.99,bullseye", EndLoop()]
+        with self.assertRaises(EndLoop):
+            task.pc_receive()
+        self.assertTrue(task.image_done.is_set())
+        task.android.send.assert_called_once_with("TARGET,7,bullseye")
+
+        task.android.reset_mock()
+        task.image_done.clear()
+        task.pc.receive.side_effect = ["OBJECT,7,0.91,H", EndLoop()]
+        with self.assertRaises(EndLoop):
+            task.pc_receive()
+        self.assertTrue(task.image_done.is_set())
+        task.android.send.assert_called_once_with("TARGET,7,H")
+
+        for class_id in ("dot", "NONE"):
+            task.android.reset_mock()
+            task.image_done.clear()
+            task.pc.receive.side_effect = [
+                "OBJECT,7,0.0," + class_id,
+                EndLoop(),
+            ]
+            with self.assertRaises(EndLoop):
+                task.pc_receive()
+            self.assertTrue(task.image_done.is_set())
+            task.android.send.assert_called_once_with("TARGET,7," + class_id)
 
     def test_blocking_wait_does_not_hold_index_lock(self):
         task = bare_task()

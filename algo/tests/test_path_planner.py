@@ -142,14 +142,14 @@ class PhotoDistanceTests(unittest.TestCase):
         self.assertEqual(options_for({"id": 1, "x": 10, "y": 10, "d": 0})[0], 30)
 
     def test_28_is_tried_last(self):
-        # Facing the top edge: 35+ would hang the robot too far off the arena.
-        self.assertEqual(options_for({"id": 1, "x": 10, "y": 16, "d": 0}), [30, 32, 28])
+        # Facing the top edge: only 30 and its last-resort fallback still fit.
+        self.assertEqual(options_for({"id": 1, "x": 10, "y": 15, "d": 0}), [30, 28])
 
     def test_a_blocked_30_moves_further_out(self):
-        # A neighbour diagonally behind blocks 28-42; only 45 clears it.
+        # A neighbour diagonally behind blocks the preferred close standoffs.
         self.assertEqual(
-            options_for({"id": 1, "x": 10, "y": 10, "d": 0}, {"id": 2, "x": 11, "y": 14, "d": 0}),
-            [45],
+            options_for({"id": 1, "x": 10, "y": 10, "d": 0}, {"id": 2, "x": 10, "y": 15, "d": 0}),
+            [42, 45],
         )
 
     def test_no_room_at_any_distance_is_skipped_not_fudged(self):
@@ -157,6 +157,14 @@ class PhotoDistanceTests(unittest.TestCase):
         result = pp.plan_mission([{"id": 1, "x": 10, "y": 17, "d": 0}], details=details)
         self.assertEqual(result["segments"], [])
         self.assertEqual(details["skipped"], {1: "no photo spot"})
+
+    def test_viewing_pose_uses_rear_axle_to_front_sensor_offset(self):
+        obstacle = {"id": 1, "x": 10, "y": 10, "d": 0}
+        pose = pp._viewing_pose(obstacle, 300.0)
+        expected_y = 1050.0 + 50.0 + 300.0 + pp.REAR_AXLE_TO_SENSOR_MM
+        self.assertAlmostEqual(pose.x, 1050.0)
+        self.assertAlmostEqual(pose.y, expected_y)
+        self.assertAlmostEqual(pose.theta, -math.pi / 2)
 
 
 class LegOutputTests(unittest.TestCase):
@@ -173,6 +181,62 @@ class LegOutputTests(unittest.TestCase):
         self.assertEqual(result["segment_obstacles"][-1], "1")
         self.assertEqual(result["segments"][-1][-2:], ["FU30", "S"])
         self.assertEqual(details["standoff_cm"], {1: 30})
+
+
+class SegmentRecoveryTests(unittest.TestCase):
+    OBSTACLES = [
+        {"id": 1, "x": 2.0, "y": 16.0, "d": 2},
+        {"id": 2, "x": 2.0, "y": 6.0, "d": 0},
+        {"id": 4, "x": 15.0, "y": 3.0, "d": 6},
+        {"id": 5, "x": 16.0, "y": 6.0, "d": 0},
+        {"id": 6, "x": 12.0, "y": 13.0, "d": 6},
+        {"id": 7, "x": 17.0, "y": 15.0, "d": 4},
+    ]
+
+    def test_logged_fu_overshoot_recovers_current_endpoint_and_preserves_tail(self):
+        later_segment = ["F15", "FL90", "FL90", "R15", "RL90", "FU30", "S"]
+        later_expected = [[680, 1650, 270], [385, 1356, 180], [680, 1062, 90],
+                          [530, 1062, 90], [236, 1356, 180], [250, 1230, 180],
+                          [250, 1230, 180]]
+        plan = {
+            "segments": [["FL90", "F30", "RR90", "F28", "FU30", "S"], later_segment],
+            "segment_obstacles": ["1", "2"],
+            "expected": [
+                [[964, 1644, 0], [964, 1944, 0], [1258, 1650, 270],
+                 [978, 1650, 270], [830, 1650, 270], [830, 1650, 270]],
+                later_expected,
+            ],
+            "frame_shift_mm": {"x": 0, "y": 0},
+            "start_mm": {"x": 104, "y": 125, "heading": "N"},
+        }
+        progress = {
+            "segment_index": 0,
+            "instruction_index": 4,
+            "x_grid": 6.60969892,
+            "y_grid": 16.5837032,
+            "heading_deg": 270.2,
+            "remaining_photo_ids": ["1", "2"],
+        }
+
+        replacement = pp.plan_segment_recovery(plan, self.OBSTACLES, progress)
+
+        self.assertIsNotNone(replacement)
+        self.assertEqual(replacement["segments"][0], ["R17", "S"])
+        self.assertEqual(replacement["segment_obstacles"], ["1", "2"])
+        self.assertEqual(replacement["segments"][1], later_segment)
+        self.assertEqual(replacement["expected"][1], later_expected)
+        final = replacement["expected"][0][-1]
+        self.assertLess(math.hypot(final[0] - 830, final[1] - 1650), 10)
+
+    def test_pending_photo_mismatch_refuses_replacement(self):
+        plan = {
+            "segments": [["F10", "S"]],
+            "segment_obstacles": ["7"],
+            "expected": [[[500, 500, 0], [500, 500, 0]]],
+        }
+        progress = {"segment_index": 0, "instruction_index": 0, "x_grid": 4,
+                    "y_grid": 5, "heading_deg": 0, "remaining_photo_ids": ["99"]}
+        self.assertIsNone(pp.plan_segment_recovery(plan, self.OBSTACLES, progress))
 
 
 class AndroidPoseTests(unittest.TestCase):

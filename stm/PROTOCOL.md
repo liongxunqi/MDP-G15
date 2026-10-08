@@ -450,7 +450,7 @@ RPi -> STM: FR90
 STM -> RPi: OK
 RPi -> STM: ?WPOSE
 STM -> RPi: WPOSE,<x_mm>,<y_mm>,<heading_degrees_times_10>
-RPi -> Android: ROBOT,<grid_x>,<grid_y>,<N|E|S|W>
+RPi -> Android: ROBOT,<grid_x>,<grid_y>,<heading_deg>
 RPi -> STM: F20
 ... repeat for F20, then S ...
 ```
@@ -465,11 +465,14 @@ encoder/gyro increments continuously across primitive and FU-pass resets;
 `?POSE`, `?TURN`, and motion control keep their existing local semantics.
 The boot frame has +x forward, +y left, and positive counterclockwise heading
 with the gyro source. The RPi snapshots this frame before the first instruction
-and anchors it to arena (200 mm, 200 mm, North). The arena is 20 x 20 cells,
+and anchors it to the `PATH.odometry_start` supplied by the PC planner. By
+default this is the planner's calculated rear-axle start; it is not a fixed
+`(0,0)` or `(2,2)`. The arena is 20 x 20 cells,
 each 100 mm (10 cm), for a total of 2000 x 2000 mm. Android receives fractional
 grid coordinates via position_mm / 100 (0 <= coordinate < 20), and the nearest
-cardinal direction. For example, (275 mm, 325 mm) is ROBOT,2.75,3.25,N when
-facing North. Raw WPOSE values stay in logs. Positions outside
+heading in degrees, where North is 0 and clockwise is positive. For example,
+(275 mm, 325 mm) is `ROBOT,2.75,3.25,0` when facing North. Raw WPOSE values
+stay in logs. Positions outside
 the arena stop execution rather than being clamped to a misleading valid cell.
 These coordinates are dead reckoning and can drift. They are not planner poses
 or external localization. Keep the same physical pose reference when placing

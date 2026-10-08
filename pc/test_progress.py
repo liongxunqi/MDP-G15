@@ -112,6 +112,52 @@ class MonitorUnit(unittest.TestCase):
         reply = m.handle(progress(0, 0, "F10", 3.0, 3.0, 0.0, fid=7))
         self.assertEqual(json.loads(reply.split(",", 1)[1])["feedback_id"], 7)
 
+    def test_large_error_sends_replace_and_installs_new_expected_route(self):
+        replacement = {
+            "segments": [["R17", "S"], ["F10", "S"]],
+            "segment_obstacles": ["1", "2"],
+            "expected": [
+                [[830.0, 1658.0, 270.0], [830.0, 1658.0, 270.0]],
+                [[730.0, 1658.0, 270.0], [730.0, 1658.0, 270.0]],
+            ],
+        }
+        plan = {
+            "segments": [["FU30", "S"], ["F10", "S"]],
+            "segment_obstacles": ["1", "2"],
+            "expected": [
+                [[830.0, 1650.0, 270.0], [830.0, 1650.0, 270.0]],
+                [[730.0, 1650.0, 270.0], [730.0, 1650.0, 270.0]],
+            ],
+        }
+        calls = []
+
+        def recover(current_plan, report):
+            calls.append((current_plan, report))
+            return replacement
+
+        m = pm.PlanMonitor(plan, recover)
+        reply = m.handle(progress(
+            0, 0, "FU30", 6.61, 16.58, 270.2, fid="bad-fu",
+            remaining_photo_ids=["1", "2"],
+        ))
+        tag, body = reply.split(",", 1)
+        payload = json.loads(body)
+        self.assertEqual(tag, "REPLACE")
+        self.assertEqual(payload["feedback_id"], "bad-fu")
+        self.assertEqual(payload["segments"], replacement["segments"])
+        self.assertEqual(payload["segment_obstacles"], ["1", "2"])
+        self.assertEqual(len(calls), 1)
+        self.assertIs(m.expected, replacement["expected"])
+        self.assertEqual(m.replacements, 1)
+        self.assertEqual(m.continues, 0)
+
+    def test_recovery_failure_falls_back_to_continue(self):
+        m = pm.PlanMonitor(self.PLAN, lambda current, report: None)
+        reply = m.handle(progress(0, 1, "F10", 3.0, 5.0, 0.0, fid="x"))
+        self.assertEqual(reply.split(",", 1)[0], "CONTINUE")
+        self.assertEqual(m.replacements, 0)
+        self.assertEqual(m.continues, 1)
+
     def test_garbage_never_raises_and_never_replies(self):
         m = pm.PlanMonitor(self.PLAN)
         for bad in ("not json", "{}", '{"segment_index":"x"}', "[]", "null", ""):
@@ -178,6 +224,11 @@ def emulate_rpi(server, out, feedback, turn_bias=(0.0, 0.0)):
         assert line.startswith("PATH,"), line
         plan = json.loads(line.split(",", 1)[1])
         out["photos_planned"] = sum(1 for t in plan["segment_obstacles"] if t is not None)
+        assert plan["odometry_start"] == {
+            "x": pp.RPI_ANCHOR_X_MM / 100.0,
+            "y": pp.RPI_ANCHOR_Y_MM / 100.0,
+            "dir": "N",
+        }
 
         start = plan["start_mm"]
         shift = (task1_shift_x(start), task1_shift_y(start))

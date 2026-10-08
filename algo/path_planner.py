@@ -25,7 +25,7 @@ import math
 import os
 import re
 import time
-from collections import namedtuple
+from collections import Counter, namedtuple
 from typing import Dict, List, Optional, Tuple
 
 from stm_tokens import (
@@ -35,10 +35,12 @@ from stm_tokens import (
     PROFILE_TIGHT,
     ROBOT_LENGTH_CM,
     ROBOT_WIDTH_CM,
+    REAR_AXLE_TO_SENSOR_CM,
     TURN_RADIUS_MM,
     chunk_tokens,
     fwd,
     fwd_until,
+    rev,
     stop,
 )
 
@@ -58,6 +60,18 @@ STANDOFF_PREFERENCE_CM = (30, 32, 35, 38, 40, 42, 45)
 STANDOFF_LAST_RESORT_CM = (28,)
 STANDOFF_CANDIDATES_CM = STANDOFF_PREFERENCE_CM + STANDOFF_LAST_RESORT_CM
 FU_COMPENSATE = False
+
+# Closed-loop recovery. A replacement returns to the endpoint of the segment
+# that was already being executed, then reuses the untouched later segments.
+# The grid search may join this much of the endpoint's final straight line.
+RECOVERY_APPROACH_LINE_MM = 600.0
+RECOVERY_LATERAL_TOL_MM = 25.0
+# grid_search has cardinal states. Small measured heading errors are normal and
+# may be snapped for recovery planning; larger errors need a planner that models
+# arbitrary headings and are deliberately not guessed here.
+RECOVERY_MAX_HEADING_SNAP_DEG = float(os.getenv(
+    "RECOVERY_MAX_HEADING_SNAP_DEG", "8"
+))
 
 # How far back from the photo pose a leg may join the approach line, and how
 # far off it sideways. Off-line by more than this and the camera misses the
@@ -82,6 +96,11 @@ FACE_FROM_D = {0: "N", 2: "E", 4: "S", 6: "W"}
 
 ROBOT_HALF_LENGTH_MM = ROBOT_LENGTH_CM * 10 / 2.0
 ROBOT_HALF_WIDTH_MM = ROBOT_WIDTH_CM * 10 / 2.0
+# FU<n> measures from the front sensor, but the path and STM WPOSE both track
+# the rear axle. This measured offset is therefore part of every photo pose.
+REAR_AXLE_TO_SENSOR_MM = float(os.getenv(
+    "REAR_AXLE_TO_SENSOR_CM", str(REAR_AXLE_TO_SENSOR_CM)
+)) * 10.0
 
 # Start pose: robot facing N, pushed into the start zone's bottom-left corner -
 # rear on the bottom line, left side on the left line, START_GAP_MM off each so
@@ -94,16 +113,14 @@ START_Y_MM = float(os.getenv("START_Y_MM", ROBOT_HALF_LENGTH_MM + START_GAP_MM))
 START_THETA = math.pi / 2
 
 # ── The frame the RPi reports positions in ───────────────────────────────────
-# After each instruction the RPi reads ?WPOSE, anchors it so the robot's
-# rear-axle reference started at (RPI_ANCHOR_X_MM, RPI_ANCHOR_Y_MM) facing N,
-# and STOPS the mission if the result is outside the arena (rpi/mdp_rpi/README
-# "Task 1 PC Feedback Contract", stm/PROTOCOL.md 12). Displacements are the same
-# in both frames, so  rpi_position = planner_position + (anchor - planner_start).
-# The planner's arcs use the axle-referenced radius, so its reference point IS
-# what the RPi tracks. If the RPi is changed to anchor at the planner's real
-# start, set RPI_ANCHOR_X_MM / RPI_ANCHOR_Y_MM to START_X_MM / START_Y_MM.
-RPI_ANCHOR_X_MM = float(os.getenv("RPI_ANCHOR_X_MM", "200"))
-RPI_ANCHOR_Y_MM = float(os.getenv("RPI_ANCHOR_Y_MM", "200"))
+# After each instruction the RPi reads ?WPOSE and anchors the robot's rear-axle
+# reference at this position. By default that is the planner's calculated start,
+# not an unrelated (0,0) or (2,2). The values remain configurable for a measured
+# floor mark. PATH.start is only the bottom-left cell of Android's 2 x 2 drawing.
+# Displacements are the same in both frames, so
+# rpi_position = planner_position + (anchor - planner_start).
+RPI_ANCHOR_X_MM = float(os.getenv("RPI_ANCHOR_X_MM", str(START_X_MM)))
+RPI_ANCHOR_Y_MM = float(os.getenv("RPI_ANCHOR_Y_MM", str(START_Y_MM)))
 # Keep the reference point this far INSIDE the RPi's arena check: dead reckoning
 # drifts, and the check is a hard stop. Set RPI_ARENA_GUARD=0 only if the RPi no
 # longer halts on out-of-arena positions.
@@ -150,7 +167,7 @@ def _wrap(theta):
 
 
 def _viewing_pose(obstacle: dict, standoff_mm: float) -> Optional[Pose]:
-    """Robot centre when its front sensor reads standoff_mm to the image face."""
+    """Rear-axle pose when the front sensor reads standoff_mm to the face."""
     d = obstacle.get("d")
     if d not in FACE_FROM_D:
         return None
@@ -158,7 +175,7 @@ def _viewing_pose(obstacle: dict, standoff_mm: float) -> Optional[Pose]:
 
     cx = obstacle["x"] * 100.0 + OBSTACLE_SIZE_MM / 2.0
     cy = obstacle["y"] * 100.0 + OBSTACLE_SIZE_MM / 2.0
-    dist = OBSTACLE_SIZE_MM / 2.0 + standoff_mm + ROBOT_HALF_LENGTH_MM
+    dist = OBSTACLE_SIZE_MM / 2.0 + standoff_mm + REAR_AXLE_TO_SENSOR_MM
 
     if face == "N":
         return Pose(cx, cy + dist, -math.pi / 2)
@@ -248,8 +265,8 @@ def _sonar_sees_target_first(pose: Pose, back_mm: float, standoff_mm: float,
     target_range = standoff_mm + back_mm
     steps = 4
     for side in (-APPROACH_LATERAL_TOL_MM, 0.0, APPROACH_LATERAL_TOL_MM):
-        sx = pose.x + (ROBOT_HALF_LENGTH_MM - back_mm) * c - side * s
-        sy = pose.y + (ROBOT_HALF_LENGTH_MM - back_mm) * s + side * c
+        sx = pose.x + (REAR_AXLE_TO_SENSOR_MM - back_mm) * c - side * s
+        sy = pose.y + (REAR_AXLE_TO_SENSOR_MM - back_mm) * s + side * c
         for i in range(-steps, steps + 1):
             a = pose.theta + math.radians(SONAR_HALF_ANGLE_DEG) * i / steps
             ca, sa = math.cos(a), math.sin(a)
@@ -561,6 +578,194 @@ def _choose_tour(visitable, legs: _Legs, options):
     return order, choice, cache
 
 
+def _plan_frame_shift(plan: dict) -> Tuple[float, float]:
+    """Translation from planner coordinates to the RPi's reported frame."""
+    shift = plan.get("frame_shift_mm")
+    if isinstance(shift, dict):
+        try:
+            return float(shift["x"]), float(shift["y"])
+        except (KeyError, TypeError, ValueError):
+            pass
+    start = plan.get("start_mm")
+    if isinstance(start, dict):
+        try:
+            return RPI_ANCHOR_X_MM - float(start["x"]), RPI_ANCHOR_Y_MM - float(start["y"])
+        except (KeyError, TypeError, ValueError):
+            pass
+    return 0.0, 0.0
+
+
+def _straight_distance_clear(x: float, y: float, theta: float, distance_mm: float,
+                             boxes) -> bool:
+    """Collision-check an arbitrary final straight, not only a 50 mm A* step."""
+    samples = max(1, int(math.ceil(abs(distance_mm) / 20.0)))
+    for i in range(1, samples + 1):
+        d = distance_mm * i / samples
+        if not _pose_clear(x + d * math.cos(theta), y + d * math.sin(theta), theta, boxes):
+            return False
+    return True
+
+
+def plan_segment_recovery(plan: dict, obstacles: List[dict], progress: dict,
+                          arc_profile: int = PROFILE_TIGHT) -> Optional[dict]:
+    """Return a replacement that recovers the current segment endpoint.
+
+    The completed prefix is discarded, the current segment is replaced by a
+    collision-checked route from the measured pose to its original endpoint,
+    and every later segment is copied unchanged. This preserves the original
+    visit order and avoids recomputing good future work merely because one
+    primitive drifted. None means a safe recovery could not be produced.
+    """
+    try:
+        seg = int(progress["segment_index"])
+        actual_x = float(progress["x_grid"]) * 100.0
+        actual_y = float(progress["y_grid"]) * 100.0
+        actual_hdg = float(progress["heading_deg"]) % 360.0
+        segments = plan["segments"]
+        mappings = plan["segment_obstacles"]
+        expected = plan["expected"]
+        target_x, target_y, target_hdg = (float(v) for v in expected[seg][-1])
+    except (KeyError, IndexError, TypeError, ValueError):
+        logging.exception("Cannot build recovery: plan/progress shape is inconsistent.")
+        return None
+
+    if not (len(segments) == len(mappings) == len(expected)):
+        logging.error("Cannot build recovery: PATH arrays are not parallel.")
+        return None
+
+    reported_remaining = progress.get("remaining_photo_ids")
+    if isinstance(reported_remaining, list):
+        planned_remaining = [str(v) for v in mappings[seg:] if v is not None]
+        if Counter(str(v) for v in reported_remaining) != Counter(planned_remaining):
+            logging.error(
+                "Cannot build recovery: RPi pending photos %s do not match PC route %s.",
+                reported_remaining, planned_remaining,
+            )
+            return None
+
+    shift_x, shift_y = _plan_frame_shift(plan)
+    ax, ay = actual_x - shift_x, actual_y - shift_y
+    tx, ty = target_x - shift_x, target_y - shift_y
+    actual_theta = math.radians(90.0 - actual_hdg)
+    actual_cardinal = grid_search._HEADINGS[grid_search._heading_index(actual_theta)]
+    snap_error = abs(math.degrees(_wrap(actual_theta - actual_cardinal)))
+    if snap_error > RECOVERY_MAX_HEADING_SNAP_DEG:
+        logging.error(
+            "Cannot safely recover segment %d: measured heading %.1f deg is %.1f deg "
+            "from the nearest cardinal heading (limit %.1f deg).",
+            seg, actual_hdg, snap_error, RECOVERY_MAX_HEADING_SNAP_DEG,
+        )
+        return None
+
+    target_theta = math.radians(90.0 - target_hdg)
+    target_theta = grid_search._HEADINGS[grid_search._heading_index(target_theta)]
+    boxes = grid_search.Boxes([_obstacle_aabb_mm(o) for o in obstacles])
+    if RPI_ARENA_GUARD:
+        m = RPI_ARENA_MARGIN_MM
+        boxes.ref_bounds = (
+            m - shift_x, ARENA_MM - m - shift_x,
+            m - shift_y, ARENA_MM - m - shift_y,
+        )
+
+    if not _pose_clear(ax, ay, actual_cardinal, boxes):
+        logging.error("Cannot safely recover segment %d: measured pose intersects a boundary/obstacle.", seg)
+        return None
+    if not _pose_clear(tx, ty, target_theta, boxes):
+        logging.error("Cannot safely recover segment %d: original endpoint is no longer clear.", seg)
+        return None
+
+    goal = grid_search.ApproachLine(
+        tx, ty, target_theta, RECOVERY_APPROACH_LINE_MM, RECOVERY_LATERAL_TOL_MM,
+    )
+    tokens, poses = [], []
+    terminal = Pose(ax, ay, actual_cardinal)
+
+    # Most drift is longitudinal (the FU failure in the physical logs was
+    # 169 mm). Correct that directly instead of making the 50 mm search grid
+    # overshoot and then drive back a few centimetres.
+    dx, dy = tx - ax, ty - ay
+    along = dx * math.cos(target_theta) + dy * math.sin(target_theta)
+    lateral = -dx * math.sin(target_theta) + dy * math.cos(target_theta)
+    same_heading = grid_search._heading_index(actual_cardinal) == grid_search._heading_index(target_theta)
+    direct_cm = int(round(abs(along) / 10.0))
+    direct_mm = math.copysign(direct_cm * 10.0, along) if direct_cm else 0.0
+    if (same_heading and abs(lateral) <= RECOVERY_LATERAL_TOL_MM and direct_cm and
+            _straight_distance_clear(ax, ay, target_theta, direct_mm, boxes)):
+        tokens = [fwd(direct_cm) if direct_mm > 0 else rev(direct_cm)]
+        terminal = Pose(
+            ax + direct_mm * math.cos(target_theta),
+            ay + direct_mm * math.sin(target_theta),
+            target_theta,
+        )
+        poses = [terminal]
+    else:
+        try:
+            raw_tokens, raw_poses, _ = grid_search.search_leg(
+                ax, ay, actual_cardinal, goal, TURN_RADIUS_MM[arc_profile], boxes,
+                ARENA_MM, ROBOT_HALF_LENGTH_MM, ROBOT_HALF_WIDTH_MM,
+            )
+        except grid_search.NoPathFound as exc:
+            logging.error("Cannot safely recover segment %d: %s", seg, exc)
+            return None
+
+        poses = [Pose(x, y, theta) for x, y, theta in raw_poses[1:]]
+        tokens, poses = _merge_straights(list(raw_tokens), poses)
+        terminal = Pose(ax, ay, actual_cardinal) if not poses else poses[-1]
+        back, _ = goal.offsets(terminal.x, terminal.y)
+        run_cm = max(0, int(round(back / 10.0)))
+        run_mm = run_cm * 10.0
+        if run_cm:
+            if not _straight_distance_clear(terminal.x, terminal.y, target_theta, run_mm, boxes):
+                logging.error("Cannot safely recover segment %d: final straight is obstructed.", seg)
+                return None
+            tokens.append(fwd(run_cm))
+            terminal = Pose(
+                terminal.x + run_mm * math.cos(target_theta),
+                terminal.y + run_mm * math.sin(target_theta),
+                target_theta,
+            )
+            poses.append(terminal)
+
+    if not tokens:
+        logging.warning(
+            "Recovery requested for segment %d, but the cardinal planner produced no corrective movement.",
+            seg,
+        )
+        return None
+
+    tokens.append(stop())
+    poses.append(terminal)
+    recovery_segments = chunk_tokens(tokens)
+    recovery_expected = []
+    offset = 0
+    for line in recovery_segments:
+        line_poses = poses[offset:offset + len(line)]
+        recovery_expected.append([
+            [round(p.x + shift_x, 1), round(p.y + shift_y, 1),
+             round((90.0 - math.degrees(p.theta)) % 360.0, 1)]
+            for p in line_poses
+        ])
+        offset += len(line)
+
+    current_target = mappings[seg]
+    recovery_mappings = [None] * len(recovery_segments)
+    recovery_mappings[-1] = current_target
+    replacement = {
+        "segments": recovery_segments + [list(s) for s in segments[seg + 1:]],
+        "segment_obstacles": recovery_mappings + list(mappings[seg + 1:]),
+        "expected": recovery_expected + list(expected[seg + 1:]),
+        "frame_shift_mm": {"x": shift_x, "y": shift_y},
+        "start_mm": dict(plan.get("start_mm", {})),
+    }
+    logging.warning(
+        "Recovery for segment %d: measured (%.0f,%.0f) @ %.1f deg -> original endpoint "
+        "(%.0f,%.0f) @ %.1f deg using %s; preserving %d later segment(s).",
+        seg, actual_x, actual_y, actual_hdg, target_x, target_y, target_hdg,
+        ",".join(tokens), len(segments) - seg - 1,
+    )
+    return replacement
+
+
 def plan_mission(obstacles: List[dict], arc_profile: int = PROFILE_TIGHT,
                  details: Optional[dict] = None) -> dict:
     """Plan Task 1. Pass a dict as `details` to get each photo's pose and
@@ -712,8 +917,15 @@ def plan_mission(obstacles: List[dict], arc_profile: int = PROFILE_TIGHT,
         "segment_obstacles": segment_obstacles,
         "dirs": dirs,
         "start": _pose_to_dir_entry(start),
-        # The two keys below are extra: the RPi reads only the keys it knows.
+        # Android's drawing anchor above is not an odometry point. Send the
+        # reporting origin separately so the RPi has no hardcoded (2,2).
+        "odometry_start": {
+            "x": RPI_ANCHOR_X_MM / 100.0,
+            "y": RPI_ANCHOR_Y_MM / 100.0,
+            "dir": "N",
+        },
         "start_mm": {"x": round(start.x, 1), "y": round(start.y, 1),
                      "heading": _nearest_cardinal(start.theta)},
+        "frame_shift_mm": {"x": round(shift_x, 1), "y": round(shift_y, 1)},
         "expected": expected,
     }

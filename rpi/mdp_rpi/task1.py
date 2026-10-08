@@ -41,12 +41,14 @@ import os
 from collections import Counter
 from threading import Event, Lock, Thread, Timer
 from time import sleep
+from typing import Optional
 
 from dotenv import load_dotenv
 
 load_dotenv()
 
 from communications.android import Android
+from communications import cal_profile
 from communications.pc import PC
 from communications.stm import (
     CAL_MIN_PROTOCOL,
@@ -81,9 +83,10 @@ A5_FACE_D = (0, 2, 4, 6)
 A5_FACE_NAME = {0: "N", 2: "E", 4: "S", 6: "W"}
 
 # What does NOT count as "a valid image from the image list". The bullseye is
-# the MARKER — finding it means the right obstacle and the wrong face, which is
-# the situation A.5 asks you to get out of. 'dot' is the filler class, and NONE
-# is what task1_pc.py sends when YOLO found nothing.
+# the MARKER, 'dot' is the filler class, and NONE is what task1_pc.py sends when
+# YOLO found nothing. A5 uses this to keep checking faces. Normal Task 1 uses
+# the PC detector's final selection directly, including a bullseye when no
+# preferred image class was present.
 A5_NOT_A_TARGET = {"bullseye", "dot", "none"}
 
 
@@ -100,9 +103,9 @@ class Task1:
         self.camera = Camera()
 
         # Thread handles
-        self.android_thread: Thread | None = None
-        self.pc_thread: Thread | None = None
-        self.stm_thread: Thread | None = None
+        self.android_thread: Optional[Thread] = None
+        self.pc_thread: Optional[Thread] = None
+        self.stm_thread: Optional[Thread] = None
 
         # ── Obstacle / path state ─────────────────────────────────────────────
         self.obstacles: list = []           # list of obstacle dicts from Android
@@ -112,7 +115,8 @@ class Task1:
         self._completed_photo_count = 0
         self.obstacle_order: list = []      # obstacle IDs in visit order
         self.directions: list = []          # direction info per segment (for Android map)
-        self.start_pose: dict | None = None # planner's start pose, same shape as a dirs entry
+        self.start_pose: Optional[dict] = None # Android's 2x2 drawing anchor from PATH.start
+        self.odometry_start: Optional[dict] = None # planner-provided ROBOT/PROGRESS origin
         self.direction_index: int = 0
 
         # Per-segment obstacle mapping. A segment is NOT 1:1 with an obstacle any
@@ -130,9 +134,9 @@ class Task1:
         # Off unless this was constructed by task_a5.py. Everything it touches
         # is guarded, so Task 1 behaves exactly as it did.
         self.a5_mode: bool = a5_mode
-        self._a5_base_id: int | None = None    # the id Android actually knows
+        self._a5_base_id: Optional[int] = None    # the id Android actually knows
         self._a5_face_of: dict = {}            # fanned-out id (str) -> "N"/"E"/"S"/"W"
-        self._a5_found: tuple | None = None    # (face, class_id, confidence)
+        self._a5_found: Optional[tuple] = None    # (face, class_id, confidence)
 
         # PROTOCOL.md §3: cap RESEND retries. A permanently malformed segment
         # retried forever is an infinite loop in which the robot never moves.
@@ -153,9 +157,9 @@ class Task1:
         self.path_ready = Event()
         # Debounce timer — send OBSTACLES to PC 1 s after last obstacle arrives
         self._debounce_lock = Lock()
-        self._calc_timer: Timer | None = None
+        self._calc_timer: Optional[Timer] = None
         # Watchdog on an outstanding OBSTACLES request. See _arm_path_watchdog().
-        self._path_timer: Timer | None = None
+        self._path_timer: Optional[Timer] = None
 
         # ── Tunable config from .env ──────────────────────────────────────────
         self._debounce_delay = float(os.getenv("DEBOUNCE_DELAY_S", "1.0"))
@@ -166,7 +170,8 @@ class Task1:
         self.segment_delay = float(os.getenv("SEGMENT_DELAY_S", "0.5"))
         self.detect_retries = int(os.getenv("DETECT_RETRY_COUNT", "1"))
         self.detect_retry_delay = float(os.getenv("DETECT_RETRY_DELAY_S", "0.2"))
-        self.detect_timeout = float(os.getenv("DETECT_TIMEOUT_S", "0.5"))
+        self.detect_timeout = float(os.getenv("DETECT_TIMEOUT_S", "30.0"))
+        self.capture_settle = float(os.getenv("TASK1_CAPTURE_SETTLE_S", "2.0"))
         # PROTOCOL.md §3 recommends at most three retransmissions.
         self.max_resends = int(os.getenv("STM_MAX_RESENDS", "3"))
         # PROTOCOL.md §6: 0 TIGHT (r=291mm), 1 CLEAN (r=318mm), 2 SLOW (r=306mm).
@@ -182,6 +187,7 @@ class Task1:
             f"detect_retries={self.detect_retries}  "
             f"detect_retry_delay={self.detect_retry_delay}s  "
             f"detect_timeout={self.detect_timeout}s  "
+            f"capture_settle={self.capture_settle}s  "
             f"debounce_delay={self._debounce_delay}s  "
             f"max_resends={self.max_resends}  "
             f"arc_profile={self.arc_profile}"
@@ -385,7 +391,9 @@ class Task1:
                 if self.halted or self.feedback_control.waiting:
                     return False
                 if self.instruction_mission is None:
-                    self.instruction_mission = InstructionMission(self.segments, self.start_pose)
+                    self.instruction_mission = InstructionMission(
+                        self.segments, self.odometry_start
+                    )
                 mission = self.instruction_mission
                 if not mission.send_next(self.stm):
                     return False
@@ -403,7 +411,7 @@ class Task1:
             return False
 
     def _send_start_status(self) -> None:
-        """Pass the planner's PATH.start coordinates directly to Android."""
+        """Pass the planner's Android drawing anchor directly to Android."""
         with self._idx_lock:
             start = self.start_pose
         if start is None:
@@ -664,6 +672,18 @@ class Task1:
                     if not self._send_next_segment():
                         logging.warning("Android: BEGIN received but no segments to send.")
 
+                elif tag in ("S", "STOP"):
+                    # Android's stop button sends lowercase `s` on current builds.
+                    # RST is the STM protocol's immediate brake-and-drop-queue
+                    # command; a normal S token cannot be queued safely while a
+                    # movement instruction is outstanding.
+                    if self.started and not self.halted:
+                        logging.warning("Android: emergency stop requested.")
+                        self.stm.abort()
+                        self._halt_mission("operator requested emergency stop")
+                    else:
+                        logging.info("Android: stop received while no mission is active.")
+
                 else:
                     logging.warning(f"Android: unrecognised message '{msg}' — ignoring.")
 
@@ -709,8 +729,11 @@ class Task1:
                             logging.warning("Ignoring replacement PATH during execution.")
                             continue
                         try:
-                            start = parse_start_pose(payload.get("start"))
-                            candidate = InstructionMission(payload.get("segments", []), start)
+                            parse_start_pose(payload.get("start"))
+                            odometry_start = parse_start_pose(payload.get("odometry_start"))
+                            candidate = InstructionMission(
+                                payload.get("segments", []), odometry_start
+                            )
                         except ValueError as exc:
                             logging.error("PC: invalid PATH — %s", exc)
                             continue
@@ -728,6 +751,11 @@ class Task1:
                             "y": payload["start"]["y"],
                             "dir": payload["start"]["dir"],
                         }
+                        self.odometry_start = {
+                            "x": payload["odometry_start"]["x"],
+                            "y": payload["odometry_start"]["y"],
+                            "dir": payload["odometry_start"]["dir"],
+                        }
                         self.direction_index = 0
 
                     self.path_requested = False
@@ -735,7 +763,9 @@ class Task1:
                     self.path_ready.set()
                     logging.info(
                         f"PC: PATH received — {len(self.segments)} segment(s), "
-                        f"obstacle order: {self.obstacle_order}."
+                        f"obstacle order: {self.obstacle_order}; "
+                        f"Android start: {self.start_pose}; "
+                        f"odometry start: {self.odometry_start}."
                     )
 
                     # If Android already sent BEGIN but PATH hadn't arrived yet,
@@ -900,10 +930,12 @@ class Task1:
                             # PROGRESS includes pose and execution context for PC.
                             pending = None
                             first_photo_segment = mission.segment_index if just_finished is None else just_finished
-                            mission.progress["remaining_photo_ids"] = [
-                                oid for i in range(first_photo_segment, len(mission.segments))
-                                if (oid := self._obstacle_for_segment(i)) is not None
-                            ]
+                            remaining_photo_ids = []
+                            for i in range(first_photo_segment, len(mission.segments)):
+                                obstacle_id = self._obstacle_for_segment(i)
+                                if obstacle_id is not None:
+                                    remaining_photo_ids.append(obstacle_id)
+                            mission.progress["remaining_photo_ids"] = remaining_photo_ids
                             mission.progress["awaiting_decision"] = self.feedback_control.enabled
                             if self.feedback_control.enabled:
                                 pending = self.feedback_control.arm(mission.progress)
@@ -929,6 +961,12 @@ class Task1:
                     # ── Capture + detect for the obstacle we just reached ──────
                     obstacle_id = self._obstacle_for_segment(just_finished)
                     if obstacle_id is not None:
+                        if self.capture_settle > 0:
+                            logging.info(
+                                "Waiting %.1fs for chassis vibration to settle before capture.",
+                                self.capture_settle,
+                            )
+                            sleep(self.capture_settle)
                         self._detect_and_send_image(obstacle_id)
                         self._completed_photo_count += 1
 
@@ -1047,26 +1085,6 @@ class Task1:
                     "it added is unused here — re-read PROTOCOL.md."
                 )
 
-        if self.arc_profile is None:
-            # No !PROF sent: the firmware's selected profile stands. Ask what it
-            # is rather than assume, so the planner's radius can be checked
-            # against reality instead of against a guess.
-            stat = self.stm.query("?STAT")
-            if stat:
-                logging.info(f"STM: {stat} (arc profile is the last field — §5).")
-            logging.info(
-                "STM: no !PROF sent — running the firmware's own profile "
-                "(default TIGHT, radius 291mm)."
-            )
-        elif self.stm.set_profile(self.arc_profile):
-            logging.info(f"STM: arc profile set to {self.arc_profile}.")
-        else:
-            logging.warning(
-                f"STM: could not set arc profile {self.arc_profile} — the firmware "
-                "keeps whatever it had. If the planner assumed a different radius, "
-                "its turns will land short or long."
-            )
-
     def start(self) -> None:
         """
         Connect all peripherals, start threads, and block until they exit.
@@ -1079,6 +1097,22 @@ class Task1:
         logging.info("Connecting to STM32…")
         self.stm.connect()
         self._stm_startup_check()
+        if self.arc_profile not in (None, cal_profile.ARC_PROFILE):
+            logging.error(
+                "STM_ARC_PROFILE=%s conflicts with calibrated Task 1 profile %s.",
+                self.arc_profile, cal_profile.ARC_PROFILE,
+            )
+            self.camera.stop_camera()
+            self.stm.disconnect()
+            return
+        if not cal_profile.prepare_for_task(self.stm):
+            logging.error("Task 1 calibration startup failed — refusing to move.")
+            self.camera.stop_camera()
+            self.stm.disconnect()
+            return
+        stat = self.stm.query("?STAT")
+        if stat:
+            logging.info("STM after calibration: %s", stat)
 
         logging.info("Starting Bluetooth server (waiting for Android)…")
         self.android.start()          # non-blocking; background accept loop starts

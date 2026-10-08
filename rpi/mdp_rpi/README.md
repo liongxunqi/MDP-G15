@@ -388,7 +388,8 @@ authoritative wherever it disagrees with this table.
 | `SEGMENT_DELAY_S` | 0.5 | Pause between segments (give STM time to settle) |
 | `DETECT_RETRY_COUNT` | 1 | Extra attempts if PC doesn't reply in time |
 | `DETECT_RETRY_DELAY_S` | 0.2 | Wait between retries |
-| `DETECT_TIMEOUT_S` | 0.5 | How long to wait for OBJECT reply per attempt |
+| `DETECT_TIMEOUT_S` | 30.0 | How long to wait for the PC's YOLO OBJECT reply per attempt |
+| `TASK1_CAPTURE_SETTLE_S` | 2.0 | Chassis settling time before each Task 1 photograph |
 | `DEBOUNCE_DELAY_S` | 1.0 | How long after last obstacle before auto-sending to PC |
 | `PATH_TIMEOUT_S` | 30.0 | Give up waiting for the PC's `PATH` and report `STATUS,FAILED` |
 | `TASK1_FEEDBACK_WAIT` | 0 | Set to 1 to require a PC decision after every instruction |
@@ -408,10 +409,14 @@ A.5 only (`task_a5.py`):
 
 ## Task 1 PC Feedback Contract
 
-This is an opt-in RPi feature. No PC/algo or STM implementation is supplied by
-this change. Keep `TASK1_FEEDBACK_WAIT=0` until the PC implements the responses
-below. Set it to `1` in the RPi `.env` and restart `task1.py` to enable waiting.
-The IP, port, Android messages and image framing are unchanged.
+The RPi and `pc/task1_pc.py` implement this handshake. With
+`TASK1_FEEDBACK_WAIT=1`, the PC answers `CONTINUE` while measured pose remains
+within its configured limits. Outside them it plans a collision-checked recovery
+to the current segment's original endpoint, sends that correction plus the
+unchanged later segments as `REPLACE`, and resets its expected-pose monitor to
+the replacement. If recovery is unsafe, or no valid reply arrives within
+`TASK1_FEEDBACK_TIMEOUT_S`, the RPi continues the existing path. The IP, port,
+Android messages and image framing are unchanged.
 
 After each STM `OK`, RPi queries `?WPOSE`, sends Android `ROBOT,x,y,heading`,
 then sends PC one newline-terminated `PROGRESS,<json>` message. With wait mode
@@ -445,9 +450,11 @@ Example JSON (transmit on ONE line after `PROGRESS,`):
   already completed. `segment` includes both executed and unexecuted tokens.
 - Coordinates are fractional grid units: one unit = 100 mm; arena `[0,20)` on
   each axis. Heading is degrees, north=0, clockwise positive, `[0,360)`.
-- The starting x/y/bearing comes from `PATH.start`; RPi has no fixed `(2,2)`
-  fallback. STM odometry still measures the rear-axle midpoint, so the planner
-  must resolve its centre offset before relying on feedback for geometry.
+- `PATH.start` is only the bottom-left cell of Android's 2 x 2 robot drawing.
+  The starting x/y/bearing for `ROBOT` and `PROGRESS` comes from the separate
+  `PATH.odometry_start` object. The planner sends that origin explicitly; the
+  RPi has no fixed `(2,2)` fallback. STM odometry measures the rear-axle
+  midpoint, so the planner owns any required reference-point conversion.
 - In telemetry-only mode `awaiting_decision` is false and no feedback ID is
   issued. Do not send decisions in that mode.
 - Echo the feedback ID and completed indexes exactly. A fresh feedback ID is

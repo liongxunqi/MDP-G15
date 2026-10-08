@@ -1,7 +1,7 @@
 """Execute primitives and report ROBOT,x_grid,y_grid,heading_deg to Android.
 
 Grid units are 100 mm; heading is north-zero, clockwise, in [0, 360).
-The arena start anchor comes from the PC planner's PATH.start object.
+The arena start anchor comes from the PC planner's PATH.odometry_start object.
 No axle-to-chassis-centre conversion or automatic replanning is performed here.
 
 After each successful OK/pose read, `progress` identifies the completed token
@@ -31,7 +31,7 @@ _CARDINAL_BEARINGS = {
 
 
 def parse_start_pose(start_pose):
-    """Validate PATH.start and retain its Android wire representation."""
+    """Validate a planner-provided grid pose used by the Task 1 protocol."""
     if not isinstance(start_pose, dict):
         raise ValueError("PATH must include planner start {x, y, dir}")
     try:

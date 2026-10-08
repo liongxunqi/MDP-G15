@@ -162,8 +162,8 @@ class Replay:
 
     def ahead_distance(self):
         """Front bumper to the nearest obstacle inside the sonar cone."""
-        fx = self.x + HALF_L * math.cos(self.th)
-        fy = self.y + HALF_L * math.sin(self.th)
+        fx = self.x + pp.REAR_AXLE_TO_SENSOR_MM * math.cos(self.th)
+        fy = self.y + pp.REAR_AXLE_TO_SENSOR_MM * math.sin(self.th)
         best, best_id = math.inf, None
         steps = 8
         for i in range(-steps, steps + 1):

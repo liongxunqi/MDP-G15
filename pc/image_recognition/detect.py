@@ -1,8 +1,14 @@
 import logging
+import os
 from pathlib import Path
 
 import cv2
 from ultralytics import YOLO
+
+try:
+    from .target_selection import select_target_index
+except ImportError:  # task1_pc.py adds image_recognition/ directly to sys.path
+    from target_selection import select_target_index
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -13,15 +19,17 @@ RUNS_DIR.mkdir(parents=True, exist_ok=True)
 model = YOLO(str(MODEL_PATH))
 
 INFERENCE_SIZE = 640
-YOLO_CONF = 0.25
+YOLO_INFERENCE_CONFIDENCE = 0.25
+YOLO_TARGET_CONFIDENCE = float(os.getenv("YOLO_TARGET_CONFIDENCE", "0.60"))
+FALLBACK_CLASSES = {"bullseye"}
 
 def detect(image_path):
     """
     Detect the image target.
 
     Returns (class_name, confidence), or (None, None) when nothing is detected.
-    The saved annotation draws only the same highest-confidence box that is
-    returned to the RPi, so stitched output and TARGET messages stay aligned.
+    The saved annotation draws only the marker selected for the obstacle the
+    robot is facing, so stitched output and TARGET messages stay aligned.
     """
     image = cv2.imread(str(image_path))
     if image is None:
@@ -31,7 +39,7 @@ def detect(image_path):
     results = model.predict(
         source=image,
         imgsz=INFERENCE_SIZE,
-        conf=YOLO_CONF,
+        conf=YOLO_INFERENCE_CONFIDENCE,
         save=False,
         verbose=False,
     )
@@ -49,13 +57,55 @@ def detect(image_path):
             logging.error("Detector found no target and could not save %s", output_path)
         return None, None
 
+    coordinates = boxes.xyxy.cpu().numpy()
     confidences = boxes.conf.cpu().numpy()
-    best_index = int(confidences.argmax())
-    class_id = int(boxes.cls[best_index].item())
-    confidence = float(boxes.conf[best_index].item())
-    class_name = result.names[class_id]
+    class_names = [
+        result.names[int(boxes.cls[index].item())]
+        for index in range(len(boxes))
+    ]
+    preferred = [
+        class_name.strip().lower() not in FALLBACK_CLASSES
+        for class_name in class_names
+    ]
+    has_preferred_class = any(preferred)
+    best_index = select_target_index(
+        coordinates,
+        confidences,
+        image.shape[1],
+        image.shape[0],
+        min_confidence=YOLO_TARGET_CONFIDENCE,
+        # Prefer every non-bullseye class. If the frame contains only
+        # bullseyes, select and return the best bullseye as the final result.
+        eligible=preferred if has_preferred_class else None,
+    )
+    if best_index is None:
+        output_path = RUNS_DIR / Path(image_path).name
+        saved = cv2.imwrite(str(output_path), annotated_image)
+        logging.warning(
+            "Detector candidates were all below target confidence %.2f; "
+            "saved frame to %s%s",
+            YOLO_TARGET_CONFIDENCE,
+            output_path,
+            "" if saved else " (save failed)",
+        )
+        return None, None
 
-    x1, y1, x2, y2 = boxes.xyxy[best_index].cpu().numpy().astype(int)
+    accepted = [
+        (class_names[i], float(confidences[i]))
+        for i in range(len(boxes))
+        if (preferred[i] or not has_preferred_class)
+        and float(confidences[i]) >= YOLO_TARGET_CONFIDENCE
+    ]
+    if len(accepted) > 1:
+        logging.info(
+            "Detector saw multiple credible markers %s; selecting the largest apparent marker.",
+            ", ".join(f"{name}:{confidence:.3f}" for name, confidence in accepted),
+        )
+
+    confidence = float(boxes.conf[best_index].item())
+    class_name = class_names[best_index]
+
+    x1, y1, x2, y2 = coordinates[best_index].astype(int)
     cv2.rectangle(annotated_image, (x1, y1), (x2, y2), (255, 0, 255), 3)
     label = f"{class_name} {confidence:.2f}"
     cv2.putText(
