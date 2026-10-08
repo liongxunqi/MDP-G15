@@ -375,6 +375,29 @@ const ArcProfile_t *Motion_GetArcProfileInfo(uint8_t idx);
  * what was asked for. */
 uint16_t    Motion_GetArcSteerUs(void);
 
+/* ---------------------------------------------------------------------------
+ * PER-SIDE ARC STEERING
+ *
+ * The same pulse either side of centre does not give the same wheel angle:
+ * the linkage is not symmetric, and neither is the play in it. So a left
+ * and a right turn at the same deflection trace different circles - the gyro
+ * still stops both at 90 degrees, but they land the robot in different
+ * places, while the planner and the A5 orbit assume one radius both ways.
+ *
+ * Each side's deflection is therefore its own calibration value, measured
+ * by `calibrate.py radius` (floor chord per side) and restored with the rest
+ * of the profile via !CALSL / !CALSR. 0 means "use the profile's symmetric
+ * value", which is what the robot does until something is restored.
+ *
+ * Bounds: never past the servo limits on that side, and never below
+ * MOTION_ARC_STEER_MIN_US, which is far wider than any turn the planner
+ * could use. Refused, not clamped, like every other setter.
+ * ------------------------------------------------------------------------- */
+#define MOTION_ARC_STEER_MIN_US   300U
+
+uint8_t     Motion_SetArcSteerSideUs(uint8_t right, uint16_t us);
+uint16_t    Motion_GetArcSteerSideUs(uint8_t right);   /* the value in force */
+
 typedef enum
 {
     MOTION_IDLE = 0,
@@ -434,5 +457,79 @@ int32_t Motion_GetTurnedDeg(void);
 
 /* Degrees the current arc is aiming for, signed. */
 int32_t Motion_GetTurnTargetDeg(void);
+
+/* ---------------------------------------------------------------------------
+ * LEARNING SWITCH
+ *
+ * The arc decel/lag learner and the steering trim learner used to run after
+ * every move, forever. That meant a task run kept rewriting the calibration
+ * it was being driven on, one noisy sample at a time - the numbers a robot
+ * finished a run with were not the numbers it started with, and neither was
+ * the averaged value calibrate.py measured.
+ *
+ * Now learning is OFF at power-on and runs only while something explicitly
+ * asks for it: calibrate.py (!LEARN1 ... !LEARN0) or the OLED CALIB cycle.
+ * During a task the calibration is exactly what was restored, nothing else.
+ * ------------------------------------------------------------------------- */
+void    Motion_SetLearning(uint8_t on);
+uint8_t Motion_LearningEnabled(void);
+
+/* ---------------------------------------------------------------------------
+ * HEADING CARRY-OVER
+ *
+ * Every move zeroes the odometry and the gyro total when it launches, so on
+ * its own each move only knows about itself: an FR90 that stopped at 89.5
+ * left the robot 0.5 degrees off for good, the next FR90 turned another 90
+ * from there, and errors added up turn after turn. Straights held whatever
+ * heading they started on, crooked or not.
+ *
+ * So the motion layer keeps two running totals that survive between moves:
+ *
+ *      commanded  - the sum of every arc angle ASKED for since !ZERO
+ *      actual     - the sum of every rotation the gyro MEASURED since !ZERO
+ *
+ * and every move aims at the commanded total rather than at its own start:
+ *
+ *      arc       turns  asked + (commanded - actual)
+ *      straight  holds  (commanded - actual) relative to where it starts
+ *
+ * An FR90 after an 89.5 turns 90.5; a straight after it steers the half
+ * degree out. The error left behind by any one move is corrected by the next,
+ * so it can never accumulate beyond a single move's error.
+ *
+ * The correction is capped at MOTION_CARRY_MAX_DEG. Anything bigger than that
+ * is not braking error - the robot was bumped, a wheel slipped, a move was
+ * aborted - and chasing it with a big steering input would do more harm than
+ * the error. It is applied up to the cap and counted, so ?HDG shows it.
+ *
+ * RST and a failed move re-sync commanded to actual: the robot is no longer
+ * where the plan thinks, and the sender has to re-plan anyway.
+ * ------------------------------------------------------------------------- */
+#define MOTION_CARRY_ENABLE     1
+#define MOTION_CARRY_MAX_DEG    5.0f
+
+/* Zero both totals and the odometry. What !ZERO does. */
+void    Motion_ZeroHeading(void);
+
+/* Throw away any outstanding error: commanded := actual. For RST. */
+void    Motion_ResyncHeading(void);
+
+float   Motion_GetCommandedHeading(void);   /* degrees, CCW positive      */
+float   Motion_GetActualHeading(void);      /* degrees, live              */
+float   Motion_GetLastArcAimDeg(void);      /* signed, after carry-over   */
+float   Motion_GetLastArcTurnedDeg(void);   /* signed, gyro, at stop      */
+uint16_t Motion_GetCarryClampCount(void);   /* corrections capped since zero */
+
+/* ---------------------------------------------------------------------------
+ * PROFILE LOCK
+ *
+ * The team runs TIGHT (profile 0) for everything: the planner's 291 mm radius,
+ * the A5 orbit and the saved calibration all assume it, and the braking model
+ * is a single set of numbers that only fits the profile it was measured on.
+ * With the lock on, Motion_SetArcProfile() ignores anything but 0, !PROF1/2
+ * answer RESEND, and the OLED profile mode cannot switch away. The other two
+ * profiles stay in the table so turning the lock off restores them.
+ * ------------------------------------------------------------------------- */
+#define MOTION_PROFILE_LOCK_TIGHT   1
 
 #endif /* __MOTION_H */

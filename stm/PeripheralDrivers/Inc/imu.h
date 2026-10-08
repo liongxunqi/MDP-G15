@@ -98,6 +98,23 @@
 #define IMU_GYRO_FS_DPS         1000.0f
 #define IMU_GYRO_LSB_PER_DPS    32.8f
 
+/* Per-unit correction on top of the datasheet sensitivity.
+ *
+ * 32.8 LSB/dps is the NOMINAL figure; the part is only specified to a few
+ * percent of it. A 2% scale error turns every commanded 90 into 88 or 92 on
+ * the floor while the gyro itself reports a perfect 90 - the error is
+ * invisible to everything on the robot, because the braking model, the arc
+ * termination and ?TURN all read the same gyro. The only way to see it is to
+ * measure a turn against something that is not the gyro: a tape line and a
+ * protractor. calibrate.py guided does exactly that and sends the answer here
+ * with !CALG.
+ *
+ * Multiplies the rate, so heading, yaw rate and the braking prediction all
+ * move together. 1.0 until something better is restored; refused outside
+ * the bounds below, which are far wider than any real part is out by. */
+#define IMU_GYRO_SCALE_MIN      0.90f
+#define IMU_GYRO_SCALE_MAX      1.10f
+
 /* Gyro low-pass bandwidth, GYRO_DLPFCFG.
  *
  *   0 = 196.6 Hz   3 = 51.2 Hz   6 = 5.7 Hz
@@ -132,6 +149,22 @@
  * 15 dps. At +-1000 the same number means 61 dps, so the check had quietly
  * stopped catching anything. */
 #define IMU_BIAS_SANITY_LSB      500
+
+/* Zero-rate tracking only trusts a reading this close to the current bias,
+ * raw counts. At 32.8 LSB/dps, 33 is 1 dps.
+ *
+ * "Wheels still" is not "robot still". A robot lifted, or twisted on the
+ * floor so the geared wheels skid instead of turning, has still encoders and
+ * a turning body - and the tracker used to learn that rotation as bias: about
+ * 3 counts of bias per degree turned by hand, 0.1 dps, decaying over tens of
+ * seconds. Every calibration step starts with the robot positioned by hand,
+ * so it landed in the measurements. Real bias drifts by a few counts over
+ * minutes; at the DLPF bandwidth the noise is ~2-3 counts rms. Anything past
+ * a dps is the robot moving. */
+#define IMU_BIAS_TRACK_GATE_LSB  33.0f
+
+/* Time constant of the zero-rate tracker, in ticks: 1024 is ~10 s. */
+#define IMU_BIAS_TRACK_TICKS     1024.0f
 
 /* Bring-up attempts before giving up, 100 ms apart. Covers a slow 1.8 V rail
  * and a warm MCU reset that left the sensor mid-reset. */
@@ -184,7 +217,12 @@ void IMU_ResetHeading(void);
  * temperature, and boot is when the chip is coldest.
  *
  * The filter is deliberately slow - about a ten second time constant - so a
- * genuine slow rotation cannot be mistaken for bias and calibrated away. */
+ * genuine slow rotation cannot be mistaken for bias and calibrated away. And
+ * it ignores any reading past IMU_BIAS_TRACK_GATE_LSB, because still wheels
+ * do not mean a still body - see there.
+ *
+ * The bias is held as a float. An integer bias can only ever be within half
+ * a count, 0.015 dps, which is 0.3 degrees over a 20 second square. */
 void IMU_TrackBias(void);
 
 /* Integrated heading in degrees, counter-clockwise positive. Free-running,
@@ -196,6 +234,12 @@ float IMU_GetRateDps(void);
 
 /* 1 once the part has answered and been configured. */
 uint8_t IMU_IsReady(void);
+
+/* Gyro scale correction, see IMU_GYRO_SCALE_MIN. The setter returns 0 and
+ * changes nothing outside the bounds. Caller must check the motion layer is
+ * idle - a turn in flight reads the rate every tick. */
+uint8_t IMU_SetGyroScale(float scale);
+float   IMU_GetGyroScale(void);
 
 /* Diagnostics for the OLED. */
 uint8_t  IMU_GetAddress(void);      /* 0x68, 0x69, or 0 if nothing answered */

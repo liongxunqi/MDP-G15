@@ -6,7 +6,7 @@
 #include <math.h>
 
 static Odom_Pose_t s_pose;
-static Odom_Pose_t s_worldPose;
+static Odom_Pose_t s_worldPose;     /* never reset - see Odom_GetWorldPose() */
 
 static int32_t s_lastCountA;
 static int32_t s_lastCountB;
@@ -246,13 +246,13 @@ void Odom_Update(void)
     /* Path length, always positive, so reversing does not subtract from it. */
     s_pose.distance_mm += (d_centre < 0.0f) ? -d_centre : d_centre;
 
-    /* Use the same measured increments, but retain the mission trajectory
-     * across primitive resets, including all internal FU correction passes. */
-    heading_rad = (s_worldPose.heading_deg + d_theta_deg * 0.5f)
-                  * (3.14159265f / 180.0f);
-    s_worldPose.x_mm += d_centre * cosf(heading_rad);
-    s_worldPose.y_mm += d_centre * sinf(heading_rad);
-    s_worldPose.heading_deg = wrap180(s_worldPose.heading_deg + d_theta_deg);
+    /* The same increments again, into the pose nothing resets. Odom_Reset()
+     * resyncs the encoder and gyro baselines, so a move starting adds no
+     * step here - the trajectory carries straight across. */
+    heading_rad = (s_worldPose.heading_deg + d_theta_deg * 0.5f) * (3.14159265f / 180.0f);
+    s_worldPose.x_mm        += d_centre * cosf(heading_rad);
+    s_worldPose.y_mm        += d_centre * sinf(heading_rad);
+    s_worldPose.heading_deg  = wrap180(s_worldPose.heading_deg + d_theta_deg);
     s_worldPose.distance_mm += (d_centre < 0.0f) ? -d_centre : d_centre;
 
     /* ---- heading hold, via the steering servo ---- */
@@ -275,7 +275,15 @@ void Odom_Update(void)
             float aim = s_holdHeading;
 
 #if CROSS_TRACK_ENABLE
-            float cross = -CROSS_KP_DEG_PER_MM * s_pose.y_mm;
+            /* Offset from the line the robot is MEANT to drive: through the
+             * start point along the held heading. That used to be the x axis
+             * by definition, because every straight held heading 0. With the
+             * heading carry-over it can be a few degrees off, and measuring y
+             * against the old axis would have the cross-track term pull the
+             * robot back onto the crooked line the carry-over is correcting. */
+            float hr    = s_holdHeading * (3.14159265f / 180.0f);
+            float off   = (s_pose.y_mm * cosf(hr)) - (s_pose.x_mm * sinf(hr));
+            float cross = -CROSS_KP_DEG_PER_MM * off;
 
             cross = clampf(cross, -CROSS_MAX_DEG, CROSS_MAX_DEG);
             if (s_holdRpm < 0) { cross = -cross; }
@@ -356,6 +364,8 @@ void Odom_GetPose(Odom_Pose_t *out)
 
 void Odom_GetWorldPose(Odom_Pose_t *out)
 {
+    /* Written by the tick; copy it in one piece so x, y and heading belong
+     * to the same instant. */
     uint32_t primask = __get_PRIMASK();
     __disable_irq();
     if (out != 0) { *out = s_worldPose; }

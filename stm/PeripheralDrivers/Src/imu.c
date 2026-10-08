@@ -38,10 +38,14 @@ static uint8_t  s_ready;
 static uint8_t  s_bank = 0xFF;      /* forces the first select to happen  */
 
 static volatile int16_t  s_rawZ;
-static int16_t  s_bias;
+static volatile float    s_bias;  /* raw counts, sub-count precision */
 static volatile float    s_rateDps;
 static volatile float    s_headingDeg;
 static volatile uint32_t s_errors;
+
+/* Measured correction on the datasheet sensitivity - see imu.h. RAM only,
+ * restored by the RPi with !CALG like the other calibration values. */
+static float    s_gyroScale = 1.0f;
 
 /* Poll rate diagnostics. IMU_Tick() integrates at a fixed 100 Hz using
  * whatever sample IMU_Poll() last fetched, so if the main loop is not
@@ -189,7 +193,7 @@ uint8_t IMU_Init(I2C_HandleTypeDef *hi2c)
     s_ready      = 0U;
     s_bank       = 0xFF;
     s_rawZ       = 0;
-    s_bias       = 0;
+    s_bias       = 0.0f;
     s_rateDps    = 0.0f;
     s_headingDeg = 0.0f;
     s_errors     = 0U;
@@ -241,7 +245,7 @@ uint8_t IMU_CalibrateBias(void)
 
     if (!s_ready) { return 0U; }
 
-    s_bias = 0;
+    s_bias = 0.0f;
 
     /* A gyro at rest does not read zero - it reads its own bias, and that
      * bias is what gets integrated into a growing heading error if it is not
@@ -266,17 +270,21 @@ uint8_t IMU_CalibrateBias(void)
      * a bias averaged over a quarter of the intended samples is not. */
     if (got < (IMU_BIAS_SAMPLES / 2U)) { return 0U; }
 
-    sum /= (int32_t)got;
-
-    /* If this trips, the robot was moved during calibration. Refusing is
-     * better than silently baking a motion artefact into every future
-     * reading. */
-    if ((sum > IMU_BIAS_SANITY_LSB) || (sum < -IMU_BIAS_SANITY_LSB))
+    /* Float mean: 200 samples resolve the bias well below one count, and an
+     * integer divide would throw that away. */
     {
-        return 0U;
-    }
+        float mean = (float)sum / (float)got;
 
-    s_bias = (int16_t)sum;
+        /* If this trips, the robot was moved during calibration. Refusing is
+         * better than silently baking a motion artefact into every future
+         * reading. */
+        if ((mean > (float)IMU_BIAS_SANITY_LSB) || (mean < -(float)IMU_BIAS_SANITY_LSB))
+        {
+            return 0U;
+        }
+
+        s_bias = mean;
+    }
     return 1U;
 }
 
@@ -301,7 +309,7 @@ void IMU_Poll(void)
     raw = (int16_t)(((uint16_t)buf[0] << 8) | buf[1]);
 
     s_rawZ       = raw;
-    s_rateDps    = (float)(raw - s_bias) / IMU_GYRO_LSB_PER_DPS;
+    s_rateDps    = (((float)raw - s_bias) / IMU_GYRO_LSB_PER_DPS) * s_gyroScale;
     s_lastGoodMs = HAL_GetTick();
 
     s_polls++;
@@ -366,26 +374,23 @@ void IMU_Tick(void)
 
 void IMU_TrackBias(void)
 {
-    /* s_bias is an integer count, so a plain EMA would never move for small
-     * errors - the update would round to zero every time. Accumulate the
-     * error in a wider running sum instead and shift a count across only when
-     * the sum has genuinely built up. */
-    static int32_t accum = 0;
+    float err;
 
     if (!s_ready) { return; }
 
-    accum += ((int32_t)s_rawZ - (int32_t)s_bias);
+    err = (float)s_rawZ - s_bias;
 
-    if (accum > 1024)
+    /* Still wheels, turning body: lifted, or twisted by hand on the floor.
+     * That is rotation, not bias - see IMU_BIAS_TRACK_GATE_LSB. */
+    if ((err > IMU_BIAS_TRACK_GATE_LSB) || (err < -IMU_BIAS_TRACK_GATE_LSB))
     {
-        s_bias++;
-        accum = 0;
+        return;
     }
-    else if (accum < -1024)
-    {
-        s_bias--;
-        accum = 0;
-    }
+
+    /* First-order low-pass toward the stationary reading, ~10 s time
+     * constant. The old integer version could only step a whole count at a
+     * time and dithered a count either side of the true bias. */
+    s_bias += err / IMU_BIAS_TRACK_TICKS;
 }
 
 void IMU_ResetHeading(void)
@@ -401,9 +406,25 @@ void IMU_ResetHeading(void)
 float    IMU_GetHeading(void)    { return s_headingDeg; }
 float    IMU_GetRateDps(void)    { return s_rateDps; }
 uint8_t  IMU_IsReady(void)       { return s_ready; }
+
+uint8_t IMU_SetGyroScale(float scale)
+{
+    if ((scale < IMU_GYRO_SCALE_MIN) || (scale > IMU_GYRO_SCALE_MAX))
+    {
+        return 0U;
+    }
+    s_gyroScale = scale;
+    return 1U;
+}
+
+float IMU_GetGyroScale(void) { return s_gyroScale; }
 uint8_t  IMU_GetAddress(void)    { return s_addr; }
 uint8_t  IMU_GetWhoAmI(void)     { return s_whoami; }
-int16_t  IMU_GetBias(void)       { return s_bias; }
+int16_t  IMU_GetBias(void)
+{
+    float b = s_bias;
+    return (int16_t)((b >= 0.0f) ? (b + 0.5f) : (b - 0.5f));
+}
 int16_t  IMU_GetRawZ(void)       { return s_rawZ; }
 uint32_t IMU_GetErrorCount(void) { return s_errors; }
 uint32_t IMU_GetStallCount(void)  { return s_stalls; }
