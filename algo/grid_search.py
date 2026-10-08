@@ -50,15 +50,6 @@ class NoPathFound(Exception):
     pass
 
 
-# The robot's reference point (the REAR AXLE: what ?WPOSE tracks and what every arc turns about) is not
-# the middle of its body. The body, sensor included, reaches ~230 mm FORWARD of the axle and only a few
-# cm behind it. The collision rectangle is centred this far ahead of the reference, along the heading.
-# 0 is the old model (a rectangle centred ON the reference), which cannot see the front 115 mm of the
-# robot: planned routes passed 7-29 mm from obstacles while the planner believed it kept 30+.
-# path_planner sets this from its geometry.
-BODY_CENTRE_AHEAD_MM = 0.0
-
-
 class Boxes(list):
     """Obstacle boxes, optionally carrying ref_bounds = (lo_x, hi_x, lo_y, hi_y):
     the robot's REFERENCE POINT (its centre) must stay inside, whatever the heading.
@@ -122,18 +113,15 @@ def _point_blocked(x, y, theta, boxes, arena_mm, half_length_mm, half_width_mm) 
     # exact rotated-rect bounding half-extent, not just the 4 cardinal cases
     half_extent_x = half_length_mm * c + half_width_mm * s
     half_extent_y = half_length_mm * s + half_width_mm * c
-    # (x, y) is the REFERENCE point; the body's centre is BODY_CENTRE_AHEAD_MM in front of it.
-    bx = x + BODY_CENTRE_AHEAD_MM * math.cos(theta)
-    by = y + BODY_CENTRE_AHEAD_MM * math.sin(theta)
     lo_x, hi_x = half_extent_x - ARENA_OVERHANG_MM, arena_mm - half_extent_x + ARENA_OVERHANG_MM
     lo_y, hi_y = half_extent_y - ARENA_OVERHANG_MM, arena_mm - half_extent_y + ARENA_OVERHANG_MM
-    if not (lo_x <= bx <= hi_x and lo_y <= by <= hi_y):
+    if not (lo_x <= x <= hi_x and lo_y <= y <= hi_y):
         return True
-    rb = getattr(boxes, "ref_bounds", None)             # the RPi checks the REFERENCE point, not the body
+    rb = getattr(boxes, "ref_bounds", None)
     if rb is not None and not (rb[0] <= x <= rb[1] and rb[2] <= y <= rb[3]):
         return True
     for box in boxes:
-        if _rect_hits_box(bx, by, theta, half_length_mm, half_width_mm, half_extent_x, half_extent_y, box):
+        if _rect_hits_box(x, y, theta, half_length_mm, half_width_mm, half_extent_x, half_extent_y, box):
             return True
     return False
 
