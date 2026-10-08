@@ -319,6 +319,65 @@ class TaskFeedbackTests(unittest.TestCase):
         self.assertTrue(task.feedback_control.waiting)
         task.feedback_control.cancel("test cleanup")
 
+    def test_path_after_begin_answers_the_first_preflight(self):
+        # 2026-10-09 06:48: Start was pressed while the PC was planning. The
+        # PC-receive thread started the first segment itself, then waited for
+        # the preflight decision that only it could read; 7 s later the RPi
+        # halted with "No PC safety reply" and the robot never moved.
+        import queue
+        task = bare_task()
+        task.instruction_mission = None
+        task.path_ready.clear()
+        task.path_requested = True
+        task._path_timer = None
+        task.camera_to_sensor_cm = 10.5
+        task.preflight_enabled = True
+        task.ir_feedback_enabled = True
+        task.feedback_control = FeedbackControl(True, 3)
+        wposes = iter([["100", "0", "0"]] * 10)
+
+        def query_fields(command):
+            if command == "?WPOSE":
+                return next(wposes)
+            if command == "?IR":
+                return ["65535", "65535"]
+            if command == "?IRR":
+                return ["100", "100"]
+            if command == "?US":
+                return ["30"]
+            raise AssertionError(command)
+
+        task.stm.query_fields = Mock(side_effect=query_fields)
+        inbox = queue.Queue()
+
+        def send(message):
+            if message.startswith("PROGRESS,"):
+                progress = json.loads(message.split(",", 1)[1])
+                inbox.put("CONTINUE," + json.dumps(echo(progress)))
+
+        def receive():
+            item = inbox.get(timeout=5)
+            if isinstance(item, BaseException):
+                raise item
+            return item
+
+        task.pc.send.side_effect = send
+        task.pc.receive.side_effect = receive
+        inbox.put("PATH," + json.dumps({
+            "segments": [["F10", "S"]], "segment_obstacles": ["7"],
+            "obstacle_ids": [7], "start": START, "odometry_start": START,
+        }))
+        receiver = Thread(target=lambda: self.assertRaises(EndLoop, task.pc_receive))
+        receiver.start()
+        for _ in range(100):
+            if ("F10",) in task.stm.events or task.halted:
+                break
+            Event().wait(0.02)
+        inbox.put(EndLoop())
+        receiver.join(5)
+        self.assertFalse(task.halted)
+        self.assertIn(("F10",), task.stm.events)
+
     def test_send_guard_refuses_movement_while_waiting(self):
         task = bare_task()
         task.feedback_control.arm({"segment_index": 0, "instruction_index": 0})

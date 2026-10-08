@@ -664,6 +664,16 @@ class Task1:
         finally:
             self._stm_reply_lock.release()
 
+    def _start_after_path(self) -> None:
+        """Begin a mission whose BEGIN arrived before its PATH."""
+        try:
+            self._send_start_status()
+            if not self._send_next_segment():
+                logging.warning("PC: PATH arrived but no segments to send.")
+        except Exception:
+            logging.exception("Could not start the mission after PATH arrived.")
+            self._halt_mission("could not start after PATH")
+
     def _send_start_status(self) -> None:
         """Pass the planner's Android drawing anchor directly to Android."""
         with self._idx_lock:
@@ -1494,11 +1504,13 @@ class Task1:
                     )
 
                     # If Android already sent BEGIN but PATH hadn't arrived yet,
-                    # kick off the first segment now
+                    # kick off the first segment now - on its own thread. The
+                    # first segment's preflight waits for the PC's decision,
+                    # and only this thread reads that decision: waiting here
+                    # deadlocked until the 7 s timeout halted the mission.
                     if self.started and self.segments_index == 0:
-                        self._send_start_status()
-                        if not self._send_next_segment():
-                            logging.warning("PC: PATH arrived but no segments to send.")
+                        Thread(target=self._start_after_path,
+                               name="start-after-path", daemon=True).start()
 
                 elif msg.startswith("OBJECT"):
                     # ── PC replied with a detection result ────────────────────
