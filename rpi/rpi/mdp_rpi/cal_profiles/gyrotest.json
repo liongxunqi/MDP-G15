@@ -1,0 +1,24 @@
+{
+  "note": "",
+  "checks": {
+    "gyro": {
+      "ratios": [
+        1.00447,
+        1.00612
+      ],
+      "asymmetry_pct": 0.164,
+      "from": 0.9988,
+      "to": 1.00409
+    }
+  },
+  "verified": false,
+  "taken": "2026-09-12T18:46:53",
+  "decel_x10": 5506,
+  "lag_ms_x10": 40,
+  "trim_us": 22,
+  "gyro_x10000": 10041,
+  "steer_left_us": 425,
+  "steer_right_us": 586,
+  "name": "gyrotest",
+  "arc_profile": 0
+}

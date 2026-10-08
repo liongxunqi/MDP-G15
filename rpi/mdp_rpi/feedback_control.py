@@ -43,7 +43,7 @@ class FeedbackControl:
     def submit(self, action, payload):
         with self._lock:
             pending = self._pending
-            if (action not in ("CONTINUE", "REPLACE", "SKIP", "HOLD") or
+            if (action not in ("WAIT", "CONTINUE", "REPLACE", "SKIP", "HOLD") or
                     not isinstance(payload, dict) or pending is None or
                     payload.get("feedback_id") != pending["feedback_id"] or
                     pending["response"] is not None or
@@ -53,6 +53,9 @@ class FeedbackControl:
                 if type(payload.get(key)) is not int or payload[key] != pending[key]:
                     action, payload = "INVALID", {"reason": "Decision indexes do not match feedback"}
                     break
+            if action == "WAIT":
+                pending["safety_check_pending"] = True
+                return True
             pending["response"] = (action, payload)
             pending["event"].set()
             return True
@@ -63,6 +66,8 @@ class FeedbackControl:
             if self._pending is pending:
                 self._pending = None
             response = pending["response"]
+        if response is None and pending.get("safety_check_pending"):
+            return "HOLD", {"reason": "PC safety check timed out; movement not authorised"}
         return ("TIMEOUT", {}) if response is None else response
 
     def cancel(self, reason):

@@ -501,6 +501,8 @@ class Task1:
                 not str(token).upper().startswith(("FR", "FL", "RR", "RL")) or
                 self.gyro_settle_timeout <= 0):
             return
+        logging.info("Holding stationary for 2.0s after %s before gyro verification.", token)
+        sleep(2.0)
         deadline = monotonic() + self.gyro_settle_timeout
         stable = 0
         last_rate = None
@@ -529,6 +531,12 @@ class Task1:
             self.gyro_settle_timeout, last_rate,
         )
 
+    def _request_mission_start(self):
+        """Let the motion worker wait for feedback; keep receive threads free."""
+        with self._idx_lock:
+            if self.started and not self.halted and self.segments_index == 0:
+                self._start_pending = True
+
     def _send_next_segment(self) -> bool:
         """Send the next primitive, retaining the planner's photo boundaries."""
         if self.halted:
@@ -544,7 +552,8 @@ class Task1:
                         )
                     mission = self.instruction_mission
                     needs_preflight = (
-                        getattr(self, "preflight_enabled", False) and
+                        (getattr(self, "preflight_enabled", False) or
+                         mission.segment_index in getattr(mission, "deferred_segments", set())) and
                         mission.segment_index not in mission.preflighted_segments
                     )
                 if not needs_preflight:
@@ -605,12 +614,16 @@ class Task1:
                 "remaining_photo_ids": remaining,
             }
             progress.update(self._read_ir_snapshot())
+            progress["ultrasonic_cm"] = self._read_ultrasonic_cm()
             pending = self.feedback_control.arm(progress)
             self.android.send(robot_message)
             self.pc.send("PROGRESS," + json.dumps(progress, separators=(",", ":")))
 
         decision = self._wait_for_feedback(pending, mission, None)
         if decision == "continue":
+            if mission.segment_index in getattr(mission, "deferred_segments", set()):
+                self._halt_mission("Deferred target requires a replacement route, not CONTINUE")
+                return None
             with self._idx_lock:
                 if self.instruction_mission is mission:
                     mission.preflighted_segments.add(mission.segment_index)
@@ -650,13 +663,28 @@ class Task1:
         mapping = payload.get("segment_obstacles")
         if not isinstance(mapping, list) or len(mapping) != len(candidate.segments):
             raise ValueError("REPLACE requires segment_obstacles parallel to segments")
+        deferred = payload.get("deferred_segments", [])
+        if (not isinstance(deferred, list) or any(type(i) is not int or
+                not 0 <= i < len(candidate.segments) or candidate.segments[i] != ["S"]
+                or mapping[i] is None for i in deferred)):
+            raise ValueError("Invalid deferred segment placeholders")
+        if deferred and not self.feedback_control.enabled:
+            raise ValueError("Deferred targets require PC feedback")
+        candidate.deferred_segments = set(deferred)
         if any(value is not None and
                (type(value) not in (str, int) or not str(value).strip()) for value in mapping):
             raise ValueError("Replacement obstacle IDs must be nonempty strings, integers or null")
         first = mission.segment_index if just_finished is None else just_finished
         remaining = [self._obstacle_for_segment(i) for i in range(first, len(mission.segments))]
-        if Counter(str(v) for v in mapping if v is not None) != Counter(v for v in remaining if v is not None):
-            raise ValueError("Replacement must preserve every pending photo assignment")
+        skipped = payload.get("skipped_photo_ids", [])
+        if not isinstance(skipped, list) or any(
+                type(value) not in (str, int) or not str(value).strip() for value in skipped):
+            raise ValueError("Replacement skipped_photo_ids must contain valid obstacle IDs")
+        assigned = [str(v) for v in mapping if v is not None]
+        skipped = [str(v) for v in skipped]
+        if (set(assigned).intersection(skipped) or len(skipped) != len(set(skipped)) or
+                Counter(assigned + skipped) != Counter(v for v in remaining if v is not None)):
+            raise ValueError("Replacement must preserve or explicitly report every pending photo assignment")
         candidate.origin = mission.origin
         self.instruction_mission = candidate
         self.segments = candidate.segments
@@ -666,6 +694,9 @@ class Task1:
         self.direction_index = 0
         self.segments_index = 0
         self._resend_counts.clear()
+        self.unsuccessful_photo_ids = list(getattr(self, "unsuccessful_photo_ids", [])) + skipped
+        if skipped:
+            logging.warning("Targets not reached after recovery: %s; no detections recorded for them", skipped)
         logging.info("Installed replacement: %d segments; odometry origin retained", len(self.segments))
 
     def _wait_for_feedback(self, pending, mission, just_finished):
@@ -906,6 +937,7 @@ class Task1:
         as a wrong/missing target echo rather than permission for a long blind
         drive. Every actual correction publishes WPOSE and the resulting range.
         """
+        self.photo_alignment_needed = False
         if not use_ultrasonic:
             if current_standoff_cm is None:
                 return True
@@ -920,16 +952,31 @@ class Task1:
             )
 
         measured_us = None
+        previous_us = None
+        previous_delta = None
         for correction in range(self.us_adjust_retries + 1):
             if self.us_settle_s > 0:
                 sleep(self.us_settle_s)
             measured_us = self._read_ultrasonic_cm()
             if measured_us is None:
+                self.photo_alignment_needed = True
                 logging.warning(
                     "Cannot range-correct obstacle %s to %d cm; keeping the "
                     "odometry-planned camera pose.", obstacle_id, standoff_cm,
                 )
                 return False
+
+            if previous_us is not None:
+                expected_us = previous_us - previous_delta
+                if abs(measured_us - expected_us) > max(5.0, self.us_adjust_tolerance_cm):
+                    self.photo_alignment_needed = True
+                    logging.warning(
+                        "Obstacle %s US changed inconsistently after photo motion: "
+                        "%s -> %s cm, expected about %.1f cm. Requesting alignment; "
+                        "not chasing this echo.", obstacle_id, previous_us,
+                        measured_us, expected_us,
+                    )
+                    return False
 
             camera_to_sensor_cm = float(getattr(
                 self, "camera_to_sensor_cm", 10.0
@@ -958,6 +1005,7 @@ class Task1:
 
             distance_cm = int(round(abs(error_cm)))
             if distance_cm > self.us_adjust_max_step_cm:
+                self.photo_alignment_needed = True
                 logging.warning(
                     "Ultrasonic range %d cm is %d cm from obstacle %s's %d cm "
                     "target, beyond the %d cm correction cap. This is probably "
@@ -972,6 +1020,8 @@ class Task1:
                     mission, obstacle_id, token, standoff_cm, measured_us,
                     movement_tokens=movement_tokens):
                 return False
+            previous_us = measured_us
+            previous_delta = distance_cm if error_cm > 0 else -distance_cm
         return False
 
     @staticmethod
@@ -1024,9 +1074,12 @@ class Task1:
             obstacle_key, False
         )
         if original is not None and us_adjustable:
-            self._move_for_photo(mission, obstacle_id, original,
+            positioned = self._move_for_photo(mission, obstacle_id, original,
                                  current_standoff_cm=original, use_ultrasonic=True,
                                  movement_tokens=temporary_moves)
+            if not positioned and getattr(self, "photo_alignment_needed", False):
+                self._request_photo_alignment(obstacle_id, mission)
+                return None
         if self.capture_settle > 0:
             logging.info(
                 "Waiting %.1fs for chassis vibration to settle before capture.",
@@ -1076,6 +1129,9 @@ class Task1:
                             movement_tokens=temporary_moves):
                         if self.halted:
                             break
+                        if getattr(self, "photo_alignment_needed", False):
+                            self._request_photo_alignment(obstacle_id, mission)
+                            return None
                         continue
                     current = distance
                     if self.capture_settle > 0:
@@ -1097,6 +1153,23 @@ class Task1:
                 mission, obstacle_id, original, temporary_moves,
             )
         return result
+
+    def _request_photo_alignment(self, obstacle_id, mission):
+        """Keep this photo pending while PC plans a different checked approach."""
+        if not self.feedback_control.enabled:
+            self._halt_mission("Photo alignment requires PC feedback")
+            return
+        report = dict(mission.progress)
+        _, pose = mission.report_pose(self.stm)
+        report.update(pose)
+        report.update(self._read_ir_snapshot())
+        report["ultrasonic_cm"] = self._read_ultrasonic_cm()
+        report["alignment_requested"] = True
+        pending = self.feedback_control.arm(report)
+        self.pc.send("PROGRESS," + json.dumps(report, separators=(",", ":")))
+        decision = self._wait_for_feedback(pending, mission, report["segment_index"])
+        if decision != "replace" and not self.halted:
+            self._halt_mission("PC did not provide a verified photo-alignment route")
 
     # ══ Thread: Android receive ═══════════════════════════════════════════════
 
@@ -1194,6 +1267,7 @@ class Task1:
                         self.instruction_mission = None
                         self.feedback_control.cancel("New BEGIN")
                         self._completed_photo_count = 0
+                        self.unsuccessful_photo_ids = []
                         # A fresh BEGIN clears a previous halt: the operator has
                         # seen the failure and is restarting deliberately.
                         self.halted = False
@@ -1206,10 +1280,7 @@ class Task1:
                         )
                         continue
 
-                    self._send_start_status()
-
-                    if not self._send_next_segment():
-                        logging.warning("Android: BEGIN received but no segments to send.")
+                    self._request_mission_start()
 
                 elif tag in ("S", "STOP"):
                     # Android's stop button sends lowercase `s` on current builds.
@@ -1245,7 +1316,7 @@ class Task1:
                     continue
 
                 tag = msg.split(",", 1)[0]
-                if tag in ("CONTINUE", "REPLACE", "SKIP", "HOLD"):
+                if tag in ("WAIT", "CONTINUE", "REPLACE", "SKIP", "HOLD"):
                     try:
                         payload = json.loads(msg.split(",", 1)[1])
                     except (IndexError, json.JSONDecodeError):
@@ -1340,9 +1411,7 @@ class Task1:
                     # If Android already sent BEGIN but PATH hadn't arrived yet,
                     # kick off the first segment now
                     if self.started and self.segments_index == 0:
-                        self._send_start_status()
-                        if not self._send_next_segment():
-                            logging.warning("PC: PATH arrived but no segments to send.")
+                        self._request_mission_start()
 
                 elif msg.startswith("OBJECT"):
                     # ── PC replied with a detection result ────────────────────
@@ -1416,6 +1485,17 @@ class Task1:
                 # Android between loop iterations; this check ensures the 20 s
                 # deadline begins only after that specific line is in flight.
                 if not self.stm.awaiting_reply:
+                    with self._idx_lock:
+                        start_pending = getattr(self, "_start_pending", False)
+                        self._start_pending = False
+                        start_pending = (start_pending and self.started and not self.halted
+                                         and self.path_ready.is_set()
+                                         and self.segments_index == 0)
+                    if start_pending:
+                        self._send_start_status()
+                        if not self._send_next_segment() and not self.halted:
+                            logging.warning("Mission start requested but no instruction was sent.")
+                        continue
                     sleep(0.02)
                     continue
 
@@ -1527,6 +1607,7 @@ class Task1:
                             mission.progress["remaining_photo_ids"] = remaining_photo_ids
                             mission.progress["plan_id"] = getattr(self, "plan_id", None)
                             mission.progress.update(self._read_ir_snapshot())
+                            mission.progress["ultrasonic_cm"] = self._read_ultrasonic_cm()
                             finished_obstacle = (
                                 self._obstacle_for_segment(just_finished)
                                 if just_finished is not None else None
@@ -1564,6 +1645,10 @@ class Task1:
                         self._detect_with_distance_retry(obstacle_id, mission)
                         if self.halted:
                             continue
+                        if self.instruction_mission is not mission:
+                            if not self._send_next_segment():
+                                self._halt_mission("Could not start photo-alignment route")
+                            continue
                         self._completed_photo_count += max(
                             1, getattr(self, "_last_capture_attempts", 0)
                         )
@@ -1584,6 +1669,9 @@ class Task1:
                         shots = self._completed_photo_count
                         self.pc.send(f"STITCH,{shots}\n")
                         self.android.send("STATUS,DONE")
+                        if getattr(self, "unsuccessful_photo_ids", []):
+                            logging.warning("Mission finished with unsuccessful targets: %s",
+                                            self.unsuccessful_photo_ids)
                         self.started = False
 
                         if self.a5_mode:

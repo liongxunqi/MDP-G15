@@ -168,7 +168,7 @@ class MonitorUnit(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertEqual(reply.split(",", 1)[0], "CONTINUE")
 
-    def test_unsafe_preflight_uses_legacy_continue_fallback(self):
+    def test_unsafe_preflight_never_continues_on_recovery_failure(self):
         m = pm.PlanMonitor(
             self.PLAN,
             lambda current, report: None,
@@ -180,8 +180,8 @@ class MonitorUnit(unittest.TestCase):
         body = json.loads(payload)
         body["event"] = "instruction_preflight"
         reply = m.handle(json.dumps(body))
-        self.assertEqual(reply.split(",", 1)[0], "CONTINUE")
-        self.assertEqual(m.holds, 0)
+        self.assertEqual(reply.split(",", 1)[0], "HOLD")
+        self.assertEqual(m.holds, 1)
 
     def test_unsafe_photo_adjustment_is_skipped_not_replanned(self):
         calls = []
@@ -200,6 +200,75 @@ class MonitorUnit(unittest.TestCase):
         self.assertEqual(reply.split(",", 1)[0], "SKIP")
         self.assertEqual(calls, [])
         self.assertEqual(m.skips, 1)
+
+    def test_us_mismatch_requests_at_most_three_alignment_routes(self):
+        plan = {"segments": [["F10", "S"]], "segment_obstacles": ["4"],
+                "expected": [[[500, 500, 0], [500, 500, 0]]],
+                "selected_standoffs": {"4": 30},
+                "ultrasonic_adjustments": {"4": True}, "camera_to_sensor_cm": 10.5}
+        calls = []
+        monitor = pm.PlanMonitor(plan, lambda current, report: calls.append(report) or None)
+        body = json.loads(progress(0, 1, "S", 5, 5, 0, fid="align"))
+        body.update(segment_completed=True, ultrasonic_cm=120)
+        for _ in range(4):
+            self.assertTrue(monitor.handle(json.dumps(body)).startswith("HOLD,"))
+        self.assertEqual(len(calls), 4)
+        self.assertTrue(all(p["alignment_recovery"] for p in calls))
+        self.assertFalse(any(p.get("force_defer") for p in calls[:3]))
+        self.assertTrue(calls[-1]["force_defer"])
+
+    def test_repeated_failed_photo_pose_does_not_replay_alignment(self):
+        plan = {"segments": [["S"]], "segment_obstacles": ["2"],
+                "expected": [[[35, 345, 0]]], "selected_standoffs": {"2": 30},
+                "ultrasonic_adjustments": {"2": True}}
+        calls = []
+        monitor = pm.PlanMonitor(plan, lambda current, report: calls.append(report))
+        body = json.loads(progress(0, 0, "S", .23, 4.76, 359.3, fid="a"))
+        body.update(segment_completed=True, ultrasonic_cm=101, alignment_requested=True)
+        monitor.handle(json.dumps(body))
+        body.update(feedback_id="b", y_grid=4.78, ultrasonic_cm=153)
+        monitor.handle(json.dumps(body))
+        self.assertFalse(calls[0].get("force_defer", False))
+        self.assertTrue(calls[1]["force_defer"])
+
+    def test_deferred_preflight_does_not_force_defer_at_replacement_cap(self):
+        plan = {"segments": [["S"]], "segment_obstacles": ["2"],
+                "expected": [[[500, 500, 0]]], "deferred_segments": [0]}
+        calls = []
+        monitor = pm.PlanMonitor(plan, lambda current, report: calls.append(report))
+        monitor.replacements = pm.MAX_REPLACEMENTS
+        body = json.loads(progress(0, -1, "S", 5, 5, 0, fid="route"))
+        body.update(event="instruction_preflight")
+        monitor.handle(json.dumps(body))
+        self.assertFalse(calls[0].get("force_defer", False))
+
+    def test_ir_at_replacement_cap_never_continues(self):
+        plan = {"segments": [["F10", "FR45", "S"]],
+                "segment_obstacles": ["4"],
+                "expected": [[[500, 500, 0]] * 3]}
+        monitor = pm.PlanMonitor(plan, lambda *args: None)
+        monitor.replacements = pm.MAX_REPLACEMENTS
+        reply = monitor.handle(progress(0, 0, "F10", 5, 5, 0, fid="cap", ir_left_cm=12))
+        self.assertTrue(reply.startswith("HOLD,"))
+
+    def test_previous_pose_is_before_last_movement_not_before_stop(self):
+        plan = {"segments": [["F10", "S"]], "segment_obstacles": ["4"],
+                "expected": [[[500, 600, 0], [500, 600, 0]]]}
+        monitor = pm.PlanMonitor(plan)
+        body = json.loads(progress(0, -1, "F10", 5, 5, 0))
+        body["event"] = "instruction_preflight"
+        monitor.handle(json.dumps(body))
+        monitor.handle(progress(0, 0, "F10", 5, 6, 0))
+        monitor.handle(progress(0, 1, "S", 5, 6, 0))
+        self.assertEqual(monitor._previous_pose, [500, 500, 0])
+
+    def test_deferred_preflight_requires_replacement_even_without_drift(self):
+        plan = {"segments": [["S"]], "segment_obstacles": ["4"],
+                "expected": [[[500, 500, 0]]], "deferred_segments": [0]}
+        monitor = pm.PlanMonitor(plan, lambda *args: None)
+        body = json.loads(progress(0, -1, "S", 5, 5, 0, fid="deferred"))
+        body["event"] = "instruction_preflight"
+        self.assertTrue(monitor.handle(json.dumps(body)).startswith("HOLD,"))
 
     def test_boundary_lookahead_replaces_before_the_real_2009mm_overrun(self):
         # Physical run 20261008_112200: after F10 the robot was only 72 mm off
@@ -532,6 +601,11 @@ def emulate_rpi(server, out, feedback, turn_bias=(0.0, 0.0)):
                 )  + "\n").encode())
                 if feedback:                              # stall here until the PC decides
                     reply = f.readline().decode().strip()
+                    if reply.startswith("WAIT,"):
+                        guard = json.loads(reply.split(",", 1)[1])
+                        assert guard == {"feedback_id": fid, "segment_index": si,
+                                         "instruction_index": ii}
+                        reply = f.readline().decode().strip()
                     tag, _, body = reply.partition(",")
                     try:
                         d = json.loads(body)

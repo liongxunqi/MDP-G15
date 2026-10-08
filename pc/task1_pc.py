@@ -100,8 +100,8 @@ from path_planner import (  # noqa: E402
     RPI_ANCHOR_Y_MM,
     assess_primitive_safety,
     plan_mission,
-    plan_segment_recovery,
 )
+from recovery_policy import recover_route  # noqa: E402
 
 # Must match whatever profile is actually running on the STM (?STAT).
 ARC_PROFILE = int(os.getenv("STM_ARC_PROFILE", "0"))
@@ -346,6 +346,15 @@ def main() -> None:
                     )
                     continue
             active_monitor = selected_monitor
+            try:
+                request = json.loads(payload_text)
+                if request.get("awaiting_decision"):
+                    guard = {k: request[k] for k in
+                             ("feedback_id", "segment_index", "instruction_index")}
+                    if not rpi.send("WAIT," + json.dumps(guard)):
+                        break
+            except (ValueError, KeyError, TypeError):
+                pass
             reply = selected_monitor.handle(payload_text)
             if reply is not None and not rpi.send(reply):
                 break
@@ -407,7 +416,7 @@ def main() -> None:
             monitor = PlanMonitor(
                 path,
                 recovery_planner=lambda current_plan, progress, obs=obstacle_snapshot: (
-                    plan_segment_recovery(
+                    recover_route(
                         current_plan, obs, progress, arc_profile=ARC_PROFILE,
                     )
                 ),

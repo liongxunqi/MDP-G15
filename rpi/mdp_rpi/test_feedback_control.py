@@ -18,6 +18,16 @@ def echo(progress):
 
 
 class FeedbackControlTests(unittest.TestCase):
+    def test_wait_marks_timeout_unsafe_without_completing_decision(self):
+        self.assertTrue(self.control.submit("WAIT", echo(self.progress)))
+        self.assertTrue(self.control.waiting)
+        self.pending["deadline"] = 0
+        self.assertEqual(self.control.wait(self.pending)[0], "HOLD")
+
+    def test_wait_then_continue_is_accepted(self):
+        self.assertTrue(self.control.submit("WAIT", echo(self.progress)))
+        self.assertTrue(self.control.submit("CONTINUE", echo(self.progress)))
+        self.assertEqual(self.control.wait(self.pending)[0], "CONTINUE")
     def setUp(self):
         self.control = FeedbackControl(True, 1)
         self.progress = {"segment_index": 0, "instruction_index": 1}
@@ -110,6 +120,105 @@ def run_task(task):
 
 
 class TaskFeedbackTests(unittest.TestCase):
+    def test_deferred_target_cannot_be_captured_on_continue(self):
+        task = bare_task([["S"], ["S"]])
+        self.responder(task, "REPLACE", {
+            "segments": [["F1", "S"], ["S"]], "segment_obstacles": ["8", "7"],
+            "deferred_segments": [1],
+        })
+        run_task(task)
+        self.assertTrue(task.halted)
+        task._detect_and_send_image.assert_called_once_with("8")
+
+    def test_deferred_target_replans_after_real_photo_then_captures(self):
+        task = bare_task([["S"], ["S"]])
+        initial = [True]
+        def send(message):
+            if not message.startswith("PROGRESS,"):
+                return
+            report = json.loads(message.split(",", 1)[1])
+            body = echo(report)
+            action = "CONTINUE"
+            if initial[0]:
+                initial[0] = False
+                action = "REPLACE"
+                body.update(segments=[["F1", "S"], ["S"]],
+                            segment_obstacles=["8", "7"], deferred_segments=[1])
+            elif report["event"] == "instruction_preflight":
+                task._detect_and_send_image.assert_called_once_with("8")
+                self.assertEqual(report["remaining_photo_ids"], ["7"])
+                action = "REPLACE"
+                body.update(segments=[["R1", "S"]], segment_obstacles=["7"], deferred_segments=[])
+            task.feedback_control.submit(action, body)
+        task.pc.send.side_effect = send
+        run_task(task)
+        self.assertFalse(task.halted)
+        self.assertEqual([c.args[0] for c in task._detect_and_send_image.call_args_list], ["8", "7"])
+
+    def test_begin_before_path_keeps_pc_reader_free_for_preflight_reply(self):
+        task = bare_task([["F10", "S"]], ["7"])
+        task.camera_to_sensor_cm = 10.5
+        task._cancel_path_watchdog = Mock()
+        task.preflight_enabled = True
+        task._send_start_status = Mock()
+        task._read_ir_snapshot = Mock(return_value={})
+        task._read_ultrasonic_cm = Mock(return_value=100)
+        payload = {"segments": task.segments, "segment_obstacles": ["7"],
+                   "start": START, "odometry_start": START}
+        task.pc.receive.side_effect = ["PATH," + json.dumps(payload), EndLoop()]
+        with self.assertRaises(EndLoop):
+            task.pc_receive()
+        self.assertTrue(task._start_pending)
+        self.assertFalse(task.feedback_control.waiting)
+        self.assertEqual(task.stm.events, [])
+
+        def send(message):
+            if message.startswith("PROGRESS,"):
+                report = json.loads(message.split(",", 1)[1])
+                task.pc.receive.side_effect = [
+                    "WAIT," + json.dumps(echo(report)),
+                    "CONTINUE," + json.dumps(echo(report)), EndLoop()]
+                with self.assertRaises(EndLoop):
+                    task.pc_receive()
+        task.pc.send.side_effect = send
+        with patch("task1.sleep", side_effect=EndLoop):
+            with self.assertRaises(EndLoop):
+                task.stm_receive()
+        self.assertFalse(task.halted)
+        self.assertIn(("F10",), task.stm.events)
+
+    def test_photo_alignment_keeps_target_pending(self):
+        task = bare_task()
+        mission = Mock()
+        mission.progress = {"event": "instruction_completed", "segment_index": 0,
+                            "instruction_index": 1, "segment_completed": True,
+                            "remaining_photo_ids": ["7", "8"]}
+        mission.report_pose.return_value = ("ROBOT,1,2,0", {
+            "x_grid": 1, "y_grid": 2, "heading_deg": 0})
+        task._read_ir_snapshot = Mock(return_value={})
+        task._read_ultrasonic_cm = Mock(return_value=118)
+        task._wait_for_feedback = Mock(return_value="replace")
+        task._halt_mission = Mock()
+        task._request_photo_alignment("7", mission)
+        report = json.loads(task.pc.send.call_args.args[0].split(",", 1)[1])
+        self.assertTrue(report["alignment_requested"])
+        self.assertEqual(report["remaining_photo_ids"], ["7", "8"])
+        self.assertEqual(report["ultrasonic_cm"], 118)
+        self.assertEqual(task._completed_photo_count, 0)
+        task._halt_mission.assert_not_called()
+
+    def test_photo_alignment_does_not_accept_continue(self):
+        task = bare_task()
+        mission = Mock()
+        mission.progress = {"segment_index": 0, "instruction_index": 1}
+        mission.report_pose.return_value = ("ROBOT,1,2,0", {})
+        task._read_ir_snapshot = Mock(return_value={})
+        task._read_ultrasonic_cm = Mock(return_value=118)
+        task._wait_for_feedback = Mock(return_value="continue")
+        task._halt_mission = Mock()
+        task._request_photo_alignment("7", mission)
+        task._halt_mission.assert_called_once()
+
     def responder(self, task, first_action="CONTINUE", replacement=None):
         reports = []
 
@@ -188,6 +297,8 @@ class TaskFeedbackTests(unittest.TestCase):
                 return ["65535", "65535"]
             if command == "?IRR":
                 return ["100", "100"]
+            if command == "?US":
+                return ["100"]
             raise AssertionError(command)
 
         task.stm.query_fields = Mock(side_effect=query_fields)
@@ -227,6 +338,29 @@ class TaskFeedbackTests(unittest.TestCase):
         run_task(task)
         self.assertEqual(counts, [("7", 3), ("8", 4)])
 
+    def test_reordered_replacement_photographs_both_in_new_order(self):
+        task = bare_task([["S"], ["S"]])
+        self.responder(task, "REPLACE", {
+            "segments": [["F1", "S"], ["R1", "S"]],
+            "segment_obstacles": ["8", "7"], "skipped_photo_ids": [],
+        })
+        run_task(task)
+        self.assertFalse(task.halted)
+        self.assertEqual([c.args[0] for c in task._detect_and_send_image.call_args_list], ["8", "7"])
+
+    def test_unreachable_target_is_reported_without_capture(self):
+        task = bare_task([["S"], ["S"]])
+        self.responder(task, "REPLACE", {
+            "segments": [["F1", "S"]], "segment_obstacles": ["8"],
+            "skipped_photo_ids": ["7"],
+        })
+        run_task(task)
+        self.assertFalse(task.halted)
+        self.assertEqual(task.unsuccessful_photo_ids, ["7"])
+        self.assertEqual(task._completed_photo_count, 1)
+        task._detect_and_send_image.assert_called_once_with("8")
+        task.android.send.assert_any_call("STATUS,DONE")
+
     def test_replacement_retains_prior_photo_count_but_not_prior_photo_target(self):
         task = bare_task([["S"], ["S"]])
         reports = []
@@ -260,6 +394,9 @@ class TaskFeedbackTests(unittest.TestCase):
             {"segments": [["S"], ["S"]], "segment_obstacles": ["7", "99"]},
             {"segments": [["S"]]},
             {"segments": [], "segment_obstacles": []},
+            {"segments": [["S"]], "segment_obstacles": ["8"], "skipped_photo_ids": ["99"]},
+            {"segments": [["S"]], "segment_obstacles": ["8"], "skipped_photo_ids": ["7", "7"]},
+            {"segments": [["S"]], "segment_obstacles": ["8"], "skipped_photo_ids": ["8"]},
         ]:
             with self.subTest(replacement=replacement):
                 task = bare_task()

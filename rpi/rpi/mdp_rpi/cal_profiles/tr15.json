@@ -1,0 +1,138 @@
+{
+  "note": "",
+  "verified": false,
+  "checks": {
+    "straight": {
+      "converged": false,
+      "drift_cm": [
+        -1.7,
+        -2.4,
+        -2.3,
+        -3.2,
+        -3.0,
+        -3.2
+      ],
+      "distance_err_pct": -1.17,
+      "trim_us": 23
+    },
+    "gyro": {
+      "ratios": [
+        0.99833,
+        0.99504
+      ],
+      "asymmetry_pct": 0.33,
+      "from": 0.9963,
+      "to": 0.993
+    },
+    "radius": {
+      "target_cm": 29.6,
+      "rounds": [
+        {
+          "steer_l": 574,
+          "steer_r": 626,
+          "radius_r_cm": 29.6,
+          "radius_rf_cm": 29.31,
+          "radius_rr_cm": 29.9,
+          "home_r_cm": -1.0,
+          "radius_l_cm": 21.26,
+          "radius_lf_cm": 21.93,
+          "radius_lr_cm": 20.6,
+          "home_l_cm": 0.5
+        },
+        {
+          "steer_l": 514,
+          "steer_r": 626,
+          "radius_r_cm": 29.28,
+          "radius_rf_cm": 29.13,
+          "radius_rr_cm": 29.43,
+          "home_r_cm": 0.0,
+          "radius_l_cm": 25.38,
+          "radius_lf_cm": 24.7,
+          "radius_lr_cm": 26.05,
+          "home_l_cm": 1.3
+        },
+        {
+          "steer_l": 454,
+          "steer_r": 626,
+          "radius_r_cm": 29.66,
+          "radius_rf_cm": 29.21,
+          "radius_rr_cm": 30.12,
+          "home_r_cm": 0.0,
+          "radius_l_cm": 27.77,
+          "radius_lf_cm": 26.82,
+          "radius_lr_cm": 28.72,
+          "home_l_cm": -1.0
+        },
+        {
+          "steer_l": 426,
+          "steer_r": 626,
+          "radius_r_cm": 29.44,
+          "radius_rf_cm": 29.44,
+          "radius_rr_cm": 29.43,
+          "home_r_cm": 0.0,
+          "radius_l_cm": 29.46,
+          "radius_lf_cm": 29.66,
+          "radius_lr_cm": 29.25,
+          "home_l_cm": -0.3
+        }
+      ]
+    },
+    "brakes": {
+      "worst_deg": 3.9,
+      "by_direction": {
+        "FR": -0.5,
+        "RR": -3.9,
+        "FL": 1.8,
+        "RL": -0.5
+      },
+      "all": [
+        [
+          "FR90",
+          -0.5
+        ],
+        [
+          "RR90",
+          -3.9
+        ],
+        [
+          "FL90",
+          1.8
+        ],
+        [
+          "RL90",
+          -0.5
+        ]
+      ]
+    },
+    "square": {
+      "side_cm": 50,
+      "worst_corner_deg": 1.7,
+      "gyro_heading_err_deg": 1.7,
+      "floor_angle_deg": 0.0,
+      "gap_cm": 0.0,
+      "passed": false,
+      "when": "2026-09-13T10:29:09"
+    }
+  },
+  "decel_x10": 5513,
+  "lag_ms_x10": 41,
+  "trim_us": 23,
+  "gyro_x10000": 9930,
+  "steer_left_us": 426,
+  "steer_right_us": 626,
+  "taken": "2026-09-13T10:28:22",
+  "name": "tr15",
+  "arc_profile": 0,
+  "spread": {
+    "decel_x10": {
+      "sd": 89.9,
+      "min": 5330,
+      "max": 5624
+    },
+    "lag_ms_x10": {
+      "sd": 24.1,
+      "min": 18,
+      "max": 94
+    }
+  }
+}

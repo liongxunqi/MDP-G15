@@ -62,6 +62,35 @@ START = {"x": 2, "y": 2, "dir": "N"}
 
 
 class InstructionTests(unittest.TestCase):
+    def test_turn_always_pauses_two_seconds_before_gyro_queries(self):
+        task = Task1.__new__(Task1)
+        task.gyro_settle_enabled = True
+        task.gyro_settle_timeout = 1.0
+        task.gyro_settle_samples = 3
+        task.gyro_settle_rate_dps = 1.0
+        task.stm = Mock()
+        task.stm.query_fields.return_value = ["1", "0", "0"]
+        events = Mock()
+        events.attach_mock(task.stm.query_fields, "query")
+        with patch("task1.sleep") as pause:
+            events.attach_mock(pause, "pause")
+            task._wait_for_gyro_settle("FR45")
+        self.assertEqual(events.mock_calls[0], unittest.mock.call.pause(2.0))
+        self.assertEqual(task.stm.query_fields.call_count, 3)
+
+    def test_photo_motion_rejects_range_increase_after_forward_move(self):
+        task = Task1.__new__(Task1)
+        task.us_adjust_retries = 3
+        task.us_adjust_tolerance_cm = 3.0
+        task.us_adjust_max_step_cm = 30
+        task.us_settle_s = 0
+        task.camera_to_sensor_cm = 10.5
+        task._read_ultrasonic_cm = Mock(side_effect=[31, 40])
+        task._execute_photo_adjustment = Mock(return_value=True)
+        self.assertFalse(task._move_for_photo(Mock(), "2", 30))
+        self.assertTrue(task.photo_alignment_needed)
+        self.assertEqual(task._execute_photo_adjustment.call_count, 1)
+
     def test_fine_turn_checkpoints_are_valid_mission_instructions(self):
         mission = InstructionMission(
             [["FR15", "FL30", "RR15", "RL30", "S"]], START

@@ -74,6 +74,15 @@ class PlanMonitor:
         self._warned_segments = set()
         self._warned_no_plan = False
         self._warned_bad = False
+        self._last_pose = None
+        self._previous_pose = None
+        self._alignment_attempts = {}
+        self._failed_alignment_poses = {}
+        self._photo_endpoints = {}
+        if self.plan and self.expected:
+            for oid, poses in zip(self.plan.get("segment_obstacles", []), self.expected):
+                if oid is not None and poses:
+                    self._photo_endpoints[str(oid)] = list(poses[-1])
 
     # ── public ────────────────────────────────────────────────────────────────
 
@@ -96,6 +105,11 @@ class PlanMonitor:
         event = p.get("event")
         preflight = event == "instruction_preflight"
         photo_preflight = event == "photo_adjustment_preflight"
+        measured = [x_mm, y_mm, hdg]
+        if event == "instruction_completed" and token != "S":
+            self._previous_pose = self._last_pose
+        if preflight or event == "instruction_completed":
+            self._last_pose = measured
         deviation = None if preflight else self._compare(
             seg, ins, token, x_mm, y_mm, hdg
         ) if not photo_preflight else None
@@ -110,6 +124,48 @@ class PlanMonitor:
                 boundary_risk = self._preflight_safety_risk(p)
             elif boundary_risk is None:
                 boundary_risk = self._next_boundary_risk(seg, ins, x_mm, y_mm, hdg, p)
+            deferred_route = bool(preflight and self.plan and
+                                  seg in self.plan.get("deferred_segments", []))
+            if deferred_route:
+                boundary_risk = boundary_risk or {"reason": "deferred target needs live-pose route"}
+            alignment = False
+            oid = None
+            if p.get("segment_completed") and self.plan:
+                mapping = self.plan.get("segment_obstacles", [])
+                oid = str(mapping[seg]) if seg < len(mapping) and mapping[seg] is not None else None
+                selected = self.plan.get("selected_standoffs", {}).get(oid)
+                use_us = self.plan.get("ultrasonic_adjustments", {}).get(oid, False)
+                if use_us and selected is not None and "ultrasonic_cm" in p:
+                    us = self._number(p.get("ultrasonic_cm"))
+                    target = float(selected) - float(self.plan.get("camera_to_sensor_cm", 10.5))
+                    # Small range errors remain the existing bounded F/R correction.
+                    alignment = (p.get("alignment_requested", False) or us is None
+                                 or us == 65535 or us <= 0 or abs(us - target) > 30)
+                    if alignment:
+                        attempts = self._alignment_attempts.get(oid, 0)
+                        if attempts >= 3:
+                            p["force_defer"] = True
+                            logging.warning("Obstacle %s exhausted alignment attempts; trying other targets", oid)
+                        else:
+                            self._alignment_attempts[oid] = attempts + 1
+                            logging.warning("Obstacle %s US=%s expected %.1f cm; alignment recovery %d/3",
+                                            oid, us, target, attempts + 1)
+                        p["alignment_recovery"] = True
+                        if p.get("alignment_requested"):
+                            failed = self._failed_alignment_poses.setdefault(oid, [])
+                            repeated = any(
+                                math.hypot(x_mm - pose[0], y_mm - pose[1]) <= 25
+                                and abs((hdg - pose[2] + 180) % 360 - 180) <= 6
+                                for pose in failed
+                            )
+                            if repeated:
+                                p["force_defer"] = True
+                                logging.warning(
+                                    "Obstacle %s repeated alignment failure at the same pose; "
+                                    "not replaying the failed correction.", oid,
+                                )
+                            else:
+                                failed.append(measured)
             if photo_preflight:
                 action = "SKIP" if boundary_risk is not None else "CONTINUE"
                 if action == "SKIP":
@@ -129,28 +185,32 @@ class PlanMonitor:
                 (deviation[0] > POS_WARN_MM or abs(deviation[1]) > HDG_WARN_DEG)
             )
             if (self.recovery_planner is not None and
-                    (deviation_requires_recovery or boundary_risk is not None)):
+                    (deviation_requires_recovery or boundary_risk is not None or alignment)):
                 # The replacement cap prevents noisy odometry or a persistent
                 # sensor return from endlessly rewriting the route.
-                if self.replacements >= MAX_REPLACEMENTS:
+                if self.replacements >= MAX_REPLACEMENTS and not deferred_route:
                     logging.error(
-                        "Automatic replacement limit (%d) reached; continuing existing route.",
+                        "Automatic local replacement limit (%d) reached; trying other targets.",
                         MAX_REPLACEMENTS,
                     )
-                else:
+                    p["force_defer"] = True
+                if self.recovery_planner is not None:
                     try:
                         replacement = self._plan_replacement(p, boundary_risk)
                     except Exception:  # a planner bug must not consume the RPi's decision wait
-                        logging.exception("Recovery planner crashed; continuing existing route.")
+                        logging.exception("Recovery planner crashed; checking whether continuation is safe.")
                         replacement = None
                     if self._install_replacement(replacement):
-                        self.replacements += 1
+                        if not deferred_route:
+                            self.replacements += 1
                         body = {
                             "feedback_id": p["feedback_id"],
                             "segment_index": seg,
                             "instruction_index": ins,
                             "segments": replacement["segments"],
                             "segment_obstacles": replacement["segment_obstacles"],
+                            "skipped_photo_ids": replacement.get("skipped_photo_ids", []),
+                            "deferred_segments": replacement.get("deferred_segments", []),
                         }
                         logging.warning(
                             "Replacing remaining route after segment %d instruction %d; "
@@ -158,11 +218,8 @@ class PlanMonitor:
                             seg, ins, len(replacement["segments"]), self.replacements,
                         )
                         return "REPLACE," + json.dumps(body, separators=(",", ":"))
-                    if boundary_risk is not None:
-                        logging.error(
-                            "Boundary recovery could not produce a safe replacement; "
-                            "the existing route is being retained as a last resort."
-                        )
+            if boundary_risk is not None or alignment:
+                return self._hold_reply(p, seg, ins, "No verified recovery for unsafe movement or target alignment")
             self.continues += 1
             return "CONTINUE," + json.dumps(
                 {"feedback_id": p["feedback_id"], "segment_index": seg, "instruction_index": ins},
@@ -218,6 +275,14 @@ class PlanMonitor:
         repeat indefinitely.
         """
         report = dict(progress)
+        if self.plan is not None:
+            self.plan.setdefault("original_photo_endpoints", dict(self._photo_endpoints))
+        report["previous_pose"] = self._previous_pose
+        mappings = self.plan.get("segment_obstacles", [])
+        index = int(progress["segment_index"])
+        oid = mappings[index] if 0 <= index < len(mappings) else None
+        if oid is not None and str(oid) in self._photo_endpoints:
+            report["segment_goal"] = self._photo_endpoints[str(oid)]
         if boundary_risk is not None:
             report["blocked_token"] = boundary_risk.get("next_token")
             report["recovery_reason"] = boundary_risk.get("reason")
@@ -256,7 +321,7 @@ class PlanMonitor:
         except (KeyError, TypeError):
             valid = False
         if not valid:
-            logging.error("Recovery planner returned an invalid replacement; continuing existing route.")
+            logging.error("Recovery planner returned an invalid replacement; rejecting it.")
             return False
         self.plan = replacement
         self.expected = expected
@@ -391,6 +456,13 @@ class PlanMonitor:
         # Geometric look-ahead already observes the same segment boundary rule.
         if next_seg is not None and next_seg != seg:
             return None
+
+        us = self._number(progress.get("ultrasonic_cm"))
+        if (next_token and next_token.startswith("F") and next_token[1:].isdigit()
+                and us is not None and 0 < us < 65535
+                and float(next_token[1:]) + 5 > us):
+            return {"reason": "US forward clearance too small", "next_token": next_token,
+                    "next_segment_index": next_seg, "next_instruction_index": next_ins}
 
         if next_token and next_token[:2] in ("FR", "FL", "RR", "RL"):
             left_cm = self._number(progress.get("ir_left_cm"))

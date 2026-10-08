@@ -1080,6 +1080,45 @@ def _straight_distance_clear(x: float, y: float, theta: float, distance_mm: floa
     return True
 
 
+def buffer_escape_endpoint(plan, obstacles, progress, token):
+    """Validate a reverse-only escape from the 30 mm buffer, never the body.
+
+    Only obstacle padding is reduced to 20 mm. Arena checks remain unchanged.
+    Sample every millimetre and require the endpoint to regain normal clearance.
+    """
+    match = re.fullmatch(r"R(\d+)", str(token))
+    if match is None or not 1 <= int(match.group(1)) <= 20:
+        return None
+    sx, sy = _plan_frame_shift(plan)
+    x = float(progress["x_grid"]) * 100 - sx
+    y = float(progress["y_grid"]) * 100 - sy
+    theta = math.radians(90 - float(progress["heading_deg"]))
+    boxes = _collision_boxes([_obstacle_aabb_mm(o) for o in obstacles])
+    if RPI_ARENA_GUARD:
+        m = RPI_ARENA_MARGIN_MM
+        boxes.ref_bounds = (m - sx, ARENA_MM - m - sx, m - sy, ARENA_MM - m - sy)
+    if _pose_clear(x, y, theta, boxes):
+        return None  # Not an escape: ordinary movement uses ordinary checks.
+    reduction = COLLISION_MARGIN_MM - 20.0
+    if reduction <= 0:
+        return None
+    relaxed = _collision_boxes([(a + reduction, b + reduction, c - reduction, d - reduction)
+                                for a, b, c, d in boxes])
+    relaxed.ref_bounds = boxes.ref_bounds
+    regained = False
+    for mm in range(int(match.group(1)) * 10 + 1):
+        px, py = x - mm * math.cos(theta), y - mm * math.sin(theta)
+        if not _pose_clear(px, py, theta, relaxed):
+            return None
+        clear = _pose_clear(px, py, theta, boxes)
+        if regained and not clear:
+            return None  # Never enter another buffer after escaping the first.
+        regained = regained or clear
+    if not clear:
+        return None
+    return [px + sx, py + sy, float(progress["heading_deg"]) % 360]
+
+
 def assess_primitive_safety(plan: dict, obstacles: List[dict], progress: dict,
                             token: str, arc_profile: int = PROFILE_TIGHT):
     """Check a primitive from the measured pose using the planner's full body.
@@ -1109,6 +1148,13 @@ def assess_primitive_safety(plan: dict, obstacles: List[dict], progress: dict,
         ))
 
     samples = [(x, y, theta)]
+    escape = plan.get("buffer_escape")
+    if (escape and progress.get("event") == "instruction_preflight"
+            and progress.get("segment_index") == 0
+            and command == escape and plan.get("segments", [[]])[0] == [escape, "S"]
+            and plan.get("segment_obstacles", [1])[0] is None
+            and buffer_escape_endpoint(plan, obstacles, progress, command) is not None):
+        return None
     match = re.fullmatch(r"(FR|FL|RR|RL|F|R)(\d+)", command)
     if command == "S":
         return None
@@ -1284,6 +1330,8 @@ def plan_segment_recovery(plan: dict, obstacles: List[dict], progress: dict,
         }, reverse=True)
         last_error = None
         for approach_length in approach_lengths:
+            if time.monotonic() >= progress.get("recovery_deadline", math.inf):
+                break
             goal = grid_search.ApproachLine(
                 tx, ty, target_theta, approach_length, RECOVERY_LATERAL_TOL_MM,
             )
@@ -1292,6 +1340,7 @@ def plan_segment_recovery(plan: dict, obstacles: List[dict], progress: dict,
                     ax, ay, actual_lattice, goal, TURN_RADIUS_MM[arc_profile], boxes,
                     ARENA_MM, ROBOT_HALF_LENGTH_MM, ROBOT_HALF_WIDTH_MM,
                     forbidden_first_tokens=forbidden_first,
+                    deadline=progress.get("recovery_deadline"),
                 )
             except grid_search.NoPathFound as exc:
                 last_error = exc
@@ -1327,7 +1376,7 @@ def plan_segment_recovery(plan: dict, obstacles: List[dict], progress: dict,
                 candidate_tokens, candidate_poses, candidate_terminal
             )
             break
-        else:
+        if not tokens:
             logging.error(
                 "Cannot safely recover segment %d: %s.",
                 seg, last_error or "no collision-free approach",

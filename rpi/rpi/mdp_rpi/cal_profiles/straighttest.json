@@ -1,0 +1,28 @@
+{
+  "note": "",
+  "checks": {
+    "straight": {
+      "converged": false,
+      "drift_cm": [
+        -2.2,
+        -4.3,
+        -2.2,
+        -3.0,
+        -1.4,
+        -0.3
+      ],
+      "distance_err_pct": 0.1,
+      "trim_us": 26
+    }
+  },
+  "verified": false,
+  "taken": "2026-09-12T18:28:31",
+  "decel_x10": 5446,
+  "lag_ms_x10": 61,
+  "trim_us": 26,
+  "gyro_x10000": 9988,
+  "steer_left_us": 425,
+  "steer_right_us": 586,
+  "name": "straighttest",
+  "arc_profile": 0
+}
