@@ -475,6 +475,20 @@ class SegmentRecoveryTests(unittest.TestCase):
         final = replacement["expected"][0][-1]
         self.assertLess(math.hypot(final[0] - 830, final[1] - 1650), 10)
 
+    def test_recovery_retries_with_a_thinner_margin(self):
+        # Drift had already put the robot inside the 30 mm envelope, so the
+        # full-margin search refused and the PC kept the colliding route.
+        margins = []
+
+        def fake(plan, obstacles, progress, arc_profile, margin_mm):
+            margins.append(margin_mm)
+            return None if margin_mm == pp.COLLISION_MARGIN_MM else {"ok": True}
+
+        with patch.object(pp, "_plan_segment_recovery", fake):
+            result = pp.plan_segment_recovery({}, [], {})
+        self.assertEqual(result, {"ok": True})
+        self.assertEqual(margins, [pp.COLLISION_MARGIN_MM, pp.RECOVERY_RELAXED_MARGIN_MM])
+
     def test_pending_photo_mismatch_refuses_replacement(self):
         plan = {
             "segments": [["F10", "S"]],
@@ -556,6 +570,73 @@ class AndroidPoseTests(unittest.TestCase):
         # Photo spots may hang past the edge; Android only accepts 0..18.
         self.assertEqual(self.entry(-50, 2150, math.pi)["x"], 0)
         self.assertEqual(self.entry(-50, 2150, math.pi)["y"], 18)
+
+
+
+class LiveReplanTests(unittest.TestCase):
+    """Situations from the 2026-10-09 robot runs (layout with 5 at (16,16))."""
+    OBSTACLES = [
+        {"id": 1, "x": 2.0, "y": 9.0, "d": 4}, {"id": 2, "x": 6.0, "y": 5.0, "d": 0},
+        {"id": 3, "x": 16.0, "y": 3.0, "d": 6}, {"id": 4, "x": 11.0, "y": 12.0, "d": 2},
+        {"id": 5, "x": 16.0, "y": 16.0, "d": 2}, {"id": 6, "x": 4.0, "y": 13.0, "d": 6},
+        {"id": 7, "x": 14.0, "y": 8.0, "d": 6},
+    ]
+    PLAN = {"frame_shift_mm": {"x": -114.0, "y": -125.0},
+            "start_mm": {"x": 114.0, "y": 125.0, "heading": "N"}}
+
+    def correction(self, wire_x, wire_y, heading, **sensors):
+        theta = math.radians(90.0 - heading)
+        return pp.estimate_pose_correction(
+            wire_x + 114.0, wire_y + 125.0, theta, sensors, self.OBSTACLES)
+
+    def test_ir_between_obstacles_4_and_7_gives_a_small_consistent_fix(self):
+        # 04:29:52: L=12 cm (obstacle 7), R=13 cm (obstacle 4).
+        dx, dy, _ = self.correction(1283, 1025, 224.1, ir_left_cm=12, ir_right_cm=13)
+        self.assertGreater(math.hypot(dx, dy), 5)
+        self.assertLess(math.hypot(dx, dy), 40)
+
+    def test_readings_far_from_the_map_are_ignored(self):
+        # 04:29:53, same odometry pose but L=25/R=23 (map ~13/~10): untrusted.
+        dx, dy, _ = self.correction(1283, 1025, 225.1, ir_left_cm=25, ir_right_cm=23)
+        self.assertEqual((dx, dy), (0.0, 0.0))
+        # 04:29:58: ultrasonic 120 cm where the map says ~25 cm (beam missed).
+        dx, dy, _ = self.correction(1562, 1124, 270.9, ultrasonic_cm=120)
+        self.assertEqual((dx, dy), (0.0, 0.0))
+
+    def test_ultrasonic_corrects_along_the_heading_only(self):
+        # Facing north at obstacle 1 (photo 1): reads 27 cm, map ~17 cm.
+        dx, dy, _ = self.correction(145, 377, 0.0, ultrasonic_cm=27)
+        self.assertLess(abs(dx), 1.0)
+        self.assertLess(dy, -50)          # robot is further back than odometry says
+
+    def test_stuck_between_obstacles_replans_inside_the_decision_wait(self):
+        # 04:29:57: recovery refused ("measured pose intersects") and the PC
+        # would have held the robot. A full replan must find the rest in time.
+        progress = {"x_grid": 13.58417982, "y_grid": 10.21025752, "heading_deg": 224.6,
+                    "remaining_photo_ids": ["4", "2", "7"],
+                    "ir_left_cm": 15, "ir_right_cm": 15}
+        deadline = pp.time.monotonic() + 5.5
+        result = pp.replan_from_pose(self.PLAN, self.OBSTACLES, progress, deadline)
+        self.assertLessEqual(pp.time.monotonic(), deadline + 0.5)
+        self.assertIsNotNone(result)
+        self.assertTrue(result["allow_skip"])
+        self.assertTrue(set(result["obstacle_ids"]) <= {4, 2, 7})
+        self.assertEqual(
+            [v for v in result["segment_obstacles"] if v is not None],
+            [str(v) for v in result["obstacle_ids"]],
+        )
+        # Expected poses stay in the RPi's raw odometry frame: the first one is
+        # within one move of where the robot reported itself.
+        first = result["expected"][0][0]
+        self.assertLess(math.hypot(first[0] - 1358.4, first[1] - 1021.0), 400)
+
+    def test_replan_never_targets_finished_obstacles(self):
+        progress = {"x_grid": 13.58417982, "y_grid": 10.21025752, "heading_deg": 224.6,
+                    "remaining_photo_ids": ["7"]}
+        result = pp.replan_from_pose(self.PLAN, self.OBSTACLES, progress,
+                                     pp.time.monotonic() + 5.5)
+        self.assertIsNotNone(result)
+        self.assertEqual(result["obstacle_ids"], [7])
 
 
 if __name__ == "__main__":

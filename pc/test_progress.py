@@ -37,6 +37,7 @@ import sys
 import threading
 import types
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -292,6 +293,113 @@ class MonitorUnit(unittest.TestCase):
         self.assertTrue(any("IR veto" in message
                             for message in self.cap.messages(logging.WARNING)))
 
+    def _blocked_plan_monitor(self, zero_margin_hit):
+        plan = {
+            "segments": [["F10", "FR45", "S"]],
+            "segment_obstacles": ["4"],
+            "expected": [[
+                [500.0, 500.0, 0.0],
+                [708.0, 414.0, 45.0],
+                [708.0, 414.0, 45.0],
+            ]],
+        }
+        return pm.PlanMonitor(
+            plan,
+            lambda current, report: None,          # no recovery route exists
+            safety_checker=lambda plan, report, token: {
+                "reason": "swept footprint intersects", "next_token": token,
+            },
+            collision_checker=lambda plan, report, token: (
+                {"reason": "hit"} if zero_margin_hit else None
+            ),
+        )
+
+    def test_full_replan_replaces_the_route_before_any_hold(self):
+        m = self._blocked_plan_monitor(zero_margin_hit=True)
+        calls = []
+        replacement = {
+            "segments": [["R5", "S"]], "segment_obstacles": ["4"],
+            "expected": [[[500.0, 450.0, 0.0], [500.0, 450.0, 0.0]]],
+            "frame_shift_mm": {"x": -10.0, "y": 0.0},
+            "allow_skip": True, "skipped_photo_ids": [],
+            "selected_standoffs": {"4": 25},
+        }
+        m.replanner = lambda plan, report, deadline: (
+            calls.append(deadline - pm.time.monotonic()) or replacement)
+        reply = m.handle(progress(0, 0, "F10", 5.0, 5.0, 0.0, fid="replan",
+                                  remaining_photo_ids=["4"], decision_timeout_s=7.0))
+        action, body = reply.split(",", 1)
+        self.assertEqual(action, "REPLACE")
+        body = json.loads(body)
+        self.assertTrue(body["allow_skip"])
+        self.assertEqual(body["selected_standoffs"], {"4": 25})
+        self.assertEqual(m.plan["frame_shift_mm"], {"x": -10.0, "y": 0.0})
+        # Answers inside the RPi's 7 s wait, with the reply margin kept.
+        self.assertLess(calls[0], 7.0 - pm.REPLAN_REPLY_MARGIN_S + 0.01)
+
+    def test_failed_full_replan_still_holds(self):
+        m = self._blocked_plan_monitor(zero_margin_hit=True)
+        m.replanner = lambda plan, report, deadline: None
+        reply = m.handle(progress(0, 0, "F10", 5.0, 5.0, 0.0, fid="noroute",
+                                  remaining_photo_ids=["4"]))
+        self.assertEqual(reply.split(",", 1)[0], "HOLD")
+
+    def test_replan_switch_off_goes_straight_to_hold(self):
+        m = self._blocked_plan_monitor(zero_margin_hit=True)
+        m.replanner = lambda plan, report, deadline: self.fail("replanned while off")
+        with patch.object(pm, "REPLAN_ON_HOLD", False):
+            reply = m.handle(progress(0, 0, "F10", 5.0, 5.0, 0.0, fid="off",
+                                      remaining_photo_ids=["4"]))
+        self.assertEqual(reply.split(",", 1)[0], "HOLD")
+
+    def test_unrecoverable_real_collision_holds_instead_of_continuing(self):
+        m = self._blocked_plan_monitor(zero_margin_hit=True)
+        reply = m.handle(progress(0, 0, "F10", 5.0, 5.0, 0.0, fid="hit",
+                                  remaining_photo_ids=["4"]))
+        self.assertEqual(reply.split(",", 1)[0], "HOLD")
+
+    def test_margin_only_intrusion_still_continues(self):
+        m = self._blocked_plan_monitor(zero_margin_hit=False)
+        reply = m.handle(progress(0, 0, "F10", 5.0, 5.0, 0.0, fid="margin",
+                                  remaining_photo_ids=["4"]))
+        self.assertEqual(reply.split(",", 1)[0], "CONTINUE")
+
+    def test_repeated_ir_veto_at_the_same_spot_stops_replacing(self):
+        # Run 04:11: the recovery route started with the same arc from the same
+        # gap, was vetoed again, and the loop used up all 12 replacements.
+        plan = {
+            "segments": [["F10", "FL45", "S"]],
+            "segment_obstacles": ["4"],
+            "expected": [[
+                [500.0, 500.0, 0.0],
+                [292.0, 414.0, 315.0],
+                [292.0, 414.0, 315.0],
+            ]],
+        }
+        replacement = {
+            "segments": [["R5", "FL45", "S"]],
+            "segment_obstacles": ["4"],
+            "expected": [[
+                [500.0, 450.0, 0.0],
+                [292.0, 364.0, 315.0],
+                [292.0, 364.0, 315.0],
+            ]],
+        }
+        calls = []
+        m = pm.PlanMonitor(
+            plan,
+            lambda current, report: calls.append(report) or replacement,
+        )
+        close_ir = dict(remaining_photo_ids=["4"], ir_left_cm=18,
+                        ir_right_cm=65535, ir_left_raw=1900, ir_right_raw=100)
+        first = m.handle(progress(0, 0, "F10", 5.0, 5.0, 0.0, fid="a", **close_ir))
+        second = m.handle(progress(0, 0, "R5", 5.0, 4.5, 0.0, fid="b", **close_ir))
+        self.assertEqual(first.split(",", 1)[0], "REPLACE")
+        self.assertEqual(second.split(",", 1)[0], "CONTINUE")
+        self.assertEqual(len(calls), 1)
+        self.assertTrue(any("treating it as a known obstacle" in message
+                            for message in self.cap.messages(logging.WARNING)))
+
     def test_ir_vetoes_a_15_degree_checkpoint_too(self):
         plan = {
             "segments": [["F10", "FR15", "S"]],
@@ -382,8 +490,10 @@ class MonitorUnit(unittest.TestCase):
             return None
 
         m = pm.PlanMonitor(plan, recover)
+        # 36 mm off: inside PROGRESS_POS_WARN_MM, so only the look-ahead could
+        # ask for recovery here.
         reply = m.handle(progress(
-            0, 0, "S", 17.16, 11.02, 179.8, fid="between-segments",
+            0, 0, "S", 16.80, 11.10, 179.8, fid="between-segments",
             remaining_photo_ids=["2", "4"],
         ))
         self.assertEqual(reply.split(",", 1)[0], "CONTINUE")

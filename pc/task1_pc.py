@@ -101,6 +101,7 @@ from path_planner import (  # noqa: E402
     assess_primitive_safety,
     plan_mission,
     plan_segment_recovery,
+    replan_from_pose,
 )
 
 # Must match whatever profile is actually running on the STM (?STAT).
@@ -180,9 +181,9 @@ def stitch_images(image_paths: list, output_path: str) -> None:
 
 # ── Socket helpers ─────────────────────────────────────────────────────────────
 
-# The RPi gives up on a PATH reply after PATH_TIMEOUT_S (30 s, rpi/mdp_rpi/task1.py).
+# The RPi gives up on a PATH reply after PATH_TIMEOUT_S (45 s, rpi/mdp_rpi/task1.py).
 # A plan slower than this may arrive after the RPi has stopped listening for it.
-RPI_PATH_TIMEOUT_S = float(os.getenv("PATH_TIMEOUT_S", "30.0"))
+RPI_PATH_TIMEOUT_S = float(os.getenv("PATH_TIMEOUT_S", "45.0"))
 
 
 def _connection_lost_msg(doing: str, message, exc: BaseException) -> str:
@@ -354,6 +355,11 @@ def main() -> None:
         if msg.startswith("PHOTO_PROGRESS,"):
             try:
                 report = json.loads(msg.split(",", 1)[1])
+                if report.get("event") == "photo_retry":
+                    logging.warning("Photo retry for obstacle %s: %s",
+                                    report.get("obstacle_id", "?"),
+                                    report.get("message", "?"))
+                    continue
                 logging.info(
                     "Photo adjustment: obstacle %s attempt %s used %s from US=%s cm "
                     "-> (%.2f, %.2f) @ %.1f deg.",
@@ -414,6 +420,15 @@ def main() -> None:
                 safety_checker=lambda current_plan, progress, token,
                                       obs=obstacle_snapshot: assess_primitive_safety(
                     current_plan, obs, progress, token, arc_profile=ARC_PROFILE,
+                ),
+                collision_checker=lambda current_plan, progress, token,
+                                         obs=obstacle_snapshot: assess_primitive_safety(
+                    current_plan, obs, progress, token, arc_profile=ARC_PROFILE,
+                    margin_mm=0.0,
+                ),
+                replanner=lambda current_plan, progress, deadline,
+                                 obs=obstacle_snapshot: replan_from_pose(
+                    current_plan, obs, progress, deadline, arc_profile=ARC_PROFILE,
                 ),
             )
             monitors[path["plan_id"]] = monitor

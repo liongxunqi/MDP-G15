@@ -391,9 +391,11 @@ authoritative wherever it disagrees with this table.
 | `DETECT_TIMEOUT_S` | 30.0 | How long to wait for the PC's YOLO OBJECT reply per attempt |
 | `TASK1_CAPTURE_SETTLE_S` | 2.0 | Chassis settling time before each Task 1 photograph |
 | `DEBOUNCE_DELAY_S` | 1.0 | How long after last obstacle before auto-sending to PC |
-| `PATH_TIMEOUT_S` | 30.0 | Give up waiting for the PC's `PATH` and report `STATUS,FAILED` |
+| `PATH_TIMEOUT_S` | 45.0 | Give up waiting for the PC's `PATH` and report `STATUS,FAILED` |
 | `TASK1_FEEDBACK_WAIT` | 0 | Set to 1 to require a PC decision after every instruction |
 | `TASK1_FEEDBACK_TIMEOUT_S` | 30.0 | Positive finite seconds to wait for a matching decision |
+| `TASK1_ZERO_EACH_RUN` | 1 | `!ZERO` the heading on every BEGIN. Set the robot down at the start pose and keep it still before pressing Start |
+| `TASK1_ZERO_SETTLE_TIMEOUT_S` | 2.0 | How long BEGIN waits for a still gyro before that `!ZERO` |
 
 A.5 only (`task_a5.py`):
 
@@ -440,6 +442,7 @@ Example JSON (transmit on ONE line after `PROGRESS,`):
   "y_grid": 3.25,
   "heading_deg": 92.6,
   "remaining_photo_ids": ["7"],
+  "ultrasonic_cm": 27,
   "awaiting_decision": true,
   "decision_timeout_s": 30.0,
   "feedback_id": "opaque-unique-value"
@@ -455,6 +458,8 @@ Example JSON (transmit on ONE line after `PROGRESS,`):
   `PATH.odometry_start` object. The planner sends that origin explicitly; the
   RPi has no fixed `(2,2)` fallback. STM odometry measures the rear-axle
   midpoint, so the planner owns any required reference-point conversion.
+- `ultrasonic_cm` (null when there is no echo) and the IR fields are read after
+  every move so the PC can check the odometry pose against the obstacle map.
 - In telemetry-only mode `awaiting_decision` is false and no feedback ID is
   issued. Do not send decisions in that mode.
 - Echo the feedback ID and completed indexes exactly. A fresh feedback ID is
@@ -483,6 +488,14 @@ REPLACE,{"feedback_id":"opaque-unique-value","segment_index":0,"instruction_inde
   origin and completed-photo count, resets path indexes to zero and immediately
   executes the first replacement instruction. Do not send a separate CONTINUE.
   `dirs` and `obstacle_ids` are not required or used for replacement.
+- `REPLACE` with `"allow_skip": true` is a full replan from the live pose,
+  sent where the PC would otherwise `HOLD`. Its IDs may be any subset of
+  `remaining_photo_ids`, in any order (never new or repeated IDs); the rest are
+  logged as skipped. It may also carry `photo_standoffs`,
+  `selected_standoffs`, `ultrasonic_adjustments` and `selected_view_angles`
+  for its obstacles, which replace the PATH values for those IDs.
+- `HOLD` halts the mission. The PC sends it only when the next move would hit
+  an obstacle and neither recovery nor a full replan found a route.
 - At a completed photo boundary, PROGRESS is sent BEFORE the photo. REPLACE
   defers that photo to its assignment in the replacement route. To photograph
   at the current position, a replacement segment `["S"]` with that obstacle ID

@@ -37,6 +37,7 @@ from stm_tokens import (
     REAR_AXLE_TO_CAMERA_CM,
     REAR_AXLE_TO_SENSOR_CM,
     TURN_RADIUS_MM,
+    US_BIAS_CM,
     chunk_tokens,
     fwd,
     rev,
@@ -71,6 +72,11 @@ RECOVERY_LATERAL_TOL_MM = 25.0
 RECOVERY_MAX_HEADING_SNAP_DEG = float(os.getenv(
     "RECOVERY_MAX_HEADING_SNAP_DEG", "8"
 ))
+# Second attempt when a recovery cannot be planned with the full margin. The
+# robot is physically already inside the 30 mm envelope (odometry drift), and
+# refusing to recover left the PC sending CONTINUE into the predicted collision.
+# A route planned with a thinner margin is still safer than the old route.
+RECOVERY_RELAXED_MARGIN_MM = float(os.getenv("RECOVERY_RELAXED_MARGIN_MM", "10"))
 
 # Task 1 stays on the calibrated 45-degree heading lattice. The fine-lattice
 # implementation remains available for isolated development tests, but mission
@@ -100,11 +106,16 @@ EDGE_POSITION_BIAS_DEG = 8.0
 EDGE_APPROACH_LATERAL_TOL_MM = 5.0
 EDGE_LEG_SEARCH_BUDGET_S = 1.0
 COMPACT_VIEW_DISTANCES_CM = (30, 25, 35)
-COMPACT_SEARCH_SLICE_S = 3.0
-# The RPi gives up on PATH after PATH_TIMEOUT_S (30 s). Stop trying other
+# Per-stage A* slice for targets the tour skipped. 3 s was not enough on the
+# robot laptop: obstacle 6 at (4,13) W was dropped there but found on a faster PC.
+COMPACT_SEARCH_SLICE_S = float(os.getenv("COMPACT_SEARCH_SLICE_S", "5"))
+# The RPi gives up on PATH after PATH_TIMEOUT_S (45 s). Stop trying other
 # standoffs once this much time has gone and send the best plan so far.
-PLAN_TIME_BUDGET_S = 20.0
-PLAN_ASSEMBLY_DEADLINE_S = 28.0
+# Planning can run to the assembly deadline, so PATH_TIMEOUT_S must stay well
+# above it (leave ~10 s for debounce, transfer and a slow laptop).
+# Cutting these instead cost a reachable obstacle on the 2026-10-09 layout.
+PLAN_TIME_BUDGET_S = float(os.getenv("PLAN_TIME_BUDGET_S", "20"))
+PLAN_ASSEMBLY_DEADLINE_S = float(os.getenv("PLAN_ASSEMBLY_DEADLINE_S", "35"))
 
 EXHAUSTIVE_LIMIT = 8
 
@@ -247,11 +258,13 @@ def _viewing_pose(obstacle: dict, standoff_mm: float,
     )
 
 
-def _obstacle_aabb_mm(obstacle: dict) -> Tuple[float, float, float, float]:
-    """The obstacle grown by COLLISION_MARGIN_MM on every side."""
-    x0 = obstacle["x"] * 100.0 - COLLISION_MARGIN_MM
-    y0 = obstacle["y"] * 100.0 - COLLISION_MARGIN_MM
-    size = OBSTACLE_SIZE_MM + 2 * COLLISION_MARGIN_MM
+def _obstacle_aabb_mm(obstacle: dict,
+                      margin_mm: float = None) -> Tuple[float, float, float, float]:
+    """The obstacle grown by COLLISION_MARGIN_MM (or margin_mm) on every side."""
+    margin = COLLISION_MARGIN_MM if margin_mm is None else margin_mm
+    x0 = obstacle["x"] * 100.0 - margin
+    y0 = obstacle["y"] * 100.0 - margin
+    size = OBSTACLE_SIZE_MM + 2 * margin
     return (x0, y0, x0 + size, y0 + size)
 
 
@@ -1081,7 +1094,8 @@ def _straight_distance_clear(x: float, y: float, theta: float, distance_mm: floa
 
 
 def assess_primitive_safety(plan: dict, obstacles: List[dict], progress: dict,
-                            token: str, arc_profile: int = PROFILE_TIGHT):
+                            token: str, arc_profile: int = PROFILE_TIGHT,
+                            margin_mm: float = None):
     """Check a primitive from the measured pose using the planner's full body.
 
     Returns None when every sampled footprint is clear, otherwise a diagnostic
@@ -1100,7 +1114,7 @@ def assess_primitive_safety(plan: dict, obstacles: List[dict], progress: dict,
     except (KeyError, TypeError, ValueError):
         return {"reason": "invalid measured pose", "next_token": str(token)}
 
-    boxes = _collision_boxes([_obstacle_aabb_mm(o) for o in obstacles])
+    boxes = _collision_boxes([_obstacle_aabb_mm(o, margin_mm) for o in obstacles])
     if RPI_ARENA_GUARD:
         boxes.ref_bounds = _rpi_ref_bounds(Pose(
             float(plan.get("start_mm", {}).get("x", START_X_MM)),
@@ -1157,6 +1171,23 @@ def assess_primitive_safety(plan: dict, obstacles: List[dict], progress: dict,
 
 def plan_segment_recovery(plan: dict, obstacles: List[dict], progress: dict,
                           arc_profile: int = PROFILE_TIGHT) -> Optional[dict]:
+    """Recover with the full collision margin, then with a thinner one."""
+    replacement = _plan_segment_recovery(
+        plan, obstacles, progress, arc_profile, COLLISION_MARGIN_MM,
+    )
+    if replacement is None and RECOVERY_RELAXED_MARGIN_MM < COLLISION_MARGIN_MM:
+        logging.warning(
+            "Retrying recovery with a %.0f mm obstacle margin instead of %.0f mm.",
+            RECOVERY_RELAXED_MARGIN_MM, COLLISION_MARGIN_MM,
+        )
+        replacement = _plan_segment_recovery(
+            plan, obstacles, progress, arc_profile, RECOVERY_RELAXED_MARGIN_MM,
+        )
+    return replacement
+
+
+def _plan_segment_recovery(plan: dict, obstacles: List[dict], progress: dict,
+                           arc_profile: int, margin_mm: float) -> Optional[dict]:
     """Return a replacement that recovers the current segment endpoint.
 
     The completed prefix is discarded, the current segment is replaced by a
@@ -1211,7 +1242,7 @@ def plan_segment_recovery(plan: dict, obstacles: List[dict], progress: dict,
 
     target_theta = math.radians(90.0 - target_hdg)
     target_theta = grid_search._HEADINGS[grid_search._heading_index(target_theta)]
-    boxes = _collision_boxes([_obstacle_aabb_mm(o) for o in obstacles])
+    boxes = _collision_boxes([_obstacle_aabb_mm(o, margin_mm) for o in obstacles])
     if RPI_ARENA_GUARD:
         m = RPI_ARENA_MARGIN_MM
         boxes.ref_bounds = (
@@ -1378,12 +1409,28 @@ def plan_segment_recovery(plan: dict, obstacles: List[dict], progress: dict,
 
 
 def plan_mission(obstacles: List[dict], arc_profile: int = PROFILE_TIGHT,
-                 details: Optional[dict] = None) -> dict:
+                 details: Optional[dict] = None, *,
+                 start_pose: Optional["Pose"] = None,
+                 frame_shift: Optional[Tuple[float, float]] = None,
+                 target_ids=None,
+                 time_budget_s: Optional[float] = None,
+                 assembly_deadline_s: Optional[float] = None,
+                 start_margin_mm: Optional[float] = None) -> dict:
     """Plan Task 1. Pass a dict as `details` to get each photo's pose and
-    standoff back (tests and the simulator use it; the RPi does not)."""
+    standoff back (tests and the simulator use it; the RPi does not).
+
+    The keyword arguments replan mid-run (replan_from_pose): start from the
+    robot's live pose instead of the start zone, photograph only target_ids
+    (every obstacle still blocks), report positions with the given frame
+    shift, and finish within the given budgets. The first leg is checked
+    against obstacles grown by start_margin_mm, because the robot may already
+    be inside the normal margin."""
     t0 = time.monotonic()
+    budget_s = PLAN_TIME_BUDGET_S if time_budget_s is None else time_budget_s
+    deadline_s = PLAN_ASSEMBLY_DEADLINE_S if assembly_deadline_s is None else assembly_deadline_s
     radius_mm = TURN_RADIUS_MM[arc_profile]
-    start = Pose(START_X_MM, START_Y_MM, START_THETA)
+    mid_run = start_pose is not None
+    start = start_pose if mid_run else Pose(START_X_MM, START_Y_MM, START_THETA)
     # Every obstacle, the one being approached included: even the closest
     # photo pose (28 cm) is far outside its margin, so nothing needs excluding.
     obstacle_boxes = [_obstacle_aabb_mm(o) for o in obstacles]
@@ -1394,12 +1441,22 @@ def plan_mission(obstacles: List[dict], arc_profile: int = PROFILE_TIGHT,
     # Extra blockers for the leg leaving START. If the start pose already breaks
     # them (START_X_MM / START_Y_MM set so the body is over the line) they would
     # trap the search at its first step, so drop them and say so.
-    start_boxes = _collision_boxes(list(boxes) + _start_boxes(start))
-    start_boxes.ref_bounds = boxes.ref_bounds
-    # This is a per-leg hook for measured placement tolerance. It defaults to
-    # zero: the calculated 20 mm side gap keeps even the first sweep inside.
-    start_boxes.arena_overhang_mm = START_GUARD_TOL_MM
-    if not _pose_clear(start.x, start.y, start.theta, start_boxes):
+    if mid_run:
+        # No start-zone rules mid-run; only a thinner margin for the first leg.
+        start_boxes = _collision_boxes([
+            _obstacle_aabb_mm(o, start_margin_mm) for o in obstacles
+        ])
+        start_boxes.ref_bounds = boxes.ref_bounds
+        # Drift can report the body slightly over an arena line; let the
+        # first leg start there so it can drive back in.
+        start_boxes.arena_overhang_mm = REPLAN_START_OVERHANG_MM
+    else:
+        start_boxes = _collision_boxes(list(boxes) + _start_boxes(start))
+        start_boxes.ref_bounds = boxes.ref_bounds
+        # This is a per-leg hook for measured placement tolerance. It defaults to
+        # zero: the calculated 20 mm side gap keeps even the first sweep inside.
+        start_boxes.arena_overhang_mm = START_GUARD_TOL_MM
+    if not mid_run and not _pose_clear(start.x, start.y, start.theta, start_boxes):
         logging.warning(
             "Start pose is already outside the arena or over the start guard "
             f"({start}); not restricting the first leg. Check START_X_MM / START_Y_MM."
@@ -1411,7 +1468,10 @@ def plan_mission(obstacles: List[dict], arc_profile: int = PROFILE_TIGHT,
     diagonal_options: Dict[object, List[PhotoOption]] = {}
     eligible = []
     skipped = {}
+    wanted = None if target_ids is None else {str(v) for v in target_ids}
     for obs in obstacles:
+        if wanted is not None and str(obs.get("id")) not in wanted:
+            continue
         if obs.get("d") not in FACE_FROM_D:
             logging.info(f"Obstacle {obs.get('id')}: SKIP (d={obs.get('d')}).")
             continue
@@ -1470,7 +1530,7 @@ def plan_mission(obstacles: List[dict], arc_profile: int = PROFILE_TIGHT,
                       for option in head_options[obs["id"]]]
         compact_mode = _search_any_approach(
             start, candidates, radius_mm, start_boxes,
-            min(time.monotonic() + 1.0, t0 + PLAN_ASSEMBLY_DEADLINE_S),
+            min(time.monotonic() + 1.0, t0 + deadline_s),
         ) is None
         if compact_mode:
             logging.info("Normal start connection unavailable within probe budget; "
@@ -1486,7 +1546,7 @@ def plan_mission(obstacles: List[dict], arc_profile: int = PROFILE_TIGHT,
         sequence, unreachable = _plan_compact_sequence(
             start, visitable, head_options, diagonal_options,
             radius_mm, boxes, start_boxes,
-            t0 + PLAN_ASSEMBLY_DEADLINE_S,
+            t0 + deadline_s,
         )
         order = [item[0] for item in sequence]
         for obstacle, option, leg, relaxed in sequence:
@@ -1504,7 +1564,7 @@ def plan_mission(obstacles: List[dict], arc_profile: int = PROFILE_TIGHT,
     else:
         legs = _Legs(
             start, options, radius_mm, boxes,
-            t0 + PLAN_TIME_BUDGET_S, start_boxes,
+            t0 + budget_s, start_boxes,
         )
         order, choice, cache = _choose_tour(visitable, legs, options)
         reached, _ = _prefix_score(order, cache)
@@ -1518,7 +1578,7 @@ def plan_mission(obstacles: List[dict], arc_profile: int = PROFILE_TIGHT,
     # expected[i][j] = [x_mm, y_mm, heading_deg] the RPi should report after
     # instruction j of segment i: its frame (north = 0, clockwise positive).
     expected: List[List[List[float]]] = []
-    shift_x, shift_y = _frame_shift(start)
+    shift_x, shift_y = _frame_shift(start) if frame_shift is None else frame_shift
     photo_poses, standoffs = {}, {}
     safe_standoffs = {}
     ultrasonic_adjustments = {}
@@ -1544,11 +1604,11 @@ def plan_mission(obstacles: List[dict], arc_profile: int = PROFILE_TIGHT,
         sequence, unreachable = _plan_compact_sequence(
             cur_pose, pending, head_options, diagonal_options, radius_mm,
             boxes, start_boxes if cur_id == "START" else boxes,
-            t0 + PLAN_ASSEMBLY_DEADLINE_S,
+            t0 + deadline_s,
         )
         for obstacle in unreachable:
             reason = ("planning deadline reached" if time.monotonic() >=
-                      t0 + PLAN_ASSEMBLY_DEADLINE_S else "no route found within search limits")
+                      t0 + deadline_s else "no route found within search limits")
             skipped[obstacle["id"]] = reason
             logging.warning(
                 "Obstacle %s omitted: %s (%d head-on and %d diagonal photo options).",
@@ -1591,13 +1651,13 @@ def plan_mission(obstacles: List[dict], arc_profile: int = PROFILE_TIGHT,
                 ),
             )
             for candidate_index in alternatives:
-                if time.monotonic() > t0 + PLAN_ASSEMBLY_DEADLINE_S:
+                if time.monotonic() > t0 + deadline_s:
                     break
                 candidate = options[obs["id"]][candidate_index]
                 search_boxes = start_boxes if cur_id == "START" else boxes
                 candidate_leg = _search_leg(
                     cur_pose, candidate, radius_mm, search_boxes,
-                    deadline=t0 + PLAN_ASSEMBLY_DEADLINE_S,
+                    deadline=t0 + deadline_s,
                 )
                 if candidate_leg is not None:
                     option, leg = candidate, candidate_leg
@@ -1709,7 +1769,8 @@ def plan_mission(obstacles: List[dict], arc_profile: int = PROFILE_TIGHT,
         cur_pose = terminal
         cur_id = obs["id"]
 
-    logging.info(f"Planned {len(photo_poses)}/{len(obstacles)} photo(s) in "
+    logging.info(f"Planned {len(photo_poses)}/"
+                 f"{len(eligible) if mid_run else len(obstacles)} photo(s) in "
                  f"{time.monotonic() - t0:.1f}s.")
     if details is not None:
         details["photo_poses"] = photo_poses
@@ -1753,3 +1814,233 @@ def plan_mission(obstacles: List[dict], arc_profile: int = PROFILE_TIGHT,
     if _contains_fu(result["segments"]):
         raise RuntimeError("Task 1 planner produced a forbidden FU token")
     return result
+
+
+# ── Mid-run replan with sensor position correction ────────────────────────────
+# Used where the PC would otherwise HOLD (no recovery route and a predicted
+# collision). Odometry is corrected by comparing the ultrasonic and side-IR
+# ranges with what the Android obstacle map predicts from the odometry pose,
+# then the remaining photos are planned afresh from the corrected pose.
+
+# A reading is trusted only if it is within this of the map's prediction.
+# Anything further off is probably a different object (or no object) and is
+# ignored, leaving odometry unchanged in that direction.
+POSE_CORRECTION_MAX_RESIDUAL_MM = float(os.getenv("POSE_CORRECTION_MAX_RESIDUAL_MM", "100"))
+# A second obstacle predicted this close to the reading makes the echo
+# ambiguous; the reading is then not used.
+POSE_CORRECTION_AMBIGUITY_MM = float(os.getenv("POSE_CORRECTION_AMBIGUITY_MM", "100"))
+POSE_CORRECTION_US_MAX_CM = float(os.getenv("POSE_CORRECTION_US_MAX_CM", "150"))
+POSE_CORRECTION_USE_IR = os.getenv("POSE_CORRECTION_USE_IR", "1").strip().lower() in ("1", "true", "yes")
+# The Sharp IRs are accurate near the robot only (usable 10-80 cm, right unit to
+# ~65 cm); keep to the close, steep part of the curve.
+POSE_CORRECTION_IR_MAX_CM = float(os.getenv("POSE_CORRECTION_IR_MAX_CM", "50"))
+# Left and right IR estimates of the sideways error must agree this well.
+POSE_CORRECTION_IR_AGREE_MM = float(os.getenv("POSE_CORRECTION_IR_AGREE_MM", "50"))
+# IR mounting, from the rear axle: distance ahead, and distance out to each
+# side. NOT MEASURED - assumed at the body sides, level with the chassis
+# centre. Measure and set these if the sensors sit elsewhere.
+IR_MOUNT_AHEAD_MM = float(os.getenv("IR_MOUNT_AHEAD_MM", str(BODY_CENTRE_AHEAD_MM)))
+IR_MOUNT_SIDE_MM = float(os.getenv("IR_MOUNT_SIDE_MM", str(ROBOT_HALF_WIDTH_MM)))
+IR_HALF_ANGLE_DEG = float(os.getenv("IR_HALF_ANGLE_DEG", "3"))
+US_BIAS_MM = US_BIAS_CM * 10.0
+
+# The replan must answer inside the RPi's decision wait. These split whatever
+# time is left between the tour search and assembling the route.
+REPLAN_TOUR_SHARE = 0.6
+REPLAN_ASSEMBLY_SHARE = 0.9
+REPLAN_MIN_TIME_S = 1.0
+REPLAN_START_OVERHANG_MM = float(os.getenv("REPLAN_START_OVERHANG_MM", "50"))
+
+
+def _ray_box_distance(ox, oy, angle, box) -> Optional[float]:
+    """Distance along a ray from (ox, oy) to an axis-aligned box, or None."""
+    dx, dy = math.cos(angle), math.sin(angle)
+    t_near, t_far = -math.inf, math.inf
+    for origin, direction, low, high in ((ox, dx, box[0], box[2]), (oy, dy, box[1], box[3])):
+        if abs(direction) < 1e-12:
+            if origin < low or origin > high:
+                return None
+            continue
+        t1, t2 = (low - origin) / direction, (high - origin) / direction
+        t_near, t_far = max(t_near, min(t1, t2)), min(t_far, max(t1, t2))
+    if t_near > t_far or t_far < 0:
+        return None
+    return max(0.0, t_near)
+
+
+def _predicted_range(ox, oy, centre_angle, half_angle_deg, obstacles):
+    """Nearest-echo prediction across a sensor cone, per obstacle.
+
+    Returns [(distance_mm, obstacle_id)] sorted nearest first, one entry per
+    obstacle the cone reaches."""
+    steps = max(1, int(round(half_angle_deg)))
+    best = {}
+    for k in range(-steps, steps + 1):
+        angle = centre_angle + math.radians(half_angle_deg * k / steps)
+        for obstacle in obstacles:
+            box = _obstacle_aabb_mm(obstacle, 0.0)
+            distance = _ray_box_distance(ox, oy, angle, box)
+            if distance is not None and distance < best.get(obstacle["id"], math.inf):
+                best[obstacle["id"]] = distance
+    return sorted((d, oid) for oid, d in best.items())
+
+
+def _range_residual(ox, oy, angle, half_angle_deg, measured_mm, obstacles):
+    """predicted - measured for an unambiguous reading, else None."""
+    hits = _predicted_range(ox, oy, angle, half_angle_deg, obstacles)
+    if not hits:
+        return None, "no obstacle in view on the map"
+    predicted, oid = hits[0]
+    residual = predicted - measured_mm
+    if abs(residual) > POSE_CORRECTION_MAX_RESIDUAL_MM:
+        return None, (f"reads {measured_mm:.0f} mm, map says {predicted:.0f} mm to "
+                      f"obstacle {oid}; too different to trust")
+    if len(hits) > 1 and abs(hits[1][0] - measured_mm) <= POSE_CORRECTION_AMBIGUITY_MM:
+        return None, (f"ambiguous between obstacles {oid} and {hits[1][1]}")
+    return residual, f"obstacle {oid}: map {predicted:.0f} mm, read {measured_mm:.0f} mm"
+
+
+def _sensor_number(value):
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(number) or number <= 0 or number >= 65535:
+        return None
+    return number
+
+
+def estimate_pose_correction(x, y, theta, progress: dict, obstacles: List[dict]):
+    """Correct a planner-frame rear-axle pose with the live range sensors.
+
+    Returns (dx_mm, dy_mm, notes). The ultrasonic corrects along the heading,
+    the side IRs across it. A sensor whose reading does not match the map
+    within POSE_CORRECTION_MAX_RESIDUAL_MM leaves that direction on odometry.
+    Heading is not corrected: the gyro is far better than these ranges.
+    """
+    notes = []
+    ux, uy = math.cos(theta), math.sin(theta)
+    lx, ly = -uy, ux                       # unit vector to the robot's left
+
+    along = 0.0
+    us_cm = _sensor_number(progress.get("ultrasonic_cm"))
+    if us_cm is not None and us_cm <= POSE_CORRECTION_US_MAX_CM:
+        residual, why = _range_residual(
+            x + REAR_AXLE_TO_SENSOR_MM * ux, y + REAR_AXLE_TO_SENSOR_MM * uy,
+            theta, SONAR_HALF_ANGLE_DEG, us_cm * 10.0 - US_BIAS_MM, obstacles,
+        )
+        notes.append(f"ultrasonic: {why}")
+        if residual is not None:
+            along = residual
+    else:
+        notes.append("ultrasonic: no usable reading")
+
+    sideways = []
+    if POSE_CORRECTION_USE_IR:
+        for name, side in (("left", 1.0), ("right", -1.0)):
+            reading = _sensor_number(progress.get(f"ir_{name}_cm"))
+            if reading is None or reading > POSE_CORRECTION_IR_MAX_CM:
+                notes.append(f"IR {name}: no usable reading")
+                continue
+            residual, why = _range_residual(
+                x + IR_MOUNT_AHEAD_MM * ux + side * IR_MOUNT_SIDE_MM * lx,
+                y + IR_MOUNT_AHEAD_MM * uy + side * IR_MOUNT_SIDE_MM * ly,
+                theta + side * math.pi / 2, IR_HALF_ANGLE_DEG,
+                reading * 10.0, obstacles,
+            )
+            notes.append(f"IR {name}: {why}")
+            if residual is not None:
+                sideways.append(side * residual)   # + means "actually further left"
+    lateral = 0.0
+    if len(sideways) == 2 and abs(sideways[0] - sideways[1]) > POSE_CORRECTION_IR_AGREE_MM:
+        notes.append("IR left/right disagree; sideways correction not used")
+    elif sideways:
+        lateral = sum(sideways) / len(sideways)
+
+    return along * ux + lateral * lx, along * uy + lateral * ly, notes
+
+
+def replan_from_pose(plan: dict, obstacles: List[dict], progress: dict,
+                     deadline: float, arc_profile: int = PROFILE_TIGHT) -> Optional[dict]:
+    """Plan the remaining photos afresh from the robot's (corrected) live pose.
+
+    The result is a REPLACE body that may visit the remaining obstacles in a
+    new order and leave out any it cannot reach. Its frame_shift_mm absorbs
+    the sensor correction, so later PROGRESS reports (still raw odometry) are
+    compared with, and recovered from, the corrected position. None if no
+    route to any remaining obstacle fits before `deadline` (time.monotonic()).
+    """
+    try:
+        wire_x = float(progress["x_grid"]) * 100.0
+        wire_y = float(progress["y_grid"]) * 100.0
+        bearing = float(progress["heading_deg"]) % 360.0
+        remaining = [str(v) for v in progress.get("remaining_photo_ids") or []]
+    except (KeyError, TypeError, ValueError):
+        logging.exception("Cannot replan: PROGRESS pose is malformed.")
+        return None
+    if not remaining:
+        return None
+    known = {str(o.get("id")) for o in obstacles}
+    if not set(remaining) <= known:
+        logging.error("Cannot replan: pending photos %s are not all on the map %s.",
+                      remaining, sorted(known))
+        return None
+
+    shift_x, shift_y = _plan_frame_shift(plan)
+    x, y = wire_x - shift_x, wire_y - shift_y
+    theta = math.radians(90.0 - bearing)
+    lattice = grid_search._HEADINGS[grid_search._heading_index(theta)]
+    snap_error = abs(math.degrees(_wrap(theta - lattice)))
+    if snap_error > RECOVERY_MAX_HEADING_SNAP_DEG:
+        logging.error("Cannot replan: heading %.1f deg is %.1f deg off the 45-degree lattice.",
+                      bearing, snap_error)
+        return None
+
+    dx, dy, notes = estimate_pose_correction(x, y, theta, progress, obstacles)
+    for note in notes:
+        logging.info("Pose check — %s", note)
+    # Corrected pose first; if that has no route (the correction may be
+    # wrong), the plain odometry pose with whatever time is left.
+    attempts = [(dx, dy, 0.6), (0.0, 0.0, 1.0)] if (dx or dy) else [(0.0, 0.0, 1.0)]
+    result = None
+    for cx, cy, share in attempts:
+        left = deadline - time.monotonic()
+        if left < REPLAN_MIN_TIME_S:
+            logging.error("Cannot replan: only %.1fs left before the RPi stops waiting.", left)
+            return None
+        left *= share
+        if cx or cy:
+            logging.warning("Pose corrected by (%+.0f, %+.0f) mm from the range sensors.", cx, cy)
+        elif dx or dy:
+            logging.warning("No route from the corrected pose; trying the odometry pose.")
+        result = plan_mission(
+            obstacles, arc_profile=arc_profile,
+            start_pose=Pose(x + cx, y + cy, lattice),
+            frame_shift=(shift_x - cx, shift_y - cy),
+            target_ids=remaining,
+            time_budget_s=left * REPLAN_TOUR_SHARE,
+            assembly_deadline_s=left * REPLAN_ASSEMBLY_SHARE,
+            start_margin_mm=RECOVERY_RELAXED_MARGIN_MM,
+        )
+        if result["segments"]:
+            dx, dy = cx, cy
+            break
+    if not result or not result["segments"]:
+        logging.error("Replan found no route to any of %s.", remaining)
+        return None
+    planned = [str(v) for v in result["obstacle_ids"]]
+    skipped = [oid for oid in remaining if oid not in planned]
+    if skipped:
+        logging.warning("Replan skips obstacle(s) %s: no route from here.", skipped)
+    logging.warning("Replanned from the live pose: visit order %s.", planned)
+
+    replacement = {key: result[key] for key in (
+        "segments", "segment_obstacles", "expected", "frame_shift_mm",
+        "photo_standoffs", "selected_standoffs", "ultrasonic_adjustments",
+        "selected_view_angles", "camera_to_sensor_cm", "obstacle_ids",
+    )}
+    replacement["start_mm"] = plan.get("start_mm", result["start_mm"])
+    replacement["skipped_photo_ids"] = skipped
+    replacement["allow_skip"] = True
+    replacement["pose_correction_mm"] = {"x": round(dx, 1), "y": round(dy, 1)}
+    return replacement

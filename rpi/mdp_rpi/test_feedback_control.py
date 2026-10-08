@@ -188,6 +188,8 @@ class TaskFeedbackTests(unittest.TestCase):
                 return ["65535", "65535"]
             if command == "?IRR":
                 return ["100", "100"]
+            if command == "?US":
+                return ["30"]
             raise AssertionError(command)
 
         task.stm.query_fields = Mock(side_effect=query_fields)
@@ -251,6 +253,33 @@ class TaskFeedbackTests(unittest.TestCase):
         self.assertEqual([c.args[0] for c in task._detect_and_send_image.call_args_list], ["7", "8"])
         self.assertEqual(task._completed_photo_count, 2)
         task.pc.send.assert_called_with("STITCH,2\n")
+
+    def test_full_replan_may_skip_an_obstacle_and_updates_camera_data(self):
+        task = bare_task()
+        task.selected_standoffs = {"7": 30, "8": 30}
+        task.ultrasonic_adjustments = {"7": True, "8": True}
+        self.responder(task, "REPLACE", {
+            "segments": [["R1", "S"]], "segment_obstacles": ["7"],
+            "allow_skip": True, "skipped_photo_ids": ["8"],
+            "selected_standoffs": {"7": 25},
+            "ultrasonic_adjustments": {"7": False},
+        })
+        run_task(task)
+        self.assertFalse(task.halted)
+        self.assertEqual([e for e in task.stm.events if isinstance(e, tuple)],
+                         [("F10",), ("R1",), ("S",)])
+        task._detect_and_send_image.assert_called_once_with("7")
+        self.assertEqual(task.selected_standoffs["7"], 25)
+        self.assertFalse(task.ultrasonic_adjustments["7"])
+
+    def test_skipping_replan_cannot_add_an_obstacle(self):
+        task = bare_task()
+        self.responder(task, "REPLACE", {
+            "segments": [["S"], ["S"]], "segment_obstacles": ["7", "99"],
+            "allow_skip": True,
+        })
+        run_task(task)
+        self.assertTrue(task.halted)
 
     def test_invalid_replacements_halt_without_sending_any_more_tokens(self):
         for replacement in [

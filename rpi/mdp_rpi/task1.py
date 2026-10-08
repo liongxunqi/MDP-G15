@@ -155,6 +155,10 @@ class Task1:
         # ── Synchronisation primitives ────────────────────────────────────────
         # Mutex for all mutable index / segment state
         self._idx_lock = Lock()
+        # Held by stm_thread while it waits on a movement reply, and by BEGIN
+        # while it sends !ZERO. Both replies are a plain OK on the same queue,
+        # so without this the STM thread could take !ZERO's OK as a move ending.
+        self._stm_reply_lock = Lock()
         self.feedback_control = FeedbackControl(
             enabled=os.getenv("TASK1_FEEDBACK_WAIT", "0").strip().lower() in ("1", "true", "yes"),
             timeout=float(os.getenv("TASK1_FEEDBACK_TIMEOUT_S", "7.0")),
@@ -180,7 +184,9 @@ class Task1:
         # How long to wait for PATH before calling it a failure. Generous:
         # planning is an exhaustive tour search with an A* per edge, and a slow
         # laptop is not a broken one.
-        self._path_timeout = float(os.getenv("PATH_TIMEOUT_S", "30.0"))
+        # Must stay well above the planner's 35 s assembly deadline
+        # (algo/path_planner.py) plus debounce and transfer.
+        self._path_timeout = float(os.getenv("PATH_TIMEOUT_S", "45.0"))
         self.segment_delay = float(os.getenv("SEGMENT_DELAY_S", "0.5"))
         self.detect_retries = int(os.getenv("DETECT_RETRY_COUNT", "1"))
         self.detect_retry_delay = float(os.getenv("DETECT_RETRY_DELAY_S", "0.2"))
@@ -213,6 +219,12 @@ class Task1:
         )))
         self.gyro_settle_timeout = max(0.0, float(os.getenv(
             "TASK1_GYRO_SETTLE_TIMEOUT_S", "1.0"
+        )))
+        self.zero_each_run = os.getenv(
+            "TASK1_ZERO_EACH_RUN", "1"
+        ).strip().lower() in ("1", "true", "yes")
+        self.zero_settle_timeout = max(0.0, float(os.getenv(
+            "TASK1_ZERO_SETTLE_TIMEOUT_S", "2.0"
         )))
         retry_text = os.getenv(
             "TASK1_PHOTO_RETRY_STANDOFFS", "20,25,30,33,35,40,45"
@@ -479,19 +491,20 @@ class Task1:
         )
         return snapshot
 
-    def _read_ultrasonic_cm(self):
+    def _read_ultrasonic_cm(self, quiet=False):
         """Return one usable front-ultrasonic range, or None for no echo."""
+        log = logging.debug if quiet else logging.warning
         fields = self.stm.query_fields("?US")
         if fields is None or len(fields) != 1:
-            logging.warning("STM returned no usable ?US response.")
+            log("STM returned no usable ?US response.")
             return None
         try:
             distance = int(fields[0])
         except (TypeError, ValueError):
-            logging.warning("Ignoring malformed STM ?US response: %r", fields)
+            log("Ignoring malformed STM ?US response: %r", fields)
             return None
         if distance <= 0 or distance == 65535:
-            logging.warning("Ultrasonic has no target echo (US,%s).", distance)
+            log("Ultrasonic has no target echo (US,%s).", distance)
             return None
         return distance
 
@@ -603,6 +616,7 @@ class Task1:
                 "y_grid": pose["y_grid"],
                 "heading_deg": pose["heading_deg"],
                 "remaining_photo_ids": remaining,
+                "ultrasonic_cm": self._read_ultrasonic_cm(quiet=True),
             }
             progress.update(self._read_ir_snapshot())
             pending = self.feedback_control.arm(progress)
@@ -615,6 +629,40 @@ class Task1:
                 if self.instruction_mission is mission:
                     mission.preflighted_segments.add(mission.segment_index)
         return decision
+
+    def _zero_heading_for_run(self) -> bool:
+        """
+        !ZERO at the start pose of every run, not just once at startup.
+
+        Carrying the robot back to the start rotates it, and the gyro sees that
+        as heading error. Without a fresh zero the firmware's carry-over spends
+        the next run "correcting" it, up to 5° on every move: the arcs end
+        several degrees off and the straights drift further each time.
+        """
+        if not getattr(self, "zero_each_run", True):
+            return True
+        # The robot was just put down by hand; let it stop rocking first so the
+        # zero is taken on a still gyro.
+        deadline = monotonic() + self.zero_settle_timeout
+        stable = 0
+        while monotonic() < deadline and stable < self.gyro_settle_samples:
+            fields = self.stm.query_fields("?IMU")
+            try:
+                rate = abs(int(fields[2]) / 10.0) if fields and int(fields[0]) == 1 else None
+            except (TypeError, ValueError, IndexError):
+                rate = None
+            stable = stable + 1 if rate is not None and rate <= self.gyro_settle_rate_dps else 0
+            sleep(0.05)
+        if stable < self.gyro_settle_samples:
+            logging.warning("Gyro not still before the run's !ZERO; zeroing anyway.")
+
+        if not self._stm_reply_lock.acquire(timeout=5.0):
+            logging.error("STM reply path busy — cannot zero the heading for this run.")
+            return False
+        try:
+            return cal_profile.zero_heading(self.stm)
+        finally:
+            self._stm_reply_lock.release()
 
     def _send_start_status(self) -> None:
         """Pass the planner's Android drawing anchor directly to Android."""
@@ -655,8 +703,19 @@ class Task1:
             raise ValueError("Replacement obstacle IDs must be nonempty strings, integers or null")
         first = mission.segment_index if just_finished is None else just_finished
         remaining = [self._obstacle_for_segment(i) for i in range(first, len(mission.segments))]
-        if Counter(str(v) for v in mapping if v is not None) != Counter(v for v in remaining if v is not None):
+        planned = Counter(str(v) for v in mapping if v is not None)
+        pending = Counter(str(v) for v in remaining if v is not None)
+        if payload.get("allow_skip") is True:
+            # A full replan from the live pose may leave out obstacles it
+            # cannot reach, but never invents or repeats one.
+            if planned - pending:
+                raise ValueError("Replacement photographs obstacles that are not pending")
+            skipped = sorted((pending - planned).elements())
+            if skipped:
+                logging.warning("Replacement skips obstacle(s) %s: PC found no route.", skipped)
+        elif planned != pending:
             raise ValueError("Replacement must preserve every pending photo assignment")
+        camera = self._replacement_camera_fields(payload)
         candidate.origin = mission.origin
         self.instruction_mission = candidate
         self.segments = candidate.segments
@@ -666,7 +725,38 @@ class Task1:
         self.direction_index = 0
         self.segments_index = 0
         self._resend_counts.clear()
+        for name, values in camera.items():
+            current = getattr(self, name, None)
+            if not isinstance(current, dict):
+                current = {}
+                setattr(self, name, current)
+            current.update(values)
         logging.info("Installed replacement: %d segments; odometry origin retained", len(self.segments))
+
+    @staticmethod
+    def _replacement_camera_fields(payload):
+        """Parse a full replan's per-obstacle camera data before anything changes.
+
+        A fresh plan can pick a different camera distance, a diagonal view or
+        no ultrasonic correction for an obstacle; retries must use those."""
+        parsers = {
+            "photo_standoffs": lambda v: [int(x) for x in v],
+            "selected_standoffs": int,
+            "ultrasonic_adjustments": bool,
+            "selected_view_angles": float,
+        }
+        camera = {}
+        for name, parse in parsers.items():
+            raw = payload.get(name)
+            if raw is None:
+                continue
+            if not isinstance(raw, dict):
+                raise ValueError(f"REPLACE {name} must be an object")
+            try:
+                camera[name] = {str(k): parse(v) for k, v in raw.items()}
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"REPLACE {name} is malformed: {exc}") from exc
+        return camera
 
     def _wait_for_feedback(self, pending, mission, just_finished):
         """Return continue/replace, or None if cancelled/invalid. Never hold the lock while waiting."""
@@ -919,12 +1009,17 @@ class Task1:
                 movement_tokens=movement_tokens,
             )
 
+        # Set when the very first ?US shows the sensor is not on the obstacle
+        # (no echo, or an echo far beyond the correction cap) and nothing has
+        # moved yet. The caller can then fall back to odometry-only moves.
+        self._us_echo_bad = False
         measured_us = None
         for correction in range(self.us_adjust_retries + 1):
             if self.us_settle_s > 0:
                 sleep(self.us_settle_s)
             measured_us = self._read_ultrasonic_cm()
             if measured_us is None:
+                self._us_echo_bad = correction == 0
                 logging.warning(
                     "Cannot range-correct obstacle %s to %d cm; keeping the "
                     "odometry-planned camera pose.", obstacle_id, standoff_cm,
@@ -954,10 +1049,13 @@ class Task1:
                     obstacle_id, measured_us, self.us_adjust_retries,
                     target_us_cm, standoff_cm,
                 )
-                return False
+                # The robot did move toward the target, so photograph here.
+                # Returning False made a retry distance skip its photo.
+                return correction > 0
 
             distance_cm = int(round(abs(error_cm)))
             if distance_cm > self.us_adjust_max_step_cm:
+                self._us_echo_bad = correction == 0
                 logging.warning(
                     "Ultrasonic range %d cm is %d cm from obstacle %s's %d cm "
                     "target, beyond the %d cm correction cap. This is probably "
@@ -1013,6 +1111,19 @@ class Task1:
                 return False
         return True
 
+    def _report_photo_retry(self, obstacle_id, message):
+        """Log a retry problem here and in the PC log, where runs are reviewed."""
+        logging.warning("Obstacle %s photo retry: %s", obstacle_id, message)
+        try:
+            self.pc.send("PHOTO_PROGRESS," + json.dumps({
+                "event": "photo_retry",
+                "plan_id": getattr(self, "plan_id", None),
+                "obstacle_id": str(obstacle_id),
+                "message": message,
+            }, separators=(",", ":")))
+        except (OSError, AttributeError) as exc:
+            logging.warning("Could not report photo retry to PC: %s", exc)
+
     def _detect_with_distance_retry(self, obstacle_id: str, mission):
         """Retry an unclear photograph only at planner-approved standoffs."""
         self._last_capture_attempts = 0
@@ -1023,10 +1134,21 @@ class Task1:
         us_adjustable = getattr(self, "ultrasonic_adjustments", {}).get(
             obstacle_key, False
         )
+        use_us = us_adjustable
         if original is not None and us_adjustable:
             self._move_for_photo(mission, obstacle_id, original,
                                  current_standoff_cm=original, use_ultrasonic=True,
                                  movement_tokens=temporary_moves)
+            if getattr(self, "_us_echo_bad", False):
+                # The ultrasonic is not on the face, so the robot is aimed off
+                # it. Every US-gated retry would refuse to move for the same
+                # reason; retry on odometry instead, widest view first.
+                logging.warning(
+                    "Obstacle %s: ultrasonic does not see the face at the photo "
+                    "pose; distance retries will use odometry, farthest first.",
+                    obstacle_id,
+                )
+                use_us = False
         if self.capture_settle > 0:
             logging.info(
                 "Waiting %.1fs for chassis vibration to settle before capture.",
@@ -1048,18 +1170,24 @@ class Task1:
                 # Improve framing with the smallest safe change first. Move
                 # closer before trying farther away, but never invent a range
                 # the planner did not collision-check for this exact view.
-                candidates = (
-                    sorted((value for value in configured if value < original),
-                           reverse=True)
-                    + sorted(value for value in configured if value > original)
-                )
+                closer = sorted((value for value in configured if value < original),
+                                reverse=True)
+                farther = sorted(value for value in configured if value > original)
+                # Aimed off the face (bad echo): a farther camera sees a wider
+                # strip of the arena, so it is the better first guess.
+                candidates = (closer + farther) if use_us else (farther + closer)
                 candidates = candidates[:retry_limit]
 
-            if not candidates:
+            if not candidates and original is None:
                 logging.warning(
-                    "Obstacle %s has no safe configured retry standoff "
-                    "(selected=%s, safe=%s, retry_limit=%d).",
-                    obstacle_id, original, safe, retry_limit,
+                    "Obstacle %s has no planned camera distance; no retry.",
+                    obstacle_id,
+                )
+            elif not candidates:
+                self._report_photo_retry(
+                    obstacle_id,
+                    f"no safe retry distance (selected={original}, "
+                    f"planner-safe={safe}, retry_limit={retry_limit})",
                 )
             else:
                 logging.warning(
@@ -1069,13 +1197,28 @@ class Task1:
                 )
                 current = original
                 for distance in candidates:
-                    if not self._move_for_photo(
+                    moved = self._move_for_photo(
+                        mission, obstacle_id, distance,
+                        current_standoff_cm=current,
+                        use_ultrasonic=use_us,
+                        movement_tokens=temporary_moves)
+                    if (not moved and use_us and not self.halted and
+                            getattr(self, "_us_echo_bad", False)):
+                        use_us = False
+                        moved = self._move_for_photo(
                             mission, obstacle_id, distance,
                             current_standoff_cm=current,
-                            use_ultrasonic=us_adjustable,
-                            movement_tokens=temporary_moves):
+                            use_ultrasonic=False,
+                            movement_tokens=temporary_moves)
+                    if not moved:
                         if self.halted:
                             break
+                        self._report_photo_retry(
+                            obstacle_id,
+                            f"skipped {distance} cm: could not move there "
+                            f"({'ultrasonic' if use_us else 'odometry'} move refused "
+                            "or blocked by the PC safety check)",
+                        )
                         continue
                     current = distance
                     if self.capture_settle > 0:
@@ -1198,6 +1341,19 @@ class Task1:
                         # seen the failure and is restarting deliberately.
                         self.halted = False
                         self._resend_counts.clear()
+
+                    if not self._zero_heading_for_run():
+                        with self._idx_lock:
+                            self.started = False
+                        logging.error(
+                            "Not starting: heading could not be zeroed at the "
+                            "start pose. Keep the robot still and press Start again."
+                        )
+                        try:
+                            self.android.send("STATUS,FAILED")
+                        except OSError as exc:
+                            logging.error(f"Could not notify Android: {exc}")
+                        continue
 
                     if not self.path_ready.is_set():
                         logging.info(
@@ -1410,19 +1566,23 @@ class Task1:
           2. At a segment boundary, capture its obstacle if requested.
           3. Send the next instruction, or finish and request stitching.
         """
+        # Tests build Task1 without __init__; give them a private lock.
+        reply_lock = getattr(self, "_stm_reply_lock", None) or Lock()
         while True:
             try:
                 # Do not start a reply timeout while idle. A line may be sent by
                 # Android between loop iterations; this check ensures the 20 s
                 # deadline begins only after that specific line is in flight.
-                if not self.stm.awaiting_reply:
+                with reply_lock:
+                    idle = not self.stm.awaiting_reply
+                    # It returns only line-level replies (OK / RESEND / FAIL,*);
+                    # query answers are routed separately by the STM reader
+                    # thread, so they can never be mistaken for a movement
+                    # reply here.
+                    stm_msg = None if idle else self.stm.wait_reply()
+                if idle:
                     sleep(0.02)
                     continue
-
-                # It returns only line-level replies (OK / RESEND / FAIL,*);
-                # query answers are routed separately by the STM reader thread,
-                # so they can never be mistaken for a movement reply here.
-                stm_msg = self.stm.wait_reply()
                 if not stm_msg:
                     # PROTOCOL.md §11: past the 15s watchdog this is a lost
                     # link, not a slow move.
@@ -1531,11 +1691,13 @@ class Task1:
                                 self._obstacle_for_segment(just_finished)
                                 if just_finished is not None else None
                             )
-                            if (finished_obstacle is not None and
-                                    getattr(self, "ultrasonic_adjustments", {}).get(
-                                        str(finished_obstacle), False
-                                    )):
-                                mission.progress["ultrasonic_cm"] = self._read_ultrasonic_cm()
+                            # Every report carries the front range: the PC
+                            # checks the odometry pose against the map with it.
+                            mission.progress["ultrasonic_cm"] = self._read_ultrasonic_cm(
+                                quiet=not (finished_obstacle is not None and
+                                           getattr(self, "ultrasonic_adjustments", {}).get(
+                                               str(finished_obstacle), False))
+                            )
                             mission.progress["awaiting_decision"] = self.feedback_control.enabled
                             if self.feedback_control.enabled:
                                 pending = self.feedback_control.arm(mission.progress)

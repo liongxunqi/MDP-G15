@@ -32,14 +32,43 @@ import json
 import logging
 import math
 import os
+import time
 from typing import Optional
 
-POS_WARN_MM = float(os.getenv("PROGRESS_POS_WARN_MM", "80"))
+# Replan once the robot is this far off the plan. 80 mm let typical 40-60 mm
+# drift through untouched, and that is more than the planner's 30 mm obstacle
+# margin, so the robot clipped obstacles while the PC kept answering CONTINUE.
+POS_WARN_MM = float(os.getenv("PROGRESS_POS_WARN_MM", "40"))
 HDG_WARN_DEG = float(os.getenv("PROGRESS_HDG_WARN_DEG", "6"))
-MAX_REPLACEMENTS = int(os.getenv("PROGRESS_MAX_REPLACEMENTS", "12"))
+MAX_REPLACEMENTS = int(os.getenv("PROGRESS_MAX_REPLACEMENTS", "20"))
+# When the next move is predicted to hit an obstacle and no recovery route
+# exists, re-check it against the bare obstacle (no margin). If it still hits,
+# stop the robot (HOLD) instead of driving into it.
+HOLD_ON_CERTAIN_COLLISION = os.getenv(
+    "PROGRESS_HOLD_ON_CERTAIN_COLLISION", "1"
+).strip().lower() in ("1", "true", "yes")
+# Before that HOLD, correct the pose from the range sensors and plan the
+# remaining photos afresh from there (may reorder or skip obstacles).
+REPLAN_ON_HOLD = os.getenv(
+    "PROGRESS_REPLAN_ON_HOLD", "1"
+).strip().lower() in ("1", "true", "yes")
+# Reply this long before the RPi's decision wait runs out.
+REPLAN_REPLY_MARGIN_S = float(os.getenv("PROGRESS_REPLAN_REPLY_MARGIN_S", "1.5"))
+# Extra REPLACE fields a full replan carries for the RPi's camera handling.
+_REPLAN_FIELDS = ("allow_skip", "skipped_photo_ids", "photo_standoffs",
+                  "selected_standoffs", "ultrasonic_adjustments",
+                  "selected_view_angles")
 IR_TURN_CLEARANCE_CM = float(os.getenv("PROGRESS_IR_TURN_CLEARANCE_CM", "20"))
 IR_LEFT_NEAR_RAW = int(os.getenv("PROGRESS_IR_LEFT_NEAR_RAW", "1816"))
 IR_RIGHT_NEAR_RAW = int(os.getenv("PROGRESS_IR_RIGHT_NEAR_RAW", "1555"))
+# A side-IR veto that fires again near where an earlier one already forced a
+# replacement is a known obstacle beside a planned tight pass, not a surprise.
+# The recovery planner cannot see IR, so its new route starts with the same arc
+# and gets vetoed again; that loop burned all 12 replacements in one run. After
+# this many replacements within the radius, the IR return is ignored there and
+# only the swept-footprint check decides.
+IR_VETO_REPEAT_RADIUS_MM = float(os.getenv("PROGRESS_IR_VETO_REPEAT_RADIUS_MM", "100"))
+IR_VETO_MAX_REPEATS = int(os.getenv("PROGRESS_IR_VETO_MAX_REPEATS", "1"))
 ARENA_SIZE_MM = 2000.0
 # Keep the next reported reference point this far from an arena edge. The
 # planner normally provides this clearance; this second check carries the
@@ -54,10 +83,14 @@ def _wrap180(deg: float) -> float:
 
 class PlanMonitor:
     def __init__(self, plan: Optional[dict] = None, recovery_planner=None,
-                 safety_checker=None):
+                 safety_checker=None, collision_checker=None, replanner=None):
         self.plan = plan if isinstance(plan, dict) else None
         self.recovery_planner = recovery_planner
         self.safety_checker = safety_checker
+        # Same signature as safety_checker, but against the bare obstacles.
+        self.collision_checker = collision_checker
+        # replanner(plan, progress, deadline) -> full replacement or None.
+        self.replanner = replanner
         exp = plan.get("expected") if isinstance(plan, dict) else None
         self.expected = exp if isinstance(exp, list) else None
         self.count = 0
@@ -74,6 +107,7 @@ class PlanMonitor:
         self._warned_segments = set()
         self._warned_no_plan = False
         self._warned_bad = False
+        self._ir_veto_poses = []               # (x_mm, y_mm) of each IR veto acted on
 
     # ── public ────────────────────────────────────────────────────────────────
 
@@ -81,6 +115,7 @@ class PlanMonitor:
         """Process the JSON after "PROGRESS,". Returns the full reply line to send
         to the RPi (no newline), or None. Never raises on bad input."""
         try:
+            received = time.monotonic()
             p = json.loads(payload_text)
             seg, ins = int(p["segment_index"]), int(p["instruction_index"])
             x_mm, y_mm = float(p["x_grid"]) * 100.0, float(p["y_grid"]) * 100.0
@@ -106,6 +141,8 @@ class PlanMonitor:
                 return None
             self.decisions += 1
             boundary_risk = self._sensor_risk(p)
+            if boundary_risk is not None and self._ir_veto_repeated(x_mm, y_mm):
+                boundary_risk = None
             if boundary_risk is None and (preflight or photo_preflight):
                 boundary_risk = self._preflight_safety_risk(p)
             elif boundary_risk is None:
@@ -158,11 +195,26 @@ class PlanMonitor:
                             seg, ins, len(replacement["segments"]), self.replacements,
                         )
                         return "REPLACE," + json.dumps(body, separators=(",", ":"))
-                    if boundary_risk is not None:
+                if boundary_risk is not None:
+                    if self._certain_collision(p, boundary_risk):
+                        reply = self._replan_instead_of_hold(p, seg, ins, received)
+                        if reply is not None:
+                            return reply
                         logging.error(
-                            "Boundary recovery could not produce a safe replacement; "
-                            "the existing route is being retained as a last resort."
+                            "No recovery route and %s would hit an obstacle even "
+                            "with zero margin — holding the robot.",
+                            boundary_risk.get("next_token", "?"),
                         )
+                        return self._hold_reply(
+                            p, seg, ins,
+                            f"{boundary_risk.get('next_token', 'next move')} "
+                            "would collide and no recovery route exists",
+                        )
+                    logging.error(
+                        "Boundary recovery could not produce a safe replacement; "
+                        "the existing route is being retained as a last resort "
+                        "(the move only enters the safety margin)."
+                    )
             self.continues += 1
             return "CONTINUE," + json.dumps(
                 {"feedback_id": p["feedback_id"], "segment_index": seg, "instruction_index": ins},
@@ -208,6 +260,59 @@ class PlanMonitor:
             risk.get("x_mm", "?"), risk.get("y_mm", "?"),
         )
         return risk
+
+    def _replan_instead_of_hold(self, progress, seg, ins, received):
+        """Full replan from the sensor-corrected pose; REPLACE line or None."""
+        if not REPLAN_ON_HOLD or self.replanner is None:
+            return None
+        if self.replacements >= MAX_REPLACEMENTS:
+            return None
+        try:
+            wait_s = float(progress.get("decision_timeout_s", 7.0))
+        except (TypeError, ValueError):
+            wait_s = 7.0
+        deadline = received + wait_s - REPLAN_REPLY_MARGIN_S
+        logging.warning(
+            "Collision ahead and no recovery route: checking the pose with the "
+            "range sensors and replanning the remaining photos (%.1fs left).",
+            deadline - time.monotonic(),
+        )
+        try:
+            replacement = self.replanner(self.plan, progress, deadline)
+        except Exception:
+            logging.exception("Full replan crashed; holding instead.")
+            return None
+        if not self._install_replacement(replacement):
+            return None
+        self.replacements += 1
+        body = {
+            "feedback_id": progress["feedback_id"],
+            "segment_index": seg,
+            "instruction_index": ins,
+            "segments": replacement["segments"],
+            "segment_obstacles": replacement["segment_obstacles"],
+        }
+        body.update({k: replacement[k] for k in _REPLAN_FIELDS if k in replacement})
+        logging.warning(
+            "Replacing the remaining route with a full replan (automatic replacement #%d)%s.",
+            self.replacements,
+            f"; skipping {replacement['skipped_photo_ids']}"
+            if replacement.get("skipped_photo_ids") else "",
+        )
+        return "REPLACE," + json.dumps(body, separators=(",", ":"))
+
+    def _certain_collision(self, progress, risk) -> bool:
+        if not HOLD_ON_CERTAIN_COLLISION or self.collision_checker is None:
+            return False
+        token = str(risk.get("next_token") or progress.get("token", "")).strip().upper()
+        if not token:
+            return False
+        try:
+            hit = self.collision_checker(self.plan, progress, token)
+        except Exception:
+            logging.exception("Zero-margin collision check crashed.")
+            return False
+        return hit is not None
 
     def _plan_replacement(self, progress, boundary_risk):
         """Replan from the live pose for the current, not a future, segment.
@@ -421,6 +526,22 @@ class PlanMonitor:
                 }
 
         return None
+
+    def _ir_veto_repeated(self, x_mm, y_mm):
+        """True when earlier IR vetoes here already had their replacements."""
+        nearby = sum(
+            1 for vx, vy in self._ir_veto_poses
+            if math.hypot(x_mm - vx, y_mm - vy) <= IR_VETO_REPEAT_RADIUS_MM
+        )
+        if nearby >= IR_VETO_MAX_REPEATS:
+            logging.warning(
+                "IR veto at (%.0f,%.0f) mm repeats %d earlier one(s) within %.0f mm; "
+                "treating it as a known obstacle and using the swept-footprint "
+                "check alone.", x_mm, y_mm, nearby, IR_VETO_REPEAT_RADIUS_MM,
+            )
+            return True
+        self._ir_veto_poses.append((x_mm, y_mm))
+        return False
 
     def _next_instruction(self, seg, ins):
         try:

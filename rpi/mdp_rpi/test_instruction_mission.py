@@ -430,6 +430,57 @@ class PCTransferTests(unittest.TestCase):
             [30, 20, 33],
         )
 
+    def test_every_run_zeroes_heading_on_a_still_gyro(self):
+        # Runs 04:15 and 04:25 started without a !ZERO after the robot was
+        # carried back, and the carry-over turned every move up to 5 deg off.
+        task = Task1.__new__(Task1)
+        task.zero_each_run = True
+        task.zero_settle_timeout = 1.0
+        task.gyro_settle_samples = 2
+        task.gyro_settle_rate_dps = 1.0
+        task._stm_reply_lock = Lock()
+        task.stm = Mock()
+        task.stm.query_fields.return_value = ["1", "0", "3"]   # ready, 0.3 dps
+
+        with patch("task1.cal_profile.zero_heading", return_value=True) as zero, \
+                patch("task1.sleep"):
+            self.assertTrue(task._zero_heading_for_run())
+
+        zero.assert_called_once_with(task.stm)
+        self.assertFalse(task._stm_reply_lock.locked())
+
+    def test_bad_echo_retries_on_odometry_farthest_first(self):
+        # US=120 cm at a 30 cm photo pose: the sensor is off the face. Every
+        # US-gated retry used to refuse to move, so no retry photo was taken.
+        task = Task1.__new__(Task1)
+        task.a5_mode = False
+        task.photo_standoffs = {"4": [20, 25, 30, 35, 40]}
+        task.selected_standoffs = {"4": 30}
+        task.ultrasonic_adjustments = {"4": True}
+        task.photo_retry_standoffs = [20, 25, 35, 40]
+        task.photo_retry_limit = 5
+        task.capture_settle = 0
+        task.halted = False
+        task._detect_and_send_image = Mock(side_effect=[
+            {"obstacle_id": "4", "confidence": 0.0, "class_id": "NONE"},
+            {"obstacle_id": "4", "confidence": 0.9, "class_id": "U"},
+        ])
+
+        def move(mission, obstacle_id, standoff, current_standoff_cm=None,
+                 use_ultrasonic=True, movement_tokens=None):
+            task._us_echo_bad = use_ultrasonic
+            return not use_ultrasonic
+
+        task._move_for_photo = Mock(side_effect=move)
+
+        result = task._detect_with_distance_retry("4", Mock())
+
+        self.assertEqual(result["class_id"], "U")
+        calls = task._move_for_photo.call_args_list
+        self.assertEqual(calls[0].kwargs["use_ultrasonic"], True)
+        self.assertEqual(calls[1].args[2], 35)
+        self.assertEqual(calls[1].kwargs["use_ultrasonic"], False)
+
     def test_wall_facing_photo_does_not_invent_an_unsafe_retry_pose(self):
         task = Task1.__new__(Task1)
         task.a5_mode = False
