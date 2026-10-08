@@ -125,7 +125,7 @@ class StartMove(unittest.TestCase):
                         self.assertTrue(0 <= x < 2000 and 0 <= y < 2000,
                                         f"after {tok}: the RPi would see ({x:.0f}, {y:.0f}) mm")
 
-    def test_cramped_start_falls_back_loudly_instead_of_planning_nothing(self):
+    def test_cramped_start_is_skipped_instead_of_using_uncalibrated_turns(self):
         cap = _Capture()
         logging.getLogger().addHandler(cap)
         det = {}
@@ -133,9 +133,9 @@ class StartMove(unittest.TestCase):
             plan = pp.plan_mission(CRAMPED, arc_profile=PROFILE_TIGHT, details=det)
         finally:
             logging.getLogger().removeHandler(cap)
-        self.assertTrue(plan["segments"], "planned nothing")
-        self.assertTrue(det["start_relaxed"])
-        self.assertTrue(any("could not leave the start cleanly" in m for m in cap.msgs), cap.msgs)
+        self.assertEqual(plan["segments"], [])
+        self.assertTrue(any("no route" in message.lower() for message in cap.msgs),
+                        cap.msgs)
 
 
 class StartBoxes(unittest.TestCase):
@@ -173,6 +173,9 @@ class StartBoxes(unittest.TestCase):
         s = pp.Pose(pp.START_X_MM, pp.START_Y_MM, pp.START_THETA)
         boxes = grid_search.Boxes()
         boxes.ref_bounds = pp._rpi_ref_bounds(s)
+        # This test isolates the reported-reference-point guard. Chassis arena
+        # containment has separate coverage above and is intentionally stricter.
+        boxes.arena_overhang_mm = pp.ARENA_MM
         lo_x, hi_x, lo_y, hi_y = boxes.ref_bounds
         for k in range(0, 360, 15):                       # incl. the diagonals where the body is widest
             th = math.radians(k)

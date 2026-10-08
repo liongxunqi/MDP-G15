@@ -190,7 +190,8 @@ def zero_heading(stm: STM) -> bool:
 
 
 def prepare_for_task(stm: STM, name: Optional[str] = None,
-                     required: Optional[bool] = None) -> bool:
+                     required: Optional[bool] = None,
+                     zero_at_end: bool = True) -> bool:
     """
     The fixed startup every task runs, in this order:
 
@@ -199,6 +200,10 @@ def prepare_for_task(stm: STM, name: Optional[str] = None,
         3. !PROF0                 TIGHT, the only profile calibrated
         4. restore the profile    and read it back
         5. !ZERO                  this pose is heading 0 for the carry-over
+
+    ``zero_at_end=False`` lets an orchestrator perform step 5 itself at the
+    exact boundary before it starts the rest of its connections. The default
+    remains True so every other task keeps the complete startup sequence.
 
     Must run before any movement line is outstanding: every step replies a
     plain OK on the movement path.
@@ -253,8 +258,9 @@ def prepare_for_task(stm: STM, name: Optional[str] = None,
                         "uncalibrated. Bench use only.")
 
     # Last, immediately before the task's first move: wherever the robot was
-    # placed by hand is heading 0 for the whole run.
-    if not zero_heading(stm):
+    # placed by hand is heading 0 for the whole run. Task 1 defers this one
+    # step so the guard is explicit in its startup sequence.
+    if zero_at_end and not zero_heading(stm):
         return False
 
     back = stm.read_cal_full()

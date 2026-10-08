@@ -132,6 +132,9 @@ class Task1:
         self.photo_standoffs: dict = {}
         self.selected_standoffs: dict = {}
         self.ultrasonic_adjustments: dict = {}
+        self.selected_view_angles: dict = {}
+        self.camera_to_sensor_cm = float(os.getenv("CAMERA_TO_SENSOR_CM", "10.5"))
+        self.plan_id: Optional[str] = None
 
         self.started: bool = False          # True after Android sends BEGIN
         self.path_requested: bool = False   # True while OBSTACLES request is in-flight
@@ -211,23 +214,27 @@ class Task1:
         self.gyro_settle_timeout = max(0.0, float(os.getenv(
             "TASK1_GYRO_SETTLE_TIMEOUT_S", "1.0"
         )))
-        retry_text = os.getenv("TASK1_PHOTO_RETRY_STANDOFFS", "40,45,35,33,20")
+        retry_text = os.getenv(
+            "TASK1_PHOTO_RETRY_STANDOFFS", "20,25,30,33,35,40,45"
+        )
         try:
             self.photo_retry_standoffs = [
                 int(value.strip()) for value in retry_text.split(",") if value.strip()
             ]
         except ValueError:
             logging.warning(
-                "Invalid TASK1_PHOTO_RETRY_STANDOFFS=%r; using 40,45,35,33,20.",
+                "Invalid TASK1_PHOTO_RETRY_STANDOFFS=%r; using "
+                "20,25,30,33,35,40,45.",
                 retry_text,
             )
-            self.photo_retry_standoffs = [40, 45, 35, 33, 20]
+            self.photo_retry_standoffs = [20, 25, 30, 33, 35, 40, 45]
         self.photo_retry_limit = max(
             0, int(os.getenv("TASK1_PHOTO_RETRY_LIMIT", "5"))
         )
         # PROTOCOL.md §3 recommends at most three retransmissions.
         self.max_resends = int(os.getenv("STM_MAX_RESENDS", "3"))
-        # PROTOCOL.md §6: 0 TIGHT (r=291mm), 1 CLEAN (r=318mm), 2 SLOW (r=306mm).
+        # Profile 0 TIGHT uses the measured 293.5 mm radius in algo/stm_tokens.py.
+        # Profiles 1 CLEAN and 2 SLOW use 318 mm and 306 mm respectively.
         # The firmware's own default is TIGHT, and that choice belongs to the
         # firmware — this client does not override it. Unset (the default here)
         # means send no !PROF at all and run whatever the STM already selected.
@@ -431,13 +438,15 @@ class Task1:
         convention (segment i <-> obstacle_order[i]) so a PC still sending the
         original PATH shape keeps working.
         """
-        if self.segment_obstacles:
-            if 0 <= seg_index < len(self.segment_obstacles):
-                value = self.segment_obstacles[seg_index]
+        segment_obstacles = getattr(self, "segment_obstacles", [])
+        obstacle_order = getattr(self, "obstacle_order", [])
+        if segment_obstacles:
+            if 0 <= seg_index < len(segment_obstacles):
+                value = segment_obstacles[seg_index]
                 return None if value is None else str(value)
             return None
-        if 0 <= seg_index < len(self.obstacle_order):
-            return str(self.obstacle_order[seg_index])
+        if 0 <= seg_index < len(obstacle_order):
+            return str(obstacle_order[seg_index])
         return None
 
     def _read_ir_snapshot(self):
@@ -581,6 +590,7 @@ class Task1:
             ]
             progress = {
                 "event": "instruction_preflight",
+                "plan_id": getattr(self, "plan_id", None),
                 "segment_index": mission.segment_index,
                 "instruction_index": -1,
                 "token": mission.token,
@@ -670,7 +680,20 @@ class Task1:
                 logging.info("PC decision %s for feedback %s", action, pending["feedback_id"])
                 if action == "CONTINUE":
                     return "continue"
+                if action == "SKIP":
+                    return "skip"
+                if action == "HOLD":
+                    raise ValueError(str(payload.get("reason", "PC safety hold")))
                 if action == "TIMEOUT":
+                    if pending.get("kind") == "photo_adjustment_preflight":
+                        logging.warning(
+                            "No PC safety reply for photo adjustment; skipping that move."
+                        )
+                        return "skip"
+                    if pending.get("kind") == "instruction_preflight":
+                        raise ValueError(
+                            "No PC safety reply for the next segment; refusing blind movement"
+                        )
                     logging.warning(
                         "No PC decision for feedback %s within %.1fs; continuing existing path",
                         pending["feedback_id"], self.feedback_control.timeout,
@@ -792,13 +815,110 @@ class Task1:
             self._expected_detection_id = None
         return None
 
-    def _move_for_photo(self, mission, obstacle_id: str, standoff_cm: int) -> bool:
+    def _execute_photo_adjustment(self, mission, obstacle_id, token,
+                                  target_standoff_cm, measured_us=None,
+                                  movement_tokens=None) -> bool:
+        """Preflight and execute one bounded photo-position adjustment."""
+        feedback_control = getattr(self, "feedback_control", None)
+        if feedback_control is not None and not feedback_control.enabled:
+            logging.warning(
+                "Skipping camera move %s because PC safety feedback is disabled.", token,
+            )
+            return False
+        try:
+            if feedback_control is not None:
+                robot_message, pose = mission.report_pose(self.stm)
+                progress = {
+                    "event": "photo_adjustment_preflight",
+                    "plan_id": getattr(self, "plan_id", None),
+                    "segment_index": min(mission.segment_index, len(mission.segments) - 1),
+                    "instruction_index": -2,
+                    "token": token,
+                    "obstacle_id": str(obstacle_id),
+                    "target_standoff_cm": target_standoff_cm,
+                    "x_grid": pose["x_grid"],
+                    "y_grid": pose["y_grid"],
+                    "heading_deg": pose["heading_deg"],
+                    "remaining_photo_ids": [
+                        value for i in range(mission.segment_index, len(mission.segments))
+                        for value in [self._obstacle_for_segment(i)] if value is not None
+                    ],
+                }
+                progress.update(self._read_ir_snapshot())
+                pending = feedback_control.arm(progress)
+                self.android.send(robot_message)
+                self.pc.send("PROGRESS," + json.dumps(progress, separators=(",", ":")))
+                decision = self._wait_for_feedback(pending, mission, None)
+                if decision != "continue":
+                    return False
+        except (ValueError, OSError) as exc:
+            self._halt_mission(str(exc))
+            return False
+
+        reply_upper = None
+        for resend in range(self.max_resends + 1):
+            if not self.stm.send_line([token]):
+                self._halt_mission(f"Could not send camera adjustment {token}")
+                return False
+            reply = self.stm.wait_reply()
+            if reply is None:
+                self._halt_mission(f"No STM reply for camera adjustment {token}")
+                return False
+            reply_upper = reply.strip().upper()
+            logging.info("Camera correction %s received STM reply %s.", token, reply_upper)
+            if reply_upper != "RESEND":
+                break
+            if resend >= self.max_resends:
+                self._halt_mission(f"Camera adjustment {token} exceeded RESEND limit")
+                return False
+        if reply_upper != "OK":
+            self._halt_mission(f"Camera adjustment {token} failed: {reply_upper}")
+            return False
+
+        if movement_tokens is not None:
+            movement_tokens.append(token)
+
+        try:
+            robot_message, pose = mission.report_pose(self.stm)
+            self.android.send(robot_message)
+            report = {
+                "event": "photo_distance_adjustment",
+                "plan_id": getattr(self, "plan_id", None),
+                "obstacle_id": str(obstacle_id),
+                "token": token,
+                "target_standoff_cm": target_standoff_cm,
+                "measured_us_cm_before": measured_us,
+                "x_grid": pose["x_grid"], "y_grid": pose["y_grid"],
+                "heading_deg": pose["heading_deg"],
+            }
+            self.pc.send("PHOTO_PROGRESS," + json.dumps(report, separators=(",", ":")))
+        except (ValueError, OSError) as exc:
+            self._halt_mission(str(exc))
+            return False
+        return True
+
+    def _move_for_photo(self, mission, obstacle_id: str, standoff_cm: int,
+                        current_standoff_cm=None, use_ultrasonic=True,
+                        movement_tokens=None) -> bool:
         """Reach a camera range with ?US plus bounded ordinary F/R commands.
 
         FU is deliberately not used by Task 1. A large disagreement is treated
         as a wrong/missing target echo rather than permission for a long blind
         drive. Every actual correction publishes WPOSE and the resulting range.
         """
+        if not use_ultrasonic:
+            if current_standoff_cm is None:
+                return True
+            delta = int(round(standoff_cm - current_standoff_cm))
+            if delta == 0:
+                return True
+            # Heading points at the image: forward gets closer, reverse farther.
+            token = f"R{abs(delta)}" if delta > 0 else f"F{abs(delta)}"
+            return self._execute_photo_adjustment(
+                mission, obstacle_id, token, standoff_cm,
+                movement_tokens=movement_tokens,
+            )
+
         measured_us = None
         for correction in range(self.us_adjust_retries + 1):
             if self.us_settle_s > 0:
@@ -811,19 +931,28 @@ class Task1:
                 )
                 return False
 
-            error_cm = measured_us - standoff_cm
+            camera_to_sensor_cm = float(getattr(
+                self, "camera_to_sensor_cm", 10.0
+            ))
+            target_us_cm = max(1, int(round(
+                standoff_cm - camera_to_sensor_cm
+            )))
+            error_cm = measured_us - target_us_cm
             if abs(error_cm) <= self.us_adjust_tolerance_cm:
                 logging.info(
-                    "Obstacle %s camera range is %d cm (target %d cm, tolerance %.1f cm).",
-                    obstacle_id, measured_us, standoff_cm,
+                    "Obstacle %s US range is %d cm (target %d cm for %d cm "
+                    "camera standoff, tolerance %.1f cm).",
+                    obstacle_id, measured_us, target_us_cm, standoff_cm,
                     self.us_adjust_tolerance_cm,
                 )
                 return True
             if correction >= self.us_adjust_retries:
                 logging.warning(
                     "Obstacle %s remains at %d cm after %d range correction(s); "
-                    "target is %d cm. Continuing with the photograph.",
-                    obstacle_id, measured_us, self.us_adjust_retries, standoff_cm,
+                    "US target is %d cm for a %d cm camera standoff. Continuing "
+                    "with the photograph.",
+                    obstacle_id, measured_us, self.us_adjust_retries,
+                    target_us_cm, standoff_cm,
                 )
                 return False
 
@@ -833,68 +962,71 @@ class Task1:
                     "Ultrasonic range %d cm is %d cm from obstacle %s's %d cm "
                     "target, beyond the %d cm correction cap. This is probably "
                     "the wrong echo; refusing blind motion.",
-                    measured_us, distance_cm, obstacle_id, standoff_cm,
+                    measured_us, distance_cm, obstacle_id, target_us_cm,
                     self.us_adjust_max_step_cm,
                 )
                 return False
             token = f"F{distance_cm}" if error_cm > 0 else f"R{distance_cm}"
 
-            reply_upper = None
-            for resend in range(self.max_resends + 1):
-                if not self.stm.send_line([token]):
-                    self._halt_mission(f"Could not send camera adjustment {token}")
-                    return False
-                reply = self.stm.wait_reply()
-                if reply is None:
-                    self._halt_mission(f"No STM reply for camera adjustment {token}")
-                    return False
-                reply_upper = reply.strip().upper()
-                logging.info(
-                    "Camera correction %s received STM reply %s.", token, reply_upper,
-                )
-                if reply_upper != "RESEND":
-                    break
-                if resend >= self.max_resends:
-                    self._halt_mission(f"Camera adjustment {token} exceeded RESEND limit")
-                    return False
-                logging.warning(
-                    "Camera adjustment %s was RESENDed; retry %d/%d.",
-                    token, resend + 1, self.max_resends,
-                )
-            if reply_upper != "OK":
-                self._halt_mission(f"Camera adjustment {token} failed: {reply_upper}")
-                return False
-
-            try:
-                robot_message, pose = mission.report_pose(self.stm)
-                self.android.send(robot_message)
-                report = {
-                    "event": "photo_distance_adjustment",
-                    "obstacle_id": str(obstacle_id),
-                    "token": token,
-                    "target_standoff_cm": standoff_cm,
-                    "measured_us_cm_before": measured_us,
-                    "correction_attempt": correction + 1,
-                    "x_grid": pose["x_grid"],
-                    "y_grid": pose["y_grid"],
-                    "heading_deg": pose["heading_deg"],
-                }
-                self.pc.send("PHOTO_PROGRESS," + json.dumps(report, separators=(",", ":")))
-            except (ValueError, OSError) as exc:
-                self._halt_mission(str(exc))
+            if not self._execute_photo_adjustment(
+                    mission, obstacle_id, token, standoff_cm, measured_us,
+                    movement_tokens=movement_tokens):
                 return False
         return False
+
+    @staticmethod
+    def _inverse_photo_token(token: str) -> str:
+        """Return the exact straight command that undoes a photo adjustment."""
+        token = str(token).strip().upper()
+        if token.startswith("F"):
+            return "R" + token[1:]
+        if token.startswith("R"):
+            return "F" + token[1:]
+        raise ValueError(f"Photo adjustment is not a straight command: {token}")
+
+    def _restore_planned_photo_pose(self, mission, obstacle_id: str,
+                                    standoff_cm: int, movement_tokens) -> bool:
+        """Undo temporary range moves so the next segment starts as planned.
+
+        The planner collision-checks the next segment from its original photo
+        pose. Ultrasonic correction changes that pose, so leaving the robot at
+        the corrected camera range invalidates every later expected pose and
+        swept-footprint check. Replaying the inverse straight commands returns
+        over the same static path that was just used for the photograph.
+        """
+        if not movement_tokens:
+            return True
+        logging.info(
+            "Restoring obstacle %s to its pre-photo route pose after %d "
+            "temporary camera move(s).",
+            obstacle_id, len(movement_tokens),
+        )
+        for token in reversed(movement_tokens):
+            inverse = self._inverse_photo_token(token)
+            if not self._execute_photo_adjustment(
+                    mission, obstacle_id, inverse, standoff_cm):
+                logging.error(
+                    "Could not restore the planned route pose after obstacle %s; "
+                    "the next segment preflight must recover from the live pose.",
+                    obstacle_id,
+                )
+                return False
+        return True
 
     def _detect_with_distance_retry(self, obstacle_id: str, mission):
         """Retry an unclear photograph only at planner-approved standoffs."""
         self._last_capture_attempts = 0
+        temporary_moves = []
+        retry_limit = max(0, int(getattr(self, "photo_retry_limit", 0)))
         obstacle_key = str(obstacle_id)
         original = getattr(self, "selected_standoffs", {}).get(obstacle_key)
         us_adjustable = getattr(self, "ultrasonic_adjustments", {}).get(
             obstacle_key, False
         )
         if original is not None and us_adjustable:
-            self._move_for_photo(mission, obstacle_id, original)
+            self._move_for_photo(mission, obstacle_id, original,
+                                 current_standoff_cm=original, use_ultrasonic=True,
+                                 movement_tokens=temporary_moves)
         if self.capture_settle > 0:
             logging.info(
                 "Waiting %.1fs for chassis vibration to settle before capture.",
@@ -905,59 +1037,65 @@ class Task1:
             result = self._detect_and_send_image(obstacle_id)
         else:
             result = self._detect_and_send_image(obstacle_id, original)
-        if self.a5_mode or self._valid_detection(result):
-            return result
-
-        safe = getattr(self, "photo_standoffs", {}).get(obstacle_key, [])
-        if original is None or not safe or not us_adjustable:
-            logging.warning(
-                "No planner-approved alternate camera distances for obstacle %s; "
-                "keeping the original frame.", obstacle_id,
-            )
-            return result
-
-        candidates = []
-        for distance in self.photo_retry_standoffs:
-            if distance in safe and distance != original and distance not in candidates:
-                candidates.append(distance)
-        candidates = candidates[:self.photo_retry_limit]
-        if not candidates:
-            logging.warning(
-                "Obstacle %s has no safe configured retry standoff (selected=%s, safe=%s).",
-                obstacle_id, original, safe,
-            )
-            return result
-
-        logging.warning(
-            "Detection for obstacle %s was missing/low-confidence at %d cm; "
-            "trying safe camera distances %s.",
-            obstacle_id, original, candidates,
-        )
-        moved = False
-        for distance in candidates:
-            if not self._move_for_photo(mission, obstacle_id, distance):
-                break
-            moved = True
-            if self.capture_settle > 0:
-                logging.info(
-                    "Waiting %.1fs for camera to settle at %d cm.",
-                    self.capture_settle, distance,
+        if not self.a5_mode and not self._valid_detection(result):
+            safe = getattr(self, "photo_standoffs", {}).get(obstacle_key, [])
+            candidates = []
+            if original is not None and safe:
+                configured = {
+                    distance for distance in self.photo_retry_standoffs
+                    if distance in safe and distance != original
+                }
+                # Improve framing with the smallest safe change first. Move
+                # closer before trying farther away, but never invent a range
+                # the planner did not collision-check for this exact view.
+                candidates = (
+                    sorted((value for value in configured if value < original),
+                           reverse=True)
+                    + sorted(value for value in configured if value > original)
                 )
-                sleep(self.capture_settle)
-            result = self._detect_and_send_image(obstacle_id, distance)
-            if self._valid_detection(result):
-                logging.info(
-                    "Obstacle %s detected at retry standoff %d cm.",
-                    obstacle_id, distance,
-                )
-                break
+                candidates = candidates[:retry_limit]
 
-        if moved and not self.halted:
-            logging.info(
-                "Returning obstacle %s to its planned %d cm standoff before continuing.",
-                obstacle_id, original,
+            if not candidates:
+                logging.warning(
+                    "Obstacle %s has no safe configured retry standoff "
+                    "(selected=%s, safe=%s, retry_limit=%d).",
+                    obstacle_id, original, safe, retry_limit,
+                )
+            else:
+                logging.warning(
+                    "Detection for obstacle %s was missing/low-confidence at %d cm; "
+                    "trying safe camera distances %s.",
+                    obstacle_id, original, candidates,
+                )
+                current = original
+                for distance in candidates:
+                    if not self._move_for_photo(
+                            mission, obstacle_id, distance,
+                            current_standoff_cm=current,
+                            use_ultrasonic=us_adjustable,
+                            movement_tokens=temporary_moves):
+                        if self.halted:
+                            break
+                        continue
+                    current = distance
+                    if self.capture_settle > 0:
+                        logging.info(
+                            "Waiting %.1fs for camera to settle at %d cm.",
+                            self.capture_settle, distance,
+                        )
+                        sleep(self.capture_settle)
+                    result = self._detect_and_send_image(obstacle_id, distance)
+                    if self._valid_detection(result):
+                        logging.info(
+                            "Obstacle %s detected at retry standoff %d cm.",
+                            obstacle_id, distance,
+                        )
+                        break
+
+        if not getattr(self, "halted", False) and original is not None:
+            self._restore_planned_photo_pose(
+                mission, obstacle_id, original, temporary_moves,
             )
-            self._move_for_photo(mission, obstacle_id, original)
         return result
 
     # ══ Thread: Android receive ═══════════════════════════════════════════════
@@ -1107,7 +1245,7 @@ class Task1:
                     continue
 
                 tag = msg.split(",", 1)[0]
-                if tag in ("CONTINUE", "REPLACE"):
+                if tag in ("CONTINUE", "REPLACE", "SKIP", "HOLD"):
                     try:
                         payload = json.loads(msg.split(",", 1)[1])
                     except (IndexError, json.JSONDecodeError):
@@ -1150,9 +1288,11 @@ class Task1:
                         raw_safe = payload.get("photo_standoffs", {})
                         raw_selected = payload.get("selected_standoffs", {})
                         raw_us_adjustments = payload.get("ultrasonic_adjustments", {})
+                        raw_view_angles = payload.get("selected_view_angles", {})
                         if (not isinstance(raw_safe, dict) or
                                 not isinstance(raw_selected, dict) or
-                                not isinstance(raw_us_adjustments, dict)):
+                                not isinstance(raw_us_adjustments, dict) or
+                                not isinstance(raw_view_angles, dict)):
                             raise ValueError("PATH camera standoff metadata must be objects")
                         self.photo_standoffs = {
                             str(key): [int(value) for value in values]
@@ -1166,6 +1306,13 @@ class Task1:
                             str(key): bool(value)
                             for key, value in raw_us_adjustments.items()
                         }
+                        self.selected_view_angles = {
+                            str(key): float(value) for key, value in raw_view_angles.items()
+                        }
+                        self.camera_to_sensor_cm = float(payload.get(
+                            "camera_to_sensor_cm", self.camera_to_sensor_cm
+                        ))
+                        self.plan_id = str(payload.get("plan_id", "legacy"))
                         self.directions = payload.get("dirs", [])
                         # Keep the planner's wire values for STATUS,START.
                         self.start_pose = {
@@ -1378,6 +1525,7 @@ class Task1:
                                 if obstacle_id is not None:
                                     remaining_photo_ids.append(obstacle_id)
                             mission.progress["remaining_photo_ids"] = remaining_photo_ids
+                            mission.progress["plan_id"] = getattr(self, "plan_id", None)
                             mission.progress.update(self._read_ir_snapshot())
                             finished_obstacle = (
                                 self._obstacle_for_segment(just_finished)
@@ -1553,8 +1701,17 @@ class Task1:
             self.camera.stop_camera()
             self.stm.disconnect()
             return
-        if not cal_profile.prepare_for_task(self.stm):
+        if not cal_profile.prepare_for_task(self.stm, zero_at_end=False):
             logging.error("Task 1 calibration startup failed — refusing to move.")
+            self.camera.stop_camera()
+            self.stm.disconnect()
+            return
+
+        # Heading 0 is the pose the robot is in now. The firmware carries
+        # heading error between moves, so zero immediately before Task 1 can
+        # begin accepting commands from Android.
+        if not cal_profile.zero_heading(self.stm):
+            logging.error("STM: could not zero the heading — not starting Task 1.")
             self.camera.stop_camera()
             self.stm.disconnect()
             return

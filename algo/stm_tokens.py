@@ -48,7 +48,7 @@ US_BIAS_CM = 1.3
 # it on CLEAN puts every turn 27mm wide, and the error compounds across turns.
 PROFILE_TIGHT, PROFILE_CLEAN, PROFILE_SLOW = 0, 1, 2
 TURN_RADIUS_MM = {
-    PROFILE_TIGHT: 294.5,
+    PROFILE_TIGHT: 293.5,
     PROFILE_CLEAN: 318.0,
     PROFILE_SLOW: 306.0,
 }
@@ -176,7 +176,7 @@ def arc_displacement(degrees: float, profile: int = PROFILE_TIGHT) -> Tuple[floa
     Displacement of an arc in the robot's own frame, in mm: (along, lateral).
 
     For radius R and angle t: along = R*sin(t), lateral = R*(1-cos(t)).
-    At 90 degrees both equal R — which is why a single 90 degree turn at 291mm
+    At 90 degrees both equal R — which is why a single 90 degree turn at 293.5mm
     eats roughly a seventh of a 2m arena in each axis.
     """
     radius = TURN_RADIUS_MM[profile]

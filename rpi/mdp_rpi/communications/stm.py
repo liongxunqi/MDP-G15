@@ -654,7 +654,7 @@ class STM:
 
     def set_profile(self, profile: int, timeout: Optional[float] = None) -> bool:
         """
-        Select the arc profile: 0 TIGHT (r=291mm), 1 CLEAN (r=318mm),
+        Select the arc profile: 0 TIGHT (r=293.5mm), 1 CLEAN (r=318mm),
         2 SLOW (r=306mm). Persists until changed or reset; default is TIGHT.
 
         Protocol 4 firmware is LOCKED to TIGHT and answers RESEND to !PROF1/2,

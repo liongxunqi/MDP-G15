@@ -68,9 +68,9 @@ def arena_grid_position(position_mm):
     position_mm = round(position_mm, 6)
     if not math.isfinite(position_mm):
         raise ValueError("Measured arena position must be finite")
-    # The arena has no boundary boards during assessment. The planner may allow
-    # a collision-checked body overhang while turning at an edge, so preserve
-    # the true fractional coordinate instead of halting or clamping it to 0..20.
+    # Preserve the true fractional coordinate instead of rounding to a cell.
+    # The PC preflight prevents planned boundary crossings; an out-of-range
+    # report remains valuable evidence of physical drift and must not be hidden.
     return position_mm / CELL_SIZE_MM
 
 

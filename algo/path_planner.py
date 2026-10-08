@@ -57,7 +57,7 @@ COLLISION_MARGIN_MM = 30.0
 # usable down to 20 cm, but that close pose is reserved for a face near an arena
 # edge where the normal distances would put the rear axle beyond the boundary.
 STANDOFF_PREFERENCE_CM = (30, 32, 33, 35, 38, 40, 42, 45)
-STANDOFF_LAST_RESORT_CM = (28, 20)
+STANDOFF_LAST_RESORT_CM = (28, 25, 20)
 STANDOFF_CANDIDATES_CM = STANDOFF_PREFERENCE_CM + STANDOFF_LAST_RESORT_CM
 
 # Closed-loop recovery. A replacement returns to the endpoint of the segment
@@ -65,11 +65,20 @@ STANDOFF_CANDIDATES_CM = STANDOFF_PREFERENCE_CM + STANDOFF_LAST_RESORT_CM
 # The grid search may join this much of the endpoint's final straight line.
 RECOVERY_APPROACH_LINE_MM = 600.0
 RECOVERY_LATERAL_TOL_MM = 25.0
-# grid_search has 45-degree heading states. Small measured heading errors are normal and
-# may be snapped for recovery planning; larger errors need a planner that models
-# arbitrary headings and are deliberately not guessed here.
+# Recovery may use one short, swept-footprint-checked alignment arc to reach the
+# nearest 45-degree planner heading. Normal search remains on eight headings;
+# only a failed local connection expands to the 24-heading fallback.
 RECOVERY_MAX_HEADING_SNAP_DEG = float(os.getenv(
     "RECOVERY_MAX_HEADING_SNAP_DEG", "8"
+))
+
+# Task 1 stays on the calibrated 45-degree heading lattice. The fine-lattice
+# implementation remains available for isolated development tests, but mission
+# planning does not opt into uncalibrated 15/30-degree arcs.
+FINE_TURN_FALLBACK = False
+FINE_TURN_STEPS_DEG = grid_search.FINE_TURN_STEPS_DEG
+FINE_TURN_MAX_EXPANSIONS = int(os.getenv(
+    "FINE_TURN_MAX_EXPANSIONS", "48000"
 ))
 
 # How far back from the photo pose a leg may join the approach line, and how
@@ -82,17 +91,20 @@ APPROACH_LATERAL_TOL_MM = 25.0
 # than correcting toward a neighbouring obstacle.
 US_VERIFY_RUNIN_MM = 150.0
 SONAR_HALF_ANGLE_DEG = 10.0
+CAMERA_AIM_TOL_DEG = 10.0
 
-# Head-on is preferred. A diagonal fallback lets the 45-degree lattice view a
-# face in a tight corridor, but only after the complete chassis pose and camera
-# ray have passed the same collision/visibility checks as a normal photo pose.
-PHOTO_VIEW_ANGLES_DEG = tuple(float(value) for value in os.getenv(
-    "PHOTO_VIEW_ANGLES_DEG", "0,45,-45"
-).split(",") if value.strip())
-
+# Head-on remains mandatory whenever it fits. If it does not, an edge target
+# may use either calibrated diagonal heading; both complete routes are checked.
+EDGE_VIEW_ANGLES_DEG = (-45.0, 45.0)
+EDGE_POSITION_BIAS_DEG = 8.0
+EDGE_APPROACH_LATERAL_TOL_MM = 5.0
+EDGE_LEG_SEARCH_BUDGET_S = 1.0
+COMPACT_VIEW_DISTANCES_CM = (30, 25, 35)
+COMPACT_SEARCH_SLICE_S = 3.0
 # The RPi gives up on PATH after PATH_TIMEOUT_S (30 s). Stop trying other
 # standoffs once this much time has gone and send the best plan so far.
 PLAN_TIME_BUDGET_S = 20.0
+PLAN_ASSEMBLY_DEADLINE_S = 28.0
 
 EXHAUSTIVE_LIMIT = 8
 
@@ -108,6 +120,15 @@ REAR_AXLE_TO_SENSOR_MM = float(os.getenv(
 REAR_AXLE_TO_CAMERA_MM = float(os.getenv(
     "REAR_AXLE_TO_CAMERA_CM", str(REAR_AXLE_TO_CAMERA_CM)
 )) * 10.0
+# Camera standoff and ultrasonic range use different origins. Derive their
+# separation from the two measured rear-axle offsets so they cannot drift.
+CAMERA_TO_SENSOR_MM = REAR_AXLE_TO_SENSOR_MM - REAR_AXLE_TO_CAMERA_MM
+if CAMERA_TO_SENSOR_MM < 0:
+    raise ValueError("REAR_AXLE_TO_CAMERA_CM cannot exceed REAR_AXLE_TO_SENSOR_CM")
+# The measured camera mount is approximately the geometric chassis centre.
+# Motion and feedback remain rear-axle referenced; collision checks translate
+# each sampled pose by this amount before testing the 23 x 18.8 cm rectangle.
+BODY_CENTRE_AHEAD_MM = REAR_AXLE_TO_CAMERA_MM
 
 # Start pose: robot facing N, pushed into the start zone's bottom-left corner -
 # rear on the bottom line, left side on the left line, START_GAP_MM off each so
@@ -115,7 +136,10 @@ REAR_AXLE_TO_CAMERA_MM = float(os.getenv(
 # of a 40x40 cm box is not. START_X_MM / START_Y_MM in the PC's environment
 # override the computed centre for fine-tuning on the day.
 START_GAP_MM = float(os.getenv("START_GAP_MM", "10"))
-START_X_MM = float(os.getenv("START_X_MM", ROBOT_HALF_WIDTH_MM + START_GAP_MM))
+# The first right arc needs 20 mm side clearance to keep the swept chassis
+# inside x=0. Rear clearance can remain 10 mm because the robot first moves N.
+START_SIDE_GAP_MM = float(os.getenv("START_SIDE_GAP_MM", "20"))
+START_X_MM = float(os.getenv("START_X_MM", ROBOT_HALF_WIDTH_MM + START_SIDE_GAP_MM))
 START_Y_MM = float(os.getenv("START_Y_MM", ROBOT_HALF_LENGTH_MM + START_GAP_MM))
 START_THETA = math.pi / 2
 
@@ -128,9 +152,8 @@ START_THETA = math.pi / 2
 # rpi_position = planner_position + (anchor - planner_start).
 RPI_ANCHOR_X_MM = float(os.getenv("RPI_ANCHOR_X_MM", str(START_X_MM)))
 RPI_ANCHOR_Y_MM = float(os.getenv("RPI_ANCHOR_Y_MM", str(START_Y_MM)))
-# Optional stricter reference-point boundary. It is disabled by default because
-# the RPi reports finite overhang coordinates instead of halting; the full body
-# remains bounded by grid_search.ARENA_OVERHANG_MM throughout every primitive.
+# Optional reported-coordinate guard. The normal Task 1 wire frame starts at
+# (0,0), so this is off; the stricter full-chassis arena check remains active.
 RPI_ARENA_GUARD = os.getenv("RPI_ARENA_GUARD", "0").strip().lower() not in ("0", "false", "no")
 RPI_ARENA_MARGIN_MM = float(os.getenv("RPI_ARENA_MARGIN_MM", "50"))
 
@@ -140,7 +163,7 @@ START_GUARD_MM = float(os.getenv("START_GUARD_MM", "700"))
 # ...but a body 10 mm from the line still sweeps a few mm across it in a normal
 # forward-right arc (6.8 mm at FR90), and a person places it to a few mm. Allow
 # that much; a forward-left arc from the corner (302 mm out) stays forbidden.
-START_GUARD_TOL_MM = float(os.getenv("START_GUARD_TOL_MM", "25"))
+START_GUARD_TOL_MM = float(os.getenv("START_GUARD_TOL_MM", "0"))
 # When NO clean way out of the start exists (obstacles close by, robot against two
 # lines), a leg that reverses or leaves the arena is used rather than returning
 # an empty plan - but only if nothing clean exists for that obstacle, and it is
@@ -151,6 +174,7 @@ _REAR_BLOCK_WIDTH_MM = 150.0     # ... and how far it extends past each side of 
 _BIG_MM = 10_000.0
 
 _MERGEABLE_RE = re.compile(r"^(F|R)(\d+)$")
+_ARC_RE = re.compile(r"^(FR|FL|RR|RL)(\d+)$")
 
 
 class Pose:
@@ -166,8 +190,15 @@ class Pose:
 # us_runin_mm: how far before the photo pose the target remains the nearest
 # ultrasonic echo. None means ?US cannot safely identify this target.
 PhotoOption = namedtuple(
-    "PhotoOption", "standoff_cm pose line us_runin_mm view_angle_deg"
+    "PhotoOption",
+    "standoff_cm pose line us_runin_mm view_angle_deg approach_reverse",
 )
+
+
+def _collision_boxes(items=()):
+    boxes = grid_search.Boxes(items)
+    boxes.body_centre_ahead_mm = BODY_CENTRE_AHEAD_MM
+    return boxes
 
 
 def _wrap(theta):
@@ -199,12 +230,20 @@ def _viewing_pose(obstacle: dict, standoff_mm: float,
     # distance from that face instead of shortening and laterally shifting it.
     face_x = cx + OBSTACLE_SIZE_MM / 2.0 * math.cos(outward)
     face_y = cy + OBSTACLE_SIZE_MM / 2.0 * math.sin(outward)
-    ray = outward + math.radians(view_angle_deg)
-    dist = standoff_mm + REAR_AXLE_TO_SENSOR_MM
+    heading_ray = outward + math.radians(view_angle_deg)
+    # Keep an exactly calibrated diagonal chassis heading, but place the camera
+    # slightly farther around the face. The target remains at the detector's
+    # 10-degree aim limit while the body gains edge and run-in clearance.
+    position_angle_deg = view_angle_deg
+    if view_angle_deg:
+        position_angle_deg += math.copysign(EDGE_POSITION_BIAS_DEG, view_angle_deg)
+    position_ray = outward + math.radians(position_angle_deg)
     return Pose(
-        face_x + dist * math.cos(ray),
-        face_y + dist * math.sin(ray),
-        ray + math.pi,
+        face_x + standoff_mm * math.cos(position_ray)
+        - REAR_AXLE_TO_CAMERA_MM * math.cos(heading_ray + math.pi),
+        face_y + standoff_mm * math.sin(position_ray)
+        - REAR_AXLE_TO_CAMERA_MM * math.sin(heading_ray + math.pi),
+        heading_ray + math.pi,
     )
 
 
@@ -256,7 +295,8 @@ def _start_boxes(start: "Pose") -> List[Tuple[float, float, float, float]]:
 
     w = _REAR_BLOCK_WIDTH_MM
     face = _nearest_cardinal(start.theta)
-    hl, hw = ROBOT_HALF_LENGTH_MM, ROBOT_HALF_WIDTH_MM
+    # Search poses are rear-axle positions; the footprint is centred ahead.
+    hl, hw = ROBOT_HALF_LENGTH_MM - BODY_CENTRE_AHEAD_MM, ROBOT_HALF_WIDTH_MM
     if face == "N":
         r = start.y - hl
         boxes.append((start.x - hw - w, r - _REAR_BLOCK_DEPTH_MM, start.x + hw + w, r))
@@ -273,6 +313,10 @@ def _start_boxes(start: "Pose") -> List[Tuple[float, float, float, float]]:
 
 
 def _pose_clear(x, y, theta, boxes) -> bool:
+    if not hasattr(boxes, "body_centre_ahead_mm"):
+        boxes = _collision_boxes(boxes)
+    else:
+        boxes.body_centre_ahead_mm = BODY_CENTRE_AHEAD_MM
     return not grid_search._point_blocked(
         x, y, theta, boxes, ARENA_MM, ROBOT_HALF_LENGTH_MM, ROBOT_HALF_WIDTH_MM,
     )
@@ -284,7 +328,10 @@ def _sonar_sees_target_first(pose: Pose, back_mm: float, standoff_mm: float,
     is the image face the nearest echo in the cone?"""
     c, s = math.cos(pose.theta), math.sin(pose.theta)
     squares = [(o["x"] * 100.0, o["y"] * 100.0) for o in others]
-    target_range = standoff_mm + back_mm
+    sensor_standoff_mm = standoff_mm - CAMERA_TO_SENSOR_MM
+    if sensor_standoff_mm <= 0:
+        return False
+    target_range = sensor_standoff_mm + back_mm
     steps = 4
     for side in (-APPROACH_LATERAL_TOL_MM, 0.0, APPROACH_LATERAL_TOL_MM):
         sx = pose.x + (REAR_AXLE_TO_SENSOR_MM - back_mm) * c - side * s
@@ -314,66 +361,314 @@ def _us_runin(pose: Pose, standoff_mm: float, others: List[dict]) -> Optional[fl
     return runin
 
 
+def _camera_view_clear(pose: Pose, obstacle: dict, others: List[dict]) -> bool:
+    """The selected face is centred enough and no other block hides it.
+
+    The camera is modelled at its measured mounting position. Sampling the segment
+    to the image-face centre is deliberately conservative: a neighbouring
+    obstacle in that narrow central view can otherwise be classified for the
+    wrong obstacle ID.
+    """
+    face = FACE_FROM_D.get(obstacle.get("d"))
+    if face is None:
+        return False
+    outward = {
+        "N": math.pi / 2,
+        "S": -math.pi / 2,
+        "E": 0.0,
+        "W": math.pi,
+    }[face]
+    target_x = (obstacle["x"] * 100.0 + OBSTACLE_SIZE_MM / 2.0 +
+                OBSTACLE_SIZE_MM / 2.0 * math.cos(outward))
+    target_y = (obstacle["y"] * 100.0 + OBSTACLE_SIZE_MM / 2.0 +
+                OBSTACLE_SIZE_MM / 2.0 * math.sin(outward))
+    camera_x = pose.x + REAR_AXLE_TO_CAMERA_MM * math.cos(pose.theta)
+    camera_y = pose.y + REAR_AXLE_TO_CAMERA_MM * math.sin(pose.theta)
+    dx, dy = target_x - camera_x, target_y - camera_y
+    distance = math.hypot(dx, dy)
+    if distance <= 0:
+        return False
+    target_heading = math.atan2(dy, dx)
+    heading_error = abs(math.degrees(_wrap(target_heading - pose.theta)))
+    if heading_error > CAMERA_AIM_TOL_DEG:
+        return False
+
+    steps = max(1, int(distance // 5.0))
+    boxes = [
+        (other["x"] * 100.0, other["y"] * 100.0,
+         other["x"] * 100.0 + OBSTACLE_SIZE_MM,
+         other["y"] * 100.0 + OBSTACLE_SIZE_MM)
+        for other in others
+    ]
+    for i in range(1, steps):
+        fraction = i / steps
+        x = camera_x + dx * fraction
+        y = camera_y + dy * fraction
+        if any(x0 <= x <= x1 and y0 <= y <= y1 for x0, y0, x1, y1 in boxes):
+            return False
+    return True
+
+
 def _photo_options(obstacle: dict, boxes, obstacles: List[dict],
                    allow_oblique: bool = False) -> List[PhotoOption]:
     """Every standoff in STANDOFF_CANDIDATES_CM whose photo pose is clear, in
     preference order, each with the stretch of approach line that is clear."""
     options = []
-    angles = PHOTO_VIEW_ANGLES_DEG if allow_oblique else (0.0,)
+    angles = EDGE_VIEW_ANGLES_DEG if allow_oblique else (0.0,)
     for standoff_cm in STANDOFF_CANDIDATES_CM:
         for view_angle_deg in angles:
             pose = _viewing_pose(obstacle, standoff_cm * 10.0, view_angle_deg)
             if pose is None or not _pose_clear(pose.x, pose.y, pose.theta, boxes):
                 continue
+            others = [o for o in obstacles if o is not obstacle
+                      and (o["x"], o["y"]) != (obstacle["x"], obstacle["y"])]
+            # A* may finish slightly to either side of the approach line. Every
+            # allowed offset must still have a clear, correctly aimed view.
+            lateral_tolerance = (EDGE_APPROACH_LATERAL_TOL_MM if view_angle_deg
+                                 else APPROACH_LATERAL_TOL_MM)
+            if not all(
+                _camera_view_clear(
+                    Pose(
+                        pose.x - side * math.sin(pose.theta),
+                        pose.y + side * math.cos(pose.theta),
+                        pose.theta,
+                    ),
+                    obstacle,
+                    others,
+                )
+                for side in (-lateral_tolerance, 0.0, lateral_tolerance)
+            ):
+                continue
+            approach_reverse = bool(view_angle_deg)
+            approach_direction = 1.0 if approach_reverse else -1.0
             length = 0.0
             while length + 10.0 <= APPROACH_LINE_MAX_MM:
                 back = length + 10.0
-                if not _pose_clear(pose.x - back * math.cos(pose.theta),
-                                   pose.y - back * math.sin(pose.theta), pose.theta, boxes):
+                if not _pose_clear(
+                        pose.x + approach_direction * back * math.cos(pose.theta),
+                        pose.y + approach_direction * back * math.sin(pose.theta),
+                        pose.theta, boxes):
                     break
                 length = back
-            line = grid_search.ApproachLine(
-                pose.x, pose.y, pose.theta, length, APPROACH_LATERAL_TOL_MM
-            )
-            others = [o for o in obstacles if o is not obstacle
-                      and (o["x"], o["y"]) != (obstacle["x"], obstacle["y"])]
-            runin = _us_runin(pose, standoff_cm * 10.0, others)
-            if runin is None and view_angle_deg:
+            # A static diagonal endpoint is not enough: require room for at
+            # least one full reverse grid step so the last arc finishes inboard.
+            if approach_reverse and length < grid_search.STEP_MM:
                 continue
+            line = grid_search.ApproachLine(
+                pose.x, pose.y, pose.theta, length, lateral_tolerance,
+                reverse=approach_reverse,
+            )
+            # A flat face can reflect ultrasound away from the receiver at an
+            # oblique camera angle. Keep the collision-checked view, but mark it
+            # odometry-only so the RPi never chases a wall echo with F/R.
+            runin = (None if view_angle_deg else
+                     _us_runin(pose, standoff_cm * 10.0, others))
             options.append(PhotoOption(
-                standoff_cm, pose, line, runin, view_angle_deg
+                standoff_cm, pose, line, runin, view_angle_deg,
+                approach_reverse,
             ))
     return options
 
 
-def _search_leg(from_pose: Pose, option: PhotoOption, radius_mm, boxes):
+def _outward_face_clearance_mm(obstacle: dict) -> float:
+    """Distance from the image plane to the arena edge it faces."""
+    face = FACE_FROM_D.get(obstacle.get("d"))
+    if face == "N":
+        return ARENA_MM - (obstacle["y"] + 1.0) * 100.0
+    if face == "S":
+        return obstacle["y"] * 100.0
+    if face == "E":
+        return ARENA_MM - (obstacle["x"] + 1.0) * 100.0
+    if face == "W":
+        return obstacle["x"] * 100.0
+    return math.inf
+
+
+def _on_coarse_heading(theta: float) -> bool:
+    units = (math.degrees(theta) % 360.0) / grid_search.TURN_STEP_DEG
+    return abs(units - round(units)) < 1e-6
+
+
+def _search_motion(start_x, start_y, start_theta, goal, radius_mm, boxes,
+                   forbidden_first_tokens=(), deadline=None):
+    """Use the fast 45-degree lattice first, then a bounded fine fallback."""
+    fine_required = (not _on_coarse_heading(start_theta) or
+                     not _on_coarse_heading(goal.theta))
+    if not fine_required:
+        try:
+            return grid_search.search_leg(
+                start_x, start_y, start_theta, goal, radius_mm, boxes, ARENA_MM,
+                ROBOT_HALF_LENGTH_MM, ROBOT_HALF_WIDTH_MM,
+                forbidden_first_tokens=forbidden_first_tokens,
+                deadline=deadline,
+            )
+        except grid_search.NoPathFound:
+            if (not FINE_TURN_FALLBACK or
+                    (deadline is not None and time.monotonic() >= deadline)):
+                raise
+    elif not FINE_TURN_FALLBACK:
+        raise grid_search.NoPathFound(
+            "A non-45-degree endpoint requires the fine turn lattice."
+        )
+
+    return grid_search.search_leg(
+        start_x, start_y, start_theta, goal, radius_mm, boxes, ARENA_MM,
+        ROBOT_HALF_LENGTH_MM, ROBOT_HALF_WIDTH_MM,
+        forbidden_first_tokens=forbidden_first_tokens,
+        turn_steps_deg=FINE_TURN_STEPS_DEG,
+        max_expansions=FINE_TURN_MAX_EXPANSIONS,
+        deadline=deadline,
+    )
+
+
+def _uses_fine_turn(tokens: List[str]) -> bool:
+    for token in tokens:
+        match = re.fullmatch(r"(?:FR|FL|RR|RL)(\d+)", token.upper())
+        if match is not None and int(match.group(1)) % grid_search.TURN_STEP_DEG:
+            return True
+    return False
+
+
+def _search_leg(from_pose: Pose, option: PhotoOption, radius_mm, boxes,
+                deadline=None):
     """(tokens, poses, cost) onto option's approach line, or None. Cost
     includes the straight run-in along the line, so legs compare fairly."""
+    if option.view_angle_deg:
+        edge_deadline = time.monotonic() + EDGE_LEG_SEARCH_BUDGET_S
+        deadline = edge_deadline if deadline is None else min(deadline, edge_deadline)
     try:
-        tokens, raw_poses, cost = grid_search.search_leg(
+        tokens, raw_poses, cost = _search_motion(
             from_pose.x, from_pose.y, from_pose.theta, option.line,
-            radius_mm, boxes, ARENA_MM, ROBOT_HALF_LENGTH_MM, ROBOT_HALF_WIDTH_MM,
+            radius_mm, boxes, deadline=deadline,
         )
     except grid_search.NoPathFound:
         return None
-    poses = [Pose(x, y, t) for x, y, t in raw_poses]
+    poses = _replay_motion(from_pose, tokens, radius_mm, boxes)
+    if poses is None:
+        return None
+
     back, _ = option.line.offsets(poses[-1].x, poses[-1].y)
+    if not (-1.0 <= back <= option.line.length_mm):
+        return None
+    _, side = option.line.offsets(poses[-1].x, poses[-1].y)
+    if abs(side) > option.line.lateral_tol_mm:
+        return None
     return tokens, poses, cost + max(back, 0.0)
 
 
-def _merge_runs(tokens: List[str], poses: List[Pose]):
-    """Merge straights, but preserve every 45-degree arc checkpoint.
+def _replay_motion(from_pose: Pose, tokens: List[str], radius_mm, boxes):
+    """Replay emitted tokens continuously and reject any unsafe sweep."""
+    poses = [Pose(from_pose.x, from_pose.y, from_pose.theta)]
+    current = poses[0]
+    for token in tokens:
+        match = re.fullmatch(r"(FR|FL|RR|RL|F|R)(\d+)", token.upper())
+        if match is None:
+            return None
+        op, magnitude_text = match.groups()
+        magnitude = int(magnitude_text)
+        if op in ("F", "R"):
+            distance = magnitude * 10.0 * (1.0 if op == "F" else -1.0)
+            count = max(1, int(math.ceil(abs(distance) / 10.0)))
+            samples = [
+                Pose(
+                    current.x + distance * i / count * math.cos(current.theta),
+                    current.y + distance * i / count * math.sin(current.theta),
+                    current.theta,
+                )
+                for i in range(1, count + 1)
+            ]
+        else:
+            direction = 1 if op[0] == "F" else -1
+            curvature = 1 if op[1] == "L" else -1
+            total = math.radians(magnitude)
+            count = max(1, int(math.ceil(magnitude / 2.0)))
+            samples = []
+            for i in range(1, count + 1):
+                dx, dy, theta = grid_search._arc_delta(
+                    current.theta, direction, curvature,
+                    total * i / count, radius_mm,
+                )
+                samples.append(Pose(current.x + dx, current.y + dy, theta))
+        if any(not _pose_clear(sample.x, sample.y, sample.theta, boxes)
+               for sample in samples):
+            return None
+        current = samples[-1]
+        poses.append(current)
+    return poses
 
-    Keeping each searched arc separate gives the RPi an OK, WPOSE and IR sample
-    before the next half of a larger manoeuvre. poses[i] is the pose AFTER
-    tokens[i].
-    """
+
+class _MultiApproachGoal:
+    """A* goal that accepts the approach line of any candidate target."""
+
+    def __init__(self, candidates):
+        self.candidates = candidates
+        first = candidates[0][1].line
+        # _search_motion only uses theta to choose the calibrated heading lattice.
+        self.x, self.y, self.theta = first.x, first.y, first.theta
+
+    def contains(self, state, headings):
+        return any(option.line.contains(state, headings)
+                   for _, option in self.candidates)
+
+    def distance(self, x, y):
+        return min(option.line.distance(x, y)
+                   for _, option in self.candidates)
+
+
+def _option_reached(pose: Pose, candidates):
+    heading = grid_search._heading_index(pose.theta)
+    for obstacle, option in candidates:
+        if heading != grid_search._heading_index(option.line.theta):
+            continue
+        back, side = option.line.offsets(pose.x, pose.y)
+        if (-1.0 <= back <= option.line.length_mm and
+                abs(side) <= option.line.lateral_tol_mm):
+            return obstacle, option
+    return None
+
+
+def _search_any_approach(from_pose: Pose, candidates, radius_mm, boxes,
+                         deadline):
+    """Reach one of several camera approach lines with a single A* run."""
+    if not candidates:
+        return None
+    goal = _MultiApproachGoal(candidates)
+    try:
+        tokens, _, cost = _search_motion(
+            from_pose.x, from_pose.y, from_pose.theta, goal,
+            radius_mm, boxes, deadline=deadline,
+        )
+    except grid_search.NoPathFound:
+        return None
+    poses = _replay_motion(from_pose, tokens, radius_mm, boxes)
+    if poses is None:
+        return None
+    reached = _option_reached(poses[-1], candidates)
+    if reached is None:
+        return None
+    obstacle, option = reached
+    back, _ = option.line.offsets(poses[-1].x, poses[-1].y)
+    return obstacle, option, (tokens, poses, cost + max(back, 0.0))
+
+
+def _merge_runs(tokens: List[str], poses: List[Pose]):
+    """Merge compatible straight runs and adjacent arcs up to 90 degrees."""
     out_t, out_p = [], []
     for tok, pose in zip(tokens, poses):
         m = _MERGEABLE_RE.match(tok)
         prev = _MERGEABLE_RE.match(out_t[-1]) if out_t else None
+        arc_match = _ARC_RE.match(tok)
+        prev_arc = _ARC_RE.match(out_t[-1]) if out_t else None
         if m and prev and m.group(1) == prev.group(1):
             out_t[-1] = f"{m.group(1)}{int(prev.group(2)) + int(m.group(2))}"
+            out_p[-1] = pose
+        elif (arc_match and prev_arc and
+              arc_match.group(1) == prev_arc.group(1) and
+              int(arc_match.group(2)) + int(prev_arc.group(2)) <= 90):
+            out_t[-1] = (
+                f"{arc_match.group(1)}"
+                f"{int(prev_arc.group(2)) + int(arc_match.group(2))}"
+            )
             out_p[-1] = pose
         else:
             out_t.append(tok)
@@ -504,14 +799,14 @@ class _Legs:
         from_pose = self._from_pose(from_id, choice)
         option = self.options[to_id][choice[to_id]]
         if from_id != "START":
-            return _search_leg(from_pose, option, self.radius_mm, self.boxes)
-        leg = _search_leg(from_pose, option, self.radius_mm, self.start_boxes)
-        if leg is None and self.start_boxes is not self.boxes:
-            leg = _search_leg(from_pose, option, self.radius_mm, self.boxes)
-            if leg is not None:
-                tokens, poses, cost = leg
-                leg = (tokens, poses, cost + START_RELAXED_PENALTY_MM)
-                self.relaxed.add(key)
+            return _search_leg(
+                from_pose, option, self.radius_mm, self.boxes,
+                deadline=self.deadline,
+            )
+        leg = _search_leg(
+            from_pose, option, self.radius_mm, self.start_boxes,
+            deadline=self.deadline,
+        )
         return leg
 
     def _from_pose(self, from_id, choice):
@@ -625,6 +920,138 @@ def _choose_tour(visitable, legs: _Legs, options):
     return order, choice, cache
 
 
+def _compact_diagonal_candidates(options):
+    """One bounded set of useful distances on each side of a known face."""
+    selected = []
+    for angle in EDGE_VIEW_ANGLES_DEG:
+        side = [option for option in options
+                if option.view_angle_deg == angle]
+        for distance in COMPACT_VIEW_DISTANCES_CM:
+            option = next((item for item in side
+                           if item.standoff_cm == distance), None)
+            if option is not None:
+                selected.append(option)
+    return selected
+
+
+def _terminal_after_leg(leg, option):
+    """Continuous pose after the rounded final straight camera run-in."""
+    _, poses, _ = leg
+    last = poses[-1]
+    back, _ = option.line.offsets(last.x, last.y)
+    run_cm = round(back / 10.0)
+    if run_cm <= 0:
+        return Pose(last.x, last.y, option.pose.theta)
+    direction = -1.0 if option.approach_reverse else 1.0
+    run_mm = run_cm * 10.0
+    return Pose(
+        last.x + direction * run_mm * math.cos(option.pose.theta),
+        last.y + direction * run_mm * math.sin(option.pose.theta),
+        option.pose.theta,
+    )
+
+
+def _plan_compact_sequence(start, visitable, head_options, diagonal_options,
+                           radius_mm, boxes, start_boxes, deadline):
+    """Greedily reach any safe next face with one A* search per step.
+
+    Normal head-on poses remain the first goal set. Only when none of those is
+    reachable within the bounded slice does the search expose diagonal poses.
+    Distances beyond 25/30/35 cm are left to local camera retry handling.
+    """
+    remaining = list(visitable)
+    sequence = []
+    current = start
+    first_leg = True
+    best_sequence = []
+    banned_next = {}
+    visit_index = {obstacle["id"]: index
+                   for index, obstacle in enumerate(visitable)}
+    while remaining and time.monotonic() < deadline:
+        prefix = tuple(item[0]["id"] for item in sequence)
+        banned = banned_next.get(prefix, set())
+        primary = []
+        alternate_heads = []
+        fallback = []
+        for obstacle in remaining:
+            if obstacle["id"] in banned:
+                continue
+            heads = head_options.get(obstacle["id"], [])
+            if heads:
+                primary.append((obstacle, heads[0]))
+                alternate_heads.extend((obstacle, option) for option in heads[1:])
+            else:
+                primary.extend(
+                    (obstacle, option)
+                    for option in _compact_diagonal_candidates(
+                        diagonal_options.get(obstacle["id"], [])
+                    )
+                )
+            fallback.extend(
+                (obstacle, option)
+                for option in _compact_diagonal_candidates(
+                    diagonal_options.get(obstacle["id"], [])
+                )
+            )
+
+        found = None
+        search_boxes = start_boxes if first_leg else boxes
+        # Targets with no head-on pose need diagonals immediately. For the
+        # others, try alternate head-on distances before their diagonal views.
+        stages = [(candidates, limit) for candidates, limit in
+                  ((primary, COMPACT_SEARCH_SLICE_S), (alternate_heads, 0.5),
+                   (fallback, COMPACT_SEARCH_SLICE_S)) if candidates]
+        for stage_index, (candidates, search_slice) in enumerate(stages):
+            if not candidates or time.monotonic() >= deadline:
+                continue
+            # Reserve time for diagonal candidates when head-on searches are
+            # difficult; otherwise a valid edge view can be starved entirely.
+            remaining_time = deadline - time.monotonic()
+            search_slice = min(search_slice, remaining_time / (len(stages) - stage_index))
+            found = _search_any_approach(
+                current, candidates, radius_mm, search_boxes,
+                min(deadline, time.monotonic() + search_slice),
+            )
+            if found is not None:
+                break
+        relaxed_start = False
+        if found is None:
+            if not sequence:
+                break
+            removed = sequence.pop()
+            removed_obstacle = removed[0]
+            previous_prefix = tuple(item[0]["id"] for item in sequence)
+            banned_next.setdefault(previous_prefix, set()).add(
+                removed_obstacle["id"]
+            )
+            remaining.append(removed_obstacle)
+            remaining.sort(key=lambda item: visit_index[item["id"]])
+            current = (start if not sequence else
+                       _terminal_after_leg(sequence[-1][2], sequence[-1][1]))
+            first_leg = not sequence
+            logging.info(
+                "Compact route backtracked from obstacle %s to try a different "
+                "visit order.", removed_obstacle["id"],
+            )
+            continue
+
+        obstacle, option, leg = found
+        sequence.append((obstacle, option, leg, relaxed_start))
+        if len(sequence) > len(best_sequence):
+            best_sequence = list(sequence)
+        remaining.remove(obstacle)
+        current = _terminal_after_leg(leg, option)
+        first_leg = False
+
+    # Backtracking may be interrupted by the deadline. Keep the longest valid
+    # route already found instead of returning the partially unwound stack.
+    if len(best_sequence) > len(sequence):
+        sequence = best_sequence
+        visited = {item[0]["id"] for item in sequence}
+        remaining = [obs for obs in visitable if obs["id"] not in visited]
+    return sequence, remaining
+
+
 def _plan_frame_shift(plan: dict) -> Tuple[float, float]:
     """Translation from planner coordinates to the RPi's reported frame."""
     shift = plan.get("frame_shift_mm")
@@ -673,7 +1100,7 @@ def assess_primitive_safety(plan: dict, obstacles: List[dict], progress: dict,
     except (KeyError, TypeError, ValueError):
         return {"reason": "invalid measured pose", "next_token": str(token)}
 
-    boxes = grid_search.Boxes([_obstacle_aabb_mm(o) for o in obstacles])
+    boxes = _collision_boxes([_obstacle_aabb_mm(o) for o in obstacles])
     if RPI_ARENA_GUARD:
         boxes.ref_bounds = _rpi_ref_bounds(Pose(
             float(plan.get("start_mm", {}).get("x", START_X_MM)),
@@ -702,7 +1129,7 @@ def assess_primitive_safety(plan: dict, obstacles: List[dict], progress: dict,
         direction = 1 if op[0] == "F" else -1
         curvature = 1 if op[1] == "L" else -1
         total = math.radians(magnitude)
-        count = max(1, int(math.ceil(magnitude / 7.5)))
+        count = max(1, int(math.ceil(magnitude / 2.0)))
         radius = TURN_RADIUS_MM[arc_profile]
         for i in range(1, count + 1):
             dx, dy, sample_theta = grid_search._arc_delta(
@@ -784,7 +1211,7 @@ def plan_segment_recovery(plan: dict, obstacles: List[dict], progress: dict,
 
     target_theta = math.radians(90.0 - target_hdg)
     target_theta = grid_search._HEADINGS[grid_search._heading_index(target_theta)]
-    boxes = grid_search.Boxes([_obstacle_aabb_mm(o) for o in obstacles])
+    boxes = _collision_boxes([_obstacle_aabb_mm(o) for o in obstacles])
     if RPI_ARENA_GUARD:
         m = RPI_ARENA_MARGIN_MM
         boxes.ref_bounds = (
@@ -960,15 +1387,18 @@ def plan_mission(obstacles: List[dict], arc_profile: int = PROFILE_TIGHT,
     # Every obstacle, the one being approached included: even the closest
     # photo pose (28 cm) is far outside its margin, so nothing needs excluding.
     obstacle_boxes = [_obstacle_aabb_mm(o) for o in obstacles]
-    boxes = grid_search.Boxes(obstacle_boxes)
+    boxes = _collision_boxes(obstacle_boxes)
     if RPI_ARENA_GUARD:
         boxes.ref_bounds = _rpi_ref_bounds(start)
 
     # Extra blockers for the leg leaving START. If the start pose already breaks
     # them (START_X_MM / START_Y_MM set so the body is over the line) they would
     # trap the search at its first step, so drop them and say so.
-    start_boxes = grid_search.Boxes(list(boxes) + _start_boxes(start))
+    start_boxes = _collision_boxes(list(boxes) + _start_boxes(start))
     start_boxes.ref_bounds = boxes.ref_bounds
+    # This is a per-leg hook for measured placement tolerance. It defaults to
+    # zero: the calculated 20 mm side gap keeps even the first sweep inside.
+    start_boxes.arena_overhang_mm = START_GUARD_TOL_MM
     if not _pose_clear(start.x, start.y, start.theta, start_boxes):
         logging.warning(
             "Start pose is already outside the arena or over the start guard "
@@ -977,16 +1407,45 @@ def plan_mission(obstacles: List[dict], arc_profile: int = PROFILE_TIGHT,
         start_boxes = boxes
 
     options: Dict[object, List[PhotoOption]] = {}
-    visitable = []
+    head_options: Dict[object, List[PhotoOption]] = {}
+    diagonal_options: Dict[object, List[PhotoOption]] = {}
+    eligible = []
     skipped = {}
     for obs in obstacles:
         if obs.get("d") not in FACE_FROM_D:
             logging.info(f"Obstacle {obs.get('id')}: SKIP (d={obs.get('d')}).")
             continue
-        opts = _photo_options(obs, boxes, obstacles, allow_oblique=True)
+        head_options[obs["id"]] = _photo_options(
+            obs, boxes, obstacles, allow_oblique=False,
+        )
+        eligible.append(obs)
+
+    # Use compact search immediately only when none of the targets has a
+    # head-on pose. Mixed layouts retain the normal tour, then try leftovers.
+    compact_mode = bool(eligible) and all(not head_options[obs["id"]] for obs in eligible)
+    if compact_mode:
+        logging.info(
+            "No target has a safe head-on pose; using compact-layout "
+            "multi-goal planning."
+        )
+
+    visitable = []
+    for obs in eligible:
+        heads = head_options[obs["id"]]
+        diagonals = _photo_options(
+            obs, boxes, obstacles, allow_oblique=True,
+        )
+        diagonal_options[obs["id"]] = diagonals
+        opts = heads + diagonals
         if not opts:
-            if (boxes.ref_bounds is not None and
-                    _photo_options(obs, obstacle_boxes, obstacles, allow_oblique=True)):
+            unrestricted_boxes = _collision_boxes(obstacle_boxes)
+            unrestricted_options = (
+                _photo_options(obs, unrestricted_boxes, obstacles,
+                               allow_oblique=False) or
+                _photo_options(obs, unrestricted_boxes, obstacles,
+                               allow_oblique=True)
+            )
+            if boxes.ref_bounds is not None and unrestricted_options:
                 logging.error(
                     f"Obstacle {obs['id']}: its photo spot is only reachable by taking the robot "
                     f"past the point where the RPi stops the mission (position outside the "
@@ -1004,8 +1463,54 @@ def plan_mission(obstacles: List[dict], arc_profile: int = PROFILE_TIGHT,
         options[obs["id"]] = opts
         visitable.append(obs)
 
-    legs = _Legs(start, options, radius_mm, boxes, t0 + PLAN_TIME_BUDGET_S, start_boxes)
-    order, choice, cache = _choose_tour(visitable, legs, options)
+    if not compact_mode and visitable:
+        # A bounded connectivity probe avoids spending the all-pairs budget
+        # on a dense layout whose ordinary head-on approaches are unreachable.
+        candidates = [(obs, option) for obs in visitable
+                      for option in head_options[obs["id"]]]
+        compact_mode = _search_any_approach(
+            start, candidates, radius_mm, start_boxes,
+            min(time.monotonic() + 1.0, t0 + PLAN_ASSEMBLY_DEADLINE_S),
+        ) is None
+        if compact_mode:
+            logging.info("Normal start connection unavailable within probe budget; "
+                         "trying compact-layout fallback.")
+
+    compact_legs = {}
+    compact_options = {}
+    compact_relaxed = set()
+    legs = None
+    choice = {}
+    cache = {}
+    if compact_mode:
+        sequence, unreachable = _plan_compact_sequence(
+            start, visitable, head_options, diagonal_options,
+            radius_mm, boxes, start_boxes,
+            t0 + PLAN_ASSEMBLY_DEADLINE_S,
+        )
+        order = [item[0] for item in sequence]
+        for obstacle, option, leg, relaxed in sequence:
+            compact_legs[obstacle["id"]] = leg
+            compact_options[obstacle["id"]] = option
+            if relaxed:
+                compact_relaxed.add(obstacle["id"])
+        for obstacle in unreachable:
+            logging.error(
+                "Obstacle %s: no safe route from the compact-layout search — skipping.",
+                obstacle["id"],
+            )
+            skipped[obstacle["id"]] = "no route"
+        logging.info("Compact visit order: %s.", [o["id"] for o in order])
+    else:
+        legs = _Legs(
+            start, options, radius_mm, boxes,
+            t0 + PLAN_TIME_BUDGET_S, start_boxes,
+        )
+        order, choice, cache = _choose_tour(visitable, legs, options)
+        reached, _ = _prefix_score(order, cache)
+        # Leave disconnected targets to the bounded fallback rather than
+        # spending its remaining time retrying the same missing tour edges.
+        order = order[:reached]
 
     segments: List[List[str]] = []
     segment_obstacles: List[Optional[str]] = []
@@ -1020,17 +1525,111 @@ def plan_mission(obstacles: List[dict], arc_profile: int = PROFILE_TIGHT,
     view_angles = {}
 
     cur_id = "START"
+    cur_pose = start
     start_relaxed = False
-    for obs in order:
-        option = options[obs["id"]][choice[obs["id"]]]
-        leg = cache.get((cur_id, obs["id"]))
+
+    def ordered_targets():
+        yield from order
+        if compact_mode:
+            return
+        pending = [obs for obs in visitable if obs["id"] not in photo_poses]
+        if not pending:
+            return
+        logging.info("Keeping the normal tour; compact fallback for remaining targets %s.",
+                     [obs["id"] for obs in pending])
+        for obs in pending:
+            oid = obs["id"]
+            diagonal_options[oid] = _photo_options(obs, boxes, obstacles, allow_oblique=True)
+            options[oid] = head_options[oid] + diagonal_options[oid]
+        sequence, unreachable = _plan_compact_sequence(
+            cur_pose, pending, head_options, diagonal_options, radius_mm,
+            boxes, start_boxes if cur_id == "START" else boxes,
+            t0 + PLAN_ASSEMBLY_DEADLINE_S,
+        )
+        for obstacle in unreachable:
+            reason = ("planning deadline reached" if time.monotonic() >=
+                      t0 + PLAN_ASSEMBLY_DEADLINE_S else "no route found within search limits")
+            skipped[obstacle["id"]] = reason
+            logging.warning(
+                "Obstacle %s omitted: %s (%d head-on and %d diagonal photo options).",
+                obstacle["id"], reason, len(head_options[obstacle["id"]]),
+                len(diagonal_options[obstacle["id"]]),
+            )
+        for obstacle, option, leg, relaxed in sequence:
+            oid = obstacle["id"]
+            compact_legs[oid], compact_options[oid] = leg, option
+            if relaxed:
+                compact_relaxed.add(oid)
+            yield obstacle
+
+    for obs in ordered_targets():
+        selected_index = choice.get(obs["id"], 0)
+        option = compact_options.get(
+            obs["id"], options[obs["id"]][selected_index],
+        )
+        used_relaxed_start = False
+        # Pairwise tour costs use each option's ideal pose. The real emitted
+        # whole-centimetre run-in can retain a small lateral offset, so rebuild
+        # every later leg from the endpoint the preceding segment will actually
+        # execute. Otherwise small offsets accumulate and an apparently safe arc
+        # can cross an arena line.
+        if obs["id"] in compact_legs:
+            leg = compact_legs.get(obs["id"])
+            used_relaxed_start = obs["id"] in compact_relaxed
+        elif cur_id == "START" and (cur_id, obs["id"]) in cache:
+            leg = cache.get((cur_id, obs["id"]))
+        else:
+            leg = None
+            selected = option
+            alternatives = sorted(
+                range(len(options[obs["id"]])),
+                key=lambda index: (
+                    index != selected_index,
+                    options[obs["id"]][index].view_angle_deg != selected.view_angle_deg,
+                    abs(options[obs["id"]][index].standoff_cm - selected.standoff_cm),
+                    index,
+                ),
+            )
+            for candidate_index in alternatives:
+                if time.monotonic() > t0 + PLAN_ASSEMBLY_DEADLINE_S:
+                    break
+                candidate = options[obs["id"]][candidate_index]
+                search_boxes = start_boxes if cur_id == "START" else boxes
+                candidate_leg = _search_leg(
+                    cur_pose, candidate, radius_mm, search_boxes,
+                    deadline=t0 + PLAN_ASSEMBLY_DEADLINE_S,
+                )
+                if candidate_leg is not None:
+                    option, leg = candidate, candidate_leg
+                    if candidate_index != selected_index:
+                        logging.warning(
+                            "Obstacle %s: changed assembled camera pose from %d cm/%+.0f deg "
+                            "to %d cm/%+.0f deg to connect from the preceding real endpoint.",
+                            obs["id"], selected.standoff_cm, selected.view_angle_deg,
+                            option.standoff_cm, option.view_angle_deg,
+                        )
+                    break
         if leg is None:
-            logging.error(f"Obstacle {obs['id']}: no route from {cur_id} — skipping.")
+            logging.error(
+                f"Obstacle {obs['id']}: no route from the preceding segment's "
+                "continuous endpoint — skipping."
+            )
             skipped[obs["id"]] = "no route"
             continue
 
         search_tokens, search_poses, _ = leg
-        if cur_id == "START" and ("START", None, obs["id"], choice[obs["id"]]) in legs.relaxed:
+        if _uses_fine_turn(search_tokens):
+            logging.warning(
+                "Obstacle %s: congested/edge route uses 15/30-degree turn "
+                "checkpoints: %s.",
+                obs["id"], ",".join(
+                    token for token in search_tokens
+                    if token[:2] in ("FR", "FL", "RR", "RL")
+                ),
+            )
+        if cur_id == "START" and (used_relaxed_start or
+                (legs is not None and obs["id"] in choice and
+                 ("START", None, obs["id"], choice[obs["id"]]) in legs.relaxed)):
             start_relaxed = True
             gap = min(start.x - ROBOT_HALF_WIDTH_MM, start.y - ROBOT_HALF_LENGTH_MM)
             logging.warning(
@@ -1045,16 +1644,17 @@ def plan_mission(obstacles: List[dict], arc_profile: int = PROFILE_TIGHT,
 
         final = option.pose
         back, _ = option.line.offsets(search_poses[-1].x, search_poses[-1].y)
-        # Reach the selected camera pose using ordinary odometry. Since STM
-        # distances are whole centimetres, record the rounded endpoint as the
-        # expected pose; the Pi's ?US loop removes the small residual error.
+        # Reach the selected camera pose using ordinary odometry. Edge-angle
+        # poses reverse outward after completing their turn inboard; head-on
+        # poses retain the normal forward run-in.
         run_cm = round(back / 10.0)
         if run_cm > 0:
             run_mm = run_cm * 10.0
-            tokens.append(fwd(run_cm))
+            direction = -1.0 if option.approach_reverse else 1.0
+            tokens.append(rev(run_cm) if option.approach_reverse else fwd(run_cm))
             terminal = Pose(
-                search_poses[-1].x + run_mm * math.cos(final.theta),
-                search_poses[-1].y + run_mm * math.sin(final.theta),
+                search_poses[-1].x + direction * run_mm * math.cos(final.theta),
+                search_poses[-1].y + direction * run_mm * math.sin(final.theta),
                 final.theta,
             )
             poses.append(terminal)
@@ -1068,11 +1668,18 @@ def plan_mission(obstacles: List[dict], arc_profile: int = PROFILE_TIGHT,
             logging.log(level, f"Obstacle {obs['id']}: photo at {option.standoff_cm} cm"
                                f"{' (last resort)' if level == logging.WARNING else ''}.")
         if option.view_angle_deg:
-            logging.warning(
-                "Obstacle %s: using a %+.0f degree diagonal camera view because "
-                "the head-on route is more constrained.",
-                obs["id"], option.view_angle_deg,
-            )
+            if abs(option.view_angle_deg) > 45:
+                logging.warning(
+                    "Obstacle %s: using a last-resort %+.0f degree edge view; "
+                    "ultrasonic correction is disabled for this oblique face.",
+                    obs["id"], option.view_angle_deg,
+                )
+            else:
+                logging.warning(
+                    "Obstacle %s: using a %+.0f degree diagonal camera view because "
+                    "the head-on route is more constrained.",
+                    obs["id"], option.view_angle_deg,
+                )
 
         line_start = 0
         lines = chunk_tokens(tokens)
@@ -1088,15 +1695,18 @@ def plan_mission(obstacles: List[dict], arc_profile: int = PROFILE_TIGHT,
             segment_obstacles.append(str(obs["id"]) if i == len(lines) - 1 else None)
 
         photo_poses[obs["id"]] = (terminal.x, terminal.y, terminal.theta)
+        skipped.pop(obs["id"], None)
         standoffs[obs["id"]] = option.standoff_cm
         view_angles[obs["id"]] = option.view_angle_deg
-        ultrasonic_adjustments[str(obs["id"])] = option.us_runin_mm is not None
+        ultrasonic_adjustments[str(obs["id"])] = (
+            option.view_angle_deg == 0 and option.us_runin_mm is not None
+        )
         safe_standoffs[str(obs["id"])] = sorted({
             candidate.standoff_cm for candidate in options[obs["id"]]
-            if (option.us_runin_mm is not None and
-                candidate.us_runin_mm is not None and
-                candidate.view_angle_deg == option.view_angle_deg)
+            if candidate.view_angle_deg == option.view_angle_deg
+            and (not option.view_angle_deg or candidate.standoff_cm >= 25)
         })
+        cur_pose = terminal
         cur_id = obs["id"]
 
     logging.info(f"Planned {len(photo_poses)}/{len(obstacles)} photo(s) in "
@@ -1111,7 +1721,7 @@ def plan_mission(obstacles: List[dict], arc_profile: int = PROFILE_TIGHT,
 
     result = {
         "segments": segments,
-        "obstacle_ids": [o["id"] for o in order],
+        "obstacle_ids": list(photo_poses),
         "segment_obstacles": segment_obstacles,
         "dirs": dirs,
         "start": _pose_to_dir_entry(start),
@@ -1133,6 +1743,7 @@ def plan_mission(obstacles: List[dict], arc_profile: int = PROFILE_TIGHT,
             for obstacle_id, standoff in standoffs.items()
         },
         "ultrasonic_adjustments": ultrasonic_adjustments,
+        "camera_to_sensor_cm": CAMERA_TO_SENSOR_MM / 10.0,
         "selected_view_angles": {
             str(obstacle_id): angle
             for obstacle_id, angle in view_angles.items()

@@ -62,6 +62,14 @@ START = {"x": 2, "y": 2, "dir": "N"}
 
 
 class InstructionTests(unittest.TestCase):
+    def test_fine_turn_checkpoints_are_valid_mission_instructions(self):
+        mission = InstructionMission(
+            [["FR15", "FL30", "RR15", "RL30", "S"]], START
+        )
+        self.assertEqual(
+            mission.segments[0], ["FR15", "FL30", "RR15", "RL30", "S"]
+        )
+
     def test_ten_cm_cells_cover_twenty_by_twenty_arena(self):
         for mm, expected in [(0, 0), (99.9, .999), (100, 1), (200, 2),
                              (299, 2.99), (1100, 11), (1950, 19.5), (1999, 19.99)]:
@@ -398,7 +406,7 @@ class PCTransferTests(unittest.TestCase):
         task.photo_standoffs = {"3": [20, 30, 33, 35, 40, 45]}
         task.selected_standoffs = {"3": 30}
         task.ultrasonic_adjustments = {"3": True}
-        task.photo_retry_standoffs = [40, 45, 35, 33, 20]
+        task.photo_retry_standoffs = [20, 33, 35, 40, 45]
         task.photo_retry_limit = 5
         task.capture_settle = 0
         task.halted = False
@@ -414,12 +422,12 @@ class PCTransferTests(unittest.TestCase):
         self.assertEqual(result["class_id"], "C")
         self.assertEqual(
             [call.args[2] for call in task._move_for_photo.call_args_list],
-            [30, 40, 45, 30],
+            [30, 20, 33],
         )
         self.assertEqual(task._detect_and_send_image.call_count, 3)
         self.assertEqual(
             [call.args[1] for call in task._detect_and_send_image.call_args_list],
-            [30, 40, 45],
+            [30, 20, 33],
         )
 
     def test_wall_facing_photo_does_not_invent_an_unsafe_retry_pose(self):
@@ -428,7 +436,7 @@ class PCTransferTests(unittest.TestCase):
         task.photo_standoffs = {"1": [20]}
         task.selected_standoffs = {"1": 20}
         task.ultrasonic_adjustments = {"1": False}
-        task.photo_retry_standoffs = [40, 45, 35, 33, 20]
+        task.photo_retry_standoffs = [20, 33, 35, 40, 45]
         task.photo_retry_limit = 5
         task.capture_settle = 0
         task._detect_and_send_image = Mock(return_value={
@@ -440,13 +448,35 @@ class PCTransferTests(unittest.TestCase):
 
         task._move_for_photo.assert_not_called()
 
+    def test_oblique_retry_moves_to_nearest_safe_distance_not_twenty_cm(self):
+        task = Task1.__new__(Task1)
+        task.a5_mode = False
+        task.photo_standoffs = {"8": [25, 30, 35]}
+        task.selected_standoffs = {"8": 35}
+        task.ultrasonic_adjustments = {"8": False}
+        task.photo_retry_standoffs = [20, 25, 30, 33, 35, 40, 45]
+        task.photo_retry_limit = 5
+        task.capture_settle = 0
+        task.halted = False
+        task._detect_and_send_image = Mock(side_effect=[
+            {"obstacle_id": "8", "confidence": 0.0, "class_id": "NONE"},
+            {"obstacle_id": "8", "confidence": 0.9, "class_id": "8"},
+        ])
+        task._move_for_photo = Mock(return_value=True)
+
+        result = task._detect_with_distance_retry("8", Mock())
+
+        self.assertEqual(result["class_id"], "8")
+        task._move_for_photo.assert_called_once()
+        self.assertEqual(task._move_for_photo.call_args.args[2], 30)
+
     def test_photo_adjustment_reports_pose_without_advancing_plan_indexes(self):
         mission = InstructionMission([["S"]], START)
         mission.origin = (0, 0, 0)
         stm = Mock()
         stm.send_line.return_value = True
         stm.wait_reply.return_value = "OK"
-        stm.query_fields.side_effect = [["50"], ["0", "0", "0"], ["40"]]
+        stm.query_fields.side_effect = [["50"], ["0", "0", "0"], ["30"]]
         task = Task1.__new__(Task1)
         task.stm = stm
         task.android = Mock()
@@ -463,13 +493,57 @@ class PCTransferTests(unittest.TestCase):
 
         self.assertEqual(mission.key, (0, 0))
         self.assertFalse(mission.pending)
-        stm.send_line.assert_called_once_with(["F10"])
+        stm.send_line.assert_called_once_with(["F20"])
         task.android.send.assert_called_once_with("ROBOT,2,2,0")
         photo_progress = task.pc.send.call_args.args[0]
         self.assertTrue(photo_progress.startswith("PHOTO_PROGRESS,"))
         payload = json.loads(photo_progress.split(",", 1)[1])
         self.assertEqual(payload["target_standoff_cm"], 40)
         self.assertEqual(payload["measured_us_cm_before"], 50)
+
+    def test_successful_initial_photo_adjustment_is_undone_before_next_segment(self):
+        task = Task1.__new__(Task1)
+        task.a5_mode = False
+        task.photo_standoffs = {"3": [30]}
+        task.selected_standoffs = {"3": 30}
+        task.ultrasonic_adjustments = {"3": True}
+        task.photo_retry_standoffs = [20, 40]
+        task.photo_retry_limit = 2
+        task.capture_settle = 0
+        task.halted = False
+        task._detect_and_send_image = Mock(return_value={
+            "obstacle_id": "3", "confidence": 0.9, "class_id": "C",
+        })
+        movements = []
+
+        def move(_mission, _obstacle, _distance, **kwargs):
+            kwargs["movement_tokens"].append("F10")
+            return True
+
+        task._move_for_photo = Mock(side_effect=move)
+        task._restore_planned_photo_pose = Mock(return_value=True)
+        mission = Mock()
+
+        task._detect_with_distance_retry("3", mission)
+
+        task._restore_planned_photo_pose.assert_called_once_with(
+            mission, "3", 30, ["F10"],
+        )
+
+    def test_photo_pose_restore_inverts_every_move_in_reverse_order(self):
+        task = Task1.__new__(Task1)
+        task._execute_photo_adjustment = Mock(return_value=True)
+        mission = Mock()
+
+        restored = task._restore_planned_photo_pose(
+            mission, "3", 30, ["F10", "R5", "F2"],
+        )
+
+        self.assertTrue(restored)
+        self.assertEqual(
+            [call.args[2] for call in task._execute_photo_adjustment.call_args_list],
+            ["R2", "F5", "R10"],
+        )
 
     def test_photo_adjustment_reverses_when_too_close(self):
         mission = InstructionMission([["S"]], START)
@@ -478,7 +552,7 @@ class PCTransferTests(unittest.TestCase):
         task.stm = Mock()
         task.stm.send_line.return_value = True
         task.stm.wait_reply.return_value = "OK"
-        task.stm.query_fields.side_effect = [["30"], ["0", "0", "0"], ["40"]]
+        task.stm.query_fields.side_effect = [["20"], ["0", "0", "0"], ["30"]]
         task.android = Mock()
         task.pc = Mock()
         task.max_resends = 3

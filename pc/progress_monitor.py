@@ -69,6 +69,8 @@ class PlanMonitor:
         self.worst = None                      # (pos_mm, seg, ins, token)
         self.replacements = 0
         self.continues = 0
+        self.skips = 0
+        self.holds = 0
         self._warned_segments = set()
         self._warned_no_plan = False
         self._warned_bad = False
@@ -91,10 +93,12 @@ class PlanMonitor:
 
         self.count += 1
         token = p.get("token", "?")
-        preflight = p.get("event") == "instruction_preflight"
+        event = p.get("event")
+        preflight = event == "instruction_preflight"
+        photo_preflight = event == "photo_adjustment_preflight"
         deviation = None if preflight else self._compare(
             seg, ins, token, x_mm, y_mm, hdg
-        )
+        ) if not photo_preflight else None
 
         if p.get("awaiting_decision"):
             if "feedback_id" not in p:
@@ -102,10 +106,24 @@ class PlanMonitor:
                 return None
             self.decisions += 1
             boundary_risk = self._sensor_risk(p)
-            if boundary_risk is None and preflight:
+            if boundary_risk is None and (preflight or photo_preflight):
                 boundary_risk = self._preflight_safety_risk(p)
             elif boundary_risk is None:
                 boundary_risk = self._next_boundary_risk(seg, ins, x_mm, y_mm, hdg, p)
+            if photo_preflight:
+                action = "SKIP" if boundary_risk is not None else "CONTINUE"
+                if action == "SKIP":
+                    self.skips += 1
+                    logging.warning(
+                        "Skipping unsafe photo-distance move %s for obstacle %s.",
+                        token, p.get("obstacle_id", "?"),
+                    )
+                else:
+                    self.continues += 1
+                return action + "," + json.dumps(
+                    {"feedback_id": p["feedback_id"], "segment_index": seg,
+                     "instruction_index": ins}, separators=(",", ":"),
+                )
             deviation_requires_recovery = (
                 deviation is not None and
                 (deviation[0] > POS_WARN_MM or abs(deviation[1]) > HDG_WARN_DEG)
@@ -151,6 +169,22 @@ class PlanMonitor:
                 separators=(",", ":"),
             )
         return None
+
+    def _hold_reply(self, progress, seg, ins, reason):
+        self.holds += 1
+        return "HOLD," + json.dumps(
+            {"feedback_id": progress["feedback_id"], "segment_index": seg,
+             "instruction_index": ins, "reason": reason},
+            separators=(",", ":"),
+        )
+
+    @staticmethod
+    def _replacement_starts_with_arc(replacement) -> bool:
+        try:
+            token = str(replacement["segments"][0][0]).strip().upper()
+        except (KeyError, IndexError, TypeError):
+            return False
+        return token.startswith(("FR", "FL", "RR", "RL"))
 
     def _preflight_safety_risk(self, progress):
         if self.safety_checker is None:
@@ -201,7 +235,7 @@ class PlanMonitor:
                 f"{self.max_pos:.0f} mm at worst (segment {w[1]} instruction {w[2]} '{w[3]}'); "
                 f"heading off by up to {self.max_hdg:.1f} deg. "
                 f"{self.decisions} decision(s): {self.continues} CONTINUE, "
-                f"{self.replacements} REPLACE.")
+                f"{self.replacements} REPLACE, {self.skips} SKIP, {self.holds} HOLD.")
 
     # ── internals ─────────────────────────────────────────────────────────────
 
@@ -350,6 +384,13 @@ class PlanMonitor:
         seg = int(progress["segment_index"])
         ins = int(progress["instruction_index"])
         next_seg, next_ins, next_token = self._next_instruction(seg, ins)
+
+        # A completed photo segment is followed by capture/distance adjustment,
+        # then a fresh preflight for the next segment.  Do not use the current
+        # obstacle's close IR return to veto an arc that runs after that photo.
+        # Geometric look-ahead already observes the same segment boundary rule.
+        if next_seg is not None and next_seg != seg:
+            return None
 
         if next_token and next_token[:2] in ("FR", "FL", "RR", "RL"):
             left_cm = self._number(progress.get("ir_left_cm"))
