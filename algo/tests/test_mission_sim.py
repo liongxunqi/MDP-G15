@@ -34,6 +34,7 @@ one bad approach is reported once instead of throwing off every leg after it.
 import argparse
 import logging
 import math
+import os
 import random
 import sys
 import time
@@ -47,8 +48,15 @@ from stm_tokens import PROFILE_TIGHT, TURN_RADIUS_MM  # noqa: E402
 
 ARENA = 2000.0
 OBS = 100.0
-HALF_L = pp.ROBOT_HALF_LENGTH_MM
+# The PHYSICAL robot, relative to the reference point (the rear axle - what the plan's poses are and what arcs
+# turn about). Deliberately NOT read from the planner's model, which can be switched to the old centred
+# footprint for comparison: a check that borrows the planner's assumptions can only agree with the planner,
+# and that is how a route passing 7-29 mm from obstacles was reported as collision-free.
+_TRUE_FRONT = pp.REAR_AXLE_TO_SENSOR_MM                                  # axle -> sensor tip
+_TRUE_REAR = float(os.environ.get("ROBOT_REAR_FROM_AXLE_MM", "40"))      # axle -> back edge (measure it!)
+HALF_L = (_TRUE_FRONT + _TRUE_REAR) / 2.0
 HALF_W = pp.ROBOT_HALF_WIDTH_MM
+BODY_OFF = (_TRUE_FRONT - _TRUE_REAR) / 2.0                              # the body's centre, ahead of the axle
 FACE_NORMAL = {0: (0, 1), 2: (1, 0), 4: (0, -1), 6: (-1, 0)}   # N E S W
 
 AIM_HEADING_TOL_DEG = 10.0
@@ -92,8 +100,9 @@ FIXED_LAYOUTS = {
 
 # ── geometry ──────────────────────────────────────────────────────────────────
 
-def corners(x, y, th, hl=HALF_L, hw=HALF_W):
+def corners(x, y, th, hl=HALF_L, hw=HALF_W, off=BODY_OFF):
     c, s = math.cos(th), math.sin(th)
+    x, y = x + off * c, y + off * s                    # the body's centre, ahead of the reference
     return [(x + c * a - s * b, y + s * a + c * b) for a, b in
             ((hl, hw), (hl, -hw), (-hl, -hw), (-hl, hw))]
 
