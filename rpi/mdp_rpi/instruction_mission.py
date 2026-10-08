@@ -132,20 +132,10 @@ class InstructionMission:
     def complete_instruction(self, stm):
         if not self.pending:
             raise ValueError("Unexpected OK without an outstanding instruction")
-        x, y, heading = self.read_pose(stm)
-        ox, oy, oh = self.origin
-        start_bearing = self.start_pose["bearing_deg"]
-        angle = math.radians(90.0 - start_bearing - oh)
-        dx, dy = x - ox, y - oy
-        arena_x = self.start_pose["x"] * CELL_SIZE_MM + dx * math.cos(angle) - dy * math.sin(angle)
-        arena_y = self.start_pose["y"] * CELL_SIZE_MM + dx * math.sin(angle) + dy * math.cos(angle)
-        # Wire heading: north = 0 degrees, clockwise positive, in [0, 360).
-        heading_deg = round((start_bearing - (heading - oh)) % 360.0, 1) % 360.0
-        # Preserve sub-cell positions; one grid unit is 100 mm, not one mm.
-        x_grid, y_grid = (arena_grid_position(mm) for mm in (arena_x, arena_y))
-        gx, gy = (format(value, ".8f").rstrip("0").rstrip(".")
-                  for value in (x_grid, y_grid))
-        message = f"ROBOT,{gx},{gy},{heading_deg:g}"
+        message, pose = self.report_pose(stm)
+        x_grid = pose["x_grid"]
+        y_grid = pose["y_grid"]
+        heading_deg = pose["heading_deg"]
         # Snapshot the completed instruction before advancing either index.
         segment_index, instruction_index = self.key
         token = self.token
@@ -171,3 +161,27 @@ class InstructionMission:
             "heading_deg": heading_deg,
         }
         return message, completed_segment
+
+    def report_pose(self, stm):
+        """Read and transform WPOSE without advancing the planned instruction."""
+        x, y, heading = self.read_pose(stm)
+        if self.origin is None:
+            raise ValueError("Cannot report pose before the mission odometry origin is set")
+        ox, oy, oh = self.origin
+        start_bearing = self.start_pose["bearing_deg"]
+        angle = math.radians(90.0 - start_bearing - oh)
+        dx, dy = x - ox, y - oy
+        arena_x = self.start_pose["x"] * CELL_SIZE_MM + dx * math.cos(angle) - dy * math.sin(angle)
+        arena_y = self.start_pose["y"] * CELL_SIZE_MM + dx * math.sin(angle) + dy * math.cos(angle)
+        # Wire heading: north = 0 degrees, clockwise positive, in [0, 360).
+        heading_deg = round((start_bearing - (heading - oh)) % 360.0, 1) % 360.0
+        # Preserve sub-cell positions; one grid unit is 100 mm, not one mm.
+        x_grid, y_grid = (arena_grid_position(mm) for mm in (arena_x, arena_y))
+        gx, gy = (format(value, ".8f").rstrip("0").rstrip(".")
+                  for value in (x_grid, y_grid))
+        message = f"ROBOT,{gx},{gy},{heading_deg:g}"
+        return message, {
+            "x_grid": x_grid,
+            "y_grid": y_grid,
+            "heading_deg": heading_deg,
+        }

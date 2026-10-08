@@ -8,7 +8,7 @@ What it does
 1. Connects to the RPi's TCP socket server.
 2. Waits for OBSTACLES,<json>  →  runs pathfinding  →  sends back PATH,<json>.
 3. Enters detection loop:
-    RPi sends:  DETECT,<obstacle_id>\n
+    RPi sends:  DETECT,<obstacle_id>[,<standoff_cm>]\n
     4-byte big-endian image size (struct.pack(">I", size))
     raw JPEG bytes (exactly <size> bytes)
     PC saves the JPEG, runs YOLO, sends back:
@@ -86,6 +86,9 @@ def run_detection(image_path: str):
 #   "odometry_start"    — planner-owned origin for RPi ROBOT/PROGRESS feedback
 
 sys.path.insert(0, os.path.join(REPO_ROOT, "algo"))
+os.environ.setdefault("RPI_ANCHOR_X_MM", "0") # the RPi reports ROBOT as displacement from the start
+os.environ.setdefault("RPI_ANCHOR_Y_MM", "0")
+os.environ.setdefault("RPI_ARENA_GUARD", "0") # see the caveat below
 from stm_tokens import PROFILE_NAMES, TURN_RADIUS_MM  # noqa: E402
 from path_planner import (  # noqa: E402
     REAR_AXLE_TO_SENSOR_MM,
@@ -117,6 +120,9 @@ def compute_path(obstacles: list) -> dict:
 
 def stitch_images(image_paths: list, output_path: str) -> None:
     """Save a readable, multi-row contact sheet of this run's images."""
+    if not hasattr(cv2, "imread"):
+        logging.warning("Stitch: OpenCV image support is unavailable — skipping.")
+        return
     imgs = [cv2.imread(p) for p in image_paths if os.path.exists(p)]
     imgs = [img for img in imgs if img is not None]
     if not imgs:
@@ -321,6 +327,20 @@ def main() -> None:
                 break
             continue
 
+        if msg.startswith("PHOTO_PROGRESS,"):
+            try:
+                report = json.loads(msg.split(",", 1)[1])
+                logging.info(
+                    "Photo adjustment: obstacle %s %s -> (%.2f, %.2f) @ %.1f deg, US=%s cm.",
+                    report.get("obstacle_id", "?"), report.get("token", "?"),
+                    float(report.get("x_grid")), float(report.get("y_grid")),
+                    float(report.get("heading_deg")),
+                    report.get("measured_us_cm", "?"),
+                )
+            except (ValueError, TypeError, json.JSONDecodeError):
+                logging.warning("Malformed PHOTO_PROGRESS from RPi: %s", msg[:300])
+            continue
+
         # ── OBSTACLES → pathfinding → PATH ────────────────────────────────────
         if msg.startswith("OBSTACLES"):
             try:
@@ -371,21 +391,36 @@ def main() -> None:
         elif msg.startswith("DETECT"):
             parts = msg.split(",")
             obstacle_id = parts[1].strip() if len(parts) > 1 else "0"
+            standoff = parts[2].strip() if len(parts) > 2 else "unknown"
+            distance_tag = f"_{standoff}cm" if standoff.isdigit() else ""
 
             # Save path — named by obstacle ID + timestamp so files don't collide
-            filename = f"obstacle_{obstacle_id}_{int(time.time())}.jpg"
+            # A distance retry can produce several frames in one second.
+            filename = f"obstacle_{obstacle_id}{distance_tag}_{time.time_ns()}.jpg"
             save_path = os.path.join(RECEIVED_DIR, filename)
 
             # Receive the JPEG (4-byte length header + raw bytes)
             ok = rpi.receive_image(save_path)
             if not ok:
-                logging.error(f"Image receive failed for obstacle {obstacle_id}.")
+                logging.error(
+                    "Image receive failed for obstacle %s at %s cm.",
+                    obstacle_id, standoff,
+                )
                 if not rpi.send(f"OBJECT,{obstacle_id},0.0,NONE"):
                     break
                 continue
 
-            # Run YOLO via your detect.py
-            class_id, confidence = run_detection(save_path)
+            # Run YOLO via your detect.py. A detector exception must not lose
+            # the photograph or terminate the PC server; the raw frame still
+            # belongs in the live stitch and NONE lets the RPi try a new range.
+            try:
+                class_id, confidence = run_detection(save_path)
+            except Exception:
+                logging.exception(
+                    "Detector crashed for obstacle %s at %s cm; keeping the raw frame.",
+                    obstacle_id, standoff,
+                )
+                class_id, confidence = None, None
 
             # detect.py saves an annotated frame even when no trustworthy box
             # is found. Include every attempt in the live contact sheet so it
@@ -393,23 +428,26 @@ def main() -> None:
             annotated_path = os.path.join(
                 ANNOTATED_DIR, os.path.basename(save_path)
             )
-            if os.path.exists(annotated_path):
-                annotated_images.append(annotated_path)
-                stitch_images(annotated_images, STITCHED_OUTPUT)
-            else:
-                logging.warning(
-                    "Detector did not create the expected annotation %s.",
+            stitch_source = annotated_path if os.path.exists(annotated_path) else save_path
+            if not os.path.exists(annotated_path):
+                logging.info(
+                    "Detector did not create %s; adding the received frame to the stitch instead.",
                     annotated_path,
                 )
+            annotated_images.append(stitch_source)
+            stitch_images(annotated_images, STITCHED_OUTPUT)
 
             if class_id is None:
-                logging.warning(f"Nothing detected for obstacle {obstacle_id}.")
+                logging.warning(
+                    "Nothing detected for obstacle %s at %s cm.",
+                    obstacle_id, standoff,
+                )
                 if not rpi.send(f"OBJECT,{obstacle_id},0.0,NONE"):
                     break
             else:
                 logging.info(
                     f"Detected '{class_id}' (conf={confidence:.2f}) "
-                    f"for obstacle {obstacle_id}."
+                    f"for obstacle {obstacle_id} at {standoff} cm."
                 )
                 if not rpi.send(f"OBJECT,{obstacle_id},{confidence:.4f},{class_id}"):
                     break

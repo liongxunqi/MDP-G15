@@ -136,14 +136,34 @@ def options_for(target, *others):
 
 class PhotoDistanceTests(unittest.TestCase):
     """The ultrasonic reading at each photo: 30 cm first, then further out up
-    to 45, and 28 only when nothing else fits."""
+    to 45, with close 28/20 cm fallbacks when nothing else fits."""
 
     def test_open_floor_uses_30(self):
         self.assertEqual(options_for({"id": 1, "x": 10, "y": 10, "d": 0})[0], 30)
 
-    def test_28_is_tried_last(self):
-        # Facing the top edge: only 30 and its last-resort fallback still fit.
-        self.assertEqual(options_for({"id": 1, "x": 10, "y": 15, "d": 0}), [30, 28])
+    def test_path_exposes_only_safe_camera_retry_distances(self):
+        result = pp.plan_mission([{"id": 1, "x": 10, "y": 10, "d": 0}])
+        self.assertEqual(result["selected_standoffs"], {"1": 30})
+        self.assertIn(33, result["photo_standoffs"]["1"])
+        self.assertIn(45, result["photo_standoffs"]["1"])
+
+    def test_close_distances_are_tried_only_after_normal_options(self):
+        # Facing the top edge: 30 still wins; close poses remain fallbacks.
+        self.assertEqual(
+            options_for({"id": 1, "x": 10, "y": 15, "d": 0}),
+            [30, 28, 20],
+        )
+
+    def test_20_cm_fallback_keeps_wall_facing_rear_axle_inside_guard(self):
+        # The west face of cell x=5 is at 500 mm. At 30 cm the rear-axle pose
+        # is -30 mm, but FU20 leaves it at +70 mm and inside the 50 mm RPi guard.
+        obstacle = {"id": 1, "x": 5, "y": 6, "d": 6}
+        boxes = pp.grid_search.Boxes([pp._obstacle_aabb_mm(obstacle)])
+        start = pp.Pose(pp.START_X_MM, pp.START_Y_MM, pp.START_THETA)
+        boxes.ref_bounds = pp._rpi_ref_bounds(start)
+        options = pp._photo_options(obstacle, boxes, [obstacle])
+        self.assertEqual([option.standoff_cm for option in options], [20])
+        self.assertAlmostEqual(options[0].pose.x, 70.0)
 
     def test_a_blocked_30_moves_further_out(self):
         # A neighbour diagonally behind blocks the preferred close standoffs.
@@ -181,6 +201,7 @@ class LegOutputTests(unittest.TestCase):
         self.assertEqual(result["segment_obstacles"][-1], "1")
         self.assertEqual(result["segments"][-1][-2:], ["FU30", "S"])
         self.assertEqual(details["standoff_cm"], {1: 30})
+        self.assertEqual(result["selected_standoffs"], {"1": 30})
 
 
 class SegmentRecoveryTests(unittest.TestCase):
@@ -237,6 +258,46 @@ class SegmentRecoveryTests(unittest.TestCase):
         progress = {"segment_index": 0, "instruction_index": 0, "x_grid": 4,
                     "y_grid": 5, "heading_deg": 0, "remaining_photo_ids": ["99"]}
         self.assertIsNone(pp.plan_segment_recovery(plan, self.OBSTACLES, progress))
+
+    def test_boundary_recovery_shortens_an_obstructed_approach_line(self):
+        # Physical run 20261008_112200. The nominal next FL90 would carry the
+        # measured x error to 2009 mm. The old recovery search found a point on
+        # its 600 mm approach line whose final straight crossed obstacle 2, then
+        # gave up without trying a closer, clear point on the same line.
+        obstacles = [
+            {"id": 1, "x": 5.0, "y": 6.0, "d": 6},
+            {"id": 2, "x": 16.0, "y": 6.0, "d": 0},
+            {"id": 3, "x": 2.0, "y": 16.0, "d": 2},
+            {"id": 4, "x": 17.0, "y": 15.0, "d": 4},
+            {"id": 5, "x": 12.0, "y": 13.0, "d": 6},
+        ]
+        plan = {
+            "segments": [["F10", "FL90", "R50", "FL90", "R20", "FU30", "S"]],
+            "segment_obstacles": ["4"],
+            "expected": [[
+                [1650, 1130, 180], [1944, 836, 90], [1444, 836, 90],
+                [1738, 1130, 0], [1738, 930, 0], [1750, 970, 0],
+                [1750, 970, 0],
+            ]],
+            "frame_shift_mm": {"x": 0, "y": 0},
+            "start_mm": {"x": 104, "y": 125, "heading": "N"},
+        }
+        progress = {
+            "segment_index": 0,
+            "instruction_index": 0,
+            "x_grid": 17.16426389,
+            "y_grid": 11.02233924,
+            "heading_deg": 179.8,
+            "remaining_photo_ids": ["4"],
+        }
+
+        replacement = pp.plan_segment_recovery(plan, obstacles, progress)
+
+        self.assertIsNotNone(replacement)
+        self.assertEqual(replacement["segment_obstacles"][-1], "4")
+        self.assertEqual(replacement["segments"][-1][-1], "S")
+        final = replacement["expected"][-1][-1]
+        self.assertLess(math.hypot(final[0] - 1750, final[1] - 970), 30)
 
 
 class AndroidPoseTests(unittest.TestCase):

@@ -256,7 +256,7 @@ class InstructionTests(unittest.TestCase):
         self.assertEqual(events[-1], "STATUS,DONE")
         pc_messages = [call.args[0] for call in task.pc.send.call_args_list]
         self.assertEqual(len(pc_messages), 6)
-        self.assertEqual(pc_messages[-1], "STITCH,0\n")
+        self.assertEqual(pc_messages[-1], "STITCH,1\n")
         self.assertTrue(all(m.startswith("PROGRESS,") for m in pc_messages[:-1]))
         progress = [json.loads(m.split(",", 1)[1]) for m in pc_messages[:-1]]
         self.assertEqual([(p["x_grid"], p["y_grid"], p["heading_deg"]) for p in progress],
@@ -371,10 +371,93 @@ class PCTransferTests(unittest.TestCase):
         task.camera.capture_image.return_value = b"jpeg"
         task.pc = Mock()
         task.image_done = Mock()
-        task.image_done.wait.return_value = True
-        self.assertTrue(task._detect_and_send_image("7"))
+        task._detection_lock = Lock()
+        task._expected_detection_id = None
+        task._last_detection = None
+        task._last_capture_attempts = 0
+
+        def receive_object(timeout):
+            task._last_detection = {
+                "obstacle_id": "7", "confidence": .9, "class_id": "7",
+            }
+            return True
+
+        task.image_done.wait.side_effect = receive_object
+        result = task._detect_and_send_image("7")
+        self.assertEqual(result["class_id"], "7")
         task.pc.send_image.assert_called_once_with(b"jpeg", header="DETECT,7")
         task.pc.send.assert_not_called()
+
+    def test_low_confidence_retries_safe_distances_and_restores_plan_pose(self):
+        task = Task1.__new__(Task1)
+        task.a5_mode = False
+        task.photo_standoffs = {"3": [20, 30, 33, 35, 40, 45]}
+        task.selected_standoffs = {"3": 30}
+        task.photo_retry_standoffs = [40, 45, 35, 33, 20]
+        task.photo_retry_limit = 5
+        task.capture_settle = 0
+        task.halted = False
+        task._detect_and_send_image = Mock(side_effect=[
+            {"obstacle_id": "3", "confidence": 0.0, "class_id": "NONE"},
+            {"obstacle_id": "3", "confidence": 0.0, "class_id": "NONE"},
+            {"obstacle_id": "3", "confidence": 0.82, "class_id": "C"},
+        ])
+        task._move_for_photo = Mock(return_value=True)
+
+        result = task._detect_with_distance_retry("3", Mock())
+
+        self.assertEqual(result["class_id"], "C")
+        self.assertEqual(
+            [call.args[2] for call in task._move_for_photo.call_args_list],
+            [40, 45, 30],
+        )
+        self.assertEqual(task._detect_and_send_image.call_count, 3)
+        self.assertEqual(
+            [call.args[1] for call in task._detect_and_send_image.call_args_list],
+            [30, 40, 45],
+        )
+
+    def test_wall_facing_photo_does_not_invent_an_unsafe_retry_pose(self):
+        task = Task1.__new__(Task1)
+        task.a5_mode = False
+        task.photo_standoffs = {"1": [20]}
+        task.selected_standoffs = {"1": 20}
+        task.photo_retry_standoffs = [40, 45, 35, 33, 20]
+        task.photo_retry_limit = 5
+        task._detect_and_send_image = Mock(return_value={
+            "obstacle_id": "1", "confidence": 0.0, "class_id": "NONE",
+        })
+        task._move_for_photo = Mock(return_value=True)
+
+        task._detect_with_distance_retry("1", Mock())
+
+        task._move_for_photo.assert_not_called()
+
+    def test_photo_adjustment_reports_pose_without_advancing_plan_indexes(self):
+        mission = InstructionMission([["S"]], START)
+        mission.origin = (0, 0, 0)
+        stm = Mock()
+        stm.send_line.return_value = True
+        stm.wait_reply.return_value = "OK"
+        stm.query_fields.side_effect = [["0", "0", "0"], ["40"]]
+        task = Task1.__new__(Task1)
+        task.stm = stm
+        task.android = Mock()
+        task.pc = Mock()
+        task.max_resends = 3
+        task.halted = False
+        task._halt_mission = Mock()
+
+        self.assertTrue(task._move_for_photo(mission, "3", 40))
+
+        self.assertEqual(mission.key, (0, 0))
+        self.assertFalse(mission.pending)
+        task.android.send.assert_called_once_with("ROBOT,2,2,0")
+        photo_progress = task.pc.send.call_args.args[0]
+        self.assertTrue(photo_progress.startswith("PHOTO_PROGRESS,"))
+        payload = json.loads(photo_progress.split(",", 1)[1])
+        self.assertEqual(payload["target_standoff_cm"], 40)
+        self.assertEqual(payload["measured_us_cm"], 40)
 
 
 if __name__ == "__main__":

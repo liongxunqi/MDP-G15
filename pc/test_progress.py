@@ -158,6 +158,101 @@ class MonitorUnit(unittest.TestCase):
         self.assertEqual(m.replacements, 0)
         self.assertEqual(m.continues, 1)
 
+    def test_boundary_lookahead_replaces_before_the_real_2009mm_overrun(self):
+        # Physical run 20261008_112200: after F10 the robot was only 72 mm off
+        # the plan (below the ordinary 80 mm trigger), but carrying that offset
+        # into FL90 put its rear-axle reference at x=2009 mm and halted the RPi.
+        plan = {
+            "segments": [["F10", "FL90", "R50", "S"]],
+            "segment_obstacles": ["4"],
+            "expected": [[
+                [1650.0, 1130.0, 180.0],
+                [1944.0, 836.0, 90.0],
+                [1444.0, 836.0, 90.0],
+                [1444.0, 836.0, 90.0],
+            ]],
+        }
+        replacement = {
+            "segments": [["R10", "RR90", "S"]],
+            "segment_obstacles": ["4"],
+            "expected": [[
+                [1716.0, 1202.0, 180.0],
+                [1422.0, 908.0, 270.0],
+                [1422.0, 908.0, 270.0],
+            ]],
+        }
+        calls = []
+
+        def recover(current_plan, report):
+            calls.append((current_plan, report))
+            return replacement
+
+        m = pm.PlanMonitor(plan, recover)
+        reply = m.handle(progress(
+            0, 0, "F10", 17.16, 11.02, 179.8, fid="edge-risk",
+            remaining_photo_ids=["4"],
+        ))
+        self.assertEqual(reply.split(",", 1)[0], "REPLACE")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(m.replacements, 1)
+        self.assertEqual(m.continues, 0)
+        self.assertTrue(any("Boundary look-ahead" in message
+                            for message in self.cap.messages(logging.WARNING)))
+
+    def test_boundary_lookahead_keeps_a_safe_next_instruction(self):
+        plan = {
+            "segments": [["F10", "FL90", "S"]],
+            "segment_obstacles": ["4"],
+            "expected": [[
+                [1500.0, 1130.0, 180.0],
+                [1794.0, 836.0, 90.0],
+                [1794.0, 836.0, 90.0],
+            ]],
+        }
+        calls = []
+        m = pm.PlanMonitor(plan, lambda current, report: calls.append(report))
+        reply = m.handle(progress(0, 0, "F10", 15.20, 11.10, 180.0, fid="safe"))
+        self.assertEqual(reply.split(",", 1)[0], "CONTINUE")
+        self.assertEqual(calls, [])
+
+    def test_boundary_lookahead_preserves_photo_before_replacing_next_segment(self):
+        plan = {
+            "segments": [["S"], ["FL90", "S"]],
+            "segment_obstacles": ["2", "4"],
+            "expected": [
+                [[1650.0, 1130.0, 180.0]],
+                [[1944.0, 836.0, 90.0], [1944.0, 836.0, 90.0]],
+            ],
+        }
+        recovered = {
+            "segments": [["R20", "RR90", "S"]],
+            "segment_obstacles": ["4"],
+            "expected": [[
+                [1716.0, 1302.0, 180.0],
+                [1422.0, 1008.0, 270.0],
+                [1422.0, 1008.0, 270.0],
+            ]],
+        }
+        reports = []
+
+        def recover(current_plan, report):
+            reports.append(report)
+            return recovered
+
+        m = pm.PlanMonitor(plan, recover)
+        reply = m.handle(progress(
+            0, 0, "S", 17.16, 11.02, 179.8, fid="between-segments",
+            remaining_photo_ids=["2", "4"],
+        ))
+        tag, body = reply.split(",", 1)
+        payload = json.loads(body)
+        self.assertEqual(tag, "REPLACE")
+        self.assertEqual(reports[0]["segment_index"], 1)
+        self.assertEqual(reports[0]["remaining_photo_ids"], ["4"])
+        self.assertEqual(payload["segments"][0], ["S"])
+        self.assertEqual(payload["segment_obstacles"], ["2", "4"])
+        self.assertEqual(m.expected[0][0], [1716.0, 1102.0, 179.8])
+
     def test_garbage_never_raises_and_never_replies(self):
         m = pm.PlanMonitor(self.PLAN)
         for bad in ("not json", "{}", '{"segment_index":"x"}', "[]", "null", ""):

@@ -92,7 +92,11 @@ def bare_task(segments=None, mapping=None):
     task.stm.query = Mock(return_value=None)
     task.android = Mock()
     task.pc = Mock()
+    task._last_capture_attempts = 0
     task._detect_and_send_image = Mock(return_value=True)
+    task._detect_with_distance_retry = Mock(
+        side_effect=lambda obstacle_id, mission: task._detect_and_send_image(obstacle_id)
+    )
     return task
 
 
@@ -135,7 +139,7 @@ class TaskFeedbackTests(unittest.TestCase):
         self.assertEqual(task._detect_and_send_image.call_count, 2)
         self.assertEqual(reports[1]["remaining_photo_ids"], ["7", "8"])
         self.assertEqual(reports[2]["remaining_photo_ids"], ["8"])
-        task.pc.send.assert_called_with("STITCH,1\n")
+        task.pc.send.assert_called_with("STITCH,2\n")
         task.android.send.assert_called_with("STATUS,DONE")
 
     def test_replace_mid_segment_preserves_origin_and_photo_count(self):
@@ -151,7 +155,7 @@ class TaskFeedbackTests(unittest.TestCase):
         self.assertEqual([p["y_grid"] for p in reports], [3.25] * 4)
         self.assertEqual([p["instruction_index"] for p in reports], [0, 0, 1, 0])
         self.assertEqual(len({p["feedback_id"] for p in reports}), 4)
-        task.pc.send.assert_called_with("STITCH,1\n")
+        task.pc.send.assert_called_with("STITCH,2\n")
 
     def test_replacement_at_photo_boundary_defers_photo(self):
         task = bare_task([["S"], ["S"]])
@@ -186,7 +190,7 @@ class TaskFeedbackTests(unittest.TestCase):
         self.assertFalse(task.halted)
         self.assertEqual([c.args[0] for c in task._detect_and_send_image.call_args_list], ["7", "8"])
         self.assertEqual(task._completed_photo_count, 2)
-        task.pc.send.assert_called_with("STITCH,1\n")
+        task.pc.send.assert_called_with("STITCH,2\n")
 
     def test_invalid_replacements_halt_without_sending_any_more_tokens(self):
         for replacement in [
@@ -245,6 +249,9 @@ class TaskFeedbackTests(unittest.TestCase):
     def test_task1_forwards_detector_selection_to_android(self):
         task = bare_task()
         task.image_done = Event()
+        task._detection_lock = Lock()
+        task._expected_detection_id = "7"
+        task._last_detection = None
         task.pc.receive.side_effect = ["OBJECT,7,0.99,bullseye", EndLoop()]
         with self.assertRaises(EndLoop):
             task.pc_receive()
@@ -253,6 +260,7 @@ class TaskFeedbackTests(unittest.TestCase):
 
         task.android.reset_mock()
         task.image_done.clear()
+        task._expected_detection_id = "7"
         task.pc.receive.side_effect = ["OBJECT,7,0.91,H", EndLoop()]
         with self.assertRaises(EndLoop):
             task.pc_receive()
@@ -262,6 +270,7 @@ class TaskFeedbackTests(unittest.TestCase):
         for class_id in ("dot", "NONE"):
             task.android.reset_mock()
             task.image_done.clear()
+            task._expected_detection_id = "7"
             task.pc.receive.side_effect = [
                 "OBJECT,7,0.0," + class_id,
                 EndLoop(),
@@ -269,7 +278,7 @@ class TaskFeedbackTests(unittest.TestCase):
             with self.assertRaises(EndLoop):
                 task.pc_receive()
             self.assertTrue(task.image_done.is_set())
-            task.android.send.assert_called_once_with("TARGET,7," + class_id)
+            task.android.send.assert_not_called()
 
     def test_blocking_wait_does_not_hold_index_lock(self):
         task = bare_task()

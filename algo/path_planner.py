@@ -54,10 +54,11 @@ OBSTACLE_SIZE_MM = 100.0
 COLLISION_MARGIN_MM = 30.0
 
 # Ultrasonic reading at the photo, cm - the FU<n> target - tried in this order.
-# 30 is where YOLO is most confident; further out is next best; 28 works but
-# its confidence is shaky, so it is only used when nothing else fits.
-STANDOFF_PREFERENCE_CM = (30, 32, 35, 38, 40, 42, 45)
-STANDOFF_LAST_RESORT_CM = (28,)
+# 30 is where YOLO is most confident; further out is next best. The camera is
+# usable down to 20 cm, but that close pose is reserved for a face near an arena
+# edge where the normal distances would put the rear axle beyond the boundary.
+STANDOFF_PREFERENCE_CM = (30, 32, 33, 35, 38, 40, 42, 45)
+STANDOFF_LAST_RESORT_CM = (28, 20)
 STANDOFF_CANDIDATES_CM = STANDOFF_PREFERENCE_CM + STANDOFF_LAST_RESORT_CM
 FU_COMPENSATE = False
 
@@ -674,9 +675,6 @@ def plan_segment_recovery(plan: dict, obstacles: List[dict], progress: dict,
         logging.error("Cannot safely recover segment %d: original endpoint is no longer clear.", seg)
         return None
 
-    goal = grid_search.ApproachLine(
-        tx, ty, target_theta, RECOVERY_APPROACH_LINE_MM, RECOVERY_LATERAL_TOL_MM,
-    )
     tokens, poses = [], []
     terminal = Pose(ax, ay, actual_cardinal)
 
@@ -699,32 +697,66 @@ def plan_segment_recovery(plan: dict, obstacles: List[dict], progress: dict,
         )
         poses = [terminal]
     else:
-        try:
-            raw_tokens, raw_poses, _ = grid_search.search_leg(
-                ax, ay, actual_cardinal, goal, TURN_RADIUS_MM[arc_profile], boxes,
-                ARENA_MM, ROBOT_HALF_LENGTH_MM, ROBOT_HALF_WIDTH_MM,
+        # A long approach line gives A* more possible endpoints, but the first
+        # endpoint it finds can have an obstacle between it and the real target.
+        # Retry shorter lines until both the searched route and its final
+        # straight are collision-free. This matters near arena edges where the
+        # long-line route can also choose the wrong side of a neighbouring box.
+        approach_lengths = sorted({
+            float(value) for value in
+            (RECOVERY_APPROACH_LINE_MM, 500, 400, 300, 200, 150, 100, 75, 50, 25)
+            if 0 < float(value) <= RECOVERY_APPROACH_LINE_MM
+        }, reverse=True)
+        last_error = None
+        for approach_length in approach_lengths:
+            goal = grid_search.ApproachLine(
+                tx, ty, target_theta, approach_length, RECOVERY_LATERAL_TOL_MM,
             )
-        except grid_search.NoPathFound as exc:
-            logging.error("Cannot safely recover segment %d: %s", seg, exc)
-            return None
+            try:
+                raw_tokens, raw_poses, _ = grid_search.search_leg(
+                    ax, ay, actual_cardinal, goal, TURN_RADIUS_MM[arc_profile], boxes,
+                    ARENA_MM, ROBOT_HALF_LENGTH_MM, ROBOT_HALF_WIDTH_MM,
+                )
+            except grid_search.NoPathFound as exc:
+                last_error = exc
+                continue
 
-        poses = [Pose(x, y, theta) for x, y, theta in raw_poses[1:]]
-        tokens, poses = _merge_straights(list(raw_tokens), poses)
-        terminal = Pose(ax, ay, actual_cardinal) if not poses else poses[-1]
-        back, _ = goal.offsets(terminal.x, terminal.y)
-        run_cm = max(0, int(round(back / 10.0)))
-        run_mm = run_cm * 10.0
-        if run_cm:
-            if not _straight_distance_clear(terminal.x, terminal.y, target_theta, run_mm, boxes):
-                logging.error("Cannot safely recover segment %d: final straight is obstructed.", seg)
-                return None
-            tokens.append(fwd(run_cm))
-            terminal = Pose(
-                terminal.x + run_mm * math.cos(target_theta),
-                terminal.y + run_mm * math.sin(target_theta),
-                target_theta,
+            candidate_poses = [Pose(x, y, theta) for x, y, theta in raw_poses[1:]]
+            candidate_tokens, candidate_poses = _merge_straights(
+                list(raw_tokens), candidate_poses
             )
-            poses.append(terminal)
+            candidate_terminal = (
+                Pose(ax, ay, actual_cardinal) if not candidate_poses
+                else candidate_poses[-1]
+            )
+            back, _ = goal.offsets(candidate_terminal.x, candidate_terminal.y)
+            run_cm = max(0, int(round(back / 10.0)))
+            run_mm = run_cm * 10.0
+            if (run_cm and not _straight_distance_clear(
+                    candidate_terminal.x, candidate_terminal.y,
+                    target_theta, run_mm, boxes)):
+                last_error = ValueError(
+                    f"final straight from {approach_length:.0f} mm approach is obstructed"
+                )
+                continue
+            if run_cm:
+                candidate_tokens.append(fwd(run_cm))
+                candidate_terminal = Pose(
+                    candidate_terminal.x + run_mm * math.cos(target_theta),
+                    candidate_terminal.y + run_mm * math.sin(target_theta),
+                    target_theta,
+                )
+                candidate_poses.append(candidate_terminal)
+            tokens, poses, terminal = (
+                candidate_tokens, candidate_poses, candidate_terminal
+            )
+            break
+        else:
+            logging.error(
+                "Cannot safely recover segment %d: %s.",
+                seg, last_error or "no collision-free approach",
+            )
+            return None
 
     if not tokens:
         logging.warning(
@@ -830,6 +862,10 @@ def plan_mission(obstacles: List[dict], arc_profile: int = PROFILE_TIGHT,
     expected: List[List[List[float]]] = []
     shift_x, shift_y = _frame_shift(start)
     photo_poses, standoffs = {}, {}
+    safe_standoffs = {
+        str(obstacle_id): [option.standoff_cm for option in obstacle_options]
+        for obstacle_id, obstacle_options in options.items()
+    }
 
     cur_id = "START"
     start_relaxed = False
@@ -927,5 +963,12 @@ def plan_mission(obstacles: List[dict], arc_profile: int = PROFILE_TIGHT,
         "start_mm": {"x": round(start.x, 1), "y": round(start.y, 1),
                      "heading": _nearest_cardinal(start.theta)},
         "frame_shift_mm": {"x": round(shift_x, 1), "y": round(shift_y, 1)},
+        # Camera retries may move only between these collision-checked poses.
+        # Keys are strings because JSON object keys arrive that way on the RPi.
+        "photo_standoffs": safe_standoffs,
+        "selected_standoffs": {
+            str(obstacle_id): standoff
+            for obstacle_id, standoff in standoffs.items()
+        },
         "expected": expected,
     }

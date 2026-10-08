@@ -88,6 +88,7 @@ A5_FACE_NAME = {0: "N", 2: "E", 4: "S", 6: "W"}
 # the PC detector's final selection directly, including a bullseye when no
 # preferred image class was present.
 A5_NOT_A_TARGET = {"bullseye", "dot", "none"}
+TASK1_NOT_A_TARGET = {"dot", "none"}
 
 
 class Task1:
@@ -125,6 +126,11 @@ class Task1:
         # segments are pure travel with no photo at the end. Entry is an
         # obstacle id, or None for "no detection after this segment".
         self.segment_obstacles: list = []
+        # Planner-approved camera positions, keyed by obstacle id. Distance
+        # retries never invent a pose that was not checked for arena bounds,
+        # obstacle clearance and ultrasonic line of sight.
+        self.photo_standoffs: dict = {}
+        self.selected_standoffs: dict = {}
 
         self.started: bool = False          # True after Android sends BEGIN
         self.path_requested: bool = False   # True while OBSTACLES request is in-flight
@@ -153,6 +159,10 @@ class Task1:
                      self.feedback_control.enabled, self.feedback_control.timeout)
         # Set by pc_thread when OBJECT arrives; waited on by stm_thread DETECT logic
         self.image_done = Event()
+        self._detection_lock = Lock()
+        self._expected_detection_id = None
+        self._last_detection = None
+        self._last_capture_attempts = 0
         # Set by pc_thread when PATH arrives; waited on by android_thread BEGIN logic
         self.path_ready = Event()
         # Debounce timer — send OBSTACLES to PC 1 s after last obstacle arrives
@@ -172,6 +182,20 @@ class Task1:
         self.detect_retry_delay = float(os.getenv("DETECT_RETRY_DELAY_S", "0.2"))
         self.detect_timeout = float(os.getenv("DETECT_TIMEOUT_S", "30.0"))
         self.capture_settle = float(os.getenv("TASK1_CAPTURE_SETTLE_S", "2.0"))
+        retry_text = os.getenv("TASK1_PHOTO_RETRY_STANDOFFS", "40,45,35,33,20")
+        try:
+            self.photo_retry_standoffs = [
+                int(value.strip()) for value in retry_text.split(",") if value.strip()
+            ]
+        except ValueError:
+            logging.warning(
+                "Invalid TASK1_PHOTO_RETRY_STANDOFFS=%r; using 40,45,35,33,20.",
+                retry_text,
+            )
+            self.photo_retry_standoffs = [40, 45, 35, 33, 20]
+        self.photo_retry_limit = max(
+            0, int(os.getenv("TASK1_PHOTO_RETRY_LIMIT", "5"))
+        )
         # PROTOCOL.md §3 recommends at most three retransmissions.
         self.max_resends = int(os.getenv("STM_MAX_RESENDS", "3"))
         # PROTOCOL.md §6: 0 TIGHT (r=291mm), 1 CLEAN (r=318mm), 2 SLOW (r=306mm).
@@ -188,6 +212,8 @@ class Task1:
             f"detect_retry_delay={self.detect_retry_delay}s  "
             f"detect_timeout={self.detect_timeout}s  "
             f"capture_settle={self.capture_settle}s  "
+            f"photo_retry_standoffs={self.photo_retry_standoffs}  "
+            f"photo_retry_limit={self.photo_retry_limit}  "
             f"debounce_delay={self._debounce_delay}s  "
             f"max_resends={self.max_resends}  "
             f"arc_profile={self.arc_profile}"
@@ -508,18 +534,29 @@ class Task1:
 
     # ── Image detection with retry ────────────────────────────────────────────
 
-    def _detect_and_send_image(self, obstacle_id: str) -> bool:
+    @staticmethod
+    def _valid_detection(result) -> bool:
+        if not isinstance(result, dict):
+            return False
+        class_id = str(result.get("class_id", "")).strip().lower()
+        confidence = result.get("confidence")
+        return (class_id not in TASK1_NOT_A_TARGET and
+                isinstance(confidence, (int, float)) and confidence > 0.0)
+
+    def _detect_and_send_image(self, obstacle_id: str, standoff_cm=None):
         """
         Full image capture + transfer + wait-for-result cycle with retry.
 
         Steps per attempt:
           1. Capture JPEG bytes from camera.
-          2. Tell PC a DETECT is coming: DETECT,<id>
+          2. Tell PC a DETECT is coming: DETECT,<id>[,<standoff_cm>]
           3. Send a 4-byte size header then raw bytes.
           4. Wait up to detect_timeout seconds for pc_thread to set image_done.
           5. Retry up to detect_retries times if no response.
 
-        Returns True if OBJECT was received, False after all attempts exhausted.
+        Returns the OBJECT fields as a dict, or None after all attempts fail.
+        An OBJECT with class NONE is returned normally so the caller can move
+        to another safe camera distance and take a fresh frame.
         """
         total_attempts = self.detect_retries + 1
 
@@ -531,8 +568,15 @@ class Task1:
                 continue
 
             # ── Signal + send ─────────────────────────────────────────────────
-            self.image_done.clear()
-            self.pc.send_image(image_bytes, header=f"DETECT,{obstacle_id}")
+            with self._detection_lock:
+                self._expected_detection_id = str(obstacle_id)
+                self._last_detection = None
+                self.image_done.clear()
+            header = f"DETECT,{obstacle_id}"
+            if standoff_cm is not None:
+                header += f",{int(standoff_cm)}"
+            self.pc.send_image(image_bytes, header=header)
+            self._last_capture_attempts += 1
             logging.info(
                 f"DETECT sent for obstacle {obstacle_id} "
                 f"(attempt {attempt}/{total_attempts})."
@@ -540,11 +584,15 @@ class Task1:
 
             # ── Wait for result ───────────────────────────────────────────────
             if self.image_done.wait(timeout=self.detect_timeout):
+                with self._detection_lock:
+                    result = self._last_detection
                 logging.info(
-                    f"OBJECT received for obstacle {obstacle_id} "
-                    f"on attempt {attempt}."
+                    "OBJECT received for obstacle %s on attempt %d: %s (conf=%s).",
+                    obstacle_id, attempt,
+                    result.get("class_id") if result else "invalid",
+                    result.get("confidence") if result else "?",
                 )
-                return True
+                return result
 
             logging.warning(
                 f"No OBJECT for obstacle {obstacle_id} within "
@@ -557,7 +605,131 @@ class Task1:
             f"Gave up waiting for OBJECT for obstacle {obstacle_id} "
             f"after {total_attempts} attempt(s)."
         )
+        with self._detection_lock:
+            self._expected_detection_id = None
+        return None
+
+    def _move_for_photo(self, mission, obstacle_id: str, standoff_cm: int) -> bool:
+        """Run one unplanned FU safely, publish its pose, and consume its OK."""
+        token = f"FU{standoff_cm}"
+        for attempt in range(self.max_resends + 1):
+            if not self.stm.send_line([token]):
+                self._halt_mission(f"Could not send camera adjustment {token}")
+                return False
+            reply = self.stm.wait_reply()
+            if reply is None:
+                self._halt_mission(f"No STM reply for camera adjustment {token}")
+                return False
+            reply_upper = reply.strip().upper()
+            logging.info("Camera adjustment %s received STM reply %s.", token, reply_upper)
+            if reply_upper == "RESEND":
+                if attempt < self.max_resends:
+                    logging.warning(
+                        "Camera adjustment %s was RESENDed; retry %d/%d.",
+                        token, attempt + 1, self.max_resends,
+                    )
+                    continue
+                self._halt_mission(f"Camera adjustment {token} exceeded RESEND limit")
+                return False
+            if reply_upper != "OK":
+                self._halt_mission(f"Camera adjustment {token} failed: {reply.strip()}")
+                return False
+
+            try:
+                robot_message, pose = mission.report_pose(self.stm)
+                self.android.send(robot_message)
+                fields = self.stm.query_fields("?US")
+                measured_us = None
+                if fields and len(fields) == 1:
+                    try:
+                        measured_us = int(fields[0])
+                    except (TypeError, ValueError):
+                        pass
+                report = {
+                    "event": "photo_distance_adjustment",
+                    "obstacle_id": str(obstacle_id),
+                    "token": token,
+                    "target_standoff_cm": standoff_cm,
+                    "measured_us_cm": measured_us,
+                    "x_grid": pose["x_grid"],
+                    "y_grid": pose["y_grid"],
+                    "heading_deg": pose["heading_deg"],
+                }
+                self.pc.send("PHOTO_PROGRESS," + json.dumps(report, separators=(",", ":")))
+                logging.info(
+                    "Camera position for obstacle %s: requested %d cm, ultrasonic=%s cm.",
+                    obstacle_id, standoff_cm,
+                    measured_us if measured_us is not None else "unavailable",
+                )
+                return True
+            except (ValueError, OSError) as exc:
+                self._halt_mission(str(exc))
+                return False
         return False
+
+    def _detect_with_distance_retry(self, obstacle_id: str, mission):
+        """Retry an unclear photograph only at planner-approved standoffs."""
+        self._last_capture_attempts = 0
+        obstacle_key = str(obstacle_id)
+        original = getattr(self, "selected_standoffs", {}).get(obstacle_key)
+        if original is None:
+            result = self._detect_and_send_image(obstacle_id)
+        else:
+            result = self._detect_and_send_image(obstacle_id, original)
+        if self.a5_mode or self._valid_detection(result):
+            return result
+
+        safe = getattr(self, "photo_standoffs", {}).get(obstacle_key, [])
+        if original is None or not safe:
+            logging.warning(
+                "No planner-approved alternate camera distances for obstacle %s; "
+                "keeping the original frame.", obstacle_id,
+            )
+            return result
+
+        candidates = []
+        for distance in self.photo_retry_standoffs:
+            if distance in safe and distance != original and distance not in candidates:
+                candidates.append(distance)
+        candidates = candidates[:self.photo_retry_limit]
+        if not candidates:
+            logging.warning(
+                "Obstacle %s has no safe configured retry standoff (selected=%s, safe=%s).",
+                obstacle_id, original, safe,
+            )
+            return result
+
+        logging.warning(
+            "Detection for obstacle %s was missing/low-confidence at %d cm; "
+            "trying safe camera distances %s.",
+            obstacle_id, original, candidates,
+        )
+        moved = False
+        for distance in candidates:
+            if not self._move_for_photo(mission, obstacle_id, distance):
+                break
+            moved = True
+            if self.capture_settle > 0:
+                logging.info(
+                    "Waiting %.1fs for camera to settle at %d cm.",
+                    self.capture_settle, distance,
+                )
+                sleep(self.capture_settle)
+            result = self._detect_and_send_image(obstacle_id, distance)
+            if self._valid_detection(result):
+                logging.info(
+                    "Obstacle %s detected at retry standoff %d cm.",
+                    obstacle_id, distance,
+                )
+                break
+
+        if moved and not self.halted:
+            logging.info(
+                "Returning obstacle %s to its planned %d cm standoff before continuing.",
+                obstacle_id, original,
+            )
+            self._move_for_photo(mission, obstacle_id, original)
+        return result
 
     # ══ Thread: Android receive ═══════════════════════════════════════════════
 
@@ -744,6 +916,18 @@ class Task1:
                         # Present when the planner had to split an approach
                         # across several lines to respect the §2 caps.
                         self.segment_obstacles = payload.get("segment_obstacles", [])
+                        raw_safe = payload.get("photo_standoffs", {})
+                        raw_selected = payload.get("selected_standoffs", {})
+                        if not isinstance(raw_safe, dict) or not isinstance(raw_selected, dict):
+                            raise ValueError("PATH camera standoff metadata must be objects")
+                        self.photo_standoffs = {
+                            str(key): [int(value) for value in values]
+                            for key, values in raw_safe.items()
+                            if isinstance(values, list)
+                        }
+                        self.selected_standoffs = {
+                            str(key): int(value) for key, value in raw_selected.items()
+                        }
                         self.directions = payload.get("dirs", [])
                         # Keep the planner's wire values for STATUS,START.
                         self.start_pose = {
@@ -797,17 +981,30 @@ class Task1:
                         f"class={class_id}  conf={confidence}."
                     )
 
-                    # Unblock stm_thread which is waiting for this. Must happen
-                    # for EVERY reply, valid image or not, or the segment pump
-                    # waits out its timeout on every wrong face.
-                    self.image_done.set()
+                    accepted_result = False
+                    with self._detection_lock:
+                        expected = self._expected_detection_id
+                        if expected is not None and str(obstacle_id) == expected:
+                            self._last_detection = {
+                                "obstacle_id": str(obstacle_id),
+                                "confidence": confidence,
+                                "class_id": class_id,
+                            }
+                            self._expected_detection_id = None
+                            accepted_result = True
+                            self.image_done.set()
+                        else:
+                            logging.warning(
+                                "Ignoring stale OBJECT for obstacle %s; waiting for %s.",
+                                obstacle_id, expected,
+                            )
 
                     # Forward result to Android
-                    if confidence is None:
+                    if not accepted_result or confidence is None:
                         pass
                     elif self.a5_mode:
                         self._a5_report(obstacle_id, class_id, confidence)
-                    else:
+                    elif class_id.lower() not in TASK1_NOT_A_TARGET:
                         self.android.send(f"TARGET,{obstacle_id},{class_id}")
 
                 else:
@@ -967,8 +1164,12 @@ class Task1:
                                 self.capture_settle,
                             )
                             sleep(self.capture_settle)
-                        self._detect_and_send_image(obstacle_id)
-                        self._completed_photo_count += 1
+                        self._detect_with_distance_retry(obstacle_id, mission)
+                        if self.halted:
+                            continue
+                        self._completed_photo_count += max(
+                            1, getattr(self, "_last_capture_attempts", 0)
+                        )
 
                     # ── Send next movement segment (or finish) ─────────────────
                     if more_to_send:
@@ -984,7 +1185,7 @@ class Task1:
                         # obstacle can span several segments, so len(segments)
                         # would over-count.
                         shots = self._completed_photo_count
-                        self.pc.send(f"STITCH,{max(shots - 1, 0)}\n")
+                        self.pc.send(f"STITCH,{shots}\n")
                         self.android.send("STATUS,DONE")
                         self.started = False
 
