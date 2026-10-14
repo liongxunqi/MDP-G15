@@ -35,6 +35,7 @@ class Motion:
     def __init__(self, stm, stop, report):
         self.raw, self.stop, self.report = stm, stop, report
         self.lock = Lock()
+        self.supports_fast = True
 
     def check(self):
         if self.stop.is_set():
@@ -58,7 +59,8 @@ class Motion:
         while time.monotonic() < deadline:
             reply = self.receive()
             if reply is not None:
-                self.report()
+                # Route reads measured WPOSE at its next decision point.
+                # A telemetry-only read here duplicated that serial query.
                 return reply
             self.stop.wait(0.02)
         self.abort()
@@ -75,7 +77,16 @@ class Motion:
     def set_fast(self, on, timeout=None):
         with self.lock:
             self.check()
+            if not self.supports_fast:
+                return not on  # normal mode already; no unsupported FAST0
             return self.raw.set_fast(on, timeout)
+
+    def prepare_start(self):
+        from communications import cal_profile
+        with self.lock:
+            self.check()
+            logging.info("Android BEGIN: zeroing heading at the placed start pose.")
+            return cal_profile.zero_heading(self.raw)
 
 
 class Task2(route.Task2):
@@ -84,13 +95,17 @@ class Task2(route.Task2):
         super().__init__(stm, input_fn=self._arrow, sleep_fn=stop.wait,
                          startup=False, wait_for_go=False,
                          early_arrow_fn=getattr(vision, "peek_arrow", None),
-                         lane_reached_fn=self._lane_reached)
+                         lane_reached_fn=self._lane_reached,
+                         arrow_pending_fn=getattr(vision, "arrow_pending", None))
         self.vision, self.stop, self.status = vision, stop, status
         self.obstacle = 0
         self.stage2_started = False
-        # main() has already enabled this on the firmware. Keeping the route's
-        # state in sync lets its precision phase issue !FAST0 and !FAST1.
+        # main() enabled this before BEGIN. The route must know so that its
+        # first precision phase actually sends FAST0.
         self.fast = route.FAST
+
+    def _stable_us(self, attempts=4, tolerance=2.0):
+        return geometry.stable_us(self._us, attempts, tolerance)
 
     def _pose(self):
         pose = self.frame.pose()
@@ -114,27 +129,22 @@ class Task2(route.Task2):
     def pass_obstacle1(self, x1, side1):
         self.status("BYPASS_1")
         result = super().pass_obstacle1(x1, side1)
-        if result is not None and not self.stage2_started:
-            self._lane_reached()
         return result
 
     def _lane_reached(self):
-        """Start stage 2 as soon as the robot enters the bypass lane."""
+        """Called only after the route excludes obstacle 1 from the camera view."""
         if self.stage2_started:
             return
         self.obstacle = 2
         self.status("APPROACH_2")
         self.vision.begin(2)
         self.stage2_started = True
-        logging.info("Obstacle 1 bypass lane reached; stage-2 recognition is "
-                     "live during the forward cruise.")
+        logging.info("Obstacle 1 is behind the forward camera plane; fresh "
+                     "stage-2 recognition is live.")
 
     def photo_obstacle2(self, course, side1):
         self.obstacle = 2
         self.status("APPROACH_2")
-        if not self.stage2_started:
-            self.vision.begin(2)
-            self.stage2_started = True
         return super().photo_obstacle2(course, side1)
 
     def around_obstacle2(self, course, side1, side2):
@@ -147,7 +157,7 @@ class Task2(route.Task2):
     def _first_clear(self, pose, candidates, course, what):
         # Prefer the shortest estimated execution time at the normal margin.
         # A fallback never relaxes clearance below the configured positive floor.
-        choices = [(self._check(pose, segs, course), geometry._cost(segs, self.r), segs)
+        choices = [(self._check(pose, segs, course), geometry.motion_cost(segs, self.r), segs)
                    for segs in candidates]
         for margin in (geometry.CLEARANCE_CM, geometry.CLEARANCE_FLOOR_CM):
             safe = [item for item in choices if item[0] >= margin]
@@ -163,9 +173,8 @@ class Task2(route.Task2):
         if result:
             return result
         pose = self.frame.pose()
-        us = self._us()
+        us = self._stable_us()
         left, right = self._ir("left"), self._ir("right")
-        offset = geometry.centre_offset(left, right)
         imu = self.stm.query_fields("?IMU")
         try:
             stationary = int(imu[0]) == 1 and abs(float(imu[2]) / 10) <= 1.0
@@ -177,18 +186,39 @@ class Task2(route.Task2):
             for x, y in corners)
         # Completion means fully parked, not exactly at the aiming point.
         # Use independent sensor clearance as well as the odometry footprint.
-        margin = 2.0
-        aligned = pose is not None and math.cos(pose.th) <= -math.cos(math.radians(10))
-        sensor_ok = False
-        if (aligned and all(v is not None and math.isfinite(v) and v > 0
-                            for v in (us, left, right)) and offset is not None):
-            length = (geometry.ROBOT_LENGTH_CM * abs(math.cos(pose.th))
-                      + geometry.ROBOT_WIDTH_CM * abs(math.sin(pose.th)))
-            front_gap = us * abs(math.cos(pose.th))
-            side_gap = min(left, right) - (geometry.HALF_WIDTH_CM
-                                          - geometry.IR_SIDE_OFFSET_CM)
-            sensor_ok = (front_gap >= margin and side_gap >= margin
-                         and front_gap + length <= geometry.BAY_DEPTH_CM - margin)
+        aligned = (pose is not None and geometry.parking_heading_error(pose.th)
+                   <= geometry.PARK_HEADING_TOL_DEG)
+        us_at_target = (us is not None and math.isfinite(us)
+                        and geometry.PARK_GAP_CM - geometry.PARK_GAP_TOL_CM
+                        <= us
+                        <= geometry.PARK_GAP_CM + geometry.PARK_GAP_TOL_CM)
+        # Side IRs are useful when both fences are visible, but the final
+        # parking decision must still work when one sensor looks through the
+        # open mouth. Any side reading that is present remains a hard guard.
+        side_safe = all(v is None or (math.isfinite(v)
+                                      and v >= geometry.PARK_SIDE_STOP_CM)
+                        for v in (left, right))
+        if (not inside and pose is not None and pose.x < -geometry.REAR_FROM_AXLE_CM
+                and aligned and stationary and us_at_target and side_safe):
+            # The back wall is physically impassable, but wheel odometry can
+            # place the front bumper beyond it. Accept the independent wall
+            # position only when both side fences identify the parking bay.
+            wall_y = geometry.centre_offset(left, right)
+            if wall_y is not None:
+                wall_x = (-geometry.BAY_DEPTH_CM
+                          - (geometry.FRONT_FROM_AXLE_CM + us) * math.cos(pose.th))
+                wall_pose = geometry.Pose(wall_x, wall_y, pose.th)
+                inside = all(
+                    -geometry.BAY_DEPTH_CM < x < 0
+                    and abs(y) < geometry.BAY_HALF_WIDTH_CM
+                    for x, y in geometry.footprint(wall_pose))
+                if inside:
+                    logging.warning("Parking odometry x=%.1f cm disagrees with "
+                                    "the confirmed back-wall and side-IR pose "
+                                    "(x=%.1f, y=%.1f cm); using the measured "
+                                    "bay position for completion.",
+                                    pose.x, wall_x, wall_y)
+        sensor_ok = aligned and us_at_target and side_safe
         logging.info("Parking verification: pose=%s inside=%s US=%s L=%s R=%s "
                      "stationary=%s aligned=%s sensor_clearance=%s",
                      pose, inside, us, left, right, stationary, aligned, sensor_ok)
@@ -220,7 +250,10 @@ def main():
             if android.connected:
                 android.send(message)
     def status(phase):
+        elapsed = None if started[0] is None else time.monotonic() - started[0]
         logging.info("Task 2 phase: %s", phase)
+        if elapsed is not None:
+            logging.info("Task 2 competition elapsed: %.3fs (%s)", elapsed, phase)
         send_android(android_status(phase))
     def report():
         pose = stm.read_wpose(timeout=0.5)
@@ -297,12 +330,21 @@ def main():
         us = stm.query_fields("?US")
         if not imu or imu[0] != "1" or not ir or len(ir) != 2 or not us:
             raise RuntimeError("STM IMU/IR/US startup queries failed")
+        # Latest uploaded STM source declares protocol 8 with !FAST. Query
+        # the actual board as well: uploaded source need not be flashed firmware.
+        from communications.stm import FAST_MIN_PROTOCOL
+        proto = cal_profile.firmware_protocol(stm)
+        motion.supports_fast = proto is not None and proto >= FAST_MIN_PROTOCOL
+        if not motion.supports_fast:
+            route.FAST = False
+            logging.info("Board protocol %s: using its existing normal mode; "
+                         "FAST commands will not be sent.", proto)
         if route.FAST:
-            if not stm.set_fast(True):
-                raise RuntimeError(
-                    "T2T_FAST=1 but STM refused !FAST1; flash fast-mode firmware"
-                )
+            if not motion.set_fast(True):
+                raise RuntimeError("Board advertised fast mode but refused !FAST1")
             fast_active = True
+        logging.info("Obstacle-2 configured width cap %.1f cm; PDFs specify "
+                     "minimum 30 cm and no numeric maximum.", route.W2_RANGE[1])
         if abs(geometry.RADIUS_CM - 30.0) > 0.01:
             logging.warning("Task 2 radius override: %.2f cm", geometry.RADIUS_CM)
         logging.info("Task 2 uses %s, profile 0, radius %.2f cm; fast mode %s",
@@ -333,6 +375,8 @@ def main():
         if not stop.is_set():
             started[0] = time.monotonic()
             status("START")
+            if not motion.prepare_start():
+                raise RuntimeError("Could not zero heading at BEGIN; no route movement sent")
             result = Task2(motion, vision, stop, status).run()
             status("DONE" if result == 0 else "FAILED")
     except KeyboardInterrupt:
@@ -342,10 +386,16 @@ def main():
         status("FAILED")
     finally:
         stop.set()
-        try:
-            motion.abort()
-        except Exception:
-            logging.exception("Could not send emergency brake")
+        if result != 0:
+            try:
+                motion.abort()
+            except Exception:
+                logging.exception("Could not send emergency brake")
+        else:
+            # Every movement has completed and parking has been verified.
+            # Firmware v8's RST path changes Motors_Brake() back to coast, so
+            # an unconditional shutdown RST can make a parked robot roll.
+            logging.info("Successful park verified; no shutdown RST sent.")
         if fast_active:
             try:
                 if stm.set_fast(False):

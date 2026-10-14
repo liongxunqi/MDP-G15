@@ -37,28 +37,161 @@ class Link:
 
 
 class Coordination(unittest.TestCase):
+    def test_parking_completion_uses_same_heading_limit_as_entry(self):
+        import math
+        import task2t_park as geometry
+        for error, expected in [(11, 0), (-11, 0), (13, 1)]:
+            with self.subTest(error=error), patch.object(geometry, "PARK_HEADING_TOL_DEG", 12):
+                stm = Mock()
+                stm.query_fields.return_value = ["1", "0", "0", "0"]
+                task = Task2(stm, Mock(), Event(), Mock())
+                task.frame.pose = Mock(return_value=geometry.Pose(
+                    -14.5, 0, math.pi + math.radians(error)))
+                task._us = Mock(return_value=15)
+                task._ir = Mock(return_value=24)
+                with patch("task2.route.Task2.run", return_value=0):
+                    self.assertEqual(task.run(), expected)
+
+    def test_standalone_startup_uses_supported_calibration_api(self):
+        import task2t as route
+        with patch.dict("sys.modules", {"serial": Mock()}):
+            from communications import cal_profile
+        stm = Mock()
+        stm.set_fast.return_value = True
+        task = route.Task2(stm)
+        with patch.dict("sys.modules", {"serial": Mock(),
+                                        "communications.cal_profile": cal_profile}), \
+                patch.object(cal_profile, "firmware_protocol", return_value=8), \
+                patch.object(cal_profile, "prepare_for_task", autospec=True,
+                             return_value=True) as prepare, \
+                patch.object(route, "FAST", True):
+            self.assertTrue(task._startup())
+        self.assertEqual(prepare.call_args.kwargs["required"], True)
+        stm.set_fast.assert_called_once_with(True)
+        self.assertTrue(task.fast)
+
+    def test_begin_resets_heading_after_manual_reposition(self):
+        stm = Mock()
+        stm.is_busy.return_value = False
+        heading = {"actual": -146.6, "commanded": 0.0}
+        def zero():
+            heading.update(actual=0.0, commanded=0.0)
+            return True
+        stm.zero_odometry.side_effect = zero
+        stm.read_heading.side_effect = lambda: dict(heading)
+        motion = Motion(stm, Event(), Mock())
+        with patch.dict("sys.modules", {"serial": Mock()}):
+            self.assertTrue(motion.prepare_start())
+        self.assertEqual([call[0] for call in stm.mock_calls],
+                         ["is_busy", "zero_odometry", "read_heading"])
+
+    def test_begin_refuses_busy_or_unverified_heading_reset(self):
+        for busy, zeroed, actual in [(True, True, 0), (None, True, 0),
+                                     (False, False, 0), (False, True, 12.2)]:
+            with self.subTest(busy=busy, zeroed=zeroed, actual=actual):
+                stm = Mock()
+                stm.is_busy.return_value = busy
+                stm.zero_odometry.return_value = zeroed
+                stm.read_heading.return_value = {"commanded": 0, "actual": actual}
+                with patch.dict("sys.modules", {"serial": Mock()}):
+                    self.assertFalse(Motion(stm, Event(), Mock()).prepare_start())
+                stm.send_line.assert_not_called()
+                if busy is not False:
+                    stm.zero_odometry.assert_not_called()
+
+    def test_cancelled_begin_does_not_zero_heading(self):
+        stm, stop = Mock(), Event()
+        stop.set()
+        with patch.dict("sys.modules", {"serial": Mock()}):
+            with self.assertRaisesRegex(RuntimeError, "cancelled"):
+                Motion(stm, stop, Mock()).prepare_start()
+        self.assertEqual(stm.mock_calls, [])
+
+    def test_route_tracks_startup_fast_mode_and_sends_precision_switch(self):
+        with patch("task2.route.FAST", True):
+            stm = Mock()
+            stm.set_fast.return_value = True
+            task = Task2(stm, Mock(), Event(), Mock())
+            self.assertTrue(task.fast)
+            task._set_fast(False)
+            stm.set_fast.assert_called_once_with(False)
+            self.assertFalse(task.fast)
+            task._set_fast(True)
+            self.assertTrue(task.fast)
+            self.assertEqual(stm.set_fast.call_count, 2)
+
+    def test_failed_precision_switch_does_not_claim_slow_mode(self):
+        with patch("task2.route.FAST", True):
+            stm = Mock()
+            stm.set_fast.return_value = False
+            task = Task2(stm, Mock(), Event(), Mock())
+            task._set_fast(False)
+            self.assertTrue(task.fast)
+
+    def test_pending_vote_expires_and_cannot_leak_between_stages(self):
+        vision = Vision(Mock(), Event(), "run")
+        vision.begin(2)
+        self.assertFalse(vision.arrow_pending())
+        vision.candidate_time = time.monotonic()
+        self.assertTrue(vision.arrow_pending())
+        vision.candidate_time -= vision.max_age + 1
+        self.assertFalse(vision.arrow_pending())
+        vision.candidate_time = time.monotonic()
+        vision.begin(1)
+        self.assertFalse(vision.arrow_pending())
+        vision.candidate_time = time.monotonic()
+        vision.idle()
+        self.assertFalse(vision.arrow_pending())
+
     def test_completed_parking_does_not_require_exact_target_or_centre(self):
         import math
         import task2t_park as geometry
         stm = Mock()
         stm.query_fields.return_value = ["1", "-5", "-2", "0", "6225"]
         task = Task2(stm, Mock(), Event(), Mock())
-        task.frame.pose = Mock(return_value=geometry.Pose(-21.9, 4.6, math.radians(-180.1)))
-        task._us = Mock(return_value=21.7)
-        task._ir = Mock(side_effect=[31.0, 19.0])
+        task.frame.pose = Mock(return_value=geometry.Pose(-14.5, 4.6, math.radians(-180.1)))
+        task._us = Mock(return_value=15.7)
+        task._ir = Mock(side_effect=[None, 19.0])
         with patch("task2.route.Task2.run", return_value=0):
             self.assertEqual(task.run(), 0)
+
+    def test_confirmed_bay_wall_recovers_impossible_back_wall_odometry(self):
+        import math
+        import task2t_park as geometry
+        for echoes, expected in [([16.7, 16.8], 0),
+                                 ([16.7, 25.0], 1)]:
+            with self.subTest(echoes=echoes):
+                stm = Mock()
+                stm.query_fields.return_value = ["1", "0", "0", "0"]
+                task = Task2(stm, Mock(), Event(), Mock())
+                task.frame.pose = Mock(return_value=geometry.Pose(-34.5, 3.4, math.pi))
+                task._us = Mock(side_effect=echoes)
+                task._ir = Mock(side_effect=[37.0, 16.0])
+                with patch("task2.route.Task2.run", return_value=0):
+                    self.assertEqual(task.run(), expected)
+
+    def test_unidentified_side_walls_cannot_override_outside_pose(self):
+        import math
+        import task2t_park as geometry
+        stm = Mock()
+        stm.query_fields.return_value = ["1", "0", "0", "0"]
+        task = Task2(stm, Mock(), Event(), Mock())
+        task.frame.pose = Mock(return_value=geometry.Pose(-34.5, 3.4, math.pi))
+        task._us = Mock(return_value=16.7)
+        task._ir = Mock(side_effect=[None, 16.0])
+        with patch("task2.route.Task2.run", return_value=0):
+            self.assertEqual(task.run(), 1)
+        self.assertEqual(task._us.call_count, 2)
 
     def test_parking_rejects_unsafe_missing_or_moving_measurements(self):
         import math
         import task2t_park as geometry
-        for us, left, right, rate, x in [(None, 31, 19, 0, -22),
-                                       (1, 31, 19, 0, -22),
-                                       (30, 31, 19, 0, -22),
-                                       (21.7, None, 19, 0, -22),
-                                       (21.7, 48, 2, 0, -22),
-                                       (21.7, 31, 19, 30, -22),
-                                       (21.7, 31, 19, 0, 5)]:
+        for us, left, right, rate, x in [(None, 31, 19, 0, -14.5),
+                                       (1, 31, 19, 0, -14.5),
+                                       (30, 31, 19, 0, -14.5),
+                                       (15.7, 48, 2, 0, -14.5),
+                                       (15.7, 31, 19, 30, -14.5),
+                                       (15.7, 31, 19, 0, 5)]:
             with self.subTest(us=us, left=left, right=right, rate=rate, x=x):
                 stm = Mock()
                 stm.query_fields.return_value = ["1", "0", str(rate), "0"]
@@ -123,6 +256,9 @@ class Coordination(unittest.TestCase):
         task = Task2(Mock(), vision, Event(), status)
         with patch("task2.route.Task2.pass_obstacle1", return_value=142.0):
             self.assertEqual(task.pass_obstacle1(80.0, 1.0), 142.0)
+        vision.begin.assert_not_called()
+        self.assertFalse(task.stage2_started)
+        task._lane_reached()
         vision.begin.assert_called_once_with(2)
         status.assert_any_call("BYPASS_1")
         status.assert_any_call("APPROACH_2")
@@ -147,11 +283,12 @@ class Coordination(unittest.TestCase):
         vision = Vision(link, stop, "test-run")
         stitches = []
         detections = {1: 0, 2: 0}
-        def detector(path, allowed_classes, output_dir):
+        def detector(path, allowed_classes, output_dir, selection_policy):
             self.assertEqual(allowed_classes, {"left", "right"})
             output_dir.mkdir(exist_ok=True)
             (output_dir / path.name).write_bytes(path.read_bytes())
             stage = 1 if "stage1" in path.name else 2
+            self.assertEqual(selection_policy, "nearest" if stage == 1 else "unique_arrow")
             detections[stage] += 1
             if detections[stage] == 1:
                 return None, .2
@@ -263,7 +400,8 @@ class SimulatedRoutes(unittest.TestCase):
                 return next(self.pair)
 
         for d1, d2, width in ((60, 60, 30), (60, 60, 90),
-                              (150, 150, 90), (90, 82, 38)):
+                              (150, 150, 90), (90, 82, 38),
+                              (68.7, 82.8, 71)):
             for pair in itertools.product(("left", "right"), repeat=2):
                 with self.subTest(d1=d1, d2=d2, width=width, arrows=pair):
                     course = geometry.Course(d1, d1 + 10 + d2, width)
@@ -296,7 +434,8 @@ class SimulatedRoutes(unittest.TestCase):
                 return self.peek_arrow()
 
         for d1, d2, width in ((60, 60, 30), (60, 60, 90),
-                              (150, 150, 90), (90, 82, 38)):
+                              (150, 150, 90), (90, 82, 38),
+                              (68.7, 82.8, 71)):
             for pair in itertools.product(("left", "right"), repeat=2):
                 with self.subTest(d1=d1, d2=d2, width=width, arrows=pair):
                     course = geometry.Course(d1, d1 + 10 + d2, width)
@@ -307,6 +446,121 @@ class SimulatedRoutes(unittest.TestCase):
                         self.assertEqual(task.run(), 0)
                     self.assertGreater(run_clearance(stm, course)[0],
                                        geometry.CLEARANCE_FLOOR_CM)
+
+    def test_all_arrow_pairs_with_left_ir_reading_three_cm_short(self):
+        import task2t_park as geometry
+        from task2t_sim import FakeSTM, run_clearance
+
+        class ShortLeftIR(FakeSTM):
+            def query_fields(self, command, timeout=2.0):
+                fields = super().query_fields(command, timeout)
+                if command.upper().lstrip("?") == "IR" and fields:
+                    value = int(fields[0])
+                    if value != 65535:
+                        fields[0] = str(max(1, value - 3))
+                return fields
+
+        class Arrows:
+            def __init__(self, pair):
+                self.pair = iter(pair)
+
+            def begin(self, stage):
+                pass
+
+            def idle(self):
+                pass
+
+            def wait_arrow(self, timeout):
+                return next(self.pair)
+
+        for width in (30, 70, 90):
+            for pair in itertools.product(("left", "right"), repeat=2):
+                with self.subTest(width=width, arrows=pair):
+                    course = geometry.Course(72.7, 165.1, width)
+                    stm = ShortLeftIR(course, geometry.WorldFrame(None).start,
+                                      geometry.RADIUS_CM)
+                    task = Task2(stm, Arrows(pair), Event(), lambda phase: None)
+                    with patch("time.sleep"), patch.object(task, "sleep_fn", lambda _: None):
+                        self.assertEqual(task.run(), 0)
+                    self.assertGreater(run_clearance(stm, course)[0],
+                                       geometry.CLEARANCE_FLOOR_CM)
+                    self.assertTrue(all(-geometry.BAY_DEPTH_CM < x < 0
+                                        and abs(y) < geometry.BAY_HALF_WIDTH_CM
+                                        for x, y in geometry.footprint(stm.pose)), stm.pose)
+
+    def test_four_arrow_pairs_survive_stale_ir_edges_and_park(self):
+        """Exercise the complete mission with the intermittent IR seen on the floor."""
+        import task2t as route
+        import task2t_park as geometry
+        from task2t_sim import FakeSTM, run_clearance
+
+        class Arrows:
+            def __init__(self, pair):
+                self.pair = iter(pair)
+
+            def begin(self, stage):
+                pass
+
+            def idle(self):
+                pass
+
+            def wait_arrow(self, timeout):
+                return next(self.pair)
+
+        class StaleEdgeSTM(FakeSTM):
+            """After an edge, occasionally repeat the last real side-IR echo."""
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.last_ir = [None, None]
+                self.miss_count = [0, 0]
+
+            def query_fields(self, cmd, timeout=2.0):
+                fields = super().query_fields(cmd, timeout)
+                if cmd.upper().lstrip("?") != "IR" or fields is None:
+                    return fields
+                noisy = list(fields)
+                for index, value in enumerate(fields):
+                    reading = float(value)
+                    maximum = (geometry.IR_MAX_GAP_CM["left"] if index == 0
+                               else geometry.IR_MAX_GAP_CM["right"])
+                    if reading != 65535 and reading <= maximum:
+                        self.last_ir[index] = value
+                        self.miss_count[index] = 0
+                        continue
+                    if self.last_ir[index] is None:
+                        continue
+                    self.miss_count[index] += 1
+                    # Real trace after the edge: blank, stale echo, blank, blank.
+                    # Two of the latest three still say that the face ended.
+                    if self.miss_count[index] % 4 == 2:
+                        noisy[index] = self.last_ir[index]
+                return noisy
+
+        expected_phases = ["APPROACH_1", "BYPASS_1", "APPROACH_2",
+                           "ROUND_2", "RETURN_AND_PARK"]
+        for pair in itertools.product(("left", "right"), repeat=2):
+            with self.subTest(arrows=pair):
+                course = geometry.Course(90, 182, 50)
+                stm = StaleEdgeSTM(course, geometry.WorldFrame(None).start,
+                                   geometry.RADIUS_CM)
+                phases = []
+                task = Task2(stm, Arrows(pair), Event(), phases.append)
+                with patch("time.sleep"), patch.object(
+                        task, "sleep_fn", lambda _: None):
+                    self.assertEqual(task.run(), 0)
+                mission_phases = []
+                for phase in phases:
+                    if (phase in expected_phases
+                            and (not mission_phases or phase != mission_phases[-1])):
+                        mission_phases.append(phase)
+                self.assertEqual(mission_phases, expected_phases)
+                clearance, obstacle = run_clearance(stm, course)
+                self.assertGreater(clearance, geometry.CLEARANCE_FLOOR_CM,
+                                   obstacle)
+                corners = geometry.footprint(stm.pose)
+                self.assertTrue(all(-geometry.BAY_DEPTH_CM < x < 0
+                                    and abs(y) < geometry.BAY_HALF_WIDTH_CM
+                                    for x, y in corners), stm.pose)
 
 
 if __name__ == "__main__":

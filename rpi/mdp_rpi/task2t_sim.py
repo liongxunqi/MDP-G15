@@ -223,6 +223,8 @@ def main() -> int:
     ap.add_argument("d2", type=float)
     ap.add_argument("w2", type=float)
     ap.add_argument("--arrow", choices=("left", "right"))
+    ap.add_argument("--arrow2", choices=("left", "right"),
+                    help="Obstacle 2 arrow; defaults to --arrow")
     ap.add_argument("--radius-err", type=float, default=0.0)
     ap.add_argument("--plot", action="store_true")
     a = ap.parse_args()
@@ -231,7 +233,10 @@ def main() -> int:
     course = Course(x1=a.d1, x2=a.d1 + tp.OBS1_SIZE_CM + a.d2, w2=a.w2)
     frame = tp.WorldFrame(None)
     fake = FakeSTM(course, frame.start, tp.RADIUS_CM + a.radius_err)
-    ask = (lambda _: a.arrow) if a.arrow else input
+    if a.arrow2 and not a.arrow:
+        ap.error("--arrow2 requires --arrow")
+    arrows = iter((a.arrow, a.arrow2 or a.arrow))
+    ask = (lambda _: next(arrows)) if a.arrow else input
     code = task2.Task2(fake, input_fn=ask, sleep_fn=lambda _: None,
                        startup=False, wait_for_go=False).run()
     clear, name = run_clearance(fake, course)

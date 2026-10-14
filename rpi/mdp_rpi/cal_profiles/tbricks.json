@@ -1,0 +1,134 @@
+{
+  "note": "",
+  "verified": false,
+  "arc_profile": 0,
+  "checks": {
+    "straight": {
+      "converged": false,
+      "drift_cm": [
+        -4.8,
+        1.3
+      ],
+      "distance_err_pct": -1.0,
+      "trim_us": 46
+    },
+    "gyro": {
+      "ratios": [
+        1.00028,
+        1.00139
+      ],
+      "asymmetry_pct": 0.111,
+      "from": 1.0101,
+      "to": 1.01094
+    },
+    "radius": {
+      "target_cm": 29.1,
+      "rounds": [
+        {
+          "steer_l": 425,
+          "steer_r": 617,
+          "radius_r_cm": 29.01,
+          "radius_rf_cm": 29.0,
+          "radius_rr_cm": 29.02,
+          "home_r_cm": 4.5,
+          "radius_l_cm": 26.76,
+          "radius_lf_cm": 29.5,
+          "radius_lr_cm": 24.01,
+          "home_l_cm": 9.8
+        },
+        {
+          "steer_l": 391,
+          "steer_r": 617,
+          "radius_r_cm": 30.0,
+          "radius_rf_cm": 30.0,
+          "radius_rr_cm": 30.0,
+          "home_r_cm": 5.5,
+          "radius_l_cm": 28.75,
+          "radius_lf_cm": 29.5,
+          "radius_lr_cm": 28.0,
+          "home_l_cm": 6.5
+        },
+        {
+          "steer_l": 391,
+          "steer_r": 626,
+          "radius_r_cm": 30.5,
+          "radius_rf_cm": 31.5,
+          "radius_rr_cm": 29.5,
+          "home_r_cm": 5.8,
+          "radius_l_cm": 29.0,
+          "radius_lf_cm": 30.5,
+          "radius_lr_cm": 27.5,
+          "home_l_cm": 6.5
+        },
+        {
+          "steer_l": 391,
+          "steer_r": 626,
+          "radius_r_cm": 30.27,
+          "radius_rf_cm": 30.51,
+          "radius_rr_cm": 30.03,
+          "home_r_cm": 4.8,
+          "radius_l_cm": 29.75,
+          "radius_lf_cm": 31.5,
+          "radius_lr_cm": 28.0,
+          "home_l_cm": 7.0
+        }
+      ]
+    },
+    "brakes": {
+      "worst_deg": 4.3,
+      "by_direction": {
+        "FR": -2.4,
+        "RR": -1.1,
+        "FL": 3.2,
+        "RL": 4.3
+      },
+      "all": [
+        [
+          "FR90",
+          -2.4
+        ],
+        [
+          "RR90",
+          -1.1
+        ],
+        [
+          "FL90",
+          3.2
+        ],
+        [
+          "RL90",
+          4.3
+        ]
+      ]
+    },
+    "square": {
+      "side_cm": 50,
+      "worst_corner_deg": 2.6,
+      "gyro_heading_err_deg": -0.3,
+      "floor_angle_deg": 0.0,
+      "gap_cm": 0.0,
+      "passed": false,
+      "when": "2026-09-13T14:46:10"
+    }
+  },
+  "decel_x10": 5632,
+  "lag_ms_x10": 0,
+  "trim_us": 46,
+  "gyro_x10000": 10109,
+  "steer_left_us": 391,
+  "steer_right_us": 626,
+  "taken": "2026-09-13T14:46:16",
+  "name": "tbricks",
+  "spread": {
+    "decel_x10": {
+      "sd": 1923.4,
+      "min": 3162,
+      "max": 7815
+    },
+    "lag_ms_x10": {
+      "sd": 0.0,
+      "min": 0,
+      "max": 0
+    }
+  }
+}

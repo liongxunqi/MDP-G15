@@ -1,5 +1,7 @@
 """Choose the marker belonging to the obstacle nearest the camera."""
 
+import math
+
 
 def select_target_index(boxes, confidences, image_width, image_height,
                         min_confidence=0.60, eligible=None):
@@ -44,3 +46,28 @@ def select_target_index(boxes, confidences, image_width, image_height,
             best_key = key
 
     return best_index
+
+
+def select_unique_arrow_index(boxes, confidences, image_width, image_height,
+                              min_confidence=0.70, eligible=None):
+    """Task 2: abstain when more than one credible arrow is visible.
+
+    Apparent size cannot establish physical obstacle identity. The Pi must
+    separately exclude obstacle 1 from the stage-2 camera view.
+    """
+    if image_width <= 0 or image_height <= 0:
+        return None
+    if eligible is None:
+        eligible = [True] * len(boxes)
+    candidates = []
+    for index, (box, confidence, allowed) in enumerate(zip(boxes, confidences, eligible)):
+        confidence = float(confidence)
+        if not allowed or not math.isfinite(confidence) or not min_confidence <= confidence <= 1:
+            continue
+        x1, y1, x2, y2 = map(float, box)
+        if (not all(map(math.isfinite, (x1, y1, x2, y2)))
+                or min(x2, image_width) <= max(x1, 0)
+                or min(y2, image_height) <= max(y1, 0)):
+            continue
+        candidates.append(index)
+    return candidates[0] if len(candidates) == 1 else None

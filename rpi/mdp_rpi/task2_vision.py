@@ -16,6 +16,7 @@ class Vision:
         self.epoch = 0
         self.stage_started = 0
         self.result = None
+        self.candidate_time = None
         self.ready = False
         self.last_frame_time = time.monotonic()
 
@@ -32,6 +33,7 @@ class Vision:
             self.epoch += 1
             self.stage_started = time.monotonic()
             self.result = None
+            self.candidate_time = None
             self.condition.notify_all()
 
     def wait_arrow(self, timeout=8.0):
@@ -50,6 +52,12 @@ class Vision:
         """Return a confirmed arrow without waiting or consuming it."""
         with self.condition:
             return self.result
+
+    def arrow_pending(self):
+        """A fresh first vote is awaiting confirmation in the current stage."""
+        with self.condition:
+            return (self.candidate_time is not None and self.stage != 0
+                    and time.monotonic() - self.candidate_time <= self.max_age)
 
     def idle(self):
         self.begin(0)
@@ -102,9 +110,11 @@ class Vision:
                     continue
                 if not valid:
                     vote, count = None, 0
+                    self.candidate_time = None
                     continue
                 count = count + 1 if direction == vote and now - vote_time <= self.max_age else 1
                 vote, vote_time = direction, now
+                self.candidate_time = now
                 logging.info("Arrow stage %s frame %s: %s %.3f (%s/2)",
                              stage, frame, direction, conf, count)
             if count >= 2:

@@ -7,6 +7,7 @@ import socket
 import struct
 import sys
 import time
+from functools import partial
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -61,7 +62,9 @@ def serve(sock, detector, directory, mapping, stitch):
                 path = directory / ("stage%d_frame%d.jpg" % (request["stage"], frame))
                 path.write_bytes(exact(stream, size))
                 label, confidence = detector(path, allowed_classes=set(mapping),
-                                             output_dir=directory / "annotated")
+                                             output_dir=directory / "annotated",
+                                             selection_policy=("nearest" if request["stage"] == 1
+                                                               else "unique_arrow"))
                 direction = mapping.get(str(label).lower())
                 reply = dict(request, direction=direction, confidence=float(confidence or 0))
                 if direction is None:
@@ -70,7 +73,8 @@ def serve(sock, detector, directory, mapping, stitch):
                     frames[frame] = (request["stage"], path, direction)
                     while len(frames) > 16:
                         _, old_path, _ = frames.pop(next(iter(frames)))
-                        discard_frame(directory, old_path)
+                        if directory / "annotated" / old_path.name not in saved.values():
+                            discard_frame(directory, old_path)
                 send("ARROW," + json.dumps(reply))
                 logging.info("Stage %s frame %s: %s confidence %.3f", request["stage"],
                              frame, direction, confidence or 0)
@@ -109,6 +113,17 @@ def stitch_images(saved, output):
     os.replace(str(temporary), str(output))
 
 
+def next_run_directory():
+    """Return a fresh evidence directory for one Pi connection."""
+    stem = "task2_" + time.strftime("%Y%m%d_%H%M%S")
+    directory = ROOT / "runs" / stem
+    suffix = 2
+    while directory.exists():
+        directory = ROOT / "runs" / (stem + "_%d" % suffix)
+        suffix += 1
+    return directory
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--host", default="192.168.15.15")
@@ -129,19 +144,36 @@ def main():
     # Pay model warm-up cost before allowing Android BEGIN.
     import numpy as np
     model.predict(source=np.zeros((540, 960, 3), dtype=np.uint8), verbose=False)
-    directory = ROOT / "runs" / ("task2_" + time.strftime("%Y%m%d_%H%M%S"))
-    logging.info("Arrow mapping %s; run evidence: %s", mapping, directory)
+    logging.info("Arrow mapping %s", mapping)
     while True:
+        sock = None
+        waiting_since = time.monotonic()
+        waiting_logged = False
+        while sock is None:
+            try:
+                sock = socket.create_connection((args.host, args.port), timeout=5)
+            except OSError:
+                if not waiting_logged:
+                    logging.info("Waiting for Pi %s:%s (further retries are quiet)",
+                                 args.host, args.port)
+                    waiting_logged = True
+                time.sleep(1)
+
+        directory = next_run_directory()
+        logging.info("Connected to Pi after %.1fs; run evidence: %s",
+                     time.monotonic() - waiting_since, directory)
         try:
-            sock = socket.create_connection((args.host, args.port), timeout=5)
-            break
-        except OSError:
-            logging.info("Waiting for Pi %s:%s", args.host, args.port)
-            time.sleep(1)
-    with sock:
-        # Android may start much later; idle time is not a failed connection.
-        sock.settimeout(None)
-        serve(sock, detect, directory, mapping, stitch_images)
+            with sock:
+                # Android may start much later; idle time is not a failed connection.
+                sock.settimeout(None)
+                serve(sock, partial(detect, target_confidence=0.70),
+                      directory, mapping, stitch_images)
+            logging.info("Pi session ended; waiting for the next Task 2 run.")
+        except KeyboardInterrupt:
+            raise
+        except (ConnectionError, OSError, ValueError, json.JSONDecodeError):
+            logging.exception("Task 2 Pi session failed; waiting for a new run.")
+        time.sleep(0.5)
 
 
 if __name__ == "__main__":

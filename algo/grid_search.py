@@ -35,7 +35,7 @@ HEURISTIC_WEIGHT = 1.5
 # this far past the 2 m line. Without it, a face pointing at a nearby edge has
 # nowhere to back out and turn, and that obstacle is a dead end. Set 0 to
 # treat the edge as a wall again.
-ARENA_OVERHANG_MM = float(os.getenv("ARENA_OVERHANG_MM", "250"))
+ARENA_OVERHANG_MM = float(os.getenv("ARENA_OVERHANG_MM", "100"))
 
 # Every arc turns the body 45 degrees, so the lattice has 8 headings: the four
 # cardinals plus the diagonals, counter-clockwise from E. Straights run on the

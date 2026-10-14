@@ -397,6 +397,8 @@ class STM:
         # Queries are deliberately exempt — they bypass the firmware queue (§5).
         self._inflight = False
         self._inflight_lock = threading.Lock()
+        self._abort_generation = 0
+        self._reply_sync_required = False
 
     @property
     def awaiting_reply(self) -> bool:
@@ -488,7 +490,11 @@ class STM:
         kind = classify_reply(line)
 
         if kind == "movement":
-            self._movement_replies.put(line)
+            with self._inflight_lock:
+                if self._reply_sync_required:
+                    logging.info("STM: discarded pre-reset movement reply %r.", line)
+                else:
+                    self._movement_replies.put(line)
             return
 
         if kind == "query":
@@ -547,6 +553,27 @@ class STM:
             return False
 
         with self._inflight_lock:
+            generation = self._abort_generation
+            needs_sync = self._reply_sync_required
+        if needs_sync:
+            # Firmware handles RST and tagged queries in input order. Reading
+            # VER after RST fences off any old OK still in transit; draining only
+            # the Python queue cannot do that. Keep the reader unlocked here.
+            synced = self.query("?VER") is not None
+            if not synced:
+                with self._inflight_lock:
+                    if generation != self._abort_generation:
+                        return False
+                logging.warning("STM: retrying post-RST version query once.")
+                synced = self.query("?VER") is not None
+            if not synced:
+                logging.error("STM: reset reply synchronization failed; not sending %s.", tokens)
+                return False
+
+        with self._inflight_lock:
+            if generation != self._abort_generation:
+                logging.warning("STM: another RST interrupted reply synchronization; not sending %s.", tokens)
+                return False
             if self._inflight:
                 # PROTOCOL.md §2 — see the note in __init__. Dropping the line is
                 # always better than desyncing the reply stream, because a desync
@@ -557,6 +584,10 @@ class STM:
                     "queue and return a single OK for two lines (PROTOCOL.md §2)."
                 )
                 return False
+            if needs_sync:
+                self._discard_movement_replies()
+                self._reply_sync_required = False
+                logging.info("STM: post-RST reply synchronization complete.")
             self._write_line(",".join(t.strip() for t in tokens))
             self._inflight = True
         return True
@@ -567,11 +598,22 @@ class STM:
         immediately, and is the ONE command that replies nothing at all — so this
         never waits for a reply.
         """
-        self._write_line("RST")
-        # RST drops the firmware queue, so the outstanding line will never be
-        # answered. Release the guard or nothing could ever be sent again.
-        self._clear_inflight()
+        with self._inflight_lock:
+            self._abort_generation += 1
+            self._reply_sync_required = True
+            self._write_line("RST")
+            self._inflight = False
+            self._discard_movement_replies()
         logging.warning("STM: RST sent (emergency abort) — no reply expected.")
+
+    def _discard_movement_replies(self) -> None:
+        """Discard queued completions while holding _inflight_lock."""
+        while True:
+            try:
+                reply = self._movement_replies.get_nowait()
+            except Empty:
+                return
+            logging.info("STM: discarded queued pre-reset movement reply %r.", reply)
 
     # ── Receiving ─────────────────────────────────────────────────────────────
 
