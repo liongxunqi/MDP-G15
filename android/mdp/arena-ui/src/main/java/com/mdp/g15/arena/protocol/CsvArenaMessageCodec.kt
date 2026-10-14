@@ -4,6 +4,25 @@ import com.mdp.g15.arena.domain.ArenaOutboundEvent
 import com.mdp.g15.arena.domain.Direction
 import com.mdp.g15.arena.domain.TargetId
 
+val IMAGE_ID_BY_CLASS = mapOf(
+    "1" to "11", 
+    "2" to "12", 
+    "3" to "13",
+    "4" to "14", 
+    "5" to "15", 
+    "6" to "16",
+    "7" to "17", 
+    "8" to "18", 
+    "9" to "19", 
+    "A" to "20", "B" to "21", "C" to "22", "D" to "23", "E" to "24", "F" to "25", "G" to "26", "H" to "27",
+    "S" to "28", "T" to "29", "U" to "30", "V" to "31", "W" to "32", "X" to "33", "Y" to "34", "Z" to "35",
+    "up_arrow" to "36", "up" to "36",
+    "down_arrow" to "37", "down" to "37",
+    "right_arrow" to "38", "right" to "38",
+    "left_arrow" to "39", "left" to "39",
+    "stop" to "40"
+)
+
 class CsvArenaMessageCodec : ArenaMessageCodec {
     override fun decode(message: String): ArenaDecodeResult {
         val clean = message.trim().trimEnd('\r', '\n')
@@ -69,14 +88,19 @@ class CsvArenaMessageCodec : ArenaMessageCodec {
         }
         val obstacleId = parts[1].replaceFirst(Regex("^[bB]"), "").toIntOrNull()?.takeIf { it > 0 }
             ?: return ArenaDecodeResult.Malformed("TARGET obstacle ID must be a positive integer.")
-        val targetId = parts[2]
+
+        val raw = parts[2]
+        // Accept either a class label ("down_arrow", "A", "7") or an already-numeric image ID ("37")
+        val targetId = IMAGE_ID_BY_CLASS[raw] ?: IMAGE_ID_BY_CLASS[raw.lowercase()] ?: raw
         TargetId.error(targetId)?.let { return ArenaDecodeResult.Malformed(it) }
+
         val face = parts.getOrNull(3)?.let {
             Direction.fromWire(it)
                 ?: return ArenaDecodeResult.Malformed("TARGET face must be N, E, S, or W.")
         }
         return ArenaDecodeResult.Decoded(ArenaInboundEvent.Target(obstacleId, targetId, face))
     }
+
 
     private fun decodeRobot(message: String): ArenaDecodeResult {
         val parts = message.split(',').map(String::trim)
