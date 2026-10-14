@@ -30,6 +30,11 @@ def android_status(phase):
     return "TASK2," + phase
 
 
+def task2_control_status(ready, running):
+    """Answer a tablet readiness query without relying on the one-time READY log."""
+    return "TASK2,RUNNING" if running else "TASK2,READY" if ready else "TASK2,NOT_READY"
+
+
 class Motion:
     """One mission thread owns movement; abort is the only cross-thread command."""
     def __init__(self, stm, stop, report):
@@ -218,7 +223,12 @@ def main():
     def send_android(message):
         with android_lock:
             if android.connected:
-                android.send(message)
+                try:
+                    android.send(message)
+                except Exception:
+                    # A tablet disconnect must not abort the autonomous mission.
+                    # The tablet can query Task 2 readiness after reconnecting.
+                    logging.warning("Could not send Android update %s", message, exc_info=True)
     def status(phase):
         logging.info("Task 2 phase: %s", phase)
         send_android(android_status(phase))
@@ -251,6 +261,8 @@ def main():
             command = message.strip().upper()
             if command in ("S", "STOP", "RST"):
                 cancel("Android STOP")
+            elif command == "TASK2,STATUS?":
+                send_android(task2_control_status(ready.is_set(), go.is_set()))
             elif command == "BEGIN":
                 if ready.is_set() and not go.is_set():
                     go.set()
@@ -328,6 +340,7 @@ def main():
             stop.wait(0.1)
         if ready.is_set() and not stop.is_set():
             status("READY")
+            send_android("TASK2,READY")
         while not stop.is_set() and not go.wait(0.1):
             pass
         if not stop.is_set():

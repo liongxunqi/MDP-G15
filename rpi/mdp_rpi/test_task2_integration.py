@@ -11,7 +11,7 @@ from pathlib import Path
 from threading import Event, Thread
 from unittest.mock import Mock, patch
 
-from task2 import Motion, Task2, android_status
+from task2 import Motion, Task2, android_status, task2_control_status
 from task2_vision import Vision
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -91,6 +91,11 @@ class Coordination(unittest.TestCase):
         self.assertEqual(android_status("READY"), "STATUS,OK")
         self.assertEqual(android_status("DONE"), "STATUS,DONE")
         self.assertEqual(android_status("ARROW,1,LEFT"), "TASK2,ARROW,1,LEFT")
+
+    def test_task2_readiness_query_covers_startup_and_active_run(self):
+        self.assertEqual(task2_control_status(False, False), "TASK2,NOT_READY")
+        self.assertEqual(task2_control_status(True, False), "TASK2,READY")
+        self.assertEqual(task2_control_status(True, True), "TASK2,RUNNING")
 
     def test_stop_blocks_new_movement(self):
         raw, stop = Mock(), Event()
