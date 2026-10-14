@@ -262,6 +262,22 @@ class Camera:
 
     # ── Teardown ─────────────────────────────────────────────────────
 
+    def continuous_images(self, stop_event, resolution=(960, 540), exposure_us=5000):
+        """Opt-in video capture; use only from the camera-owning worker."""
+        self.camera.resolution = resolution
+        self.camera.shutter_speed = exposure_us
+        stream = io.BytesIO()
+        try:
+            for _ in self.camera.capture_continuous(
+                    stream, format="jpeg", use_video_port=True):
+                if stop_event.is_set():
+                    break
+                yield stream.getvalue()
+                stream.seek(0)
+                stream.truncate()
+        finally:
+            stream.close()
+
     def stop_camera(self) -> None:
         """
         Close the camera once Task 1/testing is completely finished.

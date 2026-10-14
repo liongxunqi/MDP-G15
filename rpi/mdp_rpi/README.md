@@ -509,3 +509,120 @@ Offline verification:
 ```bash
 python3 -B -m unittest rpi/mdp_rpi/test_instruction_mission.py rpi/mdp_rpi/test_feedback_control.py rpi/mdp_rpi/test_task_a5.py -q
 ```
+
+## Autonomous Task 2
+
+Run `python3 task2.py` from `rpi/mdp_rpi` on the Pi and
+`python3 task2_pc.py --host 192.168.15.15` from `pc` on the laptop.
+Do not run Task 1 on the same sockets at the same time. Wait for the Pi's
+READY log, then send the existing Android `BEGIN` command. Android `s`/`STOP` brakes
+the robot. The main entry point is `task2.py`; `task2t.py` and
+`task2t_park.py` supply Task 2 route/parking geometry. The previous manual
+SAFE entry point is retained as `task2_safe.py` for bench comparison.
+
+- Startup loads `T2T_CAL_PROFILE=tbricks`, selects TIGHT/profile 0, verifies
+  calibration readback, zeros heading, and queries WPOSE, IMU, US and IR.
+  The route uses `T2T_RADIUS_CM=30.0` and `T2T_FAST=1`. Startup sends
+  `!FAST1` and refuses to run if the firmware does not acknowledge it, so the
+  robot cannot silently fall back to normal speed. Precision measurement around
+  obstacle 2 temporarily uses `!FAST0`; shutdown restores normal mode.
+- One mission thread owns STM movement. Separate workers receive Android
+  commands, continuously capture images, exchange PC recognition messages,
+  and monitor camera freshness/the 175-second mission deadline.
+- The camera keeps only its latest frame at 960x540 with a configurable
+  5000-microsecond shutter. Capture and inference overlap approach movement;
+  there is no fixed two-second per-photo wait. If an arrow is not confirmed
+  at the decision point, movement waits up to `T2_ARROW_TIMEOUT_S`, then fails
+  safely. Continuous capture does not remove STM's own settling logic.
+- The PC must confirm two fresh, matching arrow frames. Run, obstacle and
+  frame identifiers reject stale replies. Accepted annotations are stitched
+  into `pc/runs/task2_<timestamp>/stitched_task2.jpg` before turning is allowed.
+  Use `--left-label`/`--right-label` if the model labels are not `left`/`right`.
+- Android receives its existing valid status grammar; detailed Task 2 phases
+  are text-log messages. No new Android start command or Task 1 planner is
+  needed. Both programs write terminal and timestamped file logs.
+- After obstacle 2 is recognized, skip the remaining photo positioning and
+  read fresh WPOSE and plan the complete approach plus turn before moving.
+  There is no separate F30 advance that can consume the turning space before
+  a route is validated. Candidate joins are checked first to reject impossible
+  routes quickly; accepted routes still undergo the complete swept-footprint
+  check. Matching arrows try an all-forward
+  outward lane shift, straight, and turn behind the obstacle; opposite arrows
+  try a diagonal approach before the existing front-face route. Every accepted
+  candidate retains the footprint/wall checks. Same-direction obstacle-2
+  handoffs no longer use the reverse fallback: if no checked forward route
+  exists, the manoeuvre fails without sending an unchecked movement.
+  A forward front-face approach is also searched. When selected, the robot
+  tracks the face in precision mode using side IR, requires two sightings
+  and three misses to confirm its end, and checks front US on each poll.
+  US at 20 cm or less, an invalid US reading, or missing pose stops this scan;
+  none of these is accepted as an edge. The subsequent corner route is
+  collision-checked and forward-only. This restriction applies to the
+  same-direction obstacle-2 approach/corner, not the separate parking routine.
+  Stage-2 vision gets up to 0.3 seconds to finish an in-flight lane frame
+  before starting a photo manoeuvre. A confirmed arrow preserves that earlier
+  pose. When no direct route fits, a parallel robot can try one fully checked
+  outward sensing-lane shift. Two consistent US readings must still match
+  obstacle 2's front before the new lateral hit extends its known face bound.
+  Missing/inconsistent echoes stop recovery; they do not imply a narrower box.
+  If IR has already located the near end, the planner first tries a simple
+  forward straight and inward turn, without an unnecessary extra lane shift.
+  The same-direction final turn home also excludes reverse distances.
+  Late detections and uncertain intermediate obstacle lengths can still
+  leave no checked forward route; these changes do not guarantee every layout.
+  If the original candidates fail after vision interrupts a photo turn,
+  headings up to 45 degrees off parallel also get a forward alignment-arc
+  candidate. The alignment and remaining route are checked together before
+  either is sent. This does not guarantee an all-forward route around an
+  obstacle whose width is still unknown.
+  Forward candidates across all approach/alignment alternatives are offered
+  before reverse fallbacks. Duplicate candidates are removed and adjacent
+  forward distances in a handoff are combined before full sweep validation,
+  avoiding redundant straight stop/start commands without blending turns.
+- `T2_HANDOFF_PLAN_BUDGET_S` defaults to 2 seconds. Handoff logs include search
+  time, candidate count, selected commands, and clearance. Expiry does not
+  authorize an unchecked movement; it uses an already fully checked candidate
+  if available, otherwise reports failure. This is a planning
+  budget, not a fixed sleep or a guarantee of Raspberry Pi execution speed.
+- Obstacle-2 turns prefer `T2T_TURN_CLEARANCE_CM=8` cm body clearance;
+  front-face IR distance now targets `T2T_FACE_GAP_CM=22` cm. After finding
+  a valid handoff the search checks at most 16 more candidates for a wider
+  option. Constrained routes can still use the existing 3.5 cm floor and log
+  that fallback. These values do not change the calibrated turning radius.
+- Face scans take two stationary IR samples before moving. If the movement
+  finishes with a confirmed face but incomplete edge evidence, at most three
+  further samples are taken at rest. These add 60 ms before a scan and at most
+  90 ms afterwards, plus serial query time; no extra travel is commanded.
+  The existing range, two-sighting/three-miss and wall-guard checks remain.
+- Transfers around obstacle 2 use fast mode; side-IR edge acquisition stays
+  at precision speed. The parking runner selects precision speed at the bay
+  mouth. Success requires a stationary, home-facing robot fully inside the
+  bay with valid sensor clearance (2 cm margin), not exact centring or a
+  specific 12 cm front gap. The 12 cm gap remains the parking aiming point.
+- When front US misses a narrow obstacle, the side-IR scan brakes at its first
+  plausible sighting and requires two consistent readings at rest. Normal
+  confirmation waits 0.10 seconds after braking plus two 0.03-second sample
+  intervals, in addition to serial latency. It retains the first moving pose
+  for the edge estimate. Failed confirmation resumes only the remaining scan,
+  with at most three candidates and four confirmation queries per candidate;
+  an unconfirmed reading is never accepted as the obstacle edge.
+
+Bench validation is still required. `tbricks.json` is marked unverified and
+its measured radii differ between directions. The imported route currently
+models obstacle 2 widths of 30-90 cm, not every possible legal width. Camera,
+US and IR mounting offsets must match the robot: `T2_CAMERA_FROM_AXLE_CM=12.5`
+is a provisional camera offset, not the rear-axle-to-ultrasonic measurement.
+Test video-port capture and lighting on the Pi before a floor run. Nominal
+simulation, side IR and front US do not guarantee collision-free movement
+with odometry drift or objects outside the sensors' fields of view.
+The fault tests deliberately expect a safe failure for the tightest course
+with a 2 cm radius error plus an 11 cm short ultrasonic reading: its IR
+reading is indistinguishable from known empty-space output. Likewise, a
+measured pose already below the 3.5 cm wall-clearance floor is not labelled
+a safe parking start. Those are rejected cases, not successful completions.
+
+Offline coordination and autonomous route tests (from `rpi/mdp_rpi`):
+
+```bash
+python3 -m unittest test_task2_integration -v
+```

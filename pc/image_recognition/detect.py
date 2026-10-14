@@ -23,7 +23,7 @@ YOLO_INFERENCE_CONFIDENCE = 0.25
 YOLO_TARGET_CONFIDENCE = float(os.getenv("YOLO_TARGET_CONFIDENCE", "0.60"))
 FALLBACK_CLASSES = {"bullseye"}
 
-def detect(image_path):
+def detect(image_path, allowed_classes=None, output_dir=None):
     """
     Detect the image target.
 
@@ -31,6 +31,8 @@ def detect(image_path):
     The saved annotation draws only the marker selected for the obstacle the
     robot is facing, so stitched output and TARGET messages stay aligned.
     """
+    destination = Path(output_dir) if output_dir is not None else RUNS_DIR
+    destination.mkdir(parents=True, exist_ok=True)
     image = cv2.imread(str(image_path))
     if image is None:
         logging.error("Detector could not read image: %s", image_path)
@@ -49,7 +51,7 @@ def detect(image_path):
     annotated_image = image.copy()
 
     if boxes is None or len(boxes) == 0:
-        output_path = RUNS_DIR / Path(image_path).name
+        output_path = destination / Path(image_path).name
         saved = cv2.imwrite(str(output_path), annotated_image)
         if saved:
             logging.warning("Detector found no target; saved frame to %s", output_path)
@@ -67,6 +69,9 @@ def detect(image_path):
         class_name.strip().lower() not in FALLBACK_CLASSES
         for class_name in class_names
     ]
+    if allowed_classes is not None:
+        allowed = {name.strip().lower() for name in allowed_classes}
+        preferred = [name.strip().lower() in allowed for name in class_names]
     has_preferred_class = any(preferred)
     best_index = select_target_index(
         coordinates,
@@ -76,10 +81,10 @@ def detect(image_path):
         min_confidence=YOLO_TARGET_CONFIDENCE,
         # Prefer every non-bullseye class. If the frame contains only
         # bullseyes, select and return the best bullseye as the final result.
-        eligible=preferred if has_preferred_class else None,
+        eligible=preferred if has_preferred_class or allowed_classes is not None else None,
     )
     if best_index is None:
-        output_path = RUNS_DIR / Path(image_path).name
+        output_path = destination / Path(image_path).name
         saved = cv2.imwrite(str(output_path), annotated_image)
         logging.warning(
             "Detector candidates were all below target confidence %.2f; "
@@ -119,7 +124,7 @@ def detect(image_path):
         cv2.LINE_AA,
     )
 
-    output_path = RUNS_DIR / Path(image_path).name
+    output_path = destination / Path(image_path).name
     saved = cv2.imwrite(str(output_path), annotated_image)
     if saved:
         logging.info(

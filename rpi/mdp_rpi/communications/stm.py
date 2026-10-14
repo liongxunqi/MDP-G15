@@ -50,7 +50,7 @@ this class owns a single reader thread: it is the only thing that touches
 serial.readline(). Movement replies go to a queue consumed by the caller's
 segment pump; query replies are handed back to whichever thread asked.
 
-CAUTION: config commands (§6, !PROF0/1/2 and !ZERO) and the calibration setters
+CAUTION: config commands (§6, !PROF0/1/2, !ZERO and !FAST0/1) and the calibration setters
 (§7, !CALD/!CALL/!CALT) reply plain "OK", which is indistinguishable from a
 movement OK. They are therefore sent down the MOVEMENT path, not the query path,
 and must not be issued while a move is outstanding.
@@ -163,6 +163,10 @@ FU_MIN_PROTOCOL = 3
 FROZEN_CAL_MIN_PROTOCOL = 4
 # Protocol 5: per-side arc deflection (!CALSL / !CALSR), two more ?CAL fields.
 STEER_CAL_MIN_PROTOCOL = 5
+# Fast mode is capability-probed with !FAST1 at Task 2 startup. Keep this
+# constant for the standalone Task 2 runner's compatibility check.
+FAST_MIN_PROTOCOL = 5
+WPOSE_MIN_PROTOCOL = 5
 
 # PROTOCOL.md §5 — every tag the firmware can answer a query with.
 # CAL is protocol 2. It must appear here twice over: once so validate_token()
@@ -180,7 +184,7 @@ PROTOCOL_VERSION = 5
 # "U20", which does not parse at all.
 _MOVE_RE = re.compile(r"^(FR|FL|FU|RR|RL|F|R)(\d+)$", re.IGNORECASE)
 _QUERY_RE = re.compile(r"^\?([A-Z]+)$", re.IGNORECASE)
-_CONFIG_RE = re.compile(r"^!(PROF[012]|ZERO|LEARN[01])$", re.IGNORECASE)
+_CONFIG_RE = re.compile(r"^!(PROF[012]|ZERO|LEARN[01]|FAST[01])$", re.IGNORECASE)
 
 # PROTOCOL.md §7 — the three calibration setters, protocol 2. !CALT is the ONLY
 # token anywhere in this protocol that may carry a negative argument: every
@@ -600,6 +604,19 @@ class STM:
     def wait_receive(self, timeout: Optional[float] = None) -> Optional[str]:
         return self.wait_reply(timeout)
 
+    def read_wpose(self, timeout: float = 2.0) -> Optional[dict]:
+        """Raw firmware world pose: millimetres and counter-clockwise degrees."""
+        fields = self.query_fields("?WPOSE", timeout)
+        try:
+            import math
+            x, y, heading = map(float, fields)
+            if not all(math.isfinite(v) for v in (x, y, heading)):
+                return None
+            return {"x_mm": x, "y_mm": y, "heading_deg": heading / 10.0}
+        except (TypeError, ValueError):
+            logging.error("STM: invalid WPOSE reply: %r", fields)
+            return None
+
     def receive(self) -> Optional[str]:
         """Non-blocking pop of a movement reply, or None if none pending."""
         try:
@@ -667,6 +684,13 @@ class STM:
             logging.error(f"STM: invalid profile {profile} — must be 0, 1 or 2.")
             return False
         if not self.send_line([f"!PROF{profile}"]):
+            return False
+        reply = self.wait_reply(timeout)
+        return reply is not None and reply.strip().upper() == "OK"
+
+    def set_fast(self, on: bool, timeout: Optional[float] = None) -> bool:
+        """Enable or disable firmware fast mode. Never call during movement."""
+        if not self.send_line([f"!FAST{1 if on else 0}"]):
             return False
         reply = self.wait_reply(timeout)
         return reply is not None and reply.strip().upper() == "OK"
