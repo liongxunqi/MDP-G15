@@ -54,6 +54,8 @@ RPi units and full direction names. Active/uncertain runs and completed-result v
 do not resend the map on reconnect. It does not claim acknowledged delivery.
 See [Task 1 assessment](../TASK1_ASSESSMENT.md) for planning, starting, result retention
 and the Android/PC evidence handoff.
+See [Task 2 Android plan](../TASK2_ANDROID_PLAN.md) for the empty-map start flow,
+the RPi handoff, and the physical rehearsal checklist.
 See [Android/RPi delivery](../ANDROID_RPI_DELIVERY.md) for the protocol and limits.
 
 ## Host integration

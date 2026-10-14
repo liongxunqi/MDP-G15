@@ -110,12 +110,14 @@ class BluetoothConnectionManager(
     }
 
     /** The arena republishes its map after reconnect; individual commands never replay. */
-    fun send(message: String) {
-        if (outgoing.submit(message)) {
+    fun send(message: String): Boolean {
+        val queued = outgoing.submit(message)
+        if (queued) {
             commandLog.record(CommandLog.Kind.QUEUED, message)
         } else {
             commandLog.record(CommandLog.Kind.ERROR, "Not connected; not queued: $message")
         }
+        return queued
     }
 
     /** Convenience for the D-pad buttons (C.3). */

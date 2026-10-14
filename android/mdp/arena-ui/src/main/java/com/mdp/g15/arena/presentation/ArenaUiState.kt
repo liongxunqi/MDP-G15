@@ -2,6 +2,8 @@ package com.mdp.g15.arena.presentation
 
 import com.mdp.g15.arena.domain.ArenaState
 
+enum class TaskMode { TASK1, TASK2 }
+
 enum class Task1Phase(val label: String) {
     SETUP("Setup"),
     PATH_REQUESTED("Path requested — readiness unconfirmed"),
@@ -33,5 +35,11 @@ data class ArenaUiState(
     val autonomousRunning: Boolean = false,
     val plannerInfo: String = DEFAULT_PLANNER_INFO,
     val task1Phase: Task1Phase = Task1Phase.SETUP,
+    val taskMode: TaskMode = TaskMode.TASK1,
+    val task2Ready: Boolean = false,
     val obstacleSyncStatus: String = "Map offline — edits saved locally",
+    /** One-shot: the operator has explicitly asked the next reconnect to resend CLEAR + the
+     *  full obstacle list, overriding the normal post-BEGIN suppression. See
+     *  [ArenaViewModel.armMapResyncOnReconnect]. */
+    val forceMapResyncOnReconnect: Boolean = false,
 )

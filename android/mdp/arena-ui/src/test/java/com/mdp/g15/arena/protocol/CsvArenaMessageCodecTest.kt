@@ -9,6 +9,7 @@ import com.mdp.g15.arena.domain.ArenaAction
 import com.mdp.g15.arena.domain.ArenaReduction
 import com.mdp.g15.arena.domain.GridCoordinate
 import com.mdp.g15.arena.domain.Obstacle
+import com.mdp.g15.arena.domain.RobotFootprint
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -74,7 +75,7 @@ class CsvArenaMessageCodecTest {
     fun `robot preserves fractional grid telemetry without marking it estimated`() {
         val decoded = codec.decode("ROBOT,2.75,3.25,N") as ArenaDecodeResult.Decoded
         val pose = (decoded.event as ArenaInboundEvent.Robot).pose
-        assertEquals(GridCoordinate(2, 3), pose.position)
+        assertEquals(GridCoordinate(3, 3), pose.position)
         assertEquals(DrivePose(2.75, 3.25, 0.0), DrivePose.from(pose))
         assertEquals(null, pose.estimate)
         assertTrue(ArenaReducer().reduce(ArenaState(), ArenaAction.ApplyRobotPose(pose)) is ArenaReduction.Success)
@@ -82,15 +83,17 @@ class CsvArenaMessageCodecTest {
     }
 
     @Test
-    fun `robot rejects nonfinite coordinates and keeps fractional bounds checks`() {
+    fun `robot rejects nonfinite coordinates and keeps finite telemetry even outside arena`() {
         for (x in listOf("NaN", "Infinity", "-Infinity", "1e100", "oops")) {
             assertTrue(codec.decode("ROBOT,$x,2,N") is ArenaDecodeResult.Malformed)
             assertTrue(codec.decode("ROBOT,2,$x,N") is ArenaDecodeResult.Malformed)
         }
-        for ((x, valid) in listOf("-0.01" to false, "19.99" to true, "20" to false)) {
+        for ((x, fits) in listOf("-0.01" to false, "17.99" to true,
+                "19.99" to false, "20" to false)) {
             val decoded = codec.decode("ROBOT,$x,2,N") as ArenaDecodeResult.Decoded
             val pose = (decoded.event as ArenaInboundEvent.Robot).pose
-            assertEquals(valid, ArenaReducer().reduce(ArenaState(), ArenaAction.ApplyRobotPose(pose)) is ArenaReduction.Success)
+            assertTrue(ArenaReducer().reduce(ArenaState(), ArenaAction.ApplyRobotPose(pose)) is ArenaReduction.Success)
+            assertEquals(fits, RobotFootprint.fitsArena(pose, ArenaState().config))
         }
     }
 

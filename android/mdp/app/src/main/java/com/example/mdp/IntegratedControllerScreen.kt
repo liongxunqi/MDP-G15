@@ -6,6 +6,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.Button
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
@@ -33,6 +34,7 @@ import com.mdp.g15.arena.domain.ManualCommand
 import com.mdp.g15.arena.integration.ArenaOutboundSink
 import com.mdp.g15.arena.presentation.ArenaScreen
 import com.mdp.g15.arena.presentation.Task1Phase
+import com.mdp.g15.arena.presentation.TaskMode
 import com.mdp.g15.arena.presentation.ArenaViewModel
 import kotlinx.coroutines.flow.Flow
 
@@ -99,7 +101,7 @@ fun IntegratedControllerScreen(
         hostView.keepScreenOn = true
         onDispose { hostView.keepScreenOn = previouslyAwake }
     }
-    val beginTask1: () -> Unit = {
+    val beginSelectedTask: () -> Unit = {
         if (arenaViewModel.startRun(onBegin)) selectedTab = ControllerTab.ARENA.ordinal
     }
     LaunchedEffect(arenaState.task1Phase) {
@@ -171,7 +173,7 @@ fun IntegratedControllerScreen(
                     onForwardRight = { arenaViewModel.drive(ManualCommand.FORWARD_RIGHT, onForwardRight) },
                     onBackLeft = { arenaViewModel.drive(ManualCommand.BACK_LEFT, onBackLeft) },
                     onBackRight = { arenaViewModel.drive(ManualCommand.BACK_RIGHT, onBackRight) },
-                    onBegin = beginTask1,
+                    onBegin = beginSelectedTask,
                     onPath = { arenaViewModel.preparePath(onPath) },
                     onSendCustomMessage = { message ->
                         val command = ManualCommand.entries.firstOrNull { it.wire == message.trim().lowercase() }
@@ -179,7 +181,7 @@ fun IntegratedControllerScreen(
                             '\n' in message || '\r' in message -> arenaViewModel.rejectUnsafeCustomMessage()
                             command != null -> arenaViewModel.drive(command, movementCallbacks.getValue(command))
                             message.trim().equals("s", true) -> arenaViewModel.stopManual(onStop)
-                            message.trim().equals("BEGIN", true) -> beginTask1()
+                            message.trim().equals("BEGIN", true) -> beginSelectedTask()
                             message.trim().equals("PATH", true) -> arenaViewModel.preparePath(onPath)
                             else -> onSendCustomMessage(message)
                         }
@@ -205,15 +207,22 @@ fun IntegratedControllerScreen(
                         )
                     },
                     taskControls = {
-                        Task1Controls(
+                        TaskControls(
+                            mode = arenaState.taskMode,
                             phase = arenaState.task1Phase,
-                            canRequest = arenaViewModel.canRequestTask1(),
-                            startIssue = arenaViewModel.task1StartIssue(),
+                            canRequest = if (arenaState.taskMode == TaskMode.TASK1)
+                                arenaViewModel.canRequestTask1() else arenaViewModel.canRequestTask2(),
+                            startIssue = if (arenaState.taskMode == TaskMode.TASK1)
+                                arenaViewModel.task1StartIssue() else arenaViewModel.task2StartIssue(),
                             plannerInfo = arenaState.plannerInfo,
-                            hasResults = arenaState.arena.obstacles.values.any { it.targetId != null },
-                            canNewAttempt = !arenaState.autonomousRunning && !arenaState.manualPending && !arenaState.manualAnimating,
-
-                            onStart = beginTask1,
+                            hasResults = arenaState.taskMode == TaskMode.TASK1 &&
+                                arenaState.arena.obstacles.values.any { it.targetId != null },
+                            canNewAttempt = (!arenaState.autonomousRunning ||
+                                (arenaState.taskMode == TaskMode.TASK2 && arenaState.task1Phase == Task1Phase.UNKNOWN)) &&
+                                !arenaState.manualPending && !arenaState.manualAnimating,
+                            canSelectTask = !arenaState.autonomousRunning && !arenaState.manualPending && !arenaState.manualAnimating,
+                            onSelectTask = arenaViewModel::selectTask,
+                            onStart = beginSelectedTask,
                             onNewAttempt = arenaViewModel::newAttempt,
                         )
                     },
@@ -253,20 +262,37 @@ private fun NewlineModeButtons(appendNewline: Boolean, enabled: Boolean, onChang
 }
 
 @Composable
-private fun Task1Controls(
+private fun TaskControls(
+    mode: TaskMode,
     phase: Task1Phase,
     canRequest: Boolean,
     hasResults: Boolean,
     canNewAttempt: Boolean,
     startIssue: String?,
     plannerInfo: String,
+    canSelectTask: Boolean,
+    onSelectTask: (TaskMode) -> Unit,
     onStart: () -> Unit,
     onNewAttempt: () -> Unit,
 ) {
     var confirmNewAttempt by rememberSaveable { mutableStateOf(false) }
+    val phaseLabel = if (mode == TaskMode.TASK1) phase.label else when (phase) {
+        Task1Phase.COMPLETED -> "Completed — check image evidence"
+        Task1Phase.FAILED -> "Run ended with a failure"
+        Task1Phase.STOPPED -> "Stop requested"
+        else -> phase.label
+    }
     Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-        Text("Task 1 • ${phase.label}", style = MaterialTheme.typography.titleSmall)
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            TaskMode.entries.forEach { task ->
+                FilterChip(selected = mode == task, onClick = { onSelectTask(task) },
+                    enabled = canSelectTask, label = { Text(if (task == TaskMode.TASK1) "Task 1" else "Task 2") })
+            }
+        }
+        Text("${if (mode == TaskMode.TASK1) "Task 1" else "Task 2"} • $phaseLabel",
+            style = MaterialTheme.typography.titleSmall)
         if (phase in setOf(Task1Phase.COMPLETED, Task1Phase.FAILED, Task1Phase.STOPPED) ||
+            (mode == TaskMode.TASK2 && phase == Task1Phase.UNKNOWN) ||
             (hasResults && phase in setOf(Task1Phase.SETUP, Task1Phase.PATH_REQUESTED))) {
             OutlinedButton(onClick = { confirmNewAttempt = true }, enabled = canNewAttempt) {
                 Text("New attempt")
@@ -274,12 +300,12 @@ private fun Task1Controls(
         } else {
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 Button(onClick = onStart, enabled = canRequest, modifier = Modifier.weight(1f)) {
-                    Text("Start Task 1")
+                    Text(if (mode == TaskMode.TASK1) "Start Task 1" else "Start Task 2")
                 }
             }
         }
         if (phase in setOf(Task1Phase.SETUP, Task1Phase.PATH_REQUESTED, Task1Phase.START_REQUESTED)) {
-            Text(plannerInfo, style = MaterialTheme.typography.bodySmall)
+            if (mode == TaskMode.TASK1) Text(plannerInfo, style = MaterialTheme.typography.bodySmall)
             if (startIssue != null && phase != Task1Phase.START_REQUESTED) {
                 Text(startIssue, style = MaterialTheme.typography.bodySmall)
             }
@@ -289,12 +315,14 @@ private fun Task1Controls(
         AlertDialog(
             onDismissRequest = { confirmNewAttempt = false },
             title = { Text("Prepare a new attempt?") },
-            text = { Text("Save the result-map screenshot first. Previous image results will be cleared; obstacle positions and faces will be kept. No command will be sent to the robot.") },
+            text = { Text(if (mode == TaskMode.TASK1)
+                "Save the result-map screenshot first. Previous image results will be cleared; obstacle positions and faces will be kept. No command will be sent to the robot."
+                else "Before another Task 2 attempt, verify the robot is stationary and the previous run has ended. Saved Task 1 markers and results will be kept. Preparing does not send BEGIN or STOP. For local tests, restart the Task 2 Pi and PC programs, then wait for READY before Start. Competition retries are shared across tasks; confirm eligibility with the supervisor.") },
             confirmButton = {
                 TextButton(enabled = canNewAttempt, onClick = {
                     confirmNewAttempt = false
                     onNewAttempt()
-                }) { Text("Clear results") }
+                }) { Text(if (mode == TaskMode.TASK1) "Clear results" else "Prepare attempt") }
             },
             dismissButton = { TextButton(onClick = { confirmNewAttempt = false }) { Text("Cancel") } },
         )

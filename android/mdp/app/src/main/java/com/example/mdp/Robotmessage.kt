@@ -61,6 +61,15 @@ object RobotMessageParser {
             "MSG" -> parts.drop(1).joinToString(", ").removeSurrounding("[", "]")
                 .takeIf { it.isNotBlank() }?.let(RobotMessage::Status) ?: RobotMessage.Unknown(line)
 
+            "TASK2" -> when {
+                parts.size == 2 && parts[1] in setOf("READY", "NOT_READY", "RUNNING") ->
+                    RobotMessage.Status("Task 2 ${parts[1].lowercase().replace('_', ' ')}")
+                parts.size == 4 && parts[1] == "ARROW" && parts[2] in setOf("1", "2") &&
+                    parts[3] in setOf("LEFT", "RIGHT") ->
+                    RobotMessage.Status("Obstacle ${parts[2]} arrow: ${parts[3]}")
+                else -> RobotMessage.Unknown(line)
+            }
+
             else -> RobotMessage.Unknown(line)
         }
     }

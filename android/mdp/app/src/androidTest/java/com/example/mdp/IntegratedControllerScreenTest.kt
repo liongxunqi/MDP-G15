@@ -65,6 +65,46 @@ class IntegratedControllerScreenTest {
     }
 
     @Test
+    fun task2StartsWithEmptyArenaWithoutRemovingTask1Controls() {
+        connected = true
+        setScreen()
+        composeRule.onNodeWithText("Arena").performClick()
+        composeRule.onNodeWithText("Start Task 1").assertIsNotEnabled()
+        composeRule.onNodeWithText("Task 2").performClick()
+        composeRule.onNodeWithText("Start Task 2").assertIsNotEnabled()
+        composeRule.runOnIdle { assertTrue(incoming.tryEmit("TASK2,READY")) }
+        composeRule.waitForIdle()
+        composeRule.onNodeWithText("Start Task 2").assertIsEnabled().performClick()
+        composeRule.runOnIdle { assertEquals(listOf("BEGIN"), movement) }
+        composeRule.onNodeWithText("Start Task 2").assertIsNotEnabled()
+        composeRule.onNodeWithText("Task 2 • Start requested — awaiting robot").assertIsDisplayed()
+    }
+
+    @Test
+    fun task2UnknownRunShowsConfirmedRecoveryBeforeAnotherStart() {
+        connected = true
+        setScreen()
+        composeRule.onNodeWithText("Arena").performClick()
+        composeRule.onNodeWithText("Task 2").performClick()
+        composeRule.runOnIdle { assertTrue(incoming.tryEmit("TASK2,READY")) }
+        composeRule.waitForIdle()
+        composeRule.onNodeWithText("Start Task 2").performClick()
+        composeRule.runOnIdle { connected = false }
+        composeRule.waitForIdle()
+        composeRule.onNodeWithText("Task 2 • Connection interrupted — run status unknown").assertIsDisplayed()
+        composeRule.onNodeWithText("New attempt").performClick()
+        composeRule.onNodeWithText("Before another Task 2 attempt", substring = true).assertIsDisplayed()
+        composeRule.onNodeWithText("Prepare attempt").performClick()
+        composeRule.onNodeWithText("Start Task 2").assertIsNotEnabled()
+        composeRule.runOnIdle { connected = true }
+        composeRule.waitForIdle()
+        composeRule.onNodeWithText("Start Task 2").assertIsNotEnabled()
+        composeRule.runOnIdle { assertTrue(incoming.tryEmit("TASK2,READY")) }
+        composeRule.waitForIdle()
+        composeRule.onNodeWithText("Start Task 2").assertIsEnabled()
+    }
+
+    @Test
     fun singleStartExplainsIncompleteSetupAndPlannerNotificationIsOptional() {
         connected = true
         setScreen()

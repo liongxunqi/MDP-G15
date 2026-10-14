@@ -5,6 +5,7 @@ import android.app.Application
 import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothManager
 import android.content.Context
+import com.mdp.g15.arena.integration.CommandQueueRejected
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -74,12 +75,16 @@ class ControllerViewModel(app: Application) : AndroidViewModel(app) {
     fun reverse() = bt.sendCommand(RobotCommand.REVERSE)
     fun turnLeft() = bt.sendCommand(RobotCommand.TURN_LEFT)
     fun turnRight() = bt.sendCommand(RobotCommand.TURN_RIGHT)
-    fun stop() = bt.sendCommand(RobotCommand.STOP)
+    fun stop() {
+        if (!bt.sendCommand(RobotCommand.STOP)) throw CommandQueueRejected()
+    }
     fun forwardLeft() = bt.sendCommand(RobotCommand.FORWARD_LEFT)
     fun forwardRight() = bt.sendCommand(RobotCommand.FORWARD_RIGHT)
     fun backLeft() = bt.sendCommand(RobotCommand.BACK_LEFT)
     fun backRight() = bt.sendCommand(RobotCommand.BACK_RIGHT)
-    fun begin() = bt.sendCommand(RobotCommand.BEGIN)
+    fun begin() {
+        if (!bt.sendCommand(RobotCommand.BEGIN)) throw CommandQueueRejected()
+    }
     fun path() = bt.sendCommand(RobotCommand.PATH)
 
 
