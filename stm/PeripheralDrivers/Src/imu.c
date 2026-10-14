@@ -38,7 +38,7 @@ static uint8_t  s_ready;
 static uint8_t  s_bank = 0xFF;      /* forces the first select to happen  */
 
 static volatile int16_t  s_rawZ;
-static int16_t  s_bias;
+static volatile float    s_bias;  /* raw counts, sub-count precision */
 static volatile float    s_rateDps;
 static volatile float    s_headingDeg;
 static volatile uint32_t s_errors;
@@ -57,6 +57,14 @@ static volatile uint32_t s_pollRate;
 static volatile int16_t  s_peakRaw;
 static volatile uint32_t s_lastGoodMs;
 static volatile uint32_t s_stalls;
+
+/* Large-offset re-baseline - see IMU_BIAS_STEADY_LSB. s_tickNo counts
+ * IMU_Tick() calls so IMU_TrackBias() can tell it was called on consecutive
+ * ticks: a gap means the robot moved in between and the run starts over. */
+static uint32_t s_tickNo;
+static uint32_t s_trackTick;
+static float    s_steadyMean;
+static uint16_t s_steadyTicks;
 
 /* ------------------------------------------------------------------ */
 /* Register access                                                     */
@@ -193,7 +201,7 @@ uint8_t IMU_Init(I2C_HandleTypeDef *hi2c)
     s_ready      = 0U;
     s_bank       = 0xFF;
     s_rawZ       = 0;
-    s_bias       = 0;
+    s_bias       = 0.0f;
     s_rateDps    = 0.0f;
     s_headingDeg = 0.0f;
     s_errors     = 0U;
@@ -245,7 +253,7 @@ uint8_t IMU_CalibrateBias(void)
 
     if (!s_ready) { return 0U; }
 
-    s_bias = 0;
+    s_bias = 0.0f;
 
     /* A gyro at rest does not read zero - it reads its own bias, and that
      * bias is what gets integrated into a growing heading error if it is not
@@ -270,17 +278,21 @@ uint8_t IMU_CalibrateBias(void)
      * a bias averaged over a quarter of the intended samples is not. */
     if (got < (IMU_BIAS_SAMPLES / 2U)) { return 0U; }
 
-    sum /= (int32_t)got;
-
-    /* If this trips, the robot was moved during calibration. Refusing is
-     * better than silently baking a motion artefact into every future
-     * reading. */
-    if ((sum > IMU_BIAS_SANITY_LSB) || (sum < -IMU_BIAS_SANITY_LSB))
+    /* Float mean: 200 samples resolve the bias well below one count, and an
+     * integer divide would throw that away. */
     {
-        return 0U;
-    }
+        float mean = (float)sum / (float)got;
 
-    s_bias = (int16_t)sum;
+        /* If this trips, the robot was moved during calibration. Refusing is
+         * better than silently baking a motion artefact into every future
+         * reading. */
+        if ((mean > (float)IMU_BIAS_SANITY_LSB) || (mean < -(float)IMU_BIAS_SANITY_LSB))
+        {
+            return 0U;
+        }
+
+        s_bias = mean;
+    }
     return 1U;
 }
 
@@ -305,7 +317,7 @@ void IMU_Poll(void)
     raw = (int16_t)(((uint16_t)buf[0] << 8) | buf[1]);
 
     s_rawZ       = raw;
-    s_rateDps    = ((float)(raw - s_bias) / IMU_GYRO_LSB_PER_DPS) * s_gyroScale;
+    s_rateDps    = (((float)raw - s_bias) / IMU_GYRO_LSB_PER_DPS) * s_gyroScale;
     s_lastGoodMs = HAL_GetTick();
 
     s_polls++;
@@ -335,6 +347,8 @@ void IMU_Tick(void)
     static uint16_t ticks = 0U;
 
     if (!s_ready) { return; }
+
+    s_tickNo++;
 
     /* Staleness check FIRST. A frozen rate integrated forever is worse than
      * no heading at all: it is confidently wrong, and everything downstream -
@@ -370,26 +384,50 @@ void IMU_Tick(void)
 
 void IMU_TrackBias(void)
 {
-    /* s_bias is an integer count, so a plain EMA would never move for small
-     * errors - the update would round to zero every time. Accumulate the
-     * error in a wider running sum instead and shift a count across only when
-     * the sum has genuinely built up. */
-    static int32_t accum = 0;
+    float err;
 
     if (!s_ready) { return; }
 
-    accum += ((int32_t)s_rawZ - (int32_t)s_bias);
+    err = (float)s_rawZ - s_bias;
 
-    if (accum > 1024)
+    /* Still wheels, turning body: lifted, or twisted by hand on the floor.
+     * That is rotation, not bias - see IMU_BIAS_TRACK_GATE_LSB. Unless it
+     * holds dead steady for seconds, which a hand cannot: then it is a bias
+     * that was wrong from power-on - see IMU_BIAS_STEADY_LSB. */
+    if ((err > IMU_BIAS_TRACK_GATE_LSB) || (err < -IMU_BIAS_TRACK_GATE_LSB))
     {
-        s_bias++;
-        accum = 0;
+        float raw = (float)s_rawZ;
+        float dev;
+
+        if ((s_steadyTicks == 0U) || (s_tickNo != (s_trackTick + 1U)))
+        {
+            s_steadyMean  = raw;          /* (re)start the run here */
+            s_steadyTicks = 0U;
+        }
+        s_trackTick = s_tickNo;
+
+        dev = raw - s_steadyMean;
+        if ((dev > IMU_BIAS_STEADY_LSB) || (dev < -IMU_BIAS_STEADY_LSB))
+        {
+            s_steadyTicks = 0U;           /* moving: not an offset */
+            return;
+        }
+
+        s_steadyMean += dev / 16.0f;
+        s_steadyTicks++;
+        if (s_steadyTicks >= IMU_BIAS_RESET_TICKS)
+        {
+            s_bias        = s_steadyMean;
+            s_steadyTicks = 0U;
+        }
+        return;
     }
-    else if (accum < -1024)
-    {
-        s_bias--;
-        accum = 0;
-    }
+    s_steadyTicks = 0U;
+
+    /* First-order low-pass toward the stationary reading, ~10 s time
+     * constant. The old integer version could only step a whole count at a
+     * time and dithered a count either side of the true bias. */
+    s_bias += err / IMU_BIAS_TRACK_TICKS;
 }
 
 void IMU_ResetHeading(void)
@@ -419,7 +457,11 @@ uint8_t IMU_SetGyroScale(float scale)
 float IMU_GetGyroScale(void) { return s_gyroScale; }
 uint8_t  IMU_GetAddress(void)    { return s_addr; }
 uint8_t  IMU_GetWhoAmI(void)     { return s_whoami; }
-int16_t  IMU_GetBias(void)       { return s_bias; }
+int16_t  IMU_GetBias(void)
+{
+    float b = s_bias;
+    return (int16_t)((b >= 0.0f) ? (b + 0.5f) : (b - 0.5f));
+}
 int16_t  IMU_GetRawZ(void)       { return s_rawZ; }
 uint32_t IMU_GetErrorCount(void) { return s_errors; }
 uint32_t IMU_GetStallCount(void)  { return s_stalls; }

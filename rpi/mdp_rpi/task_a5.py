@@ -350,7 +350,10 @@ class TaskA5:
 
             # Learning off, TIGHT, the CAL_PROFILE from .env restored and read
             # back, and this pose zeroed as heading 0 for the carry-over.
-            if not cal_profile.prepare_for_task(self.stm):
+            # The orbit geometry is TIGHT's radius (TIGHT_RADIUS_CM), so a
+            # SAFE calibration is refused here rather than driven.
+            if not cal_profile.prepare_for_task(
+                    self.stm, allowed_arcs={cal_profile.ARC_TIGHT}):
                 logging.error("STM startup failed — not running A5.")
                 self.stm.disconnect()
                 return 2

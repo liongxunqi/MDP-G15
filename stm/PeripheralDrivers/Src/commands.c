@@ -68,6 +68,12 @@ static uint8_t parse_uint(const char *s, int16_t *out)
     uint32_t v = 0U;
     uint8_t  n = 0U;
 
+    /* No leading zeros: "0" is a number, "00" and "050" are not. No sender
+     * writes them, and one byte lost off "F100" leaves "F00" - which would
+     * otherwise parse as F0, drive-until-obstacle, and run the robot on to
+     * the next wall. Refused, it costs a RESEND and the sender retries. */
+    if ((s[0] == '0') && (s[1] != '\0')) { return 0U; }
+
     while (s[n] != '\0')
     {
         if ((s[n] < '0') || (s[n] > '9')) { return 0U; }
@@ -115,7 +121,7 @@ uint8_t Cmd_IsImmediate(CmdOpcode_t op)
      * silently handed to the movement parser instead. Append new ones before
      * this endpoint and move the endpoint with them. */
     return (((op >= CMD_Q_US)  && (op <= CMD_SET_CAL_TRIM)) ||
-            ((op >= CMD_Q_HDG) && (op <= CMD_SET_CAL_STEER_R))) ? 1U : 0U;
+            ((op >= CMD_Q_HDG) && (op <= CMD_SET_FAST))) ? 1U : 0U;
 }
 
 Command_t Cmd_ParseToken(const char *token)
@@ -141,6 +147,8 @@ Command_t Cmd_ParseToken(const char *token)
         else if (token_is(token, "?ir"))   { cmd.op = CMD_Q_IR;   }
         else if (token_is(token, "?irr"))  { cmd.op = CMD_Q_IRR;  }
         else if (token_is(token, "?pose")) { cmd.op = CMD_Q_POSE; }
+        else if (token_is(token, "?wpose")) { cmd.op = CMD_Q_WPOSE; }
+        else if (token_is(token, "?enc"))  { cmd.op = CMD_Q_ENC;  }
         else if (token_is(token, "?dist")) { cmd.op = CMD_Q_DIST; }
         else if (token_is(token, "?turn")) { cmd.op = CMD_Q_TURN; }
         else if (token_is(token, "?stat")) { cmd.op = CMD_Q_STAT; }
@@ -159,7 +167,7 @@ Command_t Cmd_ParseToken(const char *token)
         if ((n = token_starts(token, "!prof")) != 0U)
         {
             if (!parse_uint(&token[n], &arg)) { return cmd; }
-            if (arg > 2)                      { return cmd; }
+            if (arg > 3)                      { return cmd; }
             cmd.op  = CMD_SET_PROFILE;
             cmd.arg = arg;
             return cmd;
@@ -216,6 +224,15 @@ Command_t Cmd_ParseToken(const char *token)
             if (!parse_uint(&token[n], &arg)) { return cmd; }
             if (arg > 1)                      { return cmd; }
             cmd.op  = CMD_SET_LEARN;
+            cmd.arg = arg;
+            return cmd;
+        }
+
+        if ((n = token_starts(token, "!fast")) != 0U)
+        {
+            if (!parse_uint(&token[n], &arg)) { return cmd; }
+            if (arg > 1)                      { return cmd; }
+            cmd.op  = CMD_SET_FAST;
             cmd.arg = arg;
             return cmd;
         }

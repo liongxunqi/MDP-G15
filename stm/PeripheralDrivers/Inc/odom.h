@@ -340,6 +340,13 @@ void Odom_Update(void);
 /* Current pose. Safe to call from the main loop. */
 void Odom_GetPose(Odom_Pose_t *out);
 
+/* Continuous pose since boot, from the same per-tick increments as
+ * Odom_GetPose() but never reset - not by a move starting, not by an FU
+ * pass, not by !ZERO. Frame: where the robot was at power-on, +x forward,
+ * +y left, heading counter-clockwise positive. Dead reckoning: it drifts,
+ * and it counts the robot being carried or turned by hand. ?WPOSE. */
+void Odom_GetWorldPose(Odom_Pose_t *out);
+
 float Odom_GetHeading(void);
 
 /* Heading since the last Odom_Reset(), degrees, NOT wrapped. Positive follows
@@ -436,6 +443,12 @@ void Odom_DriveArc(int16_t rpm, uint16_t servo_us, float radius_mm,
 
 /* Stops the robot, recentres the steering, disables heading hold. */
 void Odom_Stop(void);
+
+/* Odom_Stop() without the recentre: the servo stays where the move left it.
+ * For braking out of an arc - the robot is still coasting, and swinging the
+ * front wheels to centre under it steers the coast. The motion layer
+ * recentres once the wheels have stopped. */
+void Odom_StopHoldSteer(void);
 
 /* The servo pulse width the heading loop is currently commanding, in
  * microseconds. Equals SERVO_CENTER_US when the robot is on course.

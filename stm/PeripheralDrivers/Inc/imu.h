@@ -150,6 +150,38 @@
  * stopped catching anything. */
 #define IMU_BIAS_SANITY_LSB      500
 
+/* Zero-rate tracking only trusts a reading this close to the current bias,
+ * raw counts. At 32.8 LSB/dps, 33 is 1 dps.
+ *
+ * "Wheels still" is not "robot still". A robot lifted, or twisted on the
+ * floor so the geared wheels skid instead of turning, has still encoders and
+ * a turning body - and the tracker used to learn that rotation as bias: about
+ * 3 counts of bias per degree turned by hand, 0.1 dps, decaying over tens of
+ * seconds. Every calibration step starts with the robot positioned by hand,
+ * so it landed in the measurements. Real bias drifts by a few counts over
+ * minutes; at the DLPF bandwidth the noise is ~2-3 counts rms. Anything past
+ * a dps is the robot moving. */
+#define IMU_BIAS_TRACK_GATE_LSB  33.0f
+
+/* Time constant of the zero-rate tracker, in ticks: 1024 is ~10 s. */
+#define IMU_BIAS_TRACK_TICKS     1024.0f
+
+/* Re-baselining a bias that is WRONG by more than the gate.
+ *
+ * The gate above stops a hand rotation being learned as bias - but it also
+ * stops the tracker ever repairing a bias that was bad from power-on: robot
+ * handled during the 2.5 s boot measurement, and every reading at rest is
+ * past the gate, forever. One was seen reading 6.4 deg/s standing still,
+ * which turns every move into nonsense.
+ *
+ * A hand is not steady. So when the wheels are still and the reading has
+ * stayed within IMU_BIAS_STEADY_LSB of its own running mean for
+ * IMU_BIAS_RESET_TICKS ticks in a row, it is a constant offset, not a
+ * rotation, and it becomes the bias outright. 20 LSB is 0.6 deg/s, about
+ * five times the at-rest noise; 300 ticks is 3 s. */
+#define IMU_BIAS_STEADY_LSB      20.0f
+#define IMU_BIAS_RESET_TICKS     300U
+
 /* Bring-up attempts before giving up, 100 ms apart. Covers a slow 1.8 V rail
  * and a warm MCU reset that left the sensor mid-reset. */
 #define IMU_INIT_RETRIES        5U
@@ -201,7 +233,12 @@ void IMU_ResetHeading(void);
  * temperature, and boot is when the chip is coldest.
  *
  * The filter is deliberately slow - about a ten second time constant - so a
- * genuine slow rotation cannot be mistaken for bias and calibrated away. */
+ * genuine slow rotation cannot be mistaken for bias and calibrated away. And
+ * it ignores any reading past IMU_BIAS_TRACK_GATE_LSB, because still wheels
+ * do not mean a still body - see there.
+ *
+ * The bias is held as a float. An integer bias can only ever be within half
+ * a count, 0.015 dps, which is 0.3 degrees over a 20 second square. */
 void IMU_TrackBias(void);
 
 /* Integrated heading in degrees, counter-clockwise positive. Free-running,

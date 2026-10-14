@@ -136,7 +136,7 @@ typedef enum
     CMD_Q_IMU,          /* ?IMU   gyro health                      */
     CMD_Q_XCHK,         /* ?XCHK  last arc cross-check             */
     CMD_Q_VER,          /* ?VER   identity and protocol version    */
-    CMD_SET_PROFILE,    /* !PROFn arg = 0..2                       */
+    CMD_SET_PROFILE,    /* !PROFn arg = 0..3, 3 = SAFE             */
     CMD_SET_ZERO,       /* !ZERO  zero odometry and heading        */
 
     /* --- Calibration, protocol 2 -----------------------------------------
@@ -177,11 +177,20 @@ typedef enum
     CMD_SET_LEARN,      /* !LEARNn arg = 0 off, 1 on               */
     CMD_SET_CAL_GYRO,   /* !CALGn gyro scale x10000 (9000..11000)  */
 
-    /* --- Per-side arc steering, protocol 5 -------------------------------
-     * Inside the second immediate range: keep CMD_SET_CAL_STEER_R last, or
-     * move the endpoint in Cmd_IsImmediate() with it. */
+    /* --- Per-side arc steering, protocol 5 ------------------------------- */
     CMD_SET_CAL_STEER_L, /* !CALSLn left arc deflection, us        */
-    CMD_SET_CAL_STEER_R  /* !CALSRn right arc deflection, us       */
+    CMD_SET_CAL_STEER_R, /* !CALSRn right arc deflection, us       */
+
+    /* --- Continuous pose, protocol 5 ------------------------------------- */
+    CMD_Q_WPOSE,         /* ?WPOSE x, y, heading since boot         */
+
+    /* --- Per-wheel encoder counts, protocol 7 ---------------------------- */
+    CMD_Q_ENC,           /* ?ENC   wheel A, wheel B counts since boot */
+
+    /* --- Fast mode, protocol 8 --------------------------------------------
+     * Inside the second immediate range: keep CMD_SET_FAST last, or move the
+     * endpoint in Cmd_IsImmediate() with it. */
+    CMD_SET_FAST         /* !FASTn arg = 0 normal, 1 fast - see motion.h */
 } CmdOpcode_t;
 
 /* Bumped whenever the wire format changes in a way a sender must care about.
@@ -198,8 +207,23 @@ typedef enum
  * first three still works. A sender relying on the robot to keep learning
  * during a run must now send !LEARN1 itself. */
 /* 5: added !CALSL / !CALSR (per-side arc deflection) and two more fields
- * appended to ?CAL. Additive: a protocol 4 sender is unaffected. */
-#define CMD_PROTOCOL_VERSION    5
+ * appended to ?CAL. Additive: a protocol 4 sender is unaffected.
+ * Later added ?WPOSE (continuous pose) without a bump, matching the
+ * instruction-segmentation RPi, which probes for it directly: a protocol 5
+ * board without it answers RESEND and Task 1 stops before moving.
+ * Later added !PROF3 (SAFE profile), also without a bump: a board without
+ * it answers RESEND, and the RPi refuses to restore a SAFE calibration. */
+/* 6: ?CAL appends the last arc's raw decel measurement (x10, 0 = none), so
+ * calibrate.py can average raw arcs instead of the filtered value. Arcs now
+ * brake on the nearer tick and hold the steering through the coast, and lag
+ * is no longer learned - calibrations taken on 5 should be re-run (brakes). */
+/* 7: added ?ENC, cumulative counts per wheel. On a gyro-held straight both
+ * wheels cover the same ground, so their ratio is the one check that sees an
+ * encoder dropping counts - the pose and distance are built from those same
+ * counts and agree with themselves. Additive. */
+/* 8: added !FAST0/1 (MOTION FAST MODE in motion.h). Additive; off at
+ * power-on, so a sender that never sends it drives exactly as on 7. */
+#define CMD_PROTOCOL_VERSION    8
 #define CMD_FIRMWARE_NAME       "MDPG15-STM32"
 
 /* Replies for a primitive that did not complete. Previously a timed-out move
@@ -207,6 +231,10 @@ typedef enum
  * sender carried on believing the robot had moved. */
 #define CMD_REPLY_FAIL_TIMEOUT   "FAIL,TIMEOUT\n"
 #define CMD_REPLY_FAIL_WRONGWAY  "FAIL,WRONGWAY\n"
+
+/* An arc finished more than MOTION_ARC_FAIL_DEG from its aim (motion.h).
+ * Protocol 7, additive: every FAIL,* is already a failed line to a sender. */
+#define CMD_REPLY_FAIL_SHORT     "FAIL,SHORT\n"
 
 /* FU had nothing to aim at - the ultrasound gave no usable reading when the
  * command started. The robot did NOT move, and that is the point of a

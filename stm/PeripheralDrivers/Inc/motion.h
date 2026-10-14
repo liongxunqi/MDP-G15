@@ -226,10 +226,10 @@
  *              -------------         ---------
  *              physical coast        latency
  *
- * The two terms are separately observable, which is what makes learning both
- * of them well posed: alpha comes from the coast actually measured between
- * brake onset and standstill, t_lag from whatever terminal error is left over
- * after alpha has converged.
+ * In principle the two terms are separable by braking at different rates.
+ * In practice every arc brakes at about the same approach rate, so they are
+ * NOT separable from these arcs - see MOTION_ARC_LEARN_LAG below, which now
+ * holds the lag fixed and learns only alpha.
  *
  * Symptom of it missing: error settles to a small CONSTANT that more alpha
  * learning cannot remove, because alpha only scales the quadratic part. That
@@ -244,6 +244,19 @@
 #define MOTION_ARC_LAG_S            0.003f
 #define MOTION_ARC_LAG_GAIN         0.30f
 #define MOTION_ARC_LAG_MAX_S        0.25f
+
+/* 0 - lag is a FIXED constant (whatever !CALL restored, 0 from calibrate.py)
+ *     and only decel is learned, from the coast less w*lag. One arc then
+ *     gives a self-consistent answer: the predicted lead equals the coast
+ *     just seen.
+ * 1 - learn lag from the residual overshoot as well. Every arc brakes at
+ *     about the same rate, so one arc cannot tell the two terms apart; they
+ *     traded degrees back and forth and neither settled. */
+#define MOTION_ARC_LEARN_LAG        0
+
+/* Control tick, seconds - how far the robot turns between two brake checks
+ * is w * MOTION_TICK_S. */
+#define MOTION_TICK_S               0.01f
 
 /* Never brake later than this many degrees out, whatever the maths says.
  * Guards against a bad rate reading braking so late it sails past. */
@@ -300,6 +313,9 @@ uint8_t Motion_XCheckFailed(void);
 
 /* Current learned value, for the display. */
 float Motion_GetArcDecel(void);
+
+/* The last arc's raw decel measurement, unfiltered; 0 if it gave none. */
+float Motion_GetLastDecelMeas(void);
 
 /* Restore learned braking values, for a sender that saved them from an
  * earlier session and wants to skip the three-or-four-arc warm-up. Return 0
@@ -363,10 +379,16 @@ typedef struct
     float       diff_boost;    /* 1.0 = pure geometry, no assist     */
 } ArcProfile_t;
 
-#define MOTION_ARC_PROFILE_COUNT  3
+#define MOTION_ARC_PROFILE_COUNT  4
 
-/* Select the active profile. Out-of-range values are ignored. */
-void        Motion_SetArcProfile(uint8_t idx);
+#define MOTION_PROFILE_TIGHT      0U
+#define MOTION_PROFILE_SAFE       3U
+
+/* Select the active profile. Out-of-range and locked-out values are ignored.
+ * Returns 1 if the request was honoured (on a SAFE build, 0 selects SAFE and
+ * still counts), 0 if it was ignored. */
+uint8_t     Motion_SetArcProfile(uint8_t idx);
+uint8_t     Motion_ArcProfileAllowed(uint8_t idx);  /* see PROFILE LOCK */
 uint8_t     Motion_GetArcProfile(void);
 const ArcProfile_t *Motion_GetArcProfileInfo(uint8_t idx);
 
@@ -440,6 +462,15 @@ uint8_t Motion_IsBusy(void);
  * things: the watchdog is a stalled wheel, this is a sign inversion or a gyro
  * that is lying. Cleared when the next primitive launches. */
 uint8_t Motion_WrongWayAborted(void);
+
+/* 1 if the last arc finished more than MOTION_ARC_FAIL_DEG from its aim.
+ * It ends in MOTION_TIMEOUT and the line replies FAIL,SHORT. Normal stops
+ * land well under a degree off, and the carry-over only corrects 5, so an
+ * arc this far off has to be reported rather than answered OK - one that
+ * braked 36 degrees early off a wheel surge used to say OK. Cleared when the
+ * next primitive launches. */
+#define MOTION_ARC_FAIL_DEG     10.0f
+uint8_t Motion_ArcMissed(void);
 
 MotionState_t Motion_GetState(void);
 
@@ -523,13 +554,55 @@ uint16_t Motion_GetCarryClampCount(void);   /* corrections capped since zero */
 /* ---------------------------------------------------------------------------
  * PROFILE LOCK
  *
- * The team runs TIGHT (profile 0) for everything: the planner's 291 mm radius,
- * the A5 orbit and the saved calibration all assume it, and the braking model
- * is a single set of numbers that only fits the profile it was measured on.
- * With the lock on, Motion_SetArcProfile() ignores anything but 0, !PROF1/2
- * answer RESEND, and the OLED profile mode cannot switch away. The other two
- * profiles stay in the table so turning the lock off restores them.
+ * Only TIGHT (0) and SAFE (3) are driven, each with its OWN saved
+ * calibration: the braking model, steering and radius are one set of numbers
+ * that only fits the profile it was measured on. The firmware holds one set
+ * at a time; the RPi restores the right one with the profile (cal_profile.py
+ * records which profile each calibration was taken on).
+ *
+ * With the lock on, Motion_SetArcProfile() ignores CLEAN and SLOW, !PROF1/2
+ * answer RESEND, and the OLED profile mode only cycles TIGHT <-> SAFE. The
+ * other two stay in the table so turning the lock off restores them.
  * ------------------------------------------------------------------------- */
-#define MOTION_PROFILE_LOCK_TIGHT   1
+#define MOTION_PROFILE_LOCK         1
+
+/* ---------------------------------------------------------------------------
+ * MOTION FAST MODE  (!FAST1 / !FAST0)
+ *
+ * For Task 2, where time is the score. Off at power-on, and every task but
+ * Task 2 switches it off at startup, so nothing calibrated or tuned for the
+ * other tasks changes.
+ *
+ *   straights cruise at MOTION_FAST_CRUISE_RPM instead of MOTION_CRUISE_RPM
+ *   they start slowing MOTION_FAST_APPROACH_MM out, so the extra speed is
+ *     off before the stop - the last stretch is still MOTION_APPROACH_RPM,
+ *     which is what MOTION_BRAKE_MM was measured at
+ *   every move settles MOTION_FAST_BRAKE_TICKS after braking instead of
+ *     MOTION_BRAKE_TICKS - still only once the wheels read stopped and the
+ *     steering is back on centre (see the BRAKE phase in motion.c)
+ *
+ * Arcs are unchanged: their speed is the profile's, and their braking model
+ * is what calibration measured. */
+#define MOTION_FAST_CRUISE_RPM      150
+#define MOTION_FAST_APPROACH_MM     220.0f
+#define MOTION_FAST_BRAKE_TICKS     20U
+
+void    Motion_SetFast(uint8_t on);
+uint8_t Motion_FastEnabled(void);
+
+/* ---------------------------------------------------------------------------
+ * SAFE BUILD
+ *
+ * 0 - normal build. !PROF0 is TIGHT, as it always was, so calibrations saved
+ *     on TIGHT keep fitting.
+ * 1 - SAFE build. The robot boots on SAFE and answers !PROF0 with SAFE too.
+ *
+ * Exists for RPi code that only knows profile 0: its task startup and
+ * calibrate.py both send !PROF0, so without this they could never reach
+ * SAFE. Flash a SAFE build to calibrate and run SAFE with that code, and
+ * save its calibration under a DIFFERENT name - it will be labelled profile 0
+ * on the RPi, but it only fits SAFE. ?STAT reports 3 on a SAFE build.
+ * ------------------------------------------------------------------------- */
+#define MOTION_BUILD_SAFE           0
 
 #endif /* __MOTION_H */

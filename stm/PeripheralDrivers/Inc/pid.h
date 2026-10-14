@@ -31,6 +31,19 @@
  * huge accumulated value that takes seconds to unwind after a disturbance. */
 #define PID_I_LIMIT     300.0f
 
+/* Fast unwind. When a wheel runs more than PID_UNWIND_FRAC faster than asked
+ * while the integral is still pushing it ON, the integral is multiplied by
+ * PID_UNWIND_KEEP every tick instead of bleeding off at Ki.
+ *
+ * Why: in a turn the inner wheel is dragged against the rear scrub. If it
+ * bogs down, the integral climbs to the limit; when the wheel breaks free
+ * that 300 counts of extra duty is still there, and at Ki 2 it took ~0.75 s
+ * of overspeed to bleed away - the robot visibly lurched mid-turn. At 0.5 per
+ * tick it is gone in about 50 ms. The threshold keeps it out of normal
+ * regulation, where measured speed sits within a few rpm of the target. */
+#define PID_UNWIND_FRAC  0.10f
+#define PID_UNWIND_KEEP  0.5f
+
 /* Below this setpoint the wheel is commanded to a hard stop rather than
  * creeping. MOTOR_DEADBAND duty produces roughly 32 RPM, so anything under
  * that is not reachable and asking for it only winds up the integrator. */

@@ -143,9 +143,9 @@ def main() -> None:
     parser.add_argument(
         "--profile",
         type=int,
-        choices=(0,),
+        choices=(0, 3),
         default=DEFAULT_ARC_PROFILE,
-        help="STM arc profile (firmware is locked to 0 TIGHT)",
+        help="STM arc profile: 0 TIGHT or 3 SAFE (the firmware is locked to these)",
     )
     args = parser.parse_args()
 

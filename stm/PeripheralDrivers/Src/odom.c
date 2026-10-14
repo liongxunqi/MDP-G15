@@ -6,6 +6,7 @@
 #include <math.h>
 
 static Odom_Pose_t s_pose;
+static Odom_Pose_t s_worldPose;     /* never reset - see Odom_GetWorldPose() */
 
 static int32_t s_lastCountA;
 static int32_t s_lastCountB;
@@ -245,6 +246,15 @@ void Odom_Update(void)
     /* Path length, always positive, so reversing does not subtract from it. */
     s_pose.distance_mm += (d_centre < 0.0f) ? -d_centre : d_centre;
 
+    /* The same increments again, into the pose nothing resets. Odom_Reset()
+     * resyncs the encoder and gyro baselines, so a move starting adds no
+     * step here - the trajectory carries straight across. */
+    heading_rad = (s_worldPose.heading_deg + d_theta_deg * 0.5f) * (3.14159265f / 180.0f);
+    s_worldPose.x_mm        += d_centre * cosf(heading_rad);
+    s_worldPose.y_mm        += d_centre * sinf(heading_rad);
+    s_worldPose.heading_deg  = wrap180(s_worldPose.heading_deg + d_theta_deg);
+    s_worldPose.distance_mm += (d_centre < 0.0f) ? -d_centre : d_centre;
+
     /* ---- heading hold, via the steering servo ---- */
 
     if (s_mode == ODOM_ARC)
@@ -350,6 +360,16 @@ void Odom_GetPose(Odom_Pose_t *out)
     {
         *out = s_pose;
     }
+}
+
+void Odom_GetWorldPose(Odom_Pose_t *out)
+{
+    /* Written by the tick; copy it in one piece so x, y and heading belong
+     * to the same instant. */
+    uint32_t primask = __get_PRIMASK();
+    __disable_irq();
+    if (out != 0) { *out = s_worldPose; }
+    __set_PRIMASK(primask);
 }
 
 float    Odom_GetHeading(void)      { return s_pose.heading_deg; }
@@ -555,7 +575,7 @@ void Odom_SetSpeed(int16_t rpm)
     }
 }
 
-void Odom_Stop(void)
+void Odom_StopHoldSteer(void)
 {
     s_mode       = ODOM_OFF;
     s_holdActive = 0U;
@@ -564,10 +584,16 @@ void Odom_Stop(void)
     s_arcScaleA  = 1.0f;
     s_arcScaleB  = 1.0f;
     s_error      = 0.0f;
-    s_servoUs    = SERVO_CENTER_US;
 
-    Servo_SetMicroseconds(SERVO_CENTER_US);
     PID_Stop();
+}
+
+void Odom_Stop(void)
+{
+    Odom_StopHoldSteer();
+
+    s_servoUs = SERVO_CENTER_US;
+    Servo_SetMicroseconds(SERVO_CENTER_US);
 }
 
 /* ------------------------------------------------------------------ */

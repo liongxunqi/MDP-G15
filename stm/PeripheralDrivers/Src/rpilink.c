@@ -3,6 +3,7 @@
 #include "motors.h"
 #include "pid.h"
 #include "odom.h"
+#include "encoders.h"
 #include "imu.h"
 #include "ir.h"
 #include "ultrasonic.h"
@@ -252,6 +253,22 @@ static void answer_immediate(const Command_t *c)
         snprintf(b, sizeof(b), "DIST,%ld\n", (long)Motion_GetTravelled());
         break;
 
+    case CMD_Q_WPOSE:
+        {
+            Odom_Pose_t p;
+            Odom_GetWorldPose(&p);
+            snprintf(b, sizeof(b), "WPOSE,%ld,%ld,%ld\n",
+                     (long)p.x_mm, (long)p.y_mm, (long)scaled10(p.heading_deg));
+        }
+        break;
+
+    case CMD_Q_ENC:
+        /* Raw cumulative counts, signed, as Odom_Update() reads them. Only
+           differences mean anything - see CMD_Q_ENC in commands.h. */
+        snprintf(b, sizeof(b), "ENC,%ld,%ld\n",
+                 (long)Encoder_A_GetCount(), (long)Encoder_B_GetCount());
+        break;
+
     case CMD_Q_TURN:
         snprintf(b, sizeof(b), "TURN,%d\n",
                  (int)scaled10(Odom_GetHeadingTotal()));
@@ -300,12 +317,11 @@ static void answer_immediate(const Command_t *c)
         break;
 
     case CMD_SET_PROFILE:
-        /* Locked to TIGHT (MOTION_PROFILE_LOCK_TIGHT). Refused rather than
+        /* Locked to TIGHT/SAFE (MOTION_PROFILE_LOCK). Refused rather than
            OK'd and ignored: a sender asking for CLEAN believes the robot
            will turn at 318 mm, and an OK would let it go on believing it. */
-        Motion_SetArcProfile((uint8_t)c->arg);
         snprintf(b, sizeof(b), "%s",
-                 (Motion_GetArcProfile() == (uint8_t)c->arg)
+                 Motion_SetArcProfile((uint8_t)c->arg)
                  ? CMD_REPLY_OK : CMD_REPLY_RESEND);
         break;
 
@@ -329,6 +345,13 @@ static void answer_immediate(const Command_t *c)
                  (unsigned)Motion_GetCarryClampCount());
         break;
 
+    case CMD_SET_FAST:
+        /* Read when each move launches and while it runs - a change lands on
+           the next move, or on the speed of the one in flight, harmlessly. */
+        Motion_SetFast((uint8_t)c->arg);
+        snprintf(b, sizeof(b), "%s", CMD_REPLY_OK);
+        break;
+
     case CMD_SET_LEARN:
         /* Takes effect at the END of the move in flight, which is where the
            learners run - so unlike the setters there is nothing to guard. */
@@ -343,15 +366,23 @@ static void answer_immediate(const Command_t *c)
            quantise the whole usable range into three steps. */
         /* Protocol 4 appends gyro scale x10000 and the learning switch;
            protocol 5 the left and right arc deflections in force. Appended,
-           not inserted, so older readers still read the right fields. */
-        snprintf(b, sizeof(b), "CAL,%d,%d,%d,%d,%u,%u,%u\n",
+           not inserted, so older readers still read the right fields.
+           Protocol 6 appends the last arc's raw decel measurement, x10, 0
+           when it gave none - see Motion_GetLastDecelMeas(). */
+        snprintf(b, sizeof(b), "CAL,%d,%d,%d,%d,%u,%u,%u,%d\n",
                  (int)scaled10(Motion_GetArcDecel()),
                  (int)scaled10(Motion_GetArcLag() * 1000.0f),
-                 (int)Odom_GetHeadingTrim(),
+                 /* Rounded, not truncated: (int) cut 1.9 to 1 and -1.9
+                    to -1, so a saved trim lost up to 1 us and every value
+                    in -1..1 read as 0. */
+                 (int)((Odom_GetHeadingTrim() >= 0.0f)
+                       ? (Odom_GetHeadingTrim() + 0.5f)
+                       : (Odom_GetHeadingTrim() - 0.5f)),
                  (int)((IMU_GetGyroScale() * 10000.0f) + 0.5f),
                  (unsigned)Motion_LearningEnabled(),
                  (unsigned)Motion_GetArcSteerSideUs(0U),
-                 (unsigned)Motion_GetArcSteerSideUs(1U));
+                 (unsigned)Motion_GetArcSteerSideUs(1U),
+                 (int)scaled10(Motion_GetLastDecelMeas()));
         break;
 
     case CMD_SET_CAL_DECEL:
@@ -531,7 +562,8 @@ static uint8_t fu_poll(void)
          * as the line executor below does. */
         if (Motion_GetState() == MOTION_TIMEOUT)
         {
-            s_lineFailed = Motion_WrongWayAborted() ? 2U : 1U;
+            s_lineFailed = Motion_WrongWayAborted() ? 2U
+                         : Motion_ArcMissed()      ? 4U : 1U;
             Motion_ClearState();
             s_fuState = FU_OFF;
             return 0U;
@@ -760,7 +792,8 @@ void RpiLink_Poll(void)
      * because the reply is owed to the line and not to the primitive. */
     if (Motion_GetState() == MOTION_TIMEOUT)
     {
-        s_lineFailed = Motion_WrongWayAborted() ? 2U : 1U;
+        s_lineFailed = Motion_WrongWayAborted() ? 2U
+                     : Motion_ArcMissed()      ? 4U : 1U;
     }
 
     Motion_ClearState();
@@ -784,6 +817,7 @@ void RpiLink_Poll(void)
 
         if      (failed == 3U) { link_reply(CMD_REPLY_FAIL_NOECHO);   }
         else if (failed == 2U) { link_reply(CMD_REPLY_FAIL_WRONGWAY); }
+        else if (failed == 4U) { link_reply(CMD_REPLY_FAIL_SHORT);    }
         else if (failed == 1U) { link_reply(CMD_REPLY_FAIL_TIMEOUT);  }
         else                   { link_reply(CMD_REPLY_OK);            }
         return;

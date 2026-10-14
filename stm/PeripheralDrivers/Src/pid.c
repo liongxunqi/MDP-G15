@@ -102,6 +102,17 @@ static int16_t pid_step(PID_t *p, float measured_rpm)
 
     error = p->target_rpm - measured_rpm;
 
+    /* Overspeeding with the integral still pushing the same way it is
+     * already going too fast: drop the integral fast. See PID_UNWIND_FRAC.
+     * Works for reverse too - there the integral is negative and an
+     * overspeed makes the error positive. */
+    if ((((error < 0.0f) && (p->integral > 0.0f)) ||
+         ((error > 0.0f) && (p->integral < 0.0f))) &&
+        (((error < 0.0f) ? -error : error) > (PID_UNWIND_FRAC * mag_target)))
+    {
+        p->integral *= PID_UNWIND_KEEP;
+    }
+
     p_term = p->kp * error;
 
     /* Integrate before saturation is known, then undo it below if the output

@@ -41,7 +41,8 @@ static uint16_t s_settleTarget;   /* servo angle being settled onto        */
  * ------------------------------------------------------------------------- */
 static const ArcProfile_t s_profiles[MOTION_ARC_PROFILE_COUNT] =
 {
-    /* 0: the calibrated one. Tight and quick.                              */
+    /* 0: the calibrated one. Tight and quick. Saved calibrations taken
+     *    before SAFE existed were all taken on this, and still fit it. */
     { "TIGHT", 575U, 150, 100, 20.0f,   8.0f, 291.0f, 2.0f },
 
     /* 1: no differential assist. Wider, but the rear tyres are not scrubbed
@@ -58,10 +59,33 @@ static const ArcProfile_t s_profiles[MOTION_ARC_PROFILE_COUNT] =
     /* 2: slow. Longer to execute, but the coast is much smaller so the stop
      *    is more repeatable, and the inner wheel has plenty of margin above
      *    the deadband. MEASURE brake_deg and radius_mm. */
-    { "SLOW",  575U,  70,  70, 15.0f,   3.0f, 306.0f, 1.5f }
+    { "SLOW",  575U,  70,  70, 15.0f,   3.0f, 306.0f, 1.5f },
+
+    /* 3: TIGHT slowed down and de-scrubbed. Same steering, cruise 150 ->
+     *    120, and diff_boost 2.0 -> 1.2.
+     *
+     *    At 2.0 the rear wheels are split for a ~15 cm circle while the front
+     *    steers ~29 cm, so the radius is a tug-of-war between tyre slip and
+     *    rear scrub: it moves with floor, battery and direction, forward and
+     *    reverse disagree, and per-side steering barely moves it - which is
+     *    why the radius step would not settle. At 1.2 the steering decides
+     *    the radius again. Expect it WIDER than TIGHT's.
+     *
+     *    approach_rpm 100: inner wheel at ~0.74 of centre, ~74 rpm, well
+     *    clear of the ~55 rpm floor.
+     *
+     *    radius_mm is TIGHT's, NOT MEASURED. Floor-chord it on SAFE
+     *    (calibrate.py radius NAME --arc safe --target auto) and put the
+     *    answer here and in the planner's TURN_RADIUS_MM[PROFILE_SAFE]. It
+     *    only sets the wheel split; the gyro still ends the turn. */
+    { "SAFE",  575U, 120, 100, 20.0f,   8.0f, 291.0f, 1.2f }
 };
 
-static uint8_t s_profileIdx = 0U;
+#if MOTION_BUILD_SAFE
+static uint8_t s_profileIdx = MOTION_PROFILE_SAFE;
+#else
+static uint8_t s_profileIdx = MOTION_PROFILE_TIGHT;
+#endif
 
 /* Learned angular deceleration and the state needed to measure it. */
 static float s_arcDecel   = MOTION_ARC_DECEL_DPS2;
@@ -79,6 +103,10 @@ static float s_brakeRate  = 0.0f;   /* |yaw rate| when braking started */
 static float s_brakeAngle = 0.0f;   /* |heading| when braking started  */
 static float s_arcLag     = MOTION_ARC_LAG_S;
 static uint8_t s_lagSeeded   = 0U;
+
+/* The last arc's own decel measurement, before any filtering. 0 when the
+ * last arc did not produce one (learning off, rejected, or not an arc). */
+static float s_lastDecelMeas = 0.0f;
 
 /* Learning switch - see Motion_SetLearning() in motion.h. OFF at power-on:
  * nothing changes the calibration unless calibration asked it to. */
@@ -108,6 +136,7 @@ float   Motion_GetXCheckErrPct(void) { return s_xcheckErrPct; }
 uint8_t Motion_XCheckFailed(void)    { return s_xcheckFailed; }
 
 float Motion_GetArcDecel(void) { return s_arcDecel; }
+float Motion_GetLastDecelMeas(void) { return s_lastDecelMeas; }
 float Motion_GetArcLag(void)   { return s_arcLag; }
 
 /* Restore a previously learned value. Both REJECT rather than clamp: a
@@ -156,15 +185,38 @@ static uint16_t arc_steer_us(void)
     return (prof()->steer_us > cap) ? cap : prof()->steer_us;
 }
 
-void Motion_SetArcProfile(uint8_t idx)
+uint8_t Motion_ArcProfileAllowed(uint8_t idx)
 {
-#if MOTION_PROFILE_LOCK_TIGHT
-    if (idx != 0U) { return; }
+    if (idx >= MOTION_ARC_PROFILE_COUNT) { return 0U; }
+#if MOTION_PROFILE_LOCK
+    return ((idx == MOTION_PROFILE_TIGHT) || (idx == MOTION_PROFILE_SAFE)) ? 1U : 0U;
+#else
+    return 1U;
 #endif
-    if (idx < MOTION_ARC_PROFILE_COUNT) { s_profileIdx = idx; }
+}
+
+uint8_t Motion_SetArcProfile(uint8_t idx)
+{
+#if MOTION_BUILD_SAFE
+    /* See SAFE BUILD in motion.h: profile 0 means SAFE on this build. */
+    if (idx == MOTION_PROFILE_TIGHT) { idx = MOTION_PROFILE_SAFE; }
+#endif
+    if (!Motion_ArcProfileAllowed(idx)) { return 0U; }
+    s_profileIdx = idx;
+    return 1U;
 }
 
 void    Motion_SetLearning(uint8_t on)  { s_learnOn = on ? 1U : 0U; }
+
+/* Fast mode - see MOTION FAST MODE in motion.h. */
+static uint8_t s_fast = 0U;
+
+void    Motion_SetFast(uint8_t on)      { s_fast = on ? 1U : 0U; }
+uint8_t Motion_FastEnabled(void)        { return s_fast; }
+
+static int16_t  cruise_rpm(void)  { return s_fast ? MOTION_FAST_CRUISE_RPM : MOTION_CRUISE_RPM; }
+static float    approach_mm(void) { return s_fast ? MOTION_FAST_APPROACH_MM : MOTION_APPROACH_MM; }
+static uint32_t brake_ticks(void) { return s_fast ? MOTION_FAST_BRAKE_TICKS : MOTION_BRAKE_TICKS; }
 uint8_t Motion_LearningEnabled(void)    { return s_learnOn; }
 
 float Motion_GetCommandedHeading(void)  { return s_worldCmd; }
@@ -205,6 +257,10 @@ const ArcProfile_t *Motion_GetArcProfileInfo(uint8_t idx)
  * versus a sign inversion or a lying gyro - and the command layer reports them
  * separately so the fix is obvious from the reply alone. */
 static uint8_t  s_wrongWay;
+
+/* Set when an arc finished more than MOTION_ARC_FAIL_DEG from its aim -
+ * see there. Cleared when the next primitive launches. */
+static uint8_t  s_arcMissed;
 
 static int16_t  s_arcCommandDeg;  /* what the caller ASKED for, uncompensated */
 static uint8_t  s_recentreStep;   /* 0 waiting to stop, 1 preloaded, 2 done */
@@ -264,6 +320,22 @@ static void motion_halt(void)
 {
     Odom_Stop();        /* recentres steering, drops the odom drive mode */
     PID_Enable(0);      /* stop the loop writing duty - MUST precede brake */
+    Motors_Brake();
+    s_lastRpm = 0;
+}
+
+/* Brake out of an arc with the steering left at the arc angle.
+ *
+ * motion_halt() recentres at once, and at brake onset the robot still has
+ * several degrees of coast to go - so the front wheels swung through ~575 us
+ * while it slid, and the coast was neither the arc nor a straight. That tail
+ * is in every stop angle, every learned decel and every radius chord, and it
+ * differs forward to reverse. The BRAKE phase recentres once the encoders
+ * read still, which is what that code was always meant to do. */
+static void motion_halt_arc(void)
+{
+    Odom_StopHoldSteer();
+    PID_Enable(0);
     Motors_Brake();
     s_lastRpm = 0;
 }
@@ -330,7 +402,9 @@ static void motion_launch(void)
 {
     float carry;
 
-    s_wrongWay = 0U;
+    s_wrongWay      = 0U;
+    s_arcMissed     = 0U;
+    s_lastDecelMeas = 0.0f;
 
     /* Fold everything the gyro saw since the last launch into the running
      * actual heading BEFORE the reset below throws it away. */
@@ -360,7 +434,7 @@ static void motion_launch(void)
     s_brakeTicks = 0U;
     s_lastRpm    = (s_kind == MOVE_ARC)
                  ? (int16_t)(s_dir * prof()->rpm)
-                 : (int16_t)(s_dir * MOTION_CRUISE_RPM);
+                 : (int16_t)(s_dir * cruise_rpm());
     s_state      = MOTION_RUN;
 
     PID_Enable(1);
@@ -419,7 +493,9 @@ void Motion_Init(void)
     s_arcCommandDeg = 0;
     s_decelSeeded   = 0U;
     s_lagSeeded     = 0U;
+    s_lastDecelMeas = 0.0f;
     s_learnOn       = 0U;
+    s_fast          = 0U;
     s_worldCmd      = 0.0f;
     s_worldBase     = 0.0f;
     s_lastArcAim    = 0.0f;
@@ -443,7 +519,19 @@ void Motion_DriveDistance(int32_t mm)
     if (target < 0.0f) { target = 0.0f; }
     s_targetMm = target;
 
-    motion_begin_align(SERVO_CENTER_US);
+    /* Settle onto where the wheels actually point straight - centre PLUS the
+     * learned trim - not onto bare centre. Parking at centre launched every
+     * straight steered off by the trim for its first ticks, and resolved the
+     * linkage slack at a point the run never holds: approached from below
+     * for a positive trim, from above for a negative one, so the run's
+     * behaviour flipped whenever the trim crossed zero. */
+    {
+        float t = Odom_GetHeadingTrim();
+        int32_t us = (int32_t)SERVO_CENTER_US
+                   + (int32_t)((t >= 0.0f) ? (t + 0.5f) : (t - 0.5f));
+
+        motion_begin_align((uint16_t)us);
+    }
 
     crit_exit(pm);
 }
@@ -618,6 +706,15 @@ void Motion_Tick(void)
                 {
                     lead = MOTION_ARC_MIN_LEAD_DEG;
                 }
+
+                /* Brake on whichever tick is NEARER the ideal point. The
+                 * robot turns w*dt between ticks (~0.7 deg at approach), so
+                 * waiting until togo has fallen to the lead brakes late by
+                 * anything up to a whole tick - half a tick on average, a
+                 * bias that is the same size as the +/-0.5 deg target.
+                 * Braking now when the ideal point is less than half a tick
+                 * away makes the error zero-mean and halves the worst case. */
+                lead += 0.5f * w * MOTION_TICK_S;
 #endif
                 if (togo <= lead)
                 {
@@ -627,7 +724,7 @@ void Motion_Tick(void)
                                  ? -Odom_GetRateDps() : Odom_GetRateDps();
                     s_brakeAngle = (turned < 0.0f) ? -turned : turned;
 
-                    motion_halt();
+                    motion_halt_arc();
                     s_brakeTicks = 0U;
                     s_state      = MOTION_BRAKE;
                     return;
@@ -674,9 +771,9 @@ void Motion_Tick(void)
             return;
         }
 
-        want = (remaining <= MOTION_APPROACH_MM)
+        want = (remaining <= approach_mm())
              ? (int16_t)(s_dir * MOTION_APPROACH_RPM)
-             : (int16_t)(s_dir * MOTION_CRUISE_RPM);
+             : (int16_t)(s_dir * cruise_rpm());
 
         /* Only re-issue when the speed actually changes.
          *
@@ -727,8 +824,8 @@ void Motion_Tick(void)
         /* Finish when the brake has settled AND the steering is centred.
          * The second condition is capped by the tick count below so a wheel
          * that never quite reads zero cannot hang the primitive. */
-        if ((s_brakeTicks >= MOTION_BRAKE_TICKS) &&
-            ((s_recentreStep == 2U) || (s_brakeTicks >= (MOTION_BRAKE_TICKS * 2U))))
+        if ((s_brakeTicks >= brake_ticks()) &&
+            ((s_recentreStep == 2U) || (s_brakeTicks >= (brake_ticks() * 2U))))
         {
             Servo_SetMicroseconds(SERVO_CENTER_US);
             Motors_Coast();
@@ -781,7 +878,13 @@ void Motion_Tick(void)
 
             if (s_kind == MOVE_ARC)
             {
+                float miss;
+
                 s_lastArcTurned = Odom_GetHeadingTotal();
+
+                miss = s_lastArcTurned - s_arcTargetDeg;
+                if (miss < 0.0f) { miss = -miss; }
+                s_arcMissed = (miss > MOTION_ARC_FAIL_DEG) ? 1U : 0U;
             }
 
 #if MOTION_ARC_ADAPTIVE_BRAKE
@@ -790,13 +893,25 @@ void Motion_Tick(void)
              *
              * Only while learning is switched on - see Motion_SetLearning().
              * During a task the braking model is exactly what was restored. */
-            if ((s_kind == MOVE_ARC) && s_learnOn)
+            /* Not from a missed arc: its coast says nothing about braking. */
+            if ((s_kind == MOVE_ARC) && s_learnOn && !s_arcMissed)
             {
                 float ended = Odom_GetHeadingTotal();
                 float coast;
 
                 if (ended < 0.0f) { ended = -ended; }
-                coast = ended - s_brakeAngle;
+
+                /* The coast past brake onset, less the part the lag term
+                 * already predicts. Then the decel below is exactly the one
+                 * that would have made the predicted lead equal this coast:
+                 *
+                 *      w^2/(2a) + w*lag  =  coast
+                 *
+                 * Measuring a from the whole coast instead (as this did)
+                 * puts the latency in BOTH terms, and the two learners then
+                 * fight over the same degrees - which is why lag scattered
+                 * by a quarter and decel never sat still. */
+                coast = (ended - s_brakeAngle) - (s_brakeRate * s_arcLag);
 
                 if ((coast > 0.5f) && (s_brakeRate > 5.0f))
                 {
@@ -808,6 +923,10 @@ void Motion_Tick(void)
                     if ((meas > MOTION_ARC_DECEL_MIN) &&
                         (meas < MOTION_ARC_DECEL_MAX))
                     {
+                        /* Raw, for calibrate.py to average itself - the
+                         * filtered value below still carries the prior. */
+                        s_lastDecelMeas = meas;
+
 #if MOTION_ARC_SEED_FIRST
                         /* The first valid arc of a power-on is a direct
                          * measurement of THIS floor. What it is being
@@ -833,6 +952,7 @@ void Motion_Tick(void)
                         }
                     }
 
+#if MOTION_ARC_LEARN_LAG
                     /* Whatever error survives alpha is latency. Positive
                      * means overshoot, so the lag is bigger than believed
                      * and the brakes need to go on sooner. Dividing by the
@@ -869,15 +989,30 @@ void Motion_Tick(void)
                         if (s_arcLag < 0.0f)                { s_arcLag = 0.0f; }
                         if (s_arcLag > MOTION_ARC_LAG_MAX_S) { s_arcLag = MOTION_ARC_LAG_MAX_S; }
                     }
+#endif
                 }
             }
 #endif
-            s_state        = MOTION_DONE;
+            if (s_arcMissed)
+            {
+                /* Finished, but nowhere near where it aimed - braked early
+                 * off a wheel surge, or was stopped. The carry-over can only
+                 * correct MOTION_CARRY_MAX_DEG, so the plan no longer
+                 * describes the robot: fail it like any other move that did
+                 * not happen as asked. */
+                s_state = MOTION_TIMEOUT;
+                Motion_ResyncHeading();
+            }
+            else
+            {
+                s_state = MOTION_DONE;
+            }
         }
     }
 }
 
 uint8_t Motion_WrongWayAborted(void) { return s_wrongWay; }
+uint8_t Motion_ArcMissed(void)       { return s_arcMissed; }
 
 uint8_t Motion_IsBusy(void)
 {

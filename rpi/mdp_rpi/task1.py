@@ -160,9 +160,10 @@ class Task1:
         self.detect_timeout = float(os.getenv("DETECT_TIMEOUT_S", "0.5"))
         # PROTOCOL.md §3 recommends at most three retransmissions.
         self.max_resends = int(os.getenv("STM_MAX_RESENDS", "3"))
-        # Always TIGHT (r=291mm): the planner's radius, the firmware lock and
-        # the saved calibration all assume it. cal_profile.prepare_for_task()
-        # selects it at startup; there is nothing left to configure here.
+        # Whatever the CAL_PROFILE calibration was taken on, TIGHT or SAFE.
+        # cal_profile.prepare_for_task() selects it at startup and this is
+        # updated then. The PC must plan with the same profile's radius
+        # (STM_ARC_PROFILE on the PC).
         self.arc_profile = cal_profile.ARC_PROFILE
         # One CSV row of ?HDG per finished segment - see cal_profile.HeadingLog.
         self.heading_log = None
@@ -979,6 +980,10 @@ class Task1:
         # start beats a run driven on numbers nobody checked on this floor.
         if not cal_profile.prepare_for_task(self.stm):
             return False
+        self.arc_profile = cal_profile.selected_arc
+        logging.info(f"Driving arc profile {self.arc_profile} "
+                     f"({cal_profile.ARC_NAMES[self.arc_profile]}). The PC must "
+                     f"plan with STM_ARC_PROFILE={self.arc_profile}.")
         self.heading_log = cal_profile.HeadingLog(self.stm, "task1")
         return True
 

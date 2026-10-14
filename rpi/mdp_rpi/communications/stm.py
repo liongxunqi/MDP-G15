@@ -34,6 +34,7 @@ Replies (PROTOCOL.md §3):
     RESEND          parse failure, nothing executed, safe to retransmit
     FAIL,TIMEOUT    watchdog fired mid-move — wheel stalled or encoder dead
     FAIL,WRONGWAY   arc rotated away from target and was aborted
+    FAIL,SHORT      arc finished more than 10° from its aim (protocol 7)
     FAIL,NOECHO     FU<n> had no usable reading — THE ROBOT DID NOT MOVE (v3)
     <TAG>,<fields>  answer to a query (§5)
 
@@ -163,6 +164,19 @@ FU_MIN_PROTOCOL = 3
 FROZEN_CAL_MIN_PROTOCOL = 4
 # Protocol 5: per-side arc deflection (!CALSL / !CALSR), two more ?CAL fields.
 STEER_CAL_MIN_PROTOCOL = 5
+# Protocol 6: ?CAL appends the last arc's raw decel measurement, so the brakes
+# step averages measurements rather than the firmware's filtered value. Arcs
+# also hold steering through the coast and lag is no longer learned.
+RAW_DECEL_MIN_PROTOCOL = 6
+# ?WPOSE, the pose nothing resets. In this tree since 5, but some 5 boards
+# were flashed before it and answer RESEND - which lands on the movement
+# path and would be taken as the next line's reply. 6 is the first version
+# guaranteed to have it.
+WPOSE_MIN_PROTOCOL = 6
+# Protocol 7: ?ENC, cumulative counts per wheel.
+ENC_MIN_PROTOCOL = 7
+# Protocol 8: !FAST0/1, Task 2's fast mode (faster straights, shorter settle).
+FAST_MIN_PROTOCOL = 8
 
 # PROTOCOL.md §5 — every tag the firmware can answer a query with.
 # CAL is protocol 2. It must appear here twice over: once so validate_token()
@@ -170,17 +184,21 @@ STEER_CAL_MIN_PROTOCOL = 5
 # "CAL,..." answer to the waiting thread instead of discarding it as banner
 # noise. Missing from either place and the query fails silently.
 QUERY_TAGS = {"US", "IR", "IRR", "POSE", "DIST", "TURN", "STAT", "IMU", "XCHK",
-              "VER", "CAL", "HDG"}
+              "VER", "CAL", "HDG", "WPOSE", "ENC"}
 
 # This client implements protocol 4. Compared against the ?VER reply at startup.
-PROTOCOL_VERSION = 5
+PROTOCOL_VERSION = 8
 
 # FU before F, exactly as the firmware's own parser orders its prefixes: "fu"
 # would otherwise be eaten by "f" and FU20 read as F with an argument of
 # "U20", which does not parse at all.
-_MOVE_RE = re.compile(r"^(FR|FL|FU|RR|RL|F|R)(\d+)$", re.IGNORECASE)
+# No leading zeros - the firmware refuses them, because one byte lost off
+# "F100" leaves "F00", which would otherwise run as F0 (drive to obstacle).
+_MOVE_RE = re.compile(r"^(FR|FL|FU|RR|RL|F|R)(0|[1-9]\d*)$", re.IGNORECASE)
 _QUERY_RE = re.compile(r"^\?([A-Z]+)$", re.IGNORECASE)
-_CONFIG_RE = re.compile(r"^!(PROF[012]|ZERO|LEARN[01])$", re.IGNORECASE)
+# PROF3 is SAFE. Missing here, set_profile(3) was refused before it reached
+# the wire, so no SAFE calibration or SAFE task could ever select SAFE.
+_CONFIG_RE = re.compile(r"^!(PROF[0-3]|ZERO|LEARN[01]|FAST[01])$", re.IGNORECASE)
 
 # PROTOCOL.md §7 — the three calibration setters, protocol 2. !CALT is the ONLY
 # token anywhere in this protocol that may carry a negative argument: every
@@ -655,16 +673,17 @@ class STM:
     def set_profile(self, profile: int, timeout: Optional[float] = None) -> bool:
         """
         Select the arc profile: 0 TIGHT (r=291mm), 1 CLEAN (r=318mm),
-        2 SLOW (r=306mm). Persists until changed or reset; default is TIGHT.
+        2 SLOW (r=306mm), 3 SAFE (TIGHT at 120 rpm). Persists until changed
+        or reset; default is TIGHT.
 
-        Protocol 4 firmware is LOCKED to TIGHT and answers RESEND to !PROF1/2,
-        so on current firmware this returns False for anything but 0.
+        Current firmware is LOCKED to TIGHT and SAFE and answers RESEND to
+        !PROF1/2; firmware from before SAFE also refuses !PROF3.
 
         Replies plain OK, which is indistinguishable from a movement OK — so
         this MUST NOT be called while a movement line is outstanding.
         """
-        if profile not in (0, 1, 2):
-            logging.error(f"STM: invalid profile {profile} — must be 0, 1 or 2.")
+        if profile not in (0, 1, 2, 3):
+            logging.error(f"STM: invalid profile {profile} — must be 0 to 3.")
             return False
         if not self.send_line([f"!PROF{profile}"]):
             return False
@@ -730,7 +749,8 @@ class STM:
     def read_cal_full(self, timeout: float = 2.0) -> Optional[dict]:
         """
         ?CAL with the protocol 4 fields: decel_x10, lag_ms_x10, trim_us,
-        gyro_x10000 and learn (0/1). The last two are None on older firmware.
+        gyro_x10000 and learn (0/1); steer_left_us / steer_right_us (5);
+        last_decel_x10 (6). Each is None on firmware older than it.
         """
         fields = self.query_fields("?CAL", timeout)
         if fields is None or len(fields) < 3:
@@ -749,7 +769,60 @@ class STM:
             "learn": vals[4] if len(vals) > 4 else None,
             "steer_left_us": vals[5] if len(vals) > 5 else None,
             "steer_right_us": vals[6] if len(vals) > 6 else None,
+            # Protocol 6: the last arc's raw decel, x10; 0 = it gave none.
+            "last_decel_x10": vals[7] if len(vals) > 7 else None,
         }
+
+    def read_wpose(self, timeout: float = 2.0) -> Optional[dict]:
+        """
+        ?WPOSE (WPOSE_MIN_PROTOCOL): x_mm, y_mm, heading_deg of the rear axle
+        since boot. Dead reckoning from the encoders and the gyro - the same
+        sensors calibration corrects, so a cross-check, never a reference.
+        """
+        fields = self.query_fields("?WPOSE", timeout)
+        if fields is None or len(fields) < 3:
+            logging.error(f"STM: malformed or missing WPOSE reply {fields}.")
+            return None
+        try:
+            return {"x_mm": int(fields[0]), "y_mm": int(fields[1]),
+                    "heading_deg": int(fields[2]) / 10.0}
+        except ValueError:
+            logging.error(f"STM: non-integer field in WPOSE reply {fields}.")
+            return None
+
+    def read_enc(self, timeout: float = 2.0) -> Optional[Tuple[int, int]]:
+        """?ENC (ENC_MIN_PROTOCOL): cumulative counts, wheel A and wheel B."""
+        fields = self.query_fields("?ENC", timeout)
+        if fields is None or len(fields) < 2:
+            logging.error(f"STM: malformed or missing ENC reply {fields}.")
+            return None
+        try:
+            return int(fields[0]), int(fields[1])
+        except ValueError:
+            logging.error(f"STM: non-integer field in ENC reply {fields}.")
+            return None
+
+    def read_imu(self, timeout: float = 2.0) -> Optional[dict]:
+        """
+        ?IMU: ready (0/1), heading, rate, stall count, peak raw reading.
+
+        ready 0 means the gyro went quiet for 100 ms and the firmware fell
+        back to ENCODER heading for the rest of the power-on - which, with
+        the scrubbing rear wheels, is degrees out per turn. Nothing else on
+        the wire says so.
+        """
+        fields = self.query_fields("?IMU", timeout)
+        if fields is None or len(fields) < 4:
+            logging.error(f"STM: malformed or missing IMU reply {fields}.")
+            return None
+        try:
+            return {"ready": int(fields[0]) == 1,
+                    "rate_dps": int(fields[2]) / 10.0,
+                    "stalls": int(fields[3]),
+                    "peak_raw": int(fields[4]) if len(fields) > 4 else None}
+        except ValueError:
+            logging.error(f"STM: non-integer field in IMU reply {fields}.")
+            return None
 
     def read_heading(self, timeout: float = 2.0) -> Optional[dict]:
         """
@@ -778,6 +851,14 @@ class STM:
             "last_aim": aim, "last_turned": turned,
             "last_stop_err": turned - aim, "clamped": clamped,
         }
+
+    def set_fast(self, on: bool, timeout: Optional[float] = None) -> bool:
+        """!FAST1 / !FAST0 (FAST_MIN_PROTOCOL). Same OK-collision caveat as
+        set_profile(): idle only, no movement line outstanding."""
+        if not self.send_line([f"!FAST{1 if on else 0}"]):
+            return False
+        reply = self.wait_reply(timeout)
+        return reply is not None and reply.strip().upper() == "OK"
 
     def set_learning(self, on: bool, timeout: Optional[float] = None) -> bool:
         """!LEARN1 / !LEARN0. Same OK-collision caveat as set_profile()."""

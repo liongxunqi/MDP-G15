@@ -46,13 +46,17 @@ US_BIAS_CM = 1.3
 # The planner MUST use the radius of the profile the robot is actually running
 # (task1.Task1.arc_profile / STM_ARC_PROFILE). Planning a TIGHT path and running
 # it on CLEAN puts every turn 27mm wide, and the error compounds across turns.
-PROFILE_TIGHT, PROFILE_CLEAN, PROFILE_SLOW = 0, 1, 2
+PROFILE_TIGHT, PROFILE_CLEAN, PROFILE_SLOW, PROFILE_SAFE = 0, 1, 2, 3
 TURN_RADIUS_MM = {
     PROFILE_TIGHT: 291,
     PROFILE_CLEAN: 318,
     PROFILE_SLOW: 306,
+    # SAFE = TIGHT at 120 rpm. NOT MEASURED - TIGHT's value until
+    # `calibrate.py radius NAME --arc safe --target auto` gives the real one.
+    PROFILE_SAFE: 291,
 }
-PROFILE_NAMES = {PROFILE_TIGHT: "TIGHT", PROFILE_CLEAN: "CLEAN", PROFILE_SLOW: "SLOW"}
+PROFILE_NAMES = {PROFILE_TIGHT: "TIGHT", PROFILE_CLEAN: "CLEAN",
+                 PROFILE_SLOW: "SLOW", PROFILE_SAFE: "SAFE"}
 
 # ── PROTOCOL.md §8 — chassis ──────────────────────────────────────────────────
 ROBOT_WIDTH_CM = 18.8

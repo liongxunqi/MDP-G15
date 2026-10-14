@@ -174,10 +174,10 @@ DMA_HandleTypeDef  hdma_adc1;
 
 static volatile uint8_t  g_evtShort = 0, g_evtLong = 0;
 
-/* Boots into DRIVE, not CALIB, deliberately. A stray short press after
-   power-on should cost one straight run, not a five-move sequence nobody is
-   standing next to. Long press once to reach CALIB. */
-static volatile uimode_t g_mode = MODE_DRIVE;
+/* Boots into IMU (mode 10): the gyro's health is the first thing to see
+   after power-on, and a stray short press there only zeroes the display -
+   it never moves the robot. Long press to cycle on to CAL, then CALIB. */
+static volatile uimode_t g_mode = MODE_IMU;
 
 /* Calibration cycle state. Touched only from the main loop - the button ISR
    sets g_evtShort and nothing else - so none of it is volatile. */
@@ -433,6 +433,9 @@ static void Calib_Start(void)
     g_calPrevTrim    = (int32_t)Odom_GetHeadingTrim();
     g_calStep        = 0U;
     g_calState       = CALIB_RUNNING;
+    /* Placed by hand before the press. Between the cycle's own steps the
+       carry-over is wanted; across the handling it is not. */
+    Motion_ZeroHeading();
     RpiLink_Log("\r\ncalib cycle starting\r\n");
     Calib_StartStep();
 }
@@ -1317,13 +1320,18 @@ int main(void)
                 g_runStartA   = Encoder_A_GetCount();
                 g_runStartB   = Encoder_B_GetCount();
                 RpiLink_Log("\r\nA.4 turn starting\r\n");
+                Motion_ZeroHeading();   /* placed by hand - see A.3 above */
                 Motion_DriveArc(g_angleList[g_angleIdx], g_turnFwd, g_turnRight);
             }
             else if (g_mode == MODE_PROFILE)
             {
                 char msg[64];
-                uint8_t n = (uint8_t)((Motion_GetArcProfile() + 1U)
-                                      % MOTION_ARC_PROFILE_COUNT);
+                /* Next profile the lock allows - TIGHT <-> SAFE when locked. */
+                uint8_t n = Motion_GetArcProfile();
+                do
+                {
+                    n = (uint8_t)((n + 1U) % MOTION_ARC_PROFILE_COUNT);
+                } while (!Motion_ArcProfileAllowed(n));
                 Motion_SetArcProfile(n);
                 snprintf(msg, sizeof(msg), "arc profile -> %s\r\n",
                          Motion_GetArcProfileInfo(n)->name);
@@ -1381,6 +1389,13 @@ int main(void)
                 g_runStartB   = Encoder_B_GetCount();
 
                 RpiLink_Log("\r\nA.3 run starting\r\n");
+
+                /* A button run starts wherever the robot was put down by
+                   hand, and the gyro saw every bit of that handling. Without
+                   a zero the heading carry-over steers the run back toward
+                   the LAST run's heading - up to 5 deg, ~9 cm off per metre,
+                   growing with distance. This pose is heading 0. */
+                Motion_ZeroHeading();
                 Motion_DriveDistance(g_targetMm);
             }
             else
