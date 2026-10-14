@@ -55,6 +55,9 @@ fun ArenaScreen(
     belowResetControls: (@Composable () -> Unit)? = null,
 ) {
     val state by viewModel.uiState.collectAsState()
+    val displayState = if (state.taskMode == TaskMode.TASK2) state.copy(
+        arena = state.arena.copy(obstacles = emptyMap(), selectedObstacleId = null),
+    ) else state
     var confirmReset by remember { mutableStateOf(false) }
     val interactions = remember(viewModel) {
         object : ArenaInteractionListener {
@@ -77,7 +80,7 @@ fun ArenaScreen(
                 horizontalArrangement = Arrangement.spacedBy(16.dp),
             ) {
                 ArenaCanvas(
-                    state = state,
+                    state = displayState,
                     interactions = interactions,
                     modifier = Modifier
                         .weight(3f)
@@ -86,7 +89,7 @@ fun ArenaScreen(
                 Column(Modifier.weight(2f).fillMaxHeight().verticalScroll(rememberScrollState()),
                     verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     ArenaStatusPanel(
-                        state = state,
+                        state = displayState,
                         robotStatus = robotStatus,
                         viewModel = viewModel,
                         onReset = { confirmReset = true },
@@ -105,14 +108,14 @@ fun ArenaScreen(
                 verticalArrangement = Arrangement.spacedBy(16.dp),
             ) {
                 ArenaCanvas(
-                    state = state,
+                    state = displayState,
                     interactions = interactions,
                     modifier = Modifier.fillMaxWidth().weight(3f),
                 )
                 Column(Modifier.fillMaxWidth().weight(2f).verticalScroll(rememberScrollState()),
                     verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     ArenaStatusPanel(
-                        state = state,
+                        state = displayState,
                         robotStatus = robotStatus,
                         viewModel = viewModel,
                         onReset = { confirmReset = true },
@@ -230,6 +233,10 @@ private fun ArenaStatusPanel(
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
             taskControls?.invoke()
+            if (state.taskMode == TaskMode.TASK2) {
+                Text("Task 2: obstacles are discovered by the robot. Saved Task 1 markers are hidden and not sent.",
+                    style = MaterialTheme.typography.bodySmall)
+            }
             Text("Arena status", style = MaterialTheme.typography.titleLarge)
             Text("Latest action", style = MaterialTheme.typography.labelLarge)
             Text(
@@ -287,57 +294,95 @@ private fun ArenaStatusPanel(
                 } ?: "None",
             )
 
-            HorizontalDivider()
-            Text("Target face", style = MaterialTheme.typography.labelLarge)
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(6.dp),
-            ) {
-                Direction.entries.forEach { direction ->
-                    FilterChip(
-                        selected = selected?.targetFace == direction,
-                        onClick = { viewModel.setTargetFace(direction) },
-                        enabled = selected != null,
-                        label = { Text(direction.wireValue) },
+            if (state.taskMode == TaskMode.TASK1) {
+                HorizontalDivider()
+                Text("Target face", style = MaterialTheme.typography.labelLarge)
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                ) {
+                    Direction.entries.forEach { direction ->
+                        FilterChip(
+                            selected = selected?.targetFace == direction,
+                            onClick = { viewModel.setTargetFace(direction) },
+                            enabled = selected != null,
+                            label = { Text(direction.wireValue) },
+                        )
+                    }
+                }
+
+                val atObstacleLimit = state.arena.obstacles.size >= state.arena.config.maxObstacles
+                Button(
+                    onClick = { viewModel.setPlacementMode(!state.placementMode) },
+                    enabled = state.placementMode || (!atObstacleLimit && !state.manualPending && !state.manualAnimating && !state.autonomousRunning),
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Text(
+                        when {
+                            state.placementMode -> "Cancel placement"
+                            atObstacleLimit -> "Obstacle limit reached"
+                            else -> "Add obstacle"
+                        },
                     )
                 }
-            }
-
-            val atObstacleLimit = state.arena.obstacles.size >= state.arena.config.maxObstacles
-            Button(
-                onClick = { viewModel.setPlacementMode(!state.placementMode) },
-                enabled = state.placementMode || (!atObstacleLimit && !state.manualPending && !state.manualAnimating && !state.autonomousRunning),
-                modifier = Modifier.fillMaxWidth(),
-            ) {
-                Text(
-                    when {
-                        state.placementMode -> "Cancel placement"
-                        atObstacleLimit -> "Obstacle limit reached"
-                        else -> "Add obstacle"
-                    },
-                )
-            }
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-            ) {
-                OutlinedButton(
-                    onClick = viewModel::undo,
-                    enabled = state.canUndo,
-                    modifier = Modifier.weight(1f),
-                ) { Text("Undo") }
-                OutlinedButton(
-                    onClick = viewModel::redo,
-                    enabled = state.canRedo,
-                    modifier = Modifier.weight(1f),
-                ) { Text("Redo") }
-            }
-            OutlinedButton(onClick = onReset, modifier = Modifier.fillMaxWidth()) {
-                Text("Reset arena")
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    OutlinedButton(
+                        onClick = viewModel::undo,
+                        enabled = state.canUndo,
+                        modifier = Modifier.weight(1f),
+                    ) { Text("Undo") }
+                    OutlinedButton(
+                        onClick = viewModel::redo,
+                        enabled = state.canRedo,
+                        modifier = Modifier.weight(1f),
+                    ) { Text("Redo") }
+                }
+                OutlinedButton(onClick = onReset, modifier = Modifier.fillMaxWidth()) {
+                    Text("Reset arena")
+                }
             }
             belowResetControls?.invoke()
+            if (state.taskMode == TaskMode.TASK1) {
+                ResyncOnReconnectControl(
+                    phase = state.task1Phase,
+                    armed = state.forceMapResyncOnReconnect,
+                    onArm = viewModel::armMapResyncOnReconnect,
+                    onCancel = viewModel::cancelMapResyncOnReconnect,
+                )
+            }
 
         }
+    }
+}
+
+/**
+ * Recovery override for [ArenaViewModel.connectionChanged]'s normal rule: once BEGIN has been
+ * pressed, a reconnect no longer resends CLEAR + the obstacle list on its own (it would wipe
+ * the RPi's mid-mission state for no reason). This lets the operator explicitly ask for that
+ * resend anyway, armed for one connect only. Disabled before BEGIN (phase SETUP/PATH_REQUESTED),
+ * since a reconnect there already resends the map automatically.
+ */
+@Composable
+private fun ResyncOnReconnectControl(phase: Task1Phase, armed: Boolean, onArm: () -> Unit, onCancel: () -> Unit) {
+    val eligible = phase !in setOf(Task1Phase.SETUP, Task1Phase.PATH_REQUESTED)
+    Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+        if (armed) {
+            Button(onClick = onCancel, modifier = Modifier.fillMaxWidth()) {
+                Text("Map resync armed for next connect — tap to cancel")
+            }
+        } else {
+            OutlinedButton(onClick = onArm, enabled = eligible, modifier = Modifier.fillMaxWidth()) {
+                Text("Resend map on next reconnect")
+            }
+        }
+        Text(
+            "Sends CLEAR + every obstacle to the RPi the next time it (re)connects — one time only. " +
+                "Use after BEGIN only if the RPi's map is known to be out of sync; it can disrupt an active mission.",
+            style = MaterialTheme.typography.bodySmall,
+        )
     }
 }
 

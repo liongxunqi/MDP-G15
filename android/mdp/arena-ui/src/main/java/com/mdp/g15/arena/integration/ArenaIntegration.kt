@@ -7,3 +7,6 @@ interface ArenaInboundConsumer {
 fun interface ArenaOutboundSink {
     fun submit(message: String)
 }
+
+/** The transport proved a command never entered its live-session queue. */
+class CommandQueueRejected : RuntimeException()

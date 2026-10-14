@@ -26,11 +26,15 @@ class ChecklistProtocolTest {
         assertEquals("CLEAR\nOBSTACLE,1,30,40,NORTH\n", bluetoothPayload("CLEAR\nOBSTACLE,1,30,40,NORTH"))
         assertEquals("BEGIN\n", bluetoothPayload("BEGIN\n"))
         assertEquals("BEGIN", bluetoothPayload("BEGIN\n", appendNewline = false))
-        assertEquals("", bluetoothPayload("", appendNewline = false))
+        assertEquals("TASK2,STATUS?", bluetoothPayload("TASK2,STATUS?", appendNewline = false))
+        assertEquals("\n", bluetoothPayload("", appendNewline = false))
     }
 
     @Test fun `status target and robot reports remain recognized`() {
         assertEquals(RobotMessage.Status("OK"), RobotMessageParser.parse("STATUS,OK"))
+        assertEquals(RobotMessage.Status("Task 2 ready"), RobotMessageParser.parse("TASK2,READY"))
+        assertEquals(RobotMessage.Status("Task 2 not ready"), RobotMessageParser.parse("TASK2,NOT_READY"))
+        assertEquals(RobotMessage.Status("Obstacle 1 arrow: LEFT"), RobotMessageParser.parse("TASK2,ARROW,1,LEFT"))
         assertEquals(RobotMessage.Status("RUNNING,3,12"), RobotMessageParser.parse("STATUS,RUNNING,3,12"))
         assertEquals(RobotMessage.Status("START,1,2,N"), RobotMessageParser.parse("STATUS,START,1,2,N"))
         assertEquals(RobotMessage.MalformedStatus, RobotMessageParser.parse("STATUS,Exploring"))

@@ -515,7 +515,11 @@ python3 -B -m unittest rpi/mdp_rpi/test_instruction_mission.py rpi/mdp_rpi/test_
 Run `python3 task2.py` from `rpi/mdp_rpi` on the Pi and
 `python3 task2_pc.py --host 192.168.15.15` from `pc` on the laptop.
 Do not run Task 1 on the same sockets at the same time. Wait for the Pi's
-READY log, then send the existing Android `BEGIN` command. Android `s`/`STOP` brakes
+READY log, then send the existing Android `BEGIN` command. The Android Task 2
+screen now sends `TASK2,STATUS?` on connection/attempt preparation and enables
+Start only after `TASK2,READY`. The Pi also announces `TASK2,READY` when its
+camera and PC are ready; an early `BEGIN` is rejected with `TASK2,NOT_READY`.
+Android `s`/`STOP` brakes
 the robot. The main entry point is `task2.py`; `task2t.py` and
 `task2t_park.py` supply Task 2 route/parking geometry. The previous manual
 SAFE entry point is retained as `task2_safe.py` for bench comparison.
