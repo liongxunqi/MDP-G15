@@ -34,6 +34,7 @@ Replies (PROTOCOL.md §3):
     RESEND          parse failure, nothing executed, safe to retransmit
     FAIL,TIMEOUT    watchdog fired mid-move — wheel stalled or encoder dead
     FAIL,WRONGWAY   arc rotated away from target and was aborted
+    FAIL,SHORT      arc finished more than 10° from its aim (protocol 7)
     FAIL,NOECHO     FU<n> had no usable reading — THE ROBOT DID NOT MOVE (v3)
     <TAG>,<fields>  answer to a query (§5)
 
@@ -50,7 +51,7 @@ this class owns a single reader thread: it is the only thing that touches
 serial.readline(). Movement replies go to a queue consumed by the caller's
 segment pump; query replies are handed back to whichever thread asked.
 
-CAUTION: config commands (§6, !PROF0/1/2, !ZERO and !FAST0/1) and the calibration setters
+CAUTION: config commands (§6, !PROF0/1/2 and !ZERO) and the calibration setters
 (§7, !CALD/!CALL/!CALT) reply plain "OK", which is indistinguishable from a
 movement OK. They are therefore sent down the MOVEMENT path, not the query path,
 and must not be issued while a move is outstanding.
@@ -163,10 +164,25 @@ FU_MIN_PROTOCOL = 3
 FROZEN_CAL_MIN_PROTOCOL = 4
 # Protocol 5: per-side arc deflection (!CALSL / !CALSR), two more ?CAL fields.
 STEER_CAL_MIN_PROTOCOL = 5
-# Fast mode is capability-probed with !FAST1 at Task 2 startup. Keep this
-# constant for the standalone Task 2 runner's compatibility check.
-FAST_MIN_PROTOCOL = 5
-WPOSE_MIN_PROTOCOL = 5
+# Protocol 6: ?CAL appends the last arc's raw decel measurement, so the brakes
+# step averages measurements rather than the firmware's filtered value. Arcs
+# also hold steering through the coast and lag is no longer learned.
+RAW_DECEL_MIN_PROTOCOL = 6
+# ?WPOSE, the pose nothing resets. In this tree since 5, but some 5 boards
+# were flashed before it and answer RESEND - which lands on the movement
+# path and would be taken as the next line's reply. 6 is the first version
+# guaranteed to have it.
+WPOSE_MIN_PROTOCOL = 6
+# Protocol 7: ?ENC, cumulative counts per wheel.
+ENC_MIN_PROTOCOL = 7
+# Protocol 8: !FAST0/1, Task 2's fast mode (faster straights, shorter settle).
+FAST_MIN_PROTOCOL = 8
+# Protocol 9: ?IRW (side IR + world pose from one tick) and the IR edge latch
+# (!IRE / ?IRE). See IR SNAPSHOT AND EDGE LATCH in the firmware's rpilink.h.
+IRW_MIN_PROTOCOL = 9
+# Protocol 10: per-move speed (V<n> suffix), the calibration table (!K, !KCLR,
+# ?K - the firmware's caltab.h) and the move report (?MV). PROTOCOL.md §13.
+TABLE_MIN_PROTOCOL = 10
 
 # PROTOCOL.md §5 — every tag the firmware can answer a query with.
 # CAL is protocol 2. It must appear here twice over: once so validate_token()
@@ -174,17 +190,97 @@ WPOSE_MIN_PROTOCOL = 5
 # "CAL,..." answer to the waiting thread instead of discarding it as banner
 # noise. Missing from either place and the query fails silently.
 QUERY_TAGS = {"US", "IR", "IRR", "POSE", "DIST", "TURN", "STAT", "IMU", "XCHK",
-              "VER", "CAL", "HDG", "WPOSE"}
+              "VER", "CAL", "HDG", "WPOSE", "ENC", "IRW", "IRE", "MV", "K", "KG"}
 
 # This client implements protocol 4. Compared against the ?VER reply at startup.
-PROTOCOL_VERSION = 5
+PROTOCOL_VERSION = 10
 
 # FU before F, exactly as the firmware's own parser orders its prefixes: "fu"
 # would otherwise be eaten by "f" and FU20 read as F with an argument of
 # "U20", which does not parse at all.
-_MOVE_RE = re.compile(r"^(FR|FL|FU|RR|RL|F|R)(\d+)$", re.IGNORECASE)
+# No leading zeros - the firmware refuses them, because one byte lost off
+# "F100" leaves "F00", which would otherwise run as F0 (drive to obstacle).
+_MOVE_RE = re.compile(r"^(FR|FL|FU|RR|RL|F|R)(0|[1-9]\d*)(?:V([1-9]\d*))?$",
+                      re.IGNORECASE)
 _QUERY_RE = re.compile(r"^\?([A-Z]+)$", re.IGNORECASE)
-_CONFIG_RE = re.compile(r"^!(PROF[012]|ZERO|LEARN[01]|FAST[01])$", re.IGNORECASE)
+# PROF3 is SAFE. Missing here, set_profile(3) was refused before it reached
+# the wire, so no SAFE calibration or SAFE task could ever select SAFE.
+_CONFIG_RE = re.compile(r"^!(PROF[0-3]|ZERO|LEARN[01]|FAST[01])$", re.IGNORECASE)
+# !IRE<n> (protocol 9): 0, or side*10000 + lo*100 + hi - checked in full by
+# ir_edge_token(), which is the only thing that should build one.
+_IRE_RE = re.compile(r"^!IRE(0|[12]\d{4})$", re.IGNORECASE)
+
+# Protocol 10 - the calibration table (PROTOCOL.md §13). The keys and ranges
+# mirror caltab.c; CAL_TABLE_* is the one copy on this side, and k_token()
+# the only thing that should build a setter.
+#   per move:  !K<move><anchor>.<field>=<n>   move F R FR FL RR RL, anchor 0..2
+#   global:    !KG.<field>=<n>
+#   !KCLR      clear the whole table (back to protocol 9 behaviour)
+#   ?K<move><anchor> -> "K,<move>,<anchor>,<rpm>,<trim>,<coast>,<dist>,<steer>,
+#                        <decel>,<lag>,<radius>,<boost>"  ("-" unset, "." n/a)
+#   ?KG              -> "KG,<wheel>,<ffaf>,<ffar>,<ffbf>,<ffbr>,<dba>,<dbb>,<vs>,<va>"
+#   ?MV              -> the move report, see read_mv()
+CAL_TABLE_MOVES = ("F", "R", "FR", "FL", "RR", "RL")
+CAL_TABLE_ANCHORS = 3
+CAL_TABLE_FIELDS = ("rpm", "trim", "coast", "dist", "steer", "decel", "lag",
+                    "radius", "boost")
+CAL_TABLE_STRAIGHT_FIELDS = ("rpm", "trim", "coast", "dist")
+CAL_TABLE_ARC_FIELDS = ("rpm", "steer", "decel", "lag", "radius", "boost")
+CAL_TABLE_GLOBALS = ("wheel", "ffaf", "ffar", "ffbf", "ffbr", "dba", "dbb",
+                     "vs", "va")
+# (lo, hi, zero_allowed) - zero means "unset" where it is allowed.
+CAL_TABLE_LIMITS = {
+    "rpm": (40, 250, True), "trim": (-80, 80, False), "coast": (0, 400, False),
+    "dist": (8000, 12000, False), "decel": (501, 29999, False),
+    "lag": (0, 2500, False), "radius": (150, 1000, False),
+    "boost": (100, 250, False),
+    "wheel": (9000, 11000, False), "ffaf": (150, 600, True),
+    "ffar": (150, 600, True), "ffbf": (150, 600, True), "ffbr": (150, 600, True),
+    "dba": (300, 900, True), "dbb": (300, 900, True),
+    "vs": (40, 250, True), "va": (60, 170, True),
+}
+# steer: never past the servo on that side (SERVO_* in motors.h).
+CAL_TABLE_STEER = {"FR": (300, 626), "RR": (300, 626),
+                   "FL": (300, 574), "RL": (300, 574)}
+# V<n> suffix bounds, x10 rpm (commands.h CMD_V_*).
+V_STRAIGHT = (4, 25)
+V_ARC = (6, 17)
+
+_K_SET_RE = re.compile(r"^!K(FR|FL|RR|RL|F|R)([0-2])\.([A-Z]+)=(-?\d+)$",
+                       re.IGNORECASE)
+_KG_SET_RE = re.compile(r"^!KG\.([A-Z]+)=(-?\d+)$", re.IGNORECASE)
+_K_QUERY_RE = re.compile(r"^\?K(FR|FL|RR|RL|F|R)([0-2])$", re.IGNORECASE)
+
+
+def k_field_ok(move: Optional[str], field: str, value: int) -> Tuple[bool, str]:
+    """Is `field`=`value` legal on this row? move None = the global row."""
+    field = field.lower()
+    if move is None:
+        if field not in CAL_TABLE_GLOBALS:
+            return False, f"'{field}' is not a global (known: {CAL_TABLE_GLOBALS})"
+    else:
+        move = move.upper()
+        allowed = (CAL_TABLE_ARC_FIELDS if move in CAL_TABLE_STEER
+                   else CAL_TABLE_STRAIGHT_FIELDS)
+        if field not in allowed:
+            return False, f"'{field}' does not belong to {move} (allowed: {allowed})"
+    if field == "steer":
+        lo, hi = CAL_TABLE_STEER[move]
+        zero_ok = False
+    else:
+        lo, hi, zero_ok = CAL_TABLE_LIMITS[field]
+    if value == 0 and zero_ok:
+        return True, ""
+    if not (lo <= value <= hi):
+        return False, f"{field}={value} is outside {lo}..{hi}"
+    return True, ""
+
+
+def k_token(move: Optional[str], anchor: int, field: str, value: int) -> str:
+    """The !K setter for one table value; move None for the global row."""
+    if move is None:
+        return f"!KG.{field.upper()}={int(value)}"
+    return f"!K{move.upper()}{int(anchor)}.{field.upper()}={int(value)}"
 
 # PROTOCOL.md §7 — the three calibration setters, protocol 2. !CALT is the ONLY
 # token anywhere in this protocol that may carry a negative argument: every
@@ -253,6 +349,16 @@ def validate_token(token: str) -> Tuple[bool, str]:
         op, digits = m.group(1).upper(), m.group(2)
         value = int(digits)
 
+        # Protocol 10: V<n>, this move's cruise in tens of rpm.
+        if m.group(3) is not None:
+            v = int(m.group(3))
+            lo, hi = V_ARC if op in ("FR", "FL", "RR", "RL") else V_STRAIGHT
+            if op == "FU" or (op == "F" and value == 0):
+                return False, f"'{tok}': FU and F0 take no speed suffix"
+            if not (lo <= v <= hi):
+                return False, (f"'{tok}': V{v} is outside V{lo}..V{hi} for "
+                               f"{op} (PROTOCOL.md §13)")
+
         # PROTOCOL.md §4.1: FU's argument is a standoff to HOLD, not a distance
         # to travel, and it is the one movement argument with a meaningful
         # floor as well as a ceiling. Tested before the zero rule below so
@@ -275,13 +381,26 @@ def validate_token(token: str) -> Tuple[bool, str]:
             return False, f"zero argument is only valid for F (got '{tok}')"
         return True, ""
 
+    if _K_QUERY_RE.match(tok) or upper == "?KG":
+        return True, ""
+
+    if upper == "!KCLR":
+        return True, ""
+
+    m = _K_SET_RE.match(tok)
+    if m:
+        return k_field_ok(m.group(1), m.group(3), int(m.group(4)))
+    m = _KG_SET_RE.match(tok)
+    if m:
+        return k_field_ok(None, m.group(1), int(m.group(2)))
+
     if _QUERY_RE.match(tok):
         tag = upper.lstrip("?")
         if tag not in QUERY_TAGS:
             return False, f"unknown query '?{tag}' — known: {sorted(QUERY_TAGS)}"
         return True, ""
 
-    if _CONFIG_RE.match(tok):
+    if _CONFIG_RE.match(tok) or _IRE_RE.match(tok):
         return True, ""
 
     # PROTOCOL.md §7 — calibration setters, checked before the legacy pattern so
@@ -397,6 +516,9 @@ class STM:
         # Queries are deliberately exempt — they bypass the firmware queue (§5).
         self._inflight = False
         self._inflight_lock = threading.Lock()
+        # RST has no reply, but the reply to the line it cancelled may already
+        # be in flight. Fence that stale reply with a tagged ?VER before the
+        # next movement/config line is allowed onto the wire.
         self._abort_generation = 0
         self._reply_sync_required = False
 
@@ -556,9 +678,6 @@ class STM:
             generation = self._abort_generation
             needs_sync = self._reply_sync_required
         if needs_sync:
-            # Firmware handles RST and tagged queries in input order. Reading
-            # VER after RST fences off any old OK still in transit; draining only
-            # the Python queue cannot do that. Keep the reader unlocked here.
             synced = self.query("?VER") is not None
             if not synced:
                 with self._inflight_lock:
@@ -646,19 +765,6 @@ class STM:
     def wait_receive(self, timeout: Optional[float] = None) -> Optional[str]:
         return self.wait_reply(timeout)
 
-    def read_wpose(self, timeout: float = 2.0) -> Optional[dict]:
-        """Raw firmware world pose: millimetres and counter-clockwise degrees."""
-        fields = self.query_fields("?WPOSE", timeout)
-        try:
-            import math
-            x, y, heading = map(float, fields)
-            if not all(math.isfinite(v) for v in (x, y, heading)):
-                return None
-            return {"x_mm": x, "y_mm": y, "heading_deg": heading / 10.0}
-        except (TypeError, ValueError):
-            logging.error("STM: invalid WPOSE reply: %r", fields)
-            return None
-
     def receive(self) -> Optional[str]:
         """Non-blocking pop of a movement reply, or None if none pending."""
         try:
@@ -689,6 +795,9 @@ class STM:
             return None
 
         tag = tok.upper().lstrip("?")
+        # ?K<move><anchor> answers "K,...": the row is in the fields, not the tag.
+        if _K_QUERY_RE.match(tok):
+            tag = "K"
         mailbox: "Queue[str]" = Queue(maxsize=1)
 
         with self._query_lock:
@@ -714,25 +823,19 @@ class STM:
     def set_profile(self, profile: int, timeout: Optional[float] = None) -> bool:
         """
         Select the arc profile: 0 TIGHT (r=291mm), 1 CLEAN (r=318mm),
-        2 SLOW (r=306mm). Persists until changed or reset; default is TIGHT.
+        2 SLOW (r=306mm), 3 SAFE (TIGHT at 120 rpm). Persists until changed
+        or reset; default is TIGHT.
 
-        Protocol 4 firmware is LOCKED to TIGHT and answers RESEND to !PROF1/2,
-        so on current firmware this returns False for anything but 0.
+        Current firmware is LOCKED to TIGHT and SAFE and answers RESEND to
+        !PROF1/2; firmware from before SAFE also refuses !PROF3.
 
         Replies plain OK, which is indistinguishable from a movement OK — so
         this MUST NOT be called while a movement line is outstanding.
         """
-        if profile not in (0, 1, 2):
-            logging.error(f"STM: invalid profile {profile} — must be 0, 1 or 2.")
+        if profile not in (0, 1, 2, 3):
+            logging.error(f"STM: invalid profile {profile} — must be 0 to 3.")
             return False
         if not self.send_line([f"!PROF{profile}"]):
-            return False
-        reply = self.wait_reply(timeout)
-        return reply is not None and reply.strip().upper() == "OK"
-
-    def set_fast(self, on: bool, timeout: Optional[float] = None) -> bool:
-        """Enable or disable firmware fast mode. Never call during movement."""
-        if not self.send_line([f"!FAST{1 if on else 0}"]):
             return False
         reply = self.wait_reply(timeout)
         return reply is not None and reply.strip().upper() == "OK"
@@ -796,7 +899,8 @@ class STM:
     def read_cal_full(self, timeout: float = 2.0) -> Optional[dict]:
         """
         ?CAL with the protocol 4 fields: decel_x10, lag_ms_x10, trim_us,
-        gyro_x10000 and learn (0/1). The last two are None on older firmware.
+        gyro_x10000 and learn (0/1); steer_left_us / steer_right_us (5);
+        last_decel_x10 (6). Each is None on firmware older than it.
         """
         fields = self.query_fields("?CAL", timeout)
         if fields is None or len(fields) < 3:
@@ -815,7 +919,61 @@ class STM:
             "learn": vals[4] if len(vals) > 4 else None,
             "steer_left_us": vals[5] if len(vals) > 5 else None,
             "steer_right_us": vals[6] if len(vals) > 6 else None,
+            # Protocol 6: the last arc's raw decel, x10; 0 = it gave none.
+            "last_decel_x10": vals[7] if len(vals) > 7 else None,
         }
+
+    def read_wpose(self, timeout: float = 2.0) -> Optional[dict]:
+        """
+        ?WPOSE (WPOSE_MIN_PROTOCOL): x_mm, y_mm, heading_deg of the rear axle
+        since boot. Dead reckoning from the encoders and the gyro - the same
+        sensors calibration corrects, so a cross-check, never a reference.
+        """
+        fields = self.query_fields("?WPOSE", timeout)
+        if fields is None or len(fields) < 3:
+            logging.error(f"STM: malformed or missing WPOSE reply {fields}.")
+            return None
+        try:
+            return {"x_mm": int(fields[0]), "y_mm": int(fields[1]),
+                    "heading_deg": int(fields[2]) / 10.0}
+        except ValueError:
+            logging.error(f"STM: non-integer field in WPOSE reply {fields}.")
+            return None
+
+    def read_enc(self, timeout: float = 2.0) -> Optional[Tuple[int, int]]:
+        """?ENC (ENC_MIN_PROTOCOL): cumulative counts, wheel A and wheel B."""
+        fields = self.query_fields("?ENC", timeout)
+        if fields is None or len(fields) < 2:
+            logging.error(f"STM: malformed or missing ENC reply {fields}.")
+            return None
+        try:
+            return int(fields[0]), int(fields[1])
+        except ValueError:
+            logging.error(f"STM: non-integer field in ENC reply {fields}.")
+            return None
+
+    def read_imu(self, timeout: float = 2.0) -> Optional[dict]:
+        """
+        ?IMU: ready (0/1), heading, rate, stall count, peak raw reading.
+
+        ready 0 means the gyro went quiet for 100 ms and the firmware fell
+        back to ENCODER heading - which, with the scrubbing rear wheels, is
+        degrees out per turn. Nothing else on the wire says so. The firmware
+        re-arms it once the robot has stood still for ~0.5 s (~3 s if the
+        bias was never measured); see cal_profile.gyro_in_use().
+        """
+        fields = self.query_fields("?IMU", timeout)
+        if fields is None or len(fields) < 4:
+            logging.error(f"STM: malformed or missing IMU reply {fields}.")
+            return None
+        try:
+            return {"ready": int(fields[0]) == 1,
+                    "rate_dps": int(fields[2]) / 10.0,
+                    "stalls": int(fields[3]),
+                    "peak_raw": int(fields[4]) if len(fields) > 4 else None}
+        except ValueError:
+            logging.error(f"STM: non-integer field in IMU reply {fields}.")
+            return None
 
     def read_heading(self, timeout: float = 2.0) -> Optional[dict]:
         """
@@ -844,6 +1002,83 @@ class STM:
             "last_aim": aim, "last_turned": turned,
             "last_stop_err": turned - aim, "clamped": clamped,
         }
+
+    def set_fast(self, on: bool, timeout: Optional[float] = None) -> bool:
+        """!FAST1 / !FAST0 (FAST_MIN_PROTOCOL). Same OK-collision caveat as
+        set_profile(): idle only, no movement line outstanding."""
+        if not self.send_line([f"!FAST{1 if on else 0}"]):
+            return False
+        reply = self.wait_reply(timeout)
+        return reply is not None and reply.strip().upper() == "OK"
+
+    def read_irw(self, timeout: float = 2.0) -> Optional[dict]:
+        """
+        ?IRW (IRW_MIN_PROTOCOL): both side IRs and the world pose from the
+        same 10 ms control tick. Distances are cm or None (no reading); raw
+        counts tell a None apart - high counts mean closer than the IR's
+        10 cm minimum, low counts mean nothing in range. Pose is ?WPOSE's
+        frame. ms is the firmware's HAL tick of that sample.
+        """
+        fields = self.query_fields("?IRW", timeout)
+        if fields is None or len(fields) < 8:
+            logging.error(f"STM: malformed or missing IRW reply {fields}.")
+            return None
+        try:
+            v = [int(f) for f in fields[:8]]
+        except ValueError:
+            logging.error(f"STM: non-integer field in IRW reply {fields}.")
+            return None
+        none = lambda cm: None if cm == 0xFFFF else cm
+        return {"left_cm": none(v[0]), "right_cm": none(v[1]),
+                "left_raw": v[2], "right_raw": v[3],
+                "x_mm": v[4], "y_mm": v[5], "heading_deg": v[6] / 10.0,
+                "ms": v[7]}
+
+    @staticmethod
+    def ir_edge_token(side: Optional[str], lo_cm: int = 0, hi_cm: int = 0) -> str:
+        """!IRE token: side 'left'/'right' with a lo..hi cm window, or None to
+        disarm. Raises ValueError for a window the firmware would refuse."""
+        if side is None:
+            return "!IRE0"
+        code = {"left": 1, "right": 2}.get(side)
+        if code is None:
+            raise ValueError(f"IR edge side must be left or right, not {side!r}")
+        lo, hi = int(lo_cm), int(hi_cm)
+        if not (10 <= lo <= hi <= 80):
+            raise ValueError(f"IR edge window {lo}..{hi} cm outside 10..80")
+        return f"!IRE{code * 10000 + lo * 100 + hi}"
+
+    def set_ir_edge(self, side: Optional[str], lo_cm: int = 0, hi_cm: int = 0,
+                    timeout: Optional[float] = None) -> bool:
+        """
+        Arm the IR edge latch on one side for lo..hi cm (protocol 9), or
+        disarm with side=None. Arming clears the previous latch. Replies plain
+        OK on the movement path - idle only, BEFORE the line it should watch.
+        """
+        if not self.send_line([self.ir_edge_token(side, lo_cm, hi_cm)]):
+            return False
+        reply = self.wait_reply(timeout)
+        return reply is not None and reply.strip().upper() == "OK"
+
+    def read_ir_edge(self, timeout: float = 2.0) -> Optional[dict]:
+        """
+        ?IRE: {'state': 'off'|'armed'|'latched', 'side', 'cm', 'raw', 'x_mm',
+        'y_mm', 'heading_deg', 'ms'}. Once latched the reading and pose are
+        the FIRST tick of the confirming run, in ?WPOSE's frame.
+        """
+        fields = self.query_fields("?IRE", timeout)
+        if fields is None or len(fields) < 8:
+            logging.error(f"STM: malformed or missing IRE reply {fields}.")
+            return None
+        try:
+            v = [int(f) for f in fields[:8]]
+        except ValueError:
+            logging.error(f"STM: non-integer field in IRE reply {fields}.")
+            return None
+        return {"state": {0: "off", 1: "armed", 2: "latched"}.get(v[0], "?"),
+                "side": {1: "left", 2: "right"}.get(v[1]),
+                "cm": v[2], "raw": v[3], "x_mm": v[4], "y_mm": v[5],
+                "heading_deg": v[6] / 10.0, "ms": v[7]}
 
     def set_learning(self, on: bool, timeout: Optional[float] = None) -> bool:
         """!LEARN1 / !LEARN0. Same OK-collision caveat as set_profile()."""
@@ -948,3 +1183,83 @@ class STM:
                 all_ok = False
 
         return all_ok
+
+    # ── Protocol 10: calibration table and move report (PROTOCOL.md §13) ──────
+
+    def set_k(self, move: Optional[str], anchor: int, field: str, value: int,
+              retries: int = 3, retry_delay: float = 0.2) -> bool:
+        """One table value (!K / !KG). Same OK-collision caveat as set_cal()."""
+        ok, reason = k_field_ok(move, field, int(value))
+        if not ok:
+            logging.error(f"STM: not sending table value - {reason}.")
+            return False
+        return self._send_cal_token(k_token(move, anchor, field, value),
+                                    retries, retry_delay)
+
+    def clear_k(self, retries: int = 3, retry_delay: float = 0.2) -> bool:
+        """!KCLR: empty the table - every move drives as on protocol 9."""
+        return self._send_cal_token("!KCLR", retries, retry_delay)
+
+    def read_k(self, move: Optional[str], anchor: int = 0,
+               timeout: float = 2.0) -> Optional[dict]:
+        """
+        ?K<move><anchor> / ?KG as {field: int or None}. Fields that do not
+        belong to the move are left out; unset ones are None.
+        """
+        if move is None:
+            fields = self.query_fields("?KG", timeout)
+            names = CAL_TABLE_GLOBALS
+            body = fields
+        else:
+            fields = self.query_fields(f"?K{move.upper()}{int(anchor)}", timeout)
+            names = CAL_TABLE_FIELDS
+            body = fields[2:] if fields is not None else None
+        if body is None or len(body) < len(names):
+            logging.error(f"STM: malformed or missing table reply {fields}.")
+            return None
+        out = {}
+        for name, f in zip(names, body):
+            if f == ".":
+                continue
+            if f == "-":
+                out[name] = None
+                continue
+            try:
+                out[name] = int(f)
+            except ValueError:
+                logging.error(f"STM: non-integer table field {f!r} in {fields}.")
+                return None
+        return out
+
+    MV_FIELDS = ("seq", "move", "result", "rpm", "ticks", "enc_a", "enc_b", "n",
+                 "rpm_a", "rpm_b", "duty_a", "duty_b", "corr", "max_err",
+                 "dist_brake", "dist", "aim", "turned", "brake_rate",
+                 "brake_ang", "decel_meas", "x", "y", "servo", "trim", "target")
+    # Sent x10; everything else is an integer as it stands.
+    _MV_X10 = {"rpm_a", "rpm_b", "corr", "max_err", "dist_brake", "dist", "aim",
+               "turned", "brake_rate", "brake_ang", "decel_meas", "x", "y",
+               "trim", "target"}
+    MV_RESULTS = {0: "ok", 1: "timeout", 2: "wrongway", 3: "missed", 4: "rst"}
+
+    def read_mv(self, timeout: float = 2.0) -> Optional[dict]:
+        """
+        ?MV: the firmware's report on the last move (MOVE REPORT, motion.h).
+        Distances in mm, angles in degrees, rpm at the wheel, duty 0..1000.
+        "move" is the name ("F" .. "RL"), "result" "ok" / "timeout" / ....
+        """
+        fields = self.query_fields("?MV", timeout)
+        if fields is None or len(fields) < len(self.MV_FIELDS):
+            logging.error(f"STM: malformed or missing MV reply {fields}.")
+            return None
+        out = {}
+        try:
+            for name, f in zip(self.MV_FIELDS, fields):
+                v = int(f)
+                out[name] = v / 10.0 if name in self._MV_X10 else v
+        except ValueError:
+            logging.error(f"STM: non-integer field in MV reply {fields}.")
+            return None
+        mv = out["move"]
+        out["move"] = CAL_TABLE_MOVES[mv - 1] if 1 <= mv <= 6 else None
+        out["result"] = self.MV_RESULTS.get(out["result"], str(out["result"]))
+        return out

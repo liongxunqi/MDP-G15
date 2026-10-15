@@ -24,11 +24,14 @@ YOLO_TARGET_CONFIDENCE = float(os.getenv("YOLO_TARGET_CONFIDENCE", "0.60"))
 FALLBACK_CLASSES = {"bullseye"}
 
 def detect(image_path, allowed_classes=None, output_dir=None,
-           selection_policy="nearest", target_confidence=None):
+           selection_policy="nearest", target_confidence=None,
+           return_metadata=False):
     """
     Detect the image target.
 
     Returns (class_name, confidence), or (None, None) when nothing is detected.
+    Task 2 may request a third metadata value containing the selected box's
+    normalised centre.  Keeping that opt-in preserves every existing caller.
     The saved annotation draws only the marker selected for the obstacle the
     robot is facing, so stitched output and TARGET messages stay aligned.
     """
@@ -42,7 +45,7 @@ def detect(image_path, allowed_classes=None, output_dir=None,
     image = cv2.imread(str(image_path))
     if image is None:
         logging.error("Detector could not read image: %s", image_path)
-        return None, None
+        return (None, None, None) if return_metadata else (None, None)
 
     results = model.predict(
         source=image,
@@ -63,7 +66,7 @@ def detect(image_path, allowed_classes=None, output_dir=None,
             logging.warning("Detector found no target; saved frame to %s", output_path)
         else:
             logging.error("Detector found no target and could not save %s", output_path)
-        return None, None
+        return (None, None, None) if return_metadata else (None, None)
 
     coordinates = boxes.xyxy.cpu().numpy()
     confidences = boxes.conf.cpu().numpy()
@@ -100,7 +103,7 @@ def detect(image_path, allowed_classes=None, output_dir=None,
             output_path,
             "" if saved else " (save failed)",
         )
-        return None, None
+        return (None, None, None) if return_metadata else (None, None)
 
     accepted = [
         (class_names[i], float(confidences[i]))
@@ -148,6 +151,15 @@ def detect(image_path, allowed_classes=None, output_dir=None,
             output_path,
         )
 
+    if return_metadata:
+        height, width = image.shape[:2]
+        metadata = {
+            "center_x": float((x1 + x2) / (2.0 * width)),
+            "center_y": float((y1 + y2) / (2.0 * height)),
+            "width": float((x2 - x1) / width),
+            "height": float((y2 - y1) / height),
+        }
+        return class_name, confidence, metadata
     return class_name, confidence
 
 

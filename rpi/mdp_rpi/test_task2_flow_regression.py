@@ -58,23 +58,6 @@ class WholeRoute(unittest.TestCase):
                         and abs(y) <= geometry.BAY_HALF_WIDTH_CM
                         for x, y in geometry.footprint(stm.pose)))
 
-    def test_camera_detour_does_not_speculate_on_unknown_arrow(self):
-        route = route_module.Task2(Mock(), startup=False)
-        pose = geometry.Pose(42.1, 18.6, 0)
-        course = geometry.Course(71.7, 152.3, 90)
-        route._check = Mock(return_value=10)
-
-        def handoff(end, course, first, second):
-            # The direct view has no forward handoff. The detours only help
-            # the opposite arrow, which has not been recognised yet.
-            if end.y > pose.y + 1 and first != second:
-                return [geometry.Seg("R", 90)], False, 10
-            return None
-
-        route.select_face_handoff = handoff
-        selected = route._select_obstacle2_view(pose, course)
-        self.assertTrue(selected)
-        self.assertTrue(all(seg.kind == "F" for seg in selected))
 
     def test_timeout_does_not_accept_below_floor_or_partial_sweep(self):
         for result in (2.0, route_module.HANDOFF_CLEARANCE_CM - .1):
@@ -122,30 +105,6 @@ class WholeRoute(unittest.TestCase):
             geometry.Course(84, 163, 90), "recovery"))
         route.stm.send_line.assert_not_called()
 
-    def test_existing_view_straight_can_correct_lateral_drift_from_obstacle1(self):
-        route = route_module.Task2(Mock(), startup=False, sleep_fn=lambda _: None)
-        route.frame.origin = dict(x_mm=0, y_mm=0, heading_deg=0)
-        route._stage2_view_origin = geometry.Pose(50, 29, 0)
-        route.obs2_us_y = 29
-        route._pose = Mock(side_effect=[geometry.Pose(50, 29, 0),
-                                       geometry.Pose(84, 29, 0)])
-        route.frame.pose = Mock(side_effect=[geometry.Pose(66, 29, 0),
-                                            geometry.Pose(70, 29, 0)])
-        route._ir = Mock(return_value=15)
-
-        def execute(stm, token, poll):
-            self.assertEqual(token, "F34")
-            self.assertFalse(poll())
-            self.assertFalse(poll())
-            return "OK"
-
-        with patch.object(geometry, "run_polling", side_effect=execute) as motion:
-            self.assertTrue(route._view_line([geometry.Seg("F", 34)],
-                                            geometry.Course(80, 150, 90)))
-        motion.assert_called_once()
-        self.assertAlmostEqual(route.frame.y_shift, -3.75)
-        self.assertEqual(route._stage2_view_origin, geometry.Pose(50, 25.25, 0))
-        self.assertEqual(route.obs2_us_y, 25.25)
 
     def test_single_edge_measurement_preserves_return_landmark_fix(self):
         frame = Mock()

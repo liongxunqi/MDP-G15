@@ -210,8 +210,7 @@ def simulate(d1, d2, w2, arrow: str, radius_err: float = 0.0, quiet=True,
         logging.disable(logging.CRITICAL)
     try:
         t = task2.Task2(fake, input_fn=lambda _: arrow, sleep_fn=lambda _: None,
-                        startup=False, wait_for_go=False,
-                        center_stage2=task2.CENTER_STAGE2)
+                        startup=False, wait_for_go=False)
         code = t.run()
     finally:
         logging.disable(logging.NOTSET)
@@ -239,8 +238,7 @@ def main() -> int:
     arrows = iter((a.arrow, a.arrow2 or a.arrow))
     ask = (lambda _: next(arrows)) if a.arrow else input
     code = task2.Task2(fake, input_fn=ask, sleep_fn=lambda _: None,
-                       startup=False, wait_for_go=False,
-                       center_stage2=task2.CENTER_STAGE2).run()
+                       startup=False, wait_for_go=False).run()
     clear, name = run_clearance(fake, course)
     print(f"exit {code}; closest approach {clear:.1f} cm ({name}); "
           f"parked at {fake.pose}")

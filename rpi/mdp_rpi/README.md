@@ -524,7 +524,7 @@ the robot. The main entry point is `task2.py`; `task2t.py` and
 `task2t_park.py` supply Task 2 route/parking geometry. The previous manual
 SAFE entry point is retained as `task2_safe.py` for bench comparison.
 
-- Startup loads `T2T_CAL_PROFILE=tbricks`, selects TIGHT/profile 0, verifies
+- Startup loads `T2T_CAL_PROFILE=tr00`, selects TIGHT/profile 0, verifies
   calibration readback, zeros heading, and queries WPOSE, IMU, US and IR.
   The route uses `T2T_RADIUS_CM=30.0` and `T2T_FAST=1`. Startup sends
   `!FAST1` and refuses to run if the firmware does not acknowledge it, so the
@@ -613,8 +613,8 @@ SAFE entry point is retained as `task2_safe.py` for bench comparison.
   with at most three candidates and four confirmation queries per candidate;
   an unconfirmed reading is never accepted as the obstacle edge.
 
-Bench validation is still required. `tbricks.json` is marked unverified and
-its measured radii differ between directions. The imported route currently
+Hardware validation is still required. `tr00.json` is verified and carries
+the protocol-10 per-move/per-speed calibration table. The imported route currently
 models obstacle 2 widths of 30-90 cm, not every possible legal width. Camera,
 US and IR mounting offsets must match the robot: `T2_CAMERA_FROM_AXLE_CM=12.5`
 is a provisional camera offset, not the rear-axle-to-ultrasonic measurement.

@@ -333,7 +333,7 @@ class Coordination(unittest.TestCase):
             output_dir.mkdir(exist_ok=True)
             (output_dir / path.name).write_bytes(path.read_bytes())
             stage = 1 if "stage1" in path.name else 2
-            self.assertEqual(selection_policy, "nearest" if stage == 1 else "unique_arrow")
+            self.assertEqual(selection_policy, "nearest")
             thresholds[stage].append(target_confidence)
             detections[stage] += 1
             if detections[stage] == 1:
@@ -374,7 +374,7 @@ class Coordination(unittest.TestCase):
                                  [path.name for path in annotated])
                 self.assertEqual(detections, {1: 3, 2: 3})
                 self.assertEqual(set(thresholds[1]), {0.70})
-                self.assertEqual(set(thresholds[2]), {0.60})
+                self.assertEqual(set(thresholds[2]), {0.50})
             finally:
                 stop.set()
                 pi.join(1)
@@ -397,7 +397,7 @@ class Coordination(unittest.TestCase):
         for frame in (1, 2):
             replies.append("ARROW," + json.dumps({
                 "run_id": "run", "stage": 2, "frame_id": frame,
-                "min_confidence": 0.60, "direction": "left",
+                "min_confidence": 0.50, "direction": "left",
                 "confidence": 0.68,
             }))
         replies.append("SAVED,2")
@@ -422,7 +422,7 @@ class Coordination(unittest.TestCase):
         requests = [json.loads(call.kwargs["header"].split(",", 1)[1])
                     for call in pc.send_image.call_args_list]
         self.assertEqual([request["min_confidence"] for request in requests],
-                         [0.60, 0.60])
+                         [0.50, 0.50])
 
     def test_mismatched_response_rejected(self):
         pc = Mock()

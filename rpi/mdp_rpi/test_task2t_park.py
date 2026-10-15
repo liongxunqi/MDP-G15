@@ -187,23 +187,19 @@ class Obstacle2CornerExecution(unittest.TestCase):
         route._line = Mock(return_value=True)
         return route
 
-    def test_mirrored_corners_are_sent_separately_at_precision_speed(self):
+    def test_mirrored_full_margin_corners_are_sent_continuously(self):
         for kind in ("L", "R"):
             with self.subTest(kind=kind):
                 route = self.make_route()
                 segs = [t2.Seg(kind, 90), t2.Seg("F", 4), t2.Seg(kind, 90)]
                 p = Pose(0, 0, 0)
-                samples = []
-                for seg in segs:
-                    end = t2.run(p, [seg], route.r)[-1]
-                    samples.extend([p, end])
-                    p = end
-                route._pose = Mock(side_effect=samples)
+                end = t2.run(p, segs, route.r)[-1]
+                route._pose = Mock(side_effect=[p, end])
                 course = Mock()
                 course.boxes.return_value = []
                 self.assertTrue(route.execute_obstacle2_corner(segs, course))
                 self.assertEqual([c.args[0] for c in route._line.call_args_list],
-                                 [[s] for s in segs])
+                                 [segs])
                 route._set_fast.assert_called_once_with(False)
 
     def test_collision_blocks_first_command(self):
@@ -214,24 +210,22 @@ class Obstacle2CornerExecution(unittest.TestCase):
         self.assertFalse(route.execute_obstacle2_corner([t2.Seg("L", 90)], course))
         route._line.assert_not_called()
 
-    def test_finite_deviation_rechecks_and_continues_from_measured_pose(self):
+    def test_finite_continuous_completion_error_is_retained(self):
         for offset, angle in ((11, 0), (0, 10)):
             with self.subTest(offset=offset, angle=angle):
                 route = self.make_route()
                 p = Pose(0, 0, 0)
                 segs = [t2.Seg("L", 90), t2.Seg("L", 90)]
-                expected = t2.run(p, segs[:1], route.r)[-1]
+                expected = t2.run(p, segs, route.r)[-1]
                 measured = Pose(expected.x + offset, expected.y,
                                 expected.th + math.radians(angle))
-                finished = t2.run(measured, segs[1:], route.r)[-1]
-                route._pose = Mock(side_effect=[p, measured, measured, finished])
+                route._pose = Mock(side_effect=[p, measured])
                 course = Mock()
                 course.boxes.return_value = []
                 self.assertTrue(route.execute_obstacle2_corner(segs, course))
-                self.assertEqual(route._line.call_args_list,
-                                 [call(segs[:1]), call(segs[1:])])
+                route._line.assert_called_once_with(segs)
 
-    def test_invalid_completion_pose_still_withholds_second_turn(self):
+    def test_invalid_continuous_completion_pose_withholds_next_motion(self):
         route = self.make_route()
         p = Pose(0, 0, 0)
         segs = [t2.Seg("L", 90), t2.Seg("L", 90)]
@@ -242,7 +236,7 @@ class Obstacle2CornerExecution(unittest.TestCase):
         course.boxes.return_value = []
 
         self.assertFalse(route.execute_obstacle2_corner(segs, course))
-        route._line.assert_called_once_with(segs[:1])
+        route._line.assert_called_once_with(segs)
 
     def test_ir_uncertainty_expands_box_not_walls_or_calibration(self):
         route = self.make_route()
@@ -383,254 +377,18 @@ class Obstacle2CornerExecution(unittest.TestCase):
             t2.run(stopped, retreat + corner, route.r), course.boxes())
         self.assertGreaterEqual(gap, task2.TURN_CLEARANCE_CM)
 
-    def test_remaining_sweep_is_rechecked_after_small_pose_error(self):
+    def test_unsafe_complete_sweep_is_withheld_before_first_arc(self):
         route = self.make_route()
         segs = [t2.Seg("L", 90), t2.Seg("L", 90)]
         p = Pose(0, 0, 0)
-        expected = t2.run(p, segs[:1], route.r)[-1]
-        measured = Pose(expected.x + 1, expected.y, expected.th)
-        route._pose = Mock(side_effect=[p, measured, measured])
+        route._pose = Mock(return_value=p)
         course = Mock()
         course.boxes.return_value = []
-        with patch.object(t2, "path_clearance", side_effect=[(8, "box"), (2, "box")]):
+        with patch.object(t2, "path_clearance", return_value=(2, "box")):
             self.assertFalse(route.execute_obstacle2_corner(segs, course))
-        route._line.assert_called_once_with(segs[:1])
-
-
-class Stage2CameraGate(unittest.TestCase):
-    def test_logged_bypass_opens_fresh_vision_with_checked_recovery_on_both_sides(self):
-        import task2t as route_module
-        for side in (-1, 1):
-            with self.subTest(side=side):
-                notify = Mock()
-                route = route_module.Task2(Mock(), startup=False,
-                                           lane_reached_fn=notify)
-                pose = Pose(42.1, side * 18.6, -side * math.radians(.9))
-                course = Course(71.7, 152.3, 90,
-                                wall_y=route_module.CONSERVATIVE_WALL_Y)
-                route._pose = lambda: pose
-                sent = []
-
-                def move(segs):
-                    nonlocal pose
-                    sent.append(segs)
-                    clearance = route._check(pose, segs, course)
-                    self.assertGreaterEqual(clearance, t2.CLEARANCE_FLOOR_CM)
-                    pose = t2.run(pose, segs, route.r)[-1]
-                    return True
-
-                route._line = move
-                route._prepare_obstacle2_view(course)
-                self.assertEqual(len(sent), 1)
-                join = route.select_face_handoff(pose, course, side, -side)
-                if join is None:
-                    self.assertIsNotNone(route._stage2_view_origin)
-                    inverse = {"F": "B", "L": "l", "R": "r"}
-                    retreat = [t2.Seg(inverse[s.kind], s.value)
-                               for s in reversed(sent[0])]
-                    self.assertGreaterEqual(route._check(pose, retreat, course),
-                                            t2.CLEARANCE_FLOOR_CM)
-                else:
-                    self.assertTrue(all(s.kind in ("F", "L", "R") for s in join[0]))
-                self.assertGreaterEqual(route._first_board_behind_camera(pose, course.x1),
-                                        route_module.STAGE2_REAR_EXCLUSION_CM)
-                notify.assert_called_once_with()
-                route._prepare_obstacle2_view(course)
-                self.assertEqual(len(sent), 1)
-                notify.assert_called_once_with()
-
-    def test_direct_view_is_preserved_when_forward_handoff_is_available(self):
-        import task2t as route_module
-        route = route_module.Task2(Mock(), startup=False)
-        p = Pose(42.1, -18.6, math.radians(.9))
-        course = Course(71.7, 152.3, 90)
-        with patch.object(route, "select_face_handoff",
-                          return_value=([t2.Seg("L", 90)], False, 8.0)):
-            expected = int(math.ceil(
-                route_module.STAGE2_REAR_EXCLUSION_CM
-                - route._first_board_behind_camera(
-                    p, course.x1, course.obs1_y)))
-            self.assertEqual(route._select_obstacle2_view(p, course),
-                             [t2.Seg("F", expected)])
-
-    def test_gate_keeps_vision_closed_when_all_routes_hit_clearance_floor(self):
-        import task2t as route_module
-        notify = Mock()
-        route = route_module.Task2(Mock(), startup=False, lane_reached_fn=notify)
-        route._pose = Mock(return_value=Pose(42.1, -17, math.radians(.9)))
-        route._line = Mock()
-        route._check = Mock(return_value=2.5)
-        with self.assertRaisesRegex(RuntimeError, "camera-gate.*clearance"):
-            route._prepare_obstacle2_view(Course(71.7, 152.3, 90))
         route._line.assert_not_called()
-        notify.assert_not_called()
 
-    def test_latest_logged_gate_has_checked_curved_exit_at_configured_radii(self):
-        import task2t as route_module
-        for radius in (29.1, 30.0, 31.5):
-            for side in (-1, 1):
-                with self.subTest(radius=radius, side=side):
-                    notify = Mock()
-                    route = route_module.Task2(Mock(), startup=False,
-                                               lane_reached_fn=notify)
-                    route.r = radius
-                    route.fast = route_module.FAST
-                    route.obs2_us_y = side * 15.5
-                    pose = Pose(39.8, side * 17.8, -side * math.radians(1.2))
-                    course = Course(69.7, 149.0, 90,
-                                    wall_y=route_module.CONSERVATIVE_WALL_Y)
-                    route._pose = lambda: pose
-                    self.assertLess(route._check(pose, [t2.Seg("F", 34)], course),
-                                    t2.CLEARANCE_FLOOR_CM)
-                    sent = []
 
-                    def move(segs):
-                        nonlocal pose
-                        self.assertTrue(all(s.kind in ("F", "L", "R") for s in segs))
-                        self.assertGreaterEqual(route._check(pose, segs, course),
-                                                t2.CLEARANCE_FLOOR_CM)
-                        sent.append(segs)
-                        pose = t2.run(pose, segs, radius)[-1]
-                        return True
-
-                    route._line = move
-                    route._prepare_obstacle2_view(course)
-                    self.assertEqual(len(sent), 1)
-                    notify.assert_called_once_with()
-                    self.assertGreaterEqual(route._first_board_behind_camera(pose, course.x1),
-                                            route_module.STAGE2_REAR_EXCLUSION_CM)
-                    join = route.select_face_handoff(pose, course, side, -side)
-                    self.assertIsNotNone(join)
-                    self.assertTrue(all(s.kind in ("F", "L", "R") for s in join[0]))
-                    self.assertGreaterEqual(route._check(pose, join[0], course),
-                                            t2.CLEARANCE_FLOOR_CM)
-                    self.assertEqual(route.r, radius)
-
-    def test_curved_view_recovery_retraces_arcs_not_blind_straight(self):
-        import task2t as route_module
-        route = route_module.Task2(Mock(), startup=False)
-        origin = Pose(39.8, -17.8, math.radians(1.2))
-        course = Course(69.7, 149, 90,
-                        wall_y=route_module.CONSERVATIVE_WALL_Y)
-        path = [t2.Seg("R", 45), t2.Seg("L", 45)]
-        route._stage2_view_origin = origin
-        route._stage2_view_segments = path
-        pose = t2.run(origin, path, route.r)[-1]
-        route._pose = lambda: pose
-        sent = []
-
-        def move(segs):
-            nonlocal pose
-            self.assertGreaterEqual(route._check(pose, segs, course),
-                                    t2.CLEARANCE_FLOOR_CM)
-            sent.append(segs)
-            pose = t2.run(pose, segs, route.r)[-1]
-            return True
-
-        route._line = move
-        route.select_face_handoff = Mock(side_effect=[None, ([t2.Seg("L", 90)], False, 8)])
-        route._execute_face_handoff = Mock(return_value=False)
-        route.around_obstacle2(course, -1, 1)
-        self.assertEqual(sent, [[t2.Seg("l", 45), t2.Seg("r", 45)]])
-        self.assertAlmostEqual(pose.x, origin.x)
-        self.assertAlmostEqual(pose.y, origin.y)
-        self.assertIsNone(route._stage2_view_segments)
-
-    def test_drifted_curved_view_still_uses_checked_inverse(self):
-        """Regression for 06:45: same arrows must not strand the camera pose."""
-        import task2t as route_module
-        route = route_module.Task2(Mock(), startup=False)
-        origin = Pose(39.0, -27.3, math.radians(.3))
-        path = [t2.Seg("R", 8), t2.Seg("F", 45), t2.Seg("F", 3),
-                t2.Seg("L", 90)]
-        nominal = t2.run(origin, path, route.r, step=1e6)[-1]
-        pose = Pose(nominal.x + 4.0, nominal.y, nominal.th)
-        course = Course(35.6, 127.9, 50.0)
-        route._stage2_view_origin = origin
-        route._stage2_view_segments = path
-        route._pose = lambda: pose
-        sent = []
-
-        def move(segs):
-            nonlocal pose
-            sent.append(segs)
-            pose = t2.run(pose, segs, route.r, step=1e6)[-1]
-            return True
-
-        route._line = move
-        route._check = Mock(return_value=8.0)
-        route.select_face_handoff = Mock(
-            side_effect=[None, ([t2.Seg("R", 90)], False, 8.0)])
-        route._execute_face_handoff = Mock(return_value=False)
-
-        route.around_obstacle2(course, -1, -1)
-
-        self.assertEqual(sent, [[t2.Seg("l", 90), t2.Seg("B", 3),
-                                 t2.Seg("B", 45), t2.Seg("r", 8)]])
-        self.assertGreater(math.hypot(pose.x - origin.x, pose.y - origin.y),
-                           3.0)
-        route._execute_face_handoff.assert_called_once()
-
-    def test_logged_pose_reaches_parking_for_all_four_arrow_pairs(self):
-        import task2t as route_module
-        from task2t_sim import FakeSTM, run_clearance
-        for side1 in (1, -1):
-            for side2 in (1, -1):
-                with self.subTest(side1=side1, side2=side2):
-                    actual = Course(69.7, 149, 60)
-                    planned = Course(69.7, 149, 90,
-                                     wall_y=route_module.CONSERVATIVE_WALL_Y)
-                    stm = FakeSTM(actual, t2.WorldFrame(None).start, t2.RADIUS_CM)
-                    route = route_module.Task2(
-                        stm, input_fn=lambda _: "left" if side2 > 0 else "right",
-                        sleep_fn=lambda _: None, startup=False, wait_for_go=False)
-                    route.fast = route_module.FAST
-                    stm.set_fast(route.fast)
-                    self.assertTrue(route.frame.anchor())
-                    stm.pose = Pose(39.8, side1 * 17.8, -side1 * math.radians(1.2))
-                    stm.trace = [stm.pose]
-                    route.obs2_us_y = side1 * 15.5
-                    # Production task2.py uses measured, not commanded, heading.
-                    route._pose = route.frame.pose
-                    route.photo_obstacle2(planned, side1)
-                    measured = route.around_obstacle2(planned, side1, side2)
-                    self.assertIsNotNone(measured)
-                    self.assertTrue(t2.ParkRunner(stm, route.frame, measured).run())
-                    self.assertGreaterEqual(run_clearance(stm, actual)[0],
-                                            t2.CLEARANCE_FLOOR_CM)
-                    self.assertTrue(all(-t2.BAY_DEPTH_CM <= x <= 0
-                                        and abs(y) <= t2.BAY_HALF_WIDTH_CM
-                                        for x, y in t2.footprint(stm.pose)))
-
-    def test_logged_view_can_restore_handoff_room_on_either_side(self):
-        import task2t as route_module
-        for side in (-1, 1):
-            with self.subTest(side=side):
-                route = route_module.Task2(Mock(), startup=False)
-                course = Course(71.7, 152.3, 90,
-                                wall_y=route_module.CONSERVATIVE_WALL_Y)
-                origin = Pose(42.1, side * 18.6, -side * math.radians(.9))
-                route._stage2_view_origin = origin
-                pose = t2.run(origin, [t2.Seg("F", 34)], route.r)[-1]
-                route._pose = lambda: pose
-                sent = []
-
-                def move(segs):
-                    nonlocal pose
-                    self.assertGreaterEqual(route._check(pose, segs, course),
-                                            t2.CLEARANCE_FLOOR_CM)
-                    sent.append(segs)
-                    pose = t2.run(pose, segs, route.r)[-1]
-                    return True
-
-                route._line = move
-                # Stop at dispatch: this test checks real planning and the
-                # viewing retreat, not simulated IR measurements of the box.
-                route._execute_face_handoff = Mock(return_value=False)
-                route.around_obstacle2(course, side, -side)
-                self.assertEqual(sent, [[t2.Seg("B", 34)]])
-                route._execute_face_handoff.assert_called_once()
-                self.assertIsNone(route._stage2_view_origin)
 
 
 class FaceScanContinuation(unittest.TestCase):
@@ -790,6 +548,88 @@ class MeasuredForwardFlow(unittest.TestCase):
 
 
 class ForwardOnlyHandoff(unittest.TestCase):
+    def test_known_second_face_turns_inward_without_width_probe_s_turn(self):
+        """Image two follows the first parallel pose, with no second S-shift."""
+        import task2t as task2
+        route = task2.Task2(Mock(), startup=False, wait_for_go=False)
+        route.frame.anchor = Mock(return_value=True)
+        route.obstacle1 = Mock(return_value=(33.5, 1.0))
+        route.pass_obstacle1 = Mock(return_value=113.7)
+        route.position_obstacle2_camera = Mock(return_value=False)
+
+        self.assertEqual(route.run(), 1)
+
+        route.position_obstacle2_camera.assert_called_once()
+        course, side = route.position_obstacle2_camera.call_args.args
+        self.assertEqual(side, 1.0)
+        self.assertAlmostEqual(course.x1, 33.5)
+        self.assertAlmostEqual(course.x2, 113.7)
+
+    def test_1224_calibrated_pose_adds_only_the_needed_forward_lead(self):
+        """The protocol-10 run stopped 1.3 cm inside the nominal bay pose.
+
+        Its no-lead left S-turn kept 7.0 cm to the bay fence, just below the
+        measured execution floor.  The planner must move the whole turn
+        forward as one checked command rather than abort or reverse.
+        """
+        import task2t as task2
+        route = task2.Task2(Mock(), startup=False)
+        route.r = 30.0
+        pose = Pose(-16.8, 0.4, 0.0)
+        route._pose = Mock(return_value=pose)
+        route._line = Mock(return_value=False)
+
+        self.assertIsNone(route.pass_obstacle1(43.4, 1.0))
+
+        sent = route._line.call_args.args[0]
+        self.assertEqual(sent[0].kind, "F")
+        self.assertLessEqual(sent[0].value,
+                             task2.OBS1_FORWARD_LEAD_MAX_CM)
+        self.assertEqual([s.kind for s in sent[1:]], ["L", "R"])
+        course = Course(43.4, 43.4 + t2.OBS1_SIZE_CM + 60.0,
+                        task2.CONSERVATIVE_W2,
+                        wall_y=task2.CONSERVATIVE_WALL_Y)
+        self.assertGreaterEqual(route._check(pose, sent, course),
+                                task2.OBS1_TURN_MIN_CM)
+
+    def test_1332_short_f20_uses_sensor_bounded_lead_for_both_sides(self):
+        """A short physical F20 must not make obstacle 1 abort at the bay mouth.
+
+        The logged WPOSE advanced 16.5 cm and US still left 40.7 cm.  Clearing
+        the fence needs a 13 cm lead, beyond the former fixed 10 cm cap.  It
+        remains one forward-only command with the two contiguous arcs.
+        """
+        import task2t as task2
+        for side in (1.0, -1.0):
+            with self.subTest(side=side):
+                route = task2.Task2(Mock(), startup=False)
+                route.r = 30.0
+                pose = Pose(-29.0, 0.25, 0.0)
+                x1 = pose.x + t2.FRONT_FROM_AXLE_CM + 40.7
+                route._pose = Mock(return_value=pose)
+                route._stable_us = Mock(return_value=40.7)
+                route._ir = Mock(return_value=None)
+                route._line = Mock(return_value=False)
+
+                self.assertIsNone(route.pass_obstacle1(x1, side))
+
+                sent = route._line.call_args.args[0]
+                self.assertEqual(sent[0], t2.Seg("F", 13))
+                self.assertEqual([seg.kind for seg in sent[1:]],
+                                 ["L", "R"] if side > 0 else ["R", "L"])
+                self.assertTrue(all(seg.kind in ("F", "L", "R")
+                                    for seg in sent))
+                self.assertLessEqual(sent[0].value,
+                                     int(math.floor(40.7 -
+                                         task2.OBS1_LIVE_US_MIN_CM)))
+                course = Course(
+                    x1, x1 + t2.OBS1_SIZE_CM + 60.0,
+                    task2.CONSERVATIVE_W2,
+                    wall_y=task2.CONSERVATIVE_WALL_Y)
+                self.assertGreaterEqual(
+                    route._check(pose, sent, course),
+                    task2.OBS1_TURN_FALLBACK_MIN_CM)
+
     def test_front_face_ir_route_precedes_direct_outer_route(self):
         import task2t as task2
         for side in (-1, 1):
@@ -869,7 +709,7 @@ class ForwardOnlyHandoff(unittest.TestCase):
     def test_logged_right_left_pose_reaches_a_forward_handoff(self):
         """Regression for 19:59: do not strand an early stage-2 result."""
         import task2t as task2
-        route = task2.Task2(Mock(), startup=False, center_stage2=True)
+        route = task2.Task2(Mock(), startup=False)
         route.obs2_us_y = -20.8
         start = Pose(36.6, -20.8, math.radians(1.0))
         course = Course(65.7, 156.8, 90,
@@ -995,134 +835,10 @@ class ForwardOnlyHandoff(unittest.TestCase):
 
         self.assertIsNone(route.pass_obstacle1(80.0, 1.0))
 
-    def test_sensing_lane_uses_confirmed_miss_as_width_bound(self):
-        import task2t as task2
-        route = task2.Task2(Mock(), startup=False)
-        route.obs2_us_y = 21
-        route._pose = Mock(side_effect=[Pose(50, 21, 0), Pose(87, 35, 0),
-                                       Pose(50, 21, 0)])
-        route._line = Mock(return_value=True)
-        route._us = Mock(return_value=None)
-        self.assertTrue(route.prepare_forward_lane(Course(80, 150, 90), 1))
-        self.assertEqual(route.obs2_us_y, 21)
-        self.assertIsNotNone(route.obs2_half_max)
-        route._line.assert_called_once()
-        route._line.reset_mock()
-        route._check = Mock(return_value=0)
-        self.assertFalse(route.prepare_forward_lane(Course(80, 150, 90), 1))
-        route._line.assert_not_called()
 
-    def test_logged_heading_drift_is_absorbed_by_sensing_lane(self):
-        import task2t as task2
-        route = task2.Task2(Mock(), startup=False)
-        route.obs2_us_y = 14.6
-        start = Pose(56.7, 14.6, math.radians(-6.7))
-        route._pose = Mock(return_value=start)
-        route._line = Mock(return_value=True)
-        route._confirm_sensing_lane = Mock(return_value=True)
-        course = Course(86.7, 177.7, 90,
-                        wall_y=task2.CONSERVATIVE_WALL_Y)
 
-        self.assertTrue(route.prepare_forward_lane(course, 1))
 
-        sent = route._line.call_args_list
-        self.assertEqual(len(sent), 1)
-        segs = sent[0].args[0]
-        self.assertIn(t2.Seg("L", 7), segs)
-        clearance = min(route._check(start, segs, candidate)
-                        for candidate in route.same_side_courses(course))
-        self.assertGreaterEqual(
-            clearance, t2.execution_clearance(t2.CLEARANCE_CM))
-        route._confirm_sensing_lane.assert_called_once_with(course)
 
-    def test_logged_two_degree_heading_uses_existing_lane_arcs(self):
-        import task2t as task2
-        for side in (-1, 1):
-            with self.subTest(side=side):
-                route = task2.Task2(Mock(), startup=False)
-                route.r = 30.0
-                route.obs2_us_y = side * 19.2
-                pose = Pose(40.5, side * 19.2, math.radians(side * 2.1))
-                course = Course(71.1, 162.7, 90, wall_y=65)
-                route._pose = lambda: pose
-                sent = []
-
-                def move(segs):
-                    nonlocal pose
-                    clearance = min(route._check(pose, segs, c)
-                                    for c in route.same_side_courses(course))
-                    self.assertGreaterEqual(clearance, t2.CLEARANCE_FLOOR_CM)
-                    self.assertTrue(all(s.kind == "F" or s.value >= t2.MIN_ARC_DEG
-                                        for s in segs))
-                    sent.append(segs)
-                    pose = t2.run(pose, segs, route.r)[-1]
-                    return True
-
-                route._line = move
-                route._us = Mock(return_value=220)
-                self.assertTrue(route.prepare_forward_lane(course, side))
-                self.assertEqual(len(sent), 1)
-                self.assertEqual(len(sent[0]), 2)
-                self.assertLess(abs(math.degrees(pose.th)), 0.5)
-                self.assertIsNotNone(route.obs2_half_max)
-
-    def test_small_sensing_drift_does_not_disable_width_refinement(self):
-        import task2t as task2
-        for side in (-1, 1):
-            with self.subTest(side=side):
-                route = task2.Task2(Mock(), startup=False)
-                route.r = 30.0
-                route.obs2_us_y = side * 19.2
-                route.obs2_half_max = 38.5
-                course = Course(71.1, 162.7, 90, wall_y=65)
-                pose = Pose(84.9, side * 34.4, math.radians(side * 3.1))
-                route._pose = lambda: pose
-                route._confirm_sensing_lane = Mock(return_value=True)
-                sent = []
-
-                def move(segs):
-                    nonlocal pose
-                    self.assertGreaterEqual(min(route._check(pose, segs, c)
-                                                for c in route.same_side_courses(course)),
-                                            t2.execution_clearance(t2.CLEARANCE_CM))
-                    sent.extend(segs)
-                    pose = t2.run(pose, segs, route.r)[-1]
-                    return True
-
-                route._line = move
-                self.assertTrue(route.refine_forward_width(course, side))
-                self.assertEqual(len(sent), 2)
-                self.assertTrue(all(s.value >= t2.MIN_ARC_DEG for s in sent))
-                self.assertLess(abs(math.degrees(pose.th)), 0.5)
-                route._confirm_sensing_lane.assert_called_once_with(course)
-
-    def test_logged_heading_drift_is_absorbed_into_one_sensing_queue(self):
-        import task2t as task2
-        for side in (-1, 1):
-            with self.subTest(side=side):
-                route = task2.Task2(Mock(), startup=False)
-                route.r = 30.0
-                route.obs2_us_y = side * 15.5
-                pose = Pose(43.4, side * 15.5,
-                            -side * math.radians(12.2))
-                course = Course(71.0, 159.2, 90, wall_y=65)
-                route._pose = Mock(return_value=pose)
-                route._confirm_sensing_lane = Mock(return_value=True)
-                route._line = Mock(return_value=True)
-
-                self.assertTrue(route.prepare_forward_lane(course, side))
-
-                route._line.assert_called_once()
-                segs = route._line.call_args.args[0]
-                self.assertEqual(segs[0], t2.Seg("B", 8))
-                self.assertEqual(segs[1].kind, "L" if side > 0 else "R")
-                self.assertTrue(all(seg.value >= t2.MIN_ARC_DEG
-                                    for seg in segs if seg.kind in ("L", "R")))
-                clearance = min(route._check(pose, segs, candidate)
-                                for candidate in route.same_side_courses(course))
-                self.assertGreaterEqual(
-                    clearance, t2.execution_clearance(t2.CLEARANCE_CM))
-                route._confirm_sensing_lane.assert_called_once_with(course)
 
     def test_same_direction_candidates_never_request_reverse(self):
         import task2t as task2
@@ -1264,102 +980,10 @@ class ForwardOnlyHandoff(unittest.TestCase):
                 segs, course, -1, 1, False, 9.0))
         route._line.assert_called_once_with(segs)
 
-    def test_logged_left_sensing_drift_is_aligned_before_measuring(self):
-        import task2t as task2
-        for mirror in (1, -1):
-            route = task2.Task2(Mock(), startup=False)
-            route.obs2_us_y = mirror * 23.7
-            course = Course(72.7, 165.1, 90, wall_y=task2.CONSERVATIVE_WALL_Y)
-            pose = Pose(80.1, mirror * 35.1, math.radians(-7.6 * mirror))
-            route._pose = lambda: pose
-            sent = []
-            def move(segs):
-                nonlocal pose
-                self.assertGreaterEqual(min(route._check(pose, segs, c)
-                                             for c in route.same_side_courses(course)),
-                                        t2.CLEARANCE_CM)
-                sent.extend(segs)
-                pose = t2.run(pose, segs, route.r)[-1]
-                return True
-            route._line = move
-            route._us = lambda: (course.x2 - pose.x) / math.cos(pose.th) - t2.FRONT_FROM_AXLE_CM
-            self.assertTrue(route._confirm_sensing_lane(course))
-            self.assertEqual([s.token() for s in sent], ["FL8" if mirror == 1 else "FR8"])
-            selected = route.select_face_handoff(pose, course, mirror, mirror)
-            self.assertIsNotNone(selected)
-            self.assertFalse(selected[1])
-            self.assertGreaterEqual(selected[2], t2.CLEARANCE_FLOOR_CM)
 
-    def test_logged_four_degree_sensing_drift_is_projected_without_tiny_arc(self):
-        import task2t as task2
-        for mirror in (1, -1):
-            route = task2.Task2(Mock(), startup=False)
-            route.obs2_us_y = mirror * 23.7
-            course = Course(72.7, 165.1, 90,
-                            wall_y=task2.CONSERVATIVE_WALL_Y)
-            pose = Pose(111.4, mirror * 31.6,
-                        math.radians(-4.7 * mirror))
-            route._pose = Mock(return_value=pose)
-            route._line = Mock(return_value=True)
-            echo = ((course.x2 - pose.x) / math.cos(pose.th)
-                    - t2.FRONT_FROM_AXLE_CM)
-            route._us = Mock(return_value=echo)
 
-            self.assertTrue(route._confirm_sensing_lane(course))
-            route._line.assert_not_called()
-            expected_y = (pose.y
-                          + (t2.FRONT_FROM_AXLE_CM + echo) * math.sin(pose.th))
-            self.assertAlmostEqual(route.obs2_us_y, expected_y, places=6)
 
-    def test_logged_background_echo_uses_bounded_probe_not_new_face(self):
-        import task2t as task2
-        for side in (-1, 1):
-            route = task2.Task2(Mock(), startup=False)
-            route.obs2_us_y = side * 17.9
-            course = Course(62.6, 155.2, 90, wall_y=task2.CONSERVATIVE_WALL_Y)
-            pose = Pose(75.1, side * 35.6, math.radians(-side * 2))
-            route._pose = lambda: pose
-            route._us = Mock(return_value=230.7)
-            self.assertTrue(route._confirm_sensing_lane(course))
-            self.assertEqual(course.x2, 155.2)
-            self.assertGreater(route.obs2_half_max, 17.9)
-            self.assertLess(route.obs2_half_max, 40)
-            def move(segs):
-                nonlocal pose
-                self.assertTrue(all(s.kind in ("F", "L", "R") for s in segs))
-                self.assertGreaterEqual(min(route._check(pose, segs, c)
-                                             for c in route.same_side_courses(course)),
-                                        t2.CLEARANCE_CM)
-                pose = t2.run(pose, segs, route.r)[-1]
-                return True
-            route._line = move
-            route._us = lambda: (course.x2 - pose.x) / math.cos(pose.th) - t2.FRONT_FROM_AXLE_CM
-            self.assertTrue(route.refine_forward_width(course, side))
-            selected = route.select_face_handoff(pose, course, side, side)
-            self.assertIsNotNone(selected)
-            self.assertFalse(selected[1])
 
-    def test_sensing_does_not_narrow_on_unstable_or_closer_echo(self):
-        import task2t as task2
-        for hits in ([230, 190], [None, 230], [20, 20]):
-            route = task2.Task2(Mock(), startup=False)
-            route.obs2_us_y = -17.9
-            route._pose = Mock(return_value=Pose(75.1, -35.6, 0))
-            route._us = Mock(side_effect=hits)
-            self.assertFalse(route._confirm_sensing_lane(Course(62.6, 155.2, 90)))
-            self.assertIsNone(route.obs2_half_max)
-
-    def test_sensing_alignment_never_bypasses_collision_check(self):
-        import task2t as task2
-        route = task2.Task2(Mock(), startup=False)
-        route.obs2_us_y = 23.7
-        route._pose = Mock(return_value=Pose(80.1, 35.1, math.radians(-7.6)))
-        route._check = Mock(return_value=0)
-        route._line = Mock()
-        route._us = Mock()
-        self.assertFalse(route._confirm_sensing_lane(Course(72.7, 165.1, 90)))
-        route._line.assert_not_called()
-        route._us.assert_not_called()
 
     def test_front_approach_is_checked_and_faces_requested_end(self):
         import task2t as task2
@@ -1533,6 +1157,45 @@ class EndToEnd(unittest.TestCase):
         self.assertIsNotNone(measured)
         route.stm.abort.assert_called_once()
         route._wait_for_stopped_pose.assert_called_once()
+
+    def test_front_face_already_past_known_edge_turns_without_forward_scan(self):
+        """Two stationary no-face reads skip travel when IR passed the edge."""
+        import task2t as task2
+
+        route = task2.Task2(Mock(), startup=False, sleep_fn=lambda _: None)
+        # Regression from the 12:47 floor run: after F2,FR63 the axle was at
+        # y=-59.7 and the forward-mounted IR was farther beyond the right end.
+        pose = Pose(93.9, -59.7, math.radians(-107.8))
+        route._pose = Mock(return_value=pose)
+        route.frame.pose = Mock(return_value=pose)
+        route._ir = Mock(side_effect=[65, 56])
+
+        with patch.object(t2, "run_polling") as moving_scan:
+            measured = route.follow_face(
+                "F36", 119.3, +1, -1, 18,
+                minimum_edge_y=-15.0)
+
+        self.assertEqual(measured, (-15.0, 119.3))
+        self.assertEqual(route.last_stopped_pose, pose)
+        moving_scan.assert_not_called()
+        route.stm.abort.assert_not_called()
+
+    def test_front_face_absence_before_known_edge_does_not_turn_early(self):
+        """No-face readings are not an edge until the IR reaches its bound."""
+        import task2t as task2
+
+        route = task2.Task2(Mock(), startup=False, sleep_fn=lambda _: None)
+        pose = Pose(93.9, 10.0, -math.pi / 2)
+        route._pose = Mock(return_value=pose)
+        route.frame.pose = Mock(return_value=pose)
+        route._ir = Mock(side_effect=[65, 56])
+
+        with patch.object(t2, "run_polling", return_value="OK") as moving_scan:
+            self.assertIsNone(route.follow_face(
+                "F2", 119.3, +1, -1, 18,
+                minimum_edge_y=-15.0))
+
+        moving_scan.assert_called_once()
 
     def test_220643_left_right_false_edge_is_not_accepted(self):
         import task2t as task2
@@ -1832,22 +1495,6 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(polling.call_count, 3)
         self.assertIsNone(route.obs2_near_y)
 
-    def test_logged_unknown_width_requires_sensing_before_forward_turn(self):
-        import task2t as task2
-        for side in (1.0, -1.0):
-            with self.subTest(side=side):
-                route = task2.Task2(Mock(), startup=False)
-                route.r = 30.0
-                route.obs2_us_y = side * 26.44408467668212
-                pose = Pose(86.0, side * 26.8, math.radians(-side * 0.5))
-                course = Course(83.7, 162.56, 90.0, wall_y=65.0)
-                selected = route.select_face_handoff(pose, course, side, side)
-                self.assertIsNone(selected)
-                route._pose = Mock(return_value=pose)
-                route.prepare_forward_lane = Mock(return_value=False)
-                self.assertIsNone(route.around_obstacle2(course, side, side))
-                route.prepare_forward_lane.assert_called_once_with(course, side)
-                route.stm.send_line.assert_not_called()
 
     def test_confirmed_photo_does_not_search_or_reposition(self):
         import task2t as task2
@@ -1958,8 +1605,8 @@ class EndToEnd(unittest.TestCase):
         for first_side, first_turn, edge_ir in (
                 (-1.0, "R", "right"), (1.0, "L", "left")):
             with self.subTest(first_side=first_side, pairing="same"):
-                # After the checked outward sensing lane, matching arrows
-                # advance first and begin toward their named passing side.
+                # From the checked angled camera pose, matching arrows advance
+                # first and begin toward their named passing side.
                 same = task2.Task2(Mock(), startup=False)
                 same.r = 30.0
                 same.obs2_us_y = first_side * 24.6
@@ -1998,40 +1645,6 @@ class EndToEnd(unittest.TestCase):
                 self.assertEqual(crossing._ir_facing(end.th, 1.0), edge_ir)
                 self.assertGreaterEqual(clearance, t2.CLEARANCE_FLOOR_CM)
 
-    def test_matching_arrows_stop_on_the_mirrored_inward_ir(self):
-        """A clear parallel lane advances until the IR facing obstacle 2 hits."""
-        import task2t as task2
-
-        course = Course(60, 140, 30)
-        for side, sensor in ((1.0, "right"), (-1.0, "left")):
-            with self.subTest(side=side):
-                route = task2.Task2(Mock(), startup=False,
-                                    sleep_fn=lambda _: None)
-                start = Pose(100, side * 40, 0)
-                hit = Pose(125, side * 40, 0)
-                settled = Pose(126, side * 40, 0)
-                route._pose = Mock(return_value=start)
-                route.frame.pose = Mock(return_value=hit)
-                route._check = Mock(return_value=10.0)
-                route._ir = Mock(side_effect=[20.0, 20.0, 20.0])
-                route._wait_for_stopped_pose = Mock(return_value=settled)
-
-                def stopped(_stm, token, poll):
-                    self.assertEqual(token, "F39")
-                    self.assertTrue(poll())
-                    return "STOPPED"
-
-                with patch.object(task2.tp, "run_polling",
-                                  side_effect=stopped):
-                    measured = route.approach_same_side_until_ir(course, side)
-
-                self.assertIsNotNone(measured)
-                self.assertAlmostEqual(measured.x2, 140.0)
-                self.assertAlmostEqual(route.obs2_near_y, side * 15.0,
-                                       delta=0.3)
-                self.assertEqual(route._ir.call_args_list,
-                                 [call(sensor), call(sensor), call(sensor)])
-                route.stm.abort.assert_called_once_with()
 
     def test_opposite_handoff_starts_ir_over_minimum_width_face(self):
         """Regression for the floor run whose right IR stayed at 42-68 cm."""
@@ -2368,6 +1981,309 @@ class EndToEnd(unittest.TestCase):
 
 
 class MotionOptimisation(unittest.TestCase):
+    def test_1143_narrow_ir_stop_repositions_camera_before_recognition(self):
+        """The side-IR stop must not photograph after passing the front face."""
+        import task2t as route_module
+
+        route = route_module.Task2(Mock(), startup=False)
+        route.r = 30.0
+        route.obs2_near_y = 15.2
+        course = Course(94.5, 160.9, 34.4, wall_y=67.2)
+        state = [Pose(152.3, 41.9, math.radians(-7.3))]
+        sent = []
+        route._pose = lambda: state[0]
+
+        def move(segs):
+            sent.append(list(segs))
+            state[0] = t2.run(state[0], segs, route.r, step=1e6)[-1]
+            return True
+
+        route._line = move
+        self.assertTrue(route.position_obstacle2_camera(course, 1.0))
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(sent[0][0].kind, "B")
+        self.assertEqual(sent[0][1].kind, "R")
+
+        camera = t2.straight(state[0], route_module.CAMERA_FROM_AXLE_CM)
+        target = math.atan2(course.obs2_y - camera.y,
+                            course.x2 - camera.x)
+        error = abs(math.degrees(math.atan2(
+            math.sin(state[0].th - target),
+            math.cos(state[0].th - target))))
+        self.assertLessEqual(error, 6.0)
+        for side2 in (1.0, -1.0):
+            route._handoff_cache = None
+            selected = route.select_face_handoff(
+                state[0], course, 1.0, side2)
+            self.assertIsNotNone(selected)
+            self.assertFalse(selected[1])
+            self.assertTrue(all(seg.kind in ("F", "L", "R")
+                                for seg in selected[0]))
+
+    def test_safe_angled_photo_turn_does_not_read_us(self):
+        """Image two follows the aimed camera ray without US re-centring."""
+        import task2t as task2
+
+        class CameraTurnTask(task2.Task2):
+            def __init__(self):
+                super().__init__(Mock(), startup=False)
+                self.measured = Pose(59.0, 34.7, math.radians(-7.3))
+                self.sent = []
+                self.frame = Mock()
+                self.frame.pose.return_value = None
+
+            def _pose(self):
+                return self.measured
+
+            def _line(self, segs):
+                self.sent.extend(seg.token() for seg in segs)
+                self.measured = t2.run(
+                    self.measured, segs, self.r, step=1e6)[-1]
+                return True
+
+            def _stable_us(self, *args, **kwargs):
+                raise AssertionError("US must not control the camera turn")
+
+        route = CameraTurnTask()
+        course = Course(58.4, 148.5, 90.0,
+                        wall_y=task2.CONSERVATIVE_WALL_Y)
+
+        self.assertTrue(route.position_obstacle2_camera(course, 1.0))
+        self.assertTrue(route.sent[0].startswith("FR"), route.sent)
+        self.assertTrue(any(token.startswith("F")
+                            and not token.startswith(("FL", "FR"))
+                            for token in route.sent), route.sent)
+        camera = t2.straight(route.measured, task2.CAMERA_FROM_AXLE_CM)
+        target = math.atan2(course.obs2_y - camera.y,
+                            course.x2 - camera.x)
+        error = abs(math.degrees(math.atan2(
+            math.sin(route.measured.th - target),
+            math.cos(route.measured.th - target))))
+        self.assertLessEqual(error, 6.0)
+
+    def test_0915_distant_face_links_obstacle_one_to_full_finish_all_pairs(self):
+        """A face outside US range after the inward turn must not stop stage 2."""
+        import task2t as task2
+        import task2t_sim as sim
+
+        class RecordingSTM(sim.FakeSTM):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.lines = []
+
+            def send_line(self, line):
+                self.lines.append(line)
+                return super().send_line(line)
+
+        for first, second in (("left", "left"), ("right", "right"),
+                              ("left", "right"), ("right", "left")):
+            with self.subTest(first=first, second=second):
+                # Latest floor geometry: obstacle 2 was estimated near x=194
+                # (about 119 cm after obstacle 1), so it was not visible to US
+                # immediately after the shallow inward arc.
+                course = t2.Course(65.0, 194.0, 90.0)
+                fake = RecordingSTM(
+                    course, t2.WorldFrame(None).start, t2.RADIUS_CM)
+                arrows = iter((first, second))
+                route = task2.Task2(
+                    fake, input_fn=lambda _: next(arrows),
+                    sleep_fn=lambda _: None, startup=False,
+                    wait_for_go=False)
+
+                # Match the deployed robot geometry printed in the 09:15
+                # log; a laptop without its .env otherwise uses the US/front
+                # offset as the camera offset and changes the turn window.
+                with patch.object(task2, "CAMERA_FROM_AXLE_CM", 12.5):
+                    self.assertEqual(route.run(), 0, fake.lines)
+                self.assertEqual(len(fake.lines[1].split(",")), 2)
+                expected_inward = "FR" if first == "left" else "FL"
+                camera_tokens = fake.lines[2].split(",")
+                camera_turns = [token for token in camera_tokens
+                                if token.startswith(("FL", "FR"))]
+                self.assertEqual(len(camera_turns), 1, fake.lines)
+                self.assertTrue(camera_turns[0].startswith(expected_inward),
+                                fake.lines)
+                # A distant parallel echo must never cause an F lead before
+                # the inward observation sweep and image two.
+                self.assertTrue(fake.lines[2].startswith(expected_inward),
+                                fake.lines)
+                # Recognition happens at the calculated angled endpoint; the
+                # angle varies with the measured obstacle spacing.
+                clearance, obstacle = sim.run_clearance(fake, course)
+                self.assertGreaterEqual(
+                    clearance, t2.CLEARANCE_FLOOR_CM, obstacle)
+
+    def test_1255_lr_camera_pose_turns_directly_without_reverse_or_s_curve(self):
+        """The logged LR pose and mirrored RL need only one inward arc."""
+        import task2t as task2
+
+        for side1 in (1.0, -1.0):
+            with self.subTest(side1=side1):
+                route = task2.Task2(Mock(), startup=False)
+                route.r = 30.0
+                # Reconstructed from WPOSE after FR15,F24 in the 12:55 floor
+                # run, then reflected for RL.
+                pose = Pose(64.1, side1 * 17.4,
+                            math.radians(-side1 * 13.8))
+                course = Course(42.4, 112.3, 90.0, wall_y=95.0)
+                route.obs2_us_y = side1 * 25.7
+
+                selected = route.select_face_handoff(
+                    pose, course, side1, -side1)
+
+                self.assertIsNotNone(selected)
+                segs, reverse, clearance = selected
+                self.assertFalse(reverse)
+                self.assertEqual(len(segs), 1)
+                self.assertEqual(segs[0].kind,
+                                 "R" if side1 > 0 else "L")
+                self.assertFalse(any(seg.kind in ("B", "l", "r")
+                                     for seg in segs))
+                self.assertGreaterEqual(
+                    clearance, task2.HANDOFF_CONTINUOUS_CLEARANCE_CM)
+
+    def test_1255_opposite_route_never_calls_reverse_turn_pocket(self):
+        """Opposite arrows stop safely rather than reverse for turn room."""
+        import task2t as task2
+
+        route = task2.Task2(Mock(), startup=False)
+        route._pose = Mock(return_value=Pose(64.1, 17.4,
+                                             math.radians(-13.8)))
+        route.select_face_handoff = Mock(return_value=None)
+        self.assertIsNone(route.around_obstacle2(
+            Course(42.4, 112.3, 90.0, wall_y=95.0), 1.0, -1.0))
+
+    def test_minimum_gap_all_arrow_pairs_use_only_bounded_same_side_recovery(self):
+        """At 60 cm, LL/RR get one short reverse; LR/RL stay forward-only."""
+        import task2t as task2
+        import task2t_sim as sim
+
+        class RecordingSTM(sim.FakeSTM):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.lines = []
+
+            def send_line(self, line):
+                self.lines.append(line)
+                return super().send_line(line)
+
+        for first, second in (("left", "left"), ("right", "right"),
+                              ("left", "right"), ("right", "left")):
+            with self.subTest(first=first, second=second):
+                course = t2.Course(
+                    66.0, 66.0 + t2.OBS1_SIZE_CM + 60.0, 90.0)
+                fake = RecordingSTM(
+                    course, t2.WorldFrame(None).start, t2.RADIUS_CM)
+                arrows = iter((first, second))
+                route = task2.Task2(
+                    fake, input_fn=lambda _: next(arrows),
+                    sleep_fn=lambda _: None, startup=False,
+                    wait_for_go=False)
+
+                self.assertEqual(route.run(), 0)
+                obstacle1_tokens = fake.lines[1].split(",")
+                self.assertEqual(len(obstacle1_tokens), 2)
+                self.assertTrue(all(
+                    token.startswith("F") and token[1] in "LR"
+                    for token in obstacle1_tokens))
+                # Stage 2 is an append-only continuation: obstacle 1 remains
+                # the established continuous equal-angle S pair, mirrored by
+                # the first arrow, with no straight/reverse inserted.
+                self.assertEqual(obstacle1_tokens[0][2:],
+                                 obstacle1_tokens[1][2:])
+                self.assertEqual(obstacle1_tokens[0][1:2],
+                                 "L" if first == "left" else "R")
+                self.assertEqual(obstacle1_tokens[1][1:2],
+                                 "R" if first == "left" else "L")
+                camera_tokens = fake.lines[2].split(",")
+                first_camera_turn = next(
+                    token for token in camera_tokens
+                    if token.startswith(("FL", "FR")))
+                self.assertTrue(
+                    first_camera_turn.startswith(
+                        "FR" if first == "left" else "FL"),
+                    fake.lines)
+                reverse = [
+                    token for line in fake.lines for token in line.split(",")
+                    if token.startswith("R")
+                    and not token.startswith(("RL", "RR"))]
+                if first == second:
+                    self.assertEqual(len(reverse), 1, fake.lines)
+                    self.assertLessEqual(
+                        int(reverse[0][1:]),
+                        task2.SAME_SIDE_RECOVERY_MAX_CM)
+                else:
+                    self.assertEqual(reverse, [], fake.lines)
+                clearance, obstacle = sim.run_clearance(fake, course)
+                self.assertGreaterEqual(
+                    clearance, t2.CLEARANCE_FLOOR_CM, obstacle)
+
+    def test_latest_diagonal_photo_has_no_inverse_for_all_arrow_pairs(self):
+        """The 07:52 geometry must continue forward after image two."""
+        import task2t as task2
+        import task2t_sim as sim
+
+        class RecordingSTM(sim.FakeSTM):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.lines = []
+
+            def send_line(self, line):
+                self.lines.append(line)
+                return super().send_line(line)
+
+        class MarkingTask(task2.Task2):
+            def position_obstacle2_camera(self, course, side1):
+                self.stage2_start = len(self.stm.lines)
+                return super().position_obstacle2_camera(course, side1)
+
+        for width in (50.0, 80.0):
+            for first, second in (("left", "left"), ("right", "right"),
+                                  ("left", "right"), ("right", "left")):
+                with self.subTest(width=width, first=first, second=second):
+                    # Reconstruct the latest floor run: obstacle 1 near x=64,
+                    # obstacle gap about 91 cm, and the bypass US ray on face 2.
+                    course = t2.Course(64.0, 165.0, width)
+                    frame = t2.WorldFrame(None)
+                    fake = RecordingSTM(course, frame.start, t2.RADIUS_CM)
+                    arrows = iter((first, second))
+                    route = MarkingTask(
+                        fake, input_fn=lambda _: next(arrows),
+                        sleep_fn=lambda _: None, startup=False,
+                        wait_for_go=False)
+
+                    self.assertEqual(route.run(), 0)
+                    bypass = fake.lines[1].split(",")
+                    self.assertEqual(len(bypass), 2, fake.lines)
+                    self.assertTrue(all(token.startswith("F")
+                                        and token[1] in "LR"
+                                        for token in bypass), bypass)
+                    self.assertFalse(any(token.startswith("R")
+                                         for token in bypass), bypass)
+                    stage2 = fake.lines[route.stage2_start:]
+                    tokens = [token for line in stage2
+                              for token in line.split(",")]
+                    first_camera = stage2[0].split(",")
+                    self.assertTrue(
+                        first_camera[0].startswith("F")
+                        or (first_camera[0].startswith("R")
+                            and len(first_camera) > 1
+                            and first_camera[1].startswith("F")),
+                        stage2)
+                    reverses = [token for token in tokens
+                                if token.startswith("R")
+                                and not token.startswith(("RL", "RR"))]
+                    # Never undo the camera path. A bounded straight recovery
+                    # remains available only for same-arrow/brake recovery.
+                    self.assertLessEqual(len(reverses), 2, stage2)
+                    self.assertTrue(all(
+                        int(token[1:]) <= max(
+                            task2.SAME_SIDE_RECOVERY_MAX_CM, 55)
+                        for token in reverses), stage2)
+                    clearance, obstacle = sim.run_clearance(fake, course)
+                    self.assertGreaterEqual(
+                        clearance, t2.CLEARANCE_FLOOR_CM, obstacle)
+
     def test_latest_oblique_us_hit_does_not_override_the_later_ir_edge(self):
         import task2t as route_module
 
@@ -2381,11 +2297,56 @@ class MotionOptimisation(unittest.TestCase):
         self.assertAlmostEqual(route._obs2_known_half(course), 22.5)
         self.assertAlmostEqual(route._obs2_minimum_edge_half(course), 15.0)
 
+    def test_parallel_us_ray_guides_route_but_cannot_veto_live_ir_edge(self):
+        """08:52 LR: the +32 cm US ray is not a symmetric width reading."""
+        import task2t as route_module
+
+        route = route_module.Task2(Mock(), startup=False)
+        course = Course(60.0, 123.8, 90.0,
+                        wall_y=route_module.CONSERVATIVE_WALL_Y)
+        route._record_obs2_us_hit(32.0, 0.0)
+
+        # Keep the conservative US extent for planning the approach, but the
+        # hard edge-consistency gate must retain only the physical minimum
+        # until a side IR has actually measured an edge.
+        self.assertAlmostEqual(route._obs2_known_half(course), 32.0)
+        self.assertAlmostEqual(route._obs2_minimum_edge_half(course), 15.0)
+
+        route.obs2_near_y = 24.0
+        self.assertAlmostEqual(route._obs2_minimum_edge_half(course), 24.0)
+
+    def test_0852_lr_edge_pose_continues_around_obstacle_two(self):
+        """The logged LR scan endpoint must enter the existing corner code."""
+        import task2t as route_module
+
+        route = route_module.Task2(Mock(), startup=False)
+        route.r = 30.0
+        side2 = -1.0
+        near = -22.7
+        near_y = near + side2 * route_module.END_MARGIN_CM
+        wide = (route_module.W2_RANGE[1]
+                + 2 * route_module.END_MARGIN_CM)
+        partial = Course(
+            60.0, 123.8, wide,
+            obs2_y=near_y - side2 * wide / 2.0,
+            wall_y=(wide / 2.0 + t2.WALL_CLEARANCE_CM
+                    - 2 * route_module.END_MARGIN_CM))
+        stopped = Pose(98.0, -13.3, math.radians(-88.7))
+
+        planned = route.round_near_end_with_brake_recovery(
+            stopped, partial, side2, False, near)
+
+        self.assertIsNotNone(planned)
+        retreat, corner = planned
+        self.assertEqual(retreat, [])
+        self.assertEqual(corner, [t2.Seg("F", 4),
+                                  t2.Seg("L", 90),
+                                  t2.Seg("L", 90)])
+
     def test_latest_camera_pose_keeps_opposite_arrow_forward(self):
         import task2t as route_module
 
-        route = route_module.Task2(
-            Mock(), startup=False, center_stage2=True)
+        route = route_module.Task2(Mock(), startup=False)
         route.r = 30.0
         course = Course(58.4, 148.5, 90,
                         wall_y=route_module.CONSERVATIVE_WALL_Y)
@@ -2401,16 +2362,22 @@ class MotionOptimisation(unittest.TestCase):
 
         route._line = move
         self.assertTrue(route.position_obstacle2_camera(course, 1.0))
+        camera = t2.straight(state[0], route_module.CAMERA_FROM_AXLE_CM)
+        target = math.atan2(course.obs2_y - camera.y,
+                            course.x2 - camera.x)
+        error = abs(math.degrees(math.atan2(
+            math.sin(state[0].th - target),
+            math.cos(state[0].th - target))))
+        self.assertLessEqual(error, 6.0)
         selected = route.select_face_handoff(state[0], course, 1.0, -1.0)
-
         self.assertIsNotNone(selected)
         segs, reverse, clearance = selected
         self.assertFalse(reverse)
         self.assertTrue(all(seg.kind in ("F", "L", "R") for seg in segs))
         self.assertGreaterEqual(clearance,
                                 route_module.HANDOFF_CONTINUOUS_CLEARANCE_CM)
-        # The complete camera move is checked; depending on available space
-        # it may include a short final readjustment to create the turn pocket.
+        # The complete camera move is checked and preserves a direct,
+        # forward-only opposite-arrow continuation.
         self.assertGreaterEqual(route._check(
             Pose(59.0, 34.7, math.radians(-7.3)), sent[0], course),
             t2.CLEARANCE_FLOOR_CM)
@@ -2418,8 +2385,7 @@ class MotionOptimisation(unittest.TestCase):
     def test_0733_camera_standoff_absorbs_logged_hardware_drift(self):
         import task2t as route_module
 
-        route = route_module.Task2(
-            Mock(), startup=False, center_stage2=True)
+        route = route_module.Task2(Mock(), startup=False)
         route.r = 30.0
         course = Course(60.6, 149.9, 90,
                         wall_y=route_module.CONSERVATIVE_WALL_Y)
@@ -2441,12 +2407,32 @@ class MotionOptimisation(unittest.TestCase):
         route._handoff_cache = None
         selected = route.select_face_handoff(
             measured, course, 1.0, -1.0)
-
         self.assertIsNotNone(selected)
         segs, reverse, clearance = selected
         self.assertFalse(reverse)
         self.assertTrue(all(seg.kind in ("F", "L", "R") for seg in segs))
-        self.assertGreaterEqual(clearance, 10.0)
+        self.assertGreaterEqual(clearance,
+                                route_module.HANDOFF_CONTINUOUS_CLEARANCE_CM)
+
+    def test_1342_opposite_handoff_keeps_corner_reserve(self):
+        """Do not repeat FR71, which landed at y=-15 and forced R6."""
+        import task2t as route_module
+
+        route = route_module.Task2(Mock(), startup=False)
+        route.r = 30.0
+        pose = Pose(58.8, 16.7, math.radians(-18.8))
+        course = Course(21.1, 105.2, 90,
+                        wall_y=route_module.CONSERVATIVE_WALL_Y)
+        route._record_obs2_us_hit(0.0, pose.th)
+
+        selected = route.select_face_handoff(pose, course, 1.0, -1.0)
+
+        self.assertIsNotNone(selected)
+        segs, reverse, clearance = selected
+        self.assertFalse(reverse)
+        self.assertEqual([seg.token() for seg in segs], ["FR67"])
+        self.assertGreaterEqual(clearance,
+                                route_module.HANDOFF_CONTINUOUS_CLEARANCE_CM)
 
     def test_short_handoff_preserves_narrow_face_and_clearance_both_sides(self):
         import task2t as route_module
@@ -2508,6 +2494,28 @@ class MotionOptimisation(unittest.TestCase):
                 patch.object(t2, "plan_return", side_effect=t2.NoPlan("blocked")) as fallback:
             self.assertFalse(runner.run())
         self.assertEqual(fallback.call_count, 2)
+
+    def test_clear_direct_return_is_preferred_and_runs_fast(self):
+        """A clear hypotenuse wins even when the IR route estimates faster."""
+        frame, stm = Mock(), Mock()
+        start = Pose(167.1, -65.4, math.radians(180.7))
+        frame.pose.return_value = start
+        frame.needs_lateral_fix = True
+        course = Course(69.1, 162, 74.7, wall_y=83.35)
+        direct = t2.plan_direct_return(start, course)
+        self.assertIsNotNone(direct)
+        fallback = Mock(seconds=0.01)
+        runner = t2.ParkRunner(stm, frame, course)
+        runner._send = Mock(return_value=True)
+        runner._park_from_mouth = Mock(return_value=True)
+
+        with patch.object(t2, "plan_direct_return", return_value=direct), \
+                patch.object(t2, "plan_return", return_value=fallback):
+            self.assertTrue(runner.run())
+
+        runner._send.assert_called_once_with(direct.segs)
+        stm.set_fast.assert_called_once_with(True)
+        runner._park_from_mouth.assert_called_once()
 
     def test_logged_handoff_removes_reverse_and_preserves_ir_acquisition(self):
         import task2t as route_module

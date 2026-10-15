@@ -5,19 +5,12 @@ TIGHT copy of task2_park.py. Identical except the radius (T2T_RADIUS_CM,
 default TIGHT's 29.1) and the arc speed (TIGHT arcs at 150 rpm). Change
 the planning in both files, or they drift apart.
 
-The run is disqualified if the robot touches the carpark fence and penalised
-for every obstacle hit, so the return is built around one rule: the last
-manoeuvre into the bay is planned from a position MEASURED near home, never
-from dead reckoning carried around the whole course.
-
-    1. Line A  - from the far side of obstacle 2, merge to a pass lane beside
-                 obstacle 1 and drive past it. The side IR facing obstacle 1
-                 is polled the whole way. Obstacle 1 sits on the bay
-                 centreline, so its reading is the robot's true lateral
-                 offset from the bay, whatever the obstacle 2 loop drifted.
-    2. Line B  - an S-curve sized from that measured offset puts the robot on
-                 the centreline, square, before the mouth; a collision-checked
-                 odometry F stops it off the back fence.
+The return first searches for one fast arc/diagonal/arc sweep from obstacle 2
+to the bay mouth. The complete robot footprint is checked against both
+obstacles, both 50 cm side limits and the garage fences. If that direct sweep
+does not fit, the fallback passes obstacle 1 while polling its side IR, uses
+that landmark to correct lateral odometry, and then joins the centreline.
+Both routes finish with the same measured side-IR/ultrasonic parking push.
 
 Everything here except ParkRunner is pure geometry and runs on a laptop:
 
@@ -388,6 +381,12 @@ class Course:
     # robot measures both its ends in odometry y - which has drifted by then -
     # so it is wherever those ends say. The walls are placed about it too.
     obs2_y: float = 0.0
+    # Optional asymmetric hard side limits. These are needed while only the
+    # requested obstacle-2 edge has been measured: that edge already fixes
+    # its exact 50 cm outward limit even though the opposite edge/width is
+    # still unknown.
+    wall_min_y: Optional[float] = None
+    wall_max_y: Optional[float] = None
 
     def obs1(self) -> Box:
         h = OBS1_SIZE_CM / 2.0
@@ -411,9 +410,11 @@ class Course:
             return []
         y = self.wall_y if self.wall_y is not None else self.w2 / 2.0 + WALL_CLEARANCE_CM
         c = self.obs2_y
+        low = self.wall_min_y if self.wall_min_y is not None else c - y
+        high = self.wall_max_y if self.wall_max_y is not None else c + y
         x0, x1 = 0.0, self.x2 + OBS2_DEPTH_CM + 150.0
-        return [Box(x0, x1, c + y, c + y + 10.0, "left wall"),
-                Box(x0, x1, c - y - 10.0, c - y, "right wall")]
+        return [Box(x0, x1, high, high + 10.0, "left wall"),
+                Box(x0, x1, low - 10.0, low, "right wall")]
 
     def boxes(self) -> List[Box]:
         return [self.obs1(), self.obs2()] + self.fence() + self.wall_boxes()
@@ -945,6 +946,10 @@ class WorldFrame:
 
     def pose(self) -> Optional[Pose]:
         w = self.stm.read_wpose()
+        return self.pose_from_wpose(w)
+
+    def pose_from_wpose(self, w) -> Optional[Pose]:
+        """Transform an existing WPOSE/IRW sample without taking another one."""
         if w is None or self.origin is None:
             return None
         h0 = math.radians(self.origin["heading_deg"])
@@ -1007,8 +1012,20 @@ class ParkRunner:
         self.course = course
         self.dry_run = dry_run
 
+    def _wire_token(self, segment):
+        """Apply protocol-10 maximum speed only in acknowledged fast mode."""
+        token = segment.token() if isinstance(segment, Seg) else segment
+        max_v = max(4, min(25, int(_env_f("T2T_MAX_STRAIGHT_V", 25))))
+        min_cm = max(20, int(_env_f("T2T_MAX_STRAIGHT_MIN_CM", 30)))
+        if (isinstance(segment, Seg) and segment.kind == "F"
+                and segment.value >= min_cm
+                and getattr(self.stm, "supports_v_speed", False)
+                and getattr(self.stm, "fast_enabled", False)):
+            token += "V%d" % max_v
+        return token
+
     def _send(self, segs_or_tokens) -> bool:
-        tokens = [t.token() if isinstance(t, Seg) else t for t in segs_or_tokens]
+        tokens = [self._wire_token(segment) for segment in segs_or_tokens]
         if not tokens:
             return True
         line = ",".join(tokens)
@@ -1029,14 +1046,31 @@ class ParkRunner:
         return False
 
     def _ir(self, side: str) -> Optional[float]:
+        left, right = self._irs()
+        return left if side == "left" else right
+
+    def _irs(self) -> Tuple[Optional[float], Optional[float]]:
+        """Read both IR channels with one firmware query."""
         fields = self.stm.query_fields("?IR", timeout=0.5)
         if not fields or len(fields) < 2:
-            return None
+            return None, None
         try:
-            v = int(fields[0] if side == "left" else fields[1])
+            values = [int(fields[0]), int(fields[1])]
         except ValueError:
-            return None
-        return None if v == 0xFFFF else float(v)
+            return None, None
+        return tuple(None if value == 0xFFFF else float(value)
+                     for value in values)
+
+    def _ir_pose(self, side: str):
+        """One protocol-10 sample replaces separate IR and pose queries."""
+        reader = getattr(self.stm, "read_irw", None)
+        if reader is not None and getattr(self.stm, "supports_irw", False):
+            sample = reader(timeout=0.5)
+            if sample is not None:
+                value = sample.get(side + "_cm")
+                return (None if value is None else float(value),
+                        self.frame.pose_from_wpose(sample))
+        return self._ir(side), self.frame.pose()
 
     def _us(self) -> Optional[float]:
         """True front-bumper gap in cm, with the HC-SR04 bias removed."""
@@ -1060,7 +1094,7 @@ class ParkRunner:
                 # yield RESEND. Retry once; the finite F still ends outside
                 # the final approach reserve if feedback stays unavailable.
                 gap = self._us()
-            left, right = self._ir("left"), self._ir("right")
+            left, right = self._irs()
             side_unsafe = any(v is not None and v < PARK_SIDE_STOP_CM
                               for v in (left, right))
             reason = None
@@ -1147,7 +1181,7 @@ class ParkRunner:
             logging.error("Parking ?US reads %.1f cm, too far to identify the %.0f "
                           "cm-deep bay's back wall.", gap, BAY_DEPTH_CM)
             return False
-        left, right = self._ir("left"), self._ir("right")
+        left, right = self._irs()
         if any(v is not None and v < PARK_SIDE_STOP_CM for v in (left, right)):
             logging.error("Parking side clearance is unsafe (IR %s / %s); not "
                           "advancing.", left, right)
@@ -1203,8 +1237,7 @@ class ParkRunner:
         blocked = []
 
         def poll() -> bool:
-            g = self._ir(plan.side)
-            w = self.frame.pose()
+            g, w = self._ir_pose(plan.side)
             if g is not None and w is not None:
                 samples.append((w.x, g))
             if w is None or not all(math.isfinite(v) for v in (w.x, w.y, w.th)):
@@ -1246,7 +1279,7 @@ class ParkRunner:
                                 start, clearance, closest)
                 return None
 
-            line = seg.token()
+            line = self._wire_token(seg)
             reply = run_polling(self.stm, line, poll)
             if blocked:
                 return False
@@ -1308,23 +1341,24 @@ class ParkRunner:
                 except NoPlan:
                     pass
         direct_seconds = final_cost(direct.segs, direct.end) if direct is not None else float("inf")
-        needs_fix = getattr(self.frame, "needs_lateral_fix", False) is True
-        direct_clearance = getattr(direct, "clearance", None)
-        direct_has_full_margin = (
-            isinstance(direct_clearance, (int, float))
-            and direct_clearance >= CLEARANCE_CM)
-        # A single-edge obstacle-2 measurement used to force the landmark path
-        # unconditionally.  A direct sweep with the full configured clearance
-        # is already robust to that uncertainty and avoids two extra S-curves.
-        # Marginal shortcuts still retain the obstacle-1 IR correction.
-        direct_beats_fallback = (direct is not None and (
-            plan is None or direct_seconds + LINE_OVERHEAD_S < plan.seconds))
-        if direct is not None and direct_beats_fallback and (
-                not needs_fix or direct_has_full_margin or plan is None):
-            logging.info("Return selected by estimated time: direct %.2fs, "
+        # Once obstacle 2 has been rounded, prefer the single checked
+        # arc-diagonal-arc sweep whenever the direct planner returns one.
+        # The old time/needs_lateral_fix gate could choose the landmark route
+        # even though a clear hypotenuse was available, adding an entire
+        # obstacle-1 lane, IR stop and second merge.  The direct planner has
+        # already swept the complete chassis against both obstacles, both
+        # 50 cm side limits and the garage fences, and rejects candidates
+        # below the execution clearance.  If it returns None, retain the
+        # measured IR-fix route as the fallback.
+        if direct is not None:
+            logging.info("Checked diagonal return selected: direct %.2fs, "
                          "IR-fix route %s; %s, clearance %.1f cm.", direct_seconds,
                          "unavailable" if plan is None else "%.2fs" % plan.seconds,
                          ",".join(seg.token() for seg in direct.segs), direct.clearance)
+            if (not self.dry_run and hasattr(self.stm, "set_fast")
+                    and not self.stm.set_fast(True)):
+                logging.error("Cannot select fast mode for the checked diagonal return.")
+                return False
             if not self._send(direct.segs):
                 return False
             if self.dry_run:
@@ -1424,7 +1458,7 @@ class ParkRunner:
             logging.error("Cannot select precision speed at the parking mouth.")
             return False
         time.sleep(0.2)                      # let the IR filters settle
-        left, right = self._ir("left"), self._ir("right")
+        left, right = self._irs()
         y = centre_offset(left, right)
         if y is None:
             y = single_fence_offset(left, right)
@@ -1471,7 +1505,7 @@ class ParkRunner:
                 if at is None:
                     logging.error("Cannot read world pose after parking heading trim.")
                     return False
-                left, right = self._ir("left"), self._ir("right")
+                left, right = self._irs()
                 y = centre_offset(left, right)
                 measured = Pose(at.x, at.y if y is None else y, at.th)
 
@@ -1513,7 +1547,7 @@ class ParkRunner:
 
         time.sleep(0.2)
         us = self._stable_us()
-        left, right = self._ir("left"), self._ir("right")
+        left, right = self._irs()
         y = centre_offset(left, right)
         logging.info("Parked. Front gap ?US=%s cm (want %.0f); side "
                      "gaps left %s / right %s%s.", us, PARK_GAP_CM, left, right,

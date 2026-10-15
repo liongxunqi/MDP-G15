@@ -41,6 +41,8 @@ class Motion:
         self.raw, self.stop, self.report = stm, stop, report
         self.lock = Lock()
         self.supports_fast = True
+        self.supports_v_speed = False
+        self.fast_enabled = False
 
     def check(self):
         if self.stop.is_set():
@@ -79,12 +81,34 @@ class Motion:
         self.check()
         return self.raw.read_wpose(timeout)
 
+    def read_irw(self, timeout=0.5):
+        """Return protocol-10 IR and pose captured in the same control tick."""
+        self.check()
+        reader = getattr(self.raw, "read_irw", None)
+        return reader(timeout) if reader is not None else None
+
+    def set_ir_edge(self, side, lo_cm=0, hi_cm=0, timeout=None):
+        """Arm/disarm the firmware's three-tick IR acquisition latch."""
+        with self.lock:
+            self.check()
+            setter = getattr(self.raw, "set_ir_edge", None)
+            return (setter(side, lo_cm, hi_cm, timeout)
+                    if setter is not None else False)
+
+    def read_ir_edge(self, timeout=0.5):
+        self.check()
+        reader = getattr(self.raw, "read_ir_edge", None)
+        return reader(timeout) if reader is not None else None
+
     def set_fast(self, on, timeout=None):
         with self.lock:
             self.check()
             if not self.supports_fast:
                 return not on  # normal mode already; no unsupported FAST0
-            return self.raw.set_fast(on, timeout)
+            accepted = self.raw.set_fast(on, timeout)
+            if accepted:
+                self.fast_enabled = bool(on)
+            return accepted
 
     def prepare_start(self):
         from communications import cal_profile
@@ -101,8 +125,7 @@ class Task2(route.Task2):
                          startup=False, wait_for_go=False,
                          early_arrow_fn=getattr(vision, "peek_arrow", None),
                          lane_reached_fn=self._lane_reached,
-                         arrow_pending_fn=getattr(vision, "arrow_pending", None),
-                         center_stage2=route.CENTER_STAGE2)
+                         arrow_pending_fn=getattr(vision, "arrow_pending", None))
         self.vision, self.stop, self.status = vision, stop, status
         self.obstacle = 0
         self.stage2_started = False
@@ -125,6 +148,22 @@ class Task2(route.Task2):
         if self.obstacle == 1:
             self.vision.begin(1)
         direction = self.vision.wait_arrow(float(os.getenv("T2_ARROW_TIMEOUT_S", "8")))
+        center_reader = getattr(self.vision, "arrow_center_x", None)
+        center_x = center_reader() if center_reader is not None else None
+        if self.obstacle == 1 and center_x is not None:
+            # The marker is centred on the obstacle face. Convert its image
+            # offset into the shared course-axis offset used by collision
+            # checks. Positive world y is camera-left; image x grows right.
+            hfov = float(os.getenv("T2_CAMERA_HFOV_DEG", "62.0"))
+            max_offset = float(os.getenv("T2_VISION_AXIS_MAX_CM", "15.0"))
+            if 20.0 <= hfov <= 120.0 and 0.0 < max_offset <= 25.0:
+                offset = -(2.0 * center_x - 1.0) * route.OBS1_CAMERA_CHECKPOINT_CM \
+                    * math.tan(math.radians(hfov / 2.0))
+                self.obs1_y = max(-max_offset, min(max_offset, offset))
+                logging.info(
+                    "YOLO arrow centre x=%.3f sets obstacle axis y=%.1f cm "
+                    "(HFOV %.1f deg, bounded to +/-%.1f cm).",
+                    center_x, self.obs1_y, hfov, max_offset)
         logging.info("Confirmed obstacle %s arrow: %s", self.obstacle, direction)
         self.status("ARROW,%s,%s" % (self.obstacle, direction.upper()))
         self.vision.idle()
@@ -308,8 +347,13 @@ def main():
     def camera_loop():
         camera = Camera()
         try:
+            width = int(os.getenv("T2_CAMERA_WIDTH", "960"))
+            height = int(os.getenv("T2_CAMERA_HEIGHT", "540"))
+            if width < 320 or height < 240:
+                raise ValueError("Task 2 camera resolution is too small")
             for jpeg in camera.continuous_images(
-                    stop, exposure_us=int(os.getenv("T2_EXPOSURE_US", "5000"))):
+                    stop, resolution=(width, height),
+                    exposure_us=int(os.getenv("T2_EXPOSURE_US", "5000"))):
                 vision.publish(jpeg)
         finally:
             camera.stop_camera()
@@ -330,7 +374,7 @@ def main():
     fast_active = False
     try:
         stm.connect()
-        profile_name = os.getenv("T2T_CAL_PROFILE", "tbricks")
+        profile_name = os.getenv("T2T_CAL_PROFILE", "tr00")
         profile = cal_profile.load(profile_name)
         if profile is None or profile.get("arc_profile") != 0:
             raise RuntimeError("Task 2 requires a saved TIGHT/profile-0 calibration")
@@ -346,11 +390,13 @@ def main():
         us = stm.query_fields("?US")
         if not imu or imu[0] != "1" or not ir or len(ir) != 2 or not us:
             raise RuntimeError("STM IMU/IR/US startup queries failed")
-        # Latest uploaded STM source declares protocol 8 with !FAST. Query
-        # the actual board as well: uploaded source need not be flashed firmware.
-        from communications.stm import FAST_MIN_PROTOCOL
+        # Query the actual board: source on disk need not be the firmware that
+        # is currently flashed. Protocol 10 adds atomic IR/pose sampling.
+        from communications.stm import FAST_MIN_PROTOCOL, IRW_MIN_PROTOCOL
         proto = cal_profile.firmware_protocol(stm)
         motion.supports_fast = proto is not None and proto >= FAST_MIN_PROTOCOL
+        motion.supports_v_speed = proto is not None and proto >= 10
+        motion.supports_irw = proto is not None and proto >= IRW_MIN_PROTOCOL
         if not motion.supports_fast:
             route.FAST = False
             logging.info("Board protocol %s: using its existing normal mode; "
@@ -359,6 +405,11 @@ def main():
             if not motion.set_fast(True):
                 raise RuntimeError("Board advertised fast mode but refused !FAST1")
             fast_active = True
+            logging.info("Protocol-%s !FAST1 enabled: open straights use the "
+                         "firmware's calibrated 200 rpm ramp; obstacle-edge "
+                         "motion remains precision speed.", proto)
+        logging.info("Atomic IR/pose sampling and firmware IR latch: %s.",
+                     "enabled" if motion.supports_irw else "unavailable")
         logging.info("Obstacle-2 configured width cap %.1f cm; PDFs specify "
                      "minimum 30 cm and no numeric maximum.", route.W2_RANGE[1])
         if abs(geometry.RADIUS_CM - 30.0) > 0.01:

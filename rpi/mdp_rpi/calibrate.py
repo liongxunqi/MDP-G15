@@ -747,6 +747,11 @@ def gyro_drift(stm: STM, seconds: int = DRIFT_SECONDS) -> bool:
     return True
 
 
+def gyro_ok(stm: STM) -> bool:
+    """Refuse to accept a calibration batch measured without gyro heading."""
+    return cal_profile.gyro_in_use(stm, " after the calibration moves")
+
+
 # ── Profile bookkeeping ──────────────────────────────────────────────────────
 
 def snapshot(stm: STM, result: dict) -> bool:

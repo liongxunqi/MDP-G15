@@ -22,7 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 if "dotenv" not in sys.modules:
     dotenv = types.ModuleType("dotenv")
-    dotenv.load_dotenv = lambda: None
+    dotenv.load_dotenv = lambda *args, **kwargs: None
     sys.modules["dotenv"] = dotenv
 
 if "serial" not in sys.modules:
@@ -107,6 +107,8 @@ class FakeFirmware(STM):
             return reply
         if tag == "HDG":
             return "HDG," + ",".join(str(v) for v in self.hdg)
+        if tag == "IMU":
+            return "IMU,1,0,0,0"
         return None
 
 

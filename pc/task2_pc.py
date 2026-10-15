@@ -3,6 +3,7 @@ import argparse
 import json
 import logging
 import os
+import shutil
 import socket
 import struct
 import sys
@@ -68,16 +69,33 @@ def serve(sock, detector, directory, mapping, stitch):
                     raise ValueError("Invalid JPEG size")
                 path = directory / ("stage%d_frame%d.jpg" % (request["stage"], frame))
                 path.write_bytes(exact(stream, size))
-                label, confidence = detector(path, allowed_classes=set(mapping),
-                                             output_dir=directory / "annotated",
-                                             target_confidence=target_confidence,
-                                             selection_policy=("nearest" if request["stage"] == 1
-                                                               else "unique_arrow"))
+                detector_args = dict(
+                    allowed_classes=set(mapping),
+                    output_dir=directory / "annotated",
+                    target_confidence=target_confidence,
+                    selection_policy="nearest")
+                try:
+                    detected = detector(path, return_metadata=True,
+                                        **detector_args)
+                except TypeError as exc:
+                    # Preserve compatibility with small test/custom detector
+                    # adapters written before bbox metadata was added.
+                    if "return_metadata" not in str(exc):
+                        raise
+                    detected = detector(path, **detector_args)
+                if len(detected) == 3:
+                    label, confidence, target = detected
+                else:
+                    label, confidence = detected
+                    target = None
                 label_name = (str(label).strip().lower()
                               if label is not None else None)
                 direction = mapping.get(label_name)
                 reply = dict(request, direction=direction,
                              confidence=float(confidence or 0))
+                if direction is not None and target is not None:
+                    reply["center_x"] = target["center_x"]
+                    reply["box_width"] = target["width"]
                 if direction is None:
                     if label_name == "bullseye":
                         logging.info("Stage %s frame %s: ignored bullseye; "
@@ -126,6 +144,15 @@ def stitch_images(saved, output):
     if not cv2.imwrite(str(temporary), canvas):
         raise RuntimeError("Could not save stitched evidence")
     os.replace(str(temporary), str(output))
+
+    # Preserve this run's evidence and restore the stable latest-image path.
+    latest = ROOT / "runs" / "stitched_task2.jpg"
+    if output != latest:
+        latest.parent.mkdir(parents=True, exist_ok=True)
+        latest_temporary = latest.with_name("stitched_task2.tmp.jpg")
+        shutil.copyfile(output, latest_temporary)
+        os.replace(str(latest_temporary), str(latest))
+        logging.info("Latest stitched Task 2 image updated: %s", latest)
 
 
 def next_run_directory():

@@ -17,18 +17,27 @@ class Vision:
             # lower threshold against the already-read obstacle 1.
             self.confidence = {
                 1: float(os.getenv("T2_STAGE1_CONFIDENCE", "0.70")),
-                2: float(os.getenv("T2_STAGE2_CONFIDENCE", "0.60")),
+                2: float(os.getenv("T2_STAGE2_CONFIDENCE", "0.50")),
             }
         else:
             self.confidence = {1: float(confidence), 2: float(confidence)}
         if any(not 0.5 <= value <= 1.0 for value in self.confidence.values()):
             raise ValueError("Task 2 confidence thresholds must be between 0.5 and 1.0")
+        # A very strong arrow is already a complete decision: the PC has
+        # removed bullseyes and selected one nearest eligible marker. Keep the
+        # historical two-vote rule below this threshold. The conservative
+        # library default preserves old callers; Task 2's .env enables 0.90.
+        self.single_vote_confidence = float(os.getenv(
+            "T2_SINGLE_VOTE_CONFIDENCE", "1.0"))
+        if not 0.5 <= self.single_vote_confidence <= 1.0:
+            raise ValueError("T2_SINGLE_VOTE_CONFIDENCE must be between 0.5 and 1.0")
         self.condition = Condition()
         self.latest = None
         self.stage = 0
         self.epoch = 0
         self.stage_started = 0
         self.result = None
+        self.result_center_x = None
         self.candidate_time = None
         self.ready = False
         self.last_frame_time = time.monotonic()
@@ -46,6 +55,7 @@ class Vision:
             self.epoch += 1
             self.stage_started = time.monotonic()
             self.result = None
+            self.result_center_x = None
             self.candidate_time = None
             self.condition.notify_all()
 
@@ -74,6 +84,11 @@ class Vision:
         with self.condition:
             return self.result
 
+    def arrow_center_x(self):
+        """Normalised horizontal centre of the two-vote accepted arrow."""
+        with self.condition:
+            return self.result_center_x
+
     def arrow_pending(self):
         """A fresh first vote is awaiting confirmation in the current stage."""
         with self.condition:
@@ -91,6 +106,7 @@ class Vision:
             self.ready = True
             self.condition.notify_all()
         seen, vote, count, vote_time, previous_epoch = -1, None, 0, 0, -1
+        vote_centers = []
         while not self.stop.is_set():
             with self.condition:
                 self.condition.wait_for(lambda: self.stop.is_set() or (
@@ -112,6 +128,7 @@ class Vision:
                 continue
             if epoch != previous_epoch:
                 vote, count = None, 0
+                vote_centers = []
                 previous_epoch = epoch
             threshold = self.confidence[stage]
             request = {"run_id": self.run_id, "stage": stage, "frame_id": frame,
@@ -126,6 +143,10 @@ class Vision:
             now = time.monotonic()
             direction = reply.get("direction")
             conf = float(reply.get("confidence", 0))
+            center_x = reply.get("center_x")
+            center_valid = (isinstance(center_x, (int, float))
+                            and math.isfinite(float(center_x))
+                            and 0.0 <= float(center_x) <= 1.0)
             valid = (direction in ("left", "right") and math.isfinite(conf)
                      and threshold <= conf <= 1 and now - captured <= self.max_age)
             with self.condition:
@@ -137,14 +158,21 @@ class Vision:
                     # Stay at the stationary photo pose and keep requesting
                     # fresh frames until two valid arrow votes arrive.
                     vote, count = None, 0
+                    vote_centers = []
                     self.candidate_time = None
                     continue
-                count = count + 1 if direction == vote and now - vote_time <= self.max_age else 1
+                continuing = direction == vote and now - vote_time <= self.max_age
+                count = count + 1 if continuing else 1
+                if not continuing:
+                    vote_centers = []
+                if center_valid:
+                    vote_centers.append(float(center_x))
                 vote, vote_time = direction, now
                 self.candidate_time = now
-                logging.info("Arrow stage %s frame %s: %s %.3f (%s/2)",
-                             stage, frame, direction, conf, count)
-            if count >= 2:
+                votes_needed = (1 if conf >= self.single_vote_confidence else 2)
+                logging.info("Arrow stage %s frame %s: %s %.3f (%s/%s)",
+                             stage, frame, direction, conf, count, votes_needed)
+            if count >= votes_needed:
                 # Network I/O must not hold the camera publication lock.
                 self.pc.send("ACCEPT," + json.dumps(request))
                 if self.pc.receive() != "SAVED," + str(frame):
@@ -153,4 +181,6 @@ class Vision:
                     if epoch != self.epoch or self.stop.is_set():
                         continue
                     self.result = direction
+                    self.result_center_x = (sum(vote_centers) / len(vote_centers)
+                                            if vote_centers else None)
                     self.condition.notify_all()
