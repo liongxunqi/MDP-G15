@@ -16,8 +16,9 @@ class ChecklistProtocolTest {
         for (target in listOf("-1", "100", "abc", "a", "+1", "A B", "é", "💡")) {
             assertTrue(target, RobotMessageParser.parse("TARGET,1,$target") { true } is RobotMessage.TargetRejected)
         }
-        for (target in listOf("0", "9", "11", "A", "NW", "A9")) {
-            assertEquals(RobotMessage.Target(1, target), RobotMessageParser.parse("TARGET,B1,$target") { true })
+        for ((label, imageId) in mapOf("0" to "0", "9" to "19", "11" to "11",
+            "A" to "20", "NW" to "NW", "A9" to "A9")) {
+            assertEquals(RobotMessage.Target(1, imageId), RobotMessageParser.parse("TARGET,B1,$label") { true })
         }
     }
     @Test fun `every command is delimited for the RPi stream reader`() {
