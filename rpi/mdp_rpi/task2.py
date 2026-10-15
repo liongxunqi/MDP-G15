@@ -101,7 +101,8 @@ class Task2(route.Task2):
                          startup=False, wait_for_go=False,
                          early_arrow_fn=getattr(vision, "peek_arrow", None),
                          lane_reached_fn=self._lane_reached,
-                         arrow_pending_fn=getattr(vision, "arrow_pending", None))
+                         arrow_pending_fn=getattr(vision, "arrow_pending", None),
+                         center_stage2=route.CENTER_STAGE2)
         self.vision, self.stop, self.status = vision, stop, status
         self.obstacle = 0
         self.stage2_started = False
@@ -119,6 +120,10 @@ class Task2(route.Task2):
         return pose
 
     def _arrow(self, prompt):
+        # Obstacle 1 vision is opened only after the stationary 45 cm camera
+        # checkpoint. Stage 2 is opened by the measured parallel-lane callback.
+        if self.obstacle == 1:
+            self.vision.begin(1)
         direction = self.vision.wait_arrow(float(os.getenv("T2_ARROW_TIMEOUT_S", "8")))
         logging.info("Confirmed obstacle %s arrow: %s", self.obstacle, direction)
         self.status("ARROW,%s,%s" % (self.obstacle, direction.upper()))
@@ -128,7 +133,6 @@ class Task2(route.Task2):
     def obstacle1(self):
         self.obstacle = 1
         self.status("APPROACH_1")
-        self.vision.begin(1)
         return super().obstacle1()
 
     def pass_obstacle1(self, x1, side1):
@@ -137,15 +141,14 @@ class Task2(route.Task2):
         return result
 
     def _lane_reached(self):
-        """Called only after the route excludes obstacle 1 from the camera view."""
+        """Open stage 2 only after the camera is aimed at obstacle 2."""
         if self.stage2_started:
             return
         self.obstacle = 2
         self.status("APPROACH_2")
         self.vision.begin(2)
         self.stage2_started = True
-        logging.info("Obstacle 1 is behind the forward camera plane; fresh "
-                     "stage-2 recognition is live.")
+        logging.info("Camera aimed at obstacle 2; fresh stage-2 recognition is live.")
 
     def photo_obstacle2(self, course, side1):
         self.obstacle = 2
@@ -194,8 +197,7 @@ class Task2(route.Task2):
         aligned = (pose is not None and geometry.parking_heading_error(pose.th)
                    <= geometry.PARK_HEADING_TOL_DEG)
         us_at_target = (us is not None and math.isfinite(us)
-                        and geometry.PARK_GAP_CM - geometry.PARK_GAP_TOL_CM
-                        <= us
+                        and geometry.PARK_GAP_CM - geometry.PARK_GAP_TOL_CM <= us
                         <= geometry.PARK_GAP_CM + geometry.PARK_GAP_TOL_CM)
         # Side IRs are useful when both fences are visible, but the final
         # parking decision must still work when one sensor looks through the
@@ -206,8 +208,10 @@ class Task2(route.Task2):
         if (not inside and pose is not None and pose.x < -geometry.REAR_FROM_AXLE_CM
                 and aligned and stationary and us_at_target and side_safe):
             # The back wall is physically impassable, but wheel odometry can
-            # place the front bumper beyond it. Accept the independent wall
-            # position only when both side fences identify the parking bay.
+            # place the front bumper beyond it. Reconstruct x from that wall.
+            # Prefer both side fences for y; if one IR looks through the open
+            # mouth, retain the measured y only when the other side IR is
+            # present and the reconstructed whole footprint is inside.
             wall_y = geometry.centre_offset(left, right)
             if wall_y is not None:
                 wall_x = (-geometry.BAY_DEPTH_CM

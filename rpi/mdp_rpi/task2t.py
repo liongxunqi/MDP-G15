@@ -15,13 +15,15 @@ The route, in the world frame of task2t_park.py (origin the bay mouth, +x out):
 
   1. Ultrasound obstacle 1, then use odometry F moves to a standoff and ask
      for its arrow.
-  2. Turn 45 deg to that side, a short diagonal, straighten: on the lane just
-     clear of obstacle 1, the ultrasound measures obstacle 2. If it misses (a
-     narrow obstacle 2 is off the beam), widen the lane and find obstacle 2
-     with the inner IR going by.
-  3. Exclude obstacle 1 from the forward camera view using a checked
-     straight or outward lane join. Read obstacle 2 while parallel.
-  4. Turn to run along obstacle 2's face with a side IR on it. Matching
+  2. Pass obstacle 1 on its arrow side and locate obstacle 2 without opening
+     stage-2 recognition. If the measured gap permits it, return to the course
+     centreline; on a short course keep the cleared side and aim diagonally.
+  3. Once the camera is aimed at obstacle 2's centre, open recognition and
+     read its arrow from that stationary pose.
+  4. Move around obstacle 2 in that arrow's direction, then run along its
+     face with a side IR on it. The width probes now start from a confirmed
+     centre ray instead of trying to identify obstacle 2 from beside 1.
+     Matching
      arrows use a checked forward front-face approach or outer route, never
      a reverse handoff. If neither is clear, do not drive. IR confirms the
      face before declaring its end.
@@ -83,15 +85,25 @@ KICK_DEG = 45
 # geometry permits. They expand the search; measured-angle corrections remain
 # available because quantising every recovery can remove its only clear path.
 CALIBRATED_TURN_ANGLES = (45, 90, 135, 180)
-# Photo of obstacle 2: the camera this far from the arrow, looking at it
-# along the robot's heading, ideally from 45 deg. Walls close in can force it
-# nearer or straighter - it steps down to PHOTO_MIN_CM and a smaller swing.
-PHOTO_DIST_CM = tp._env_f("T2T_PHOTO_DIST_CM", 50.0)
-PHOTO_MIN_CM = tp._env_f("T2T_PHOTO_MIN_CM", 34.0)
+# Photo of obstacle 2: recognition is reliable 20-30 cm in front of the box.
+# Prefer 30 cm head-on; only a short inter-obstacle gap should force the
+# collision-checked angled family, which may step down as far as 20 cm.
+PHOTO_DIST_CM = tp._env_f("T2T_PHOTO_DIST_CM", 30.0)
+PHOTO_MIN_CM = tp._env_f("T2T_PHOTO_MIN_CM", 20.0)
 PHOTO_SWINGS = (90, 80, 70, 60)       # 90 = looking in from 45 deg
 CAMERA_FROM_AXLE_CM = tp._env_f("T2_CAMERA_FROM_AXLE_CM", tp.FRONT_FROM_AXLE_CM)
+OBS1_CAMERA_CHECKPOINT_CM = tp._env_f("T2_OBS1_CAMERA_CHECKPOINT_CM", 45.0)
+# Prefer a centred stage-2 photo when measured geometry permits it; otherwise
+# use a collision-checked oblique view. Set this to zero only to reproduce the
+# old parallel-recognition route for regression comparison.
+CENTER_STAGE2 = os.getenv("T2T_CENTER_STAGE2", "1").strip() != "0"
 # Position reserve after the entire first board is behind the forward camera.
 STAGE2_REAR_EXCLUSION_CM = max(0.0, tp._env_f("T2_STAGE2_REAR_EXCLUSION_CM", 6.0))
+# The physical straight can finish several degrees off its commanded heading.
+# Vision and the handoff generator both tolerate this angle; rejecting at five
+# degrees caused a complete stop after an otherwise clear camera-gate move.
+STAGE2_MAX_HEADING_DEG = min(
+    15.0, max(5.0, tp._env_f("T2_STAGE2_MAX_HEADING_DEG", 15.0)))
 # Stand-in for recognition time when the arrow comes off a prompt.
 OBS_PAUSE_S = tp._env_f("T2T_OBS_PAUSE_S", 0.0)
 # Running along obstacle 2's face: the IR this far off it.
@@ -107,6 +119,19 @@ IR_FACE_MAX_CM = tp._env_f("T2T_IR_FACE_MAX_CM", 26.0)
 # IR's 30-50 cm empty-floor plateau is not treated as a face indiscriminately.
 FRONT_FACE_GAP_TOL_CM = tp._env_f("T2T_FRONT_FACE_GAP_TOL_CM", 8.0)
 FRONT_FACE_HARD_MAX_CM = tp._env_f("T2T_FRONT_FACE_HARD_MAX_CM", 34.0)
+# Long primitives are vulnerable to the deployed STM's FAIL,SHORT response.
+# Splitting preserves the same ideal path while keeping each encoder target
+# bounded; the measured handoff checks still run around the resulting groups.
+HANDOFF_MAX_STRAIGHT_CM = max(
+    20.0, tp._env_f("T2T_HANDOFF_MAX_STRAIGHT_CM", 60.0))
+HANDOFF_MAX_ARC_DEG = max(
+    90.0, tp._env_f("T2T_HANDOFF_MAX_ARC_DEG", 135.0))
+# The floor trace showed that FL5 followed by its nominal inverse RL5 changed
+# measured heading by about nine degrees. Keep ranging turns in the calibrated
+# command family even when the geometry module permits smaller primitives.
+NARROW_RANGING_MIN_ARC_DEG = max(
+    15, int(math.ceil(tp._env_f("T2T_NARROW_RANGING_MIN_ARC_DEG", 15.0))))
+HANDOFF_HEADING_TOL_DEG = tp._env_f("T2T_HANDOFF_HEADING_TOL_DEG", 8.0)
 # Behind obstacle 2, the IR on its back face at most this far off it.
 BACK_GAP_MAX_CM = tp._env_f("T2T_BACK_GAP_MAX_CM", 34.0)
 # Coming round behind obstacle 2, the IR at most this far past its near end.
@@ -129,7 +154,10 @@ SENSING_LANE_CM = tp._env_f("T2T_SENSING_LANE_CM", 31.0)
 # be projected to obstacle 2's x-coordinate at this angle without moving the
 # chassis again.
 SENSING_RAY_MAX_DEG = tp._env_f("T2T_SENSING_RAY_MAX_DEG", 6.0)
-SENSING_LANE_MIN_CM = tp.execution_clearance(tp.CLEARANCE_CM)
+# A sensing-lane sweep is already checked against the complete chassis.  Do
+# not apply the unrelated nominal 6 cm route preference a second time: that
+# rejected clear 4.8 cm continuations and then created reverse readjustments.
+SENSING_LANE_MIN_CM = tp.CLEARANCE_FLOOR_CM
 # Obstacle 2's measured centre is taken as odometry drift, up to this much.
 Y_RESYNC_MAX_CM = tp._env_f("T2T_Y_RESYNC_MAX_CM", 15.0)
 # Heading home past obstacle 2, the body this far off its side.
@@ -149,17 +177,13 @@ TURN_CLEARANCE_CM = max(tp.CLEARANCE_FLOOR_CM,
 HANDOFF_CLEARANCE_CM = max(tp.CLEARANCE_FLOOR_CM,
                            tp._env_f("T2T_HANDOFF_CLEARANCE_CM", 4.5))
 # A route replanned from a measured pose can run as one STM queue when it has
-# this much clearance. Routes below it retain primitive-by-primitive checks;
-# this is what catches the first outer arc drifting toward obstacle 2.
+# this much clearance.  The measured route has already had its complete body
+# sweep checked; keeping a separate 5 cm queue threshold made the robot stop
+# after every primitive even though the selector accepted the route at the
+# execution-tolerant 3.9 cm handoff threshold.
 HANDOFF_CONTINUOUS_CLEARANCE_CM = max(
     HANDOFF_CLEARANCE_CM,
     tp._env_f("T2T_HANDOFF_CONTINUOUS_CLEARANCE_CM", 5.0))
-# Swept paths are sampled and logged to 0.1 cm, while the real robot can drift
-# a few millimetres between measured checkpoints. This remains bounded by the
-# global collision floor; it only softens the nominal handoff target.
-HANDOFF_MARGIN_TOLERANCE_CM = min(
-    HANDOFF_CLEARANCE_CM - tp.CLEARANCE_FLOOR_CM,
-    tp.EXECUTION_CLEARANCE_TOL_CM)
 # Obstacle 1 is encountered before its true swept-path error can be measured.
 # Keep a larger hardware margin there than the generic close-pass floor; the
 # floor run touched the box when the model reported 6.4 cm of clearance.
@@ -179,6 +203,17 @@ OBS1_TURN_MIN_CM = max(
 OBS1_TURN_FALLBACK_CM = max(
     tp.CLEARANCE_FLOOR_CM,
     tp._env_f("T2T_OBS1_TURN_FALLBACK_CM", 8.0))
+# Apply the same bounded execution tolerance used by the rest of the measured
+# replanner.  RST coast moved the logged turn from 9.5 cm to 7.9 cm, and a
+# strict comparison with the nominal 8 cm target stopped an otherwise checked
+# continuation by one quantised pose sample.
+OBS1_TURN_FALLBACK_MIN_CM = tp.execution_clearance(
+    OBS1_TURN_FALLBACK_CM)
+# This check is made at obstacle 1's final camera/turn standoff.  Reusing the
+# 30 cm obstacle-2 lane threshold contradicted the normal 26-29 cm standoff.
+OBS1_LIVE_US_MIN_CM = max(
+    tp.CLEARANCE_FLOOR_CM,
+    tp._env_f("T2T_OBS1_LIVE_US_MIN_CM", 20.0))
 FAST = os.getenv("T2T_FAST", "1").strip() != "0"
 # Diagram: spacing 60-150 cm; prose: obstacle 2 width at least 30 cm.
 # 90 cm is a practice-course cap, NOT a numeric limit stated in either PDF.
@@ -271,7 +306,8 @@ class Task2:
                  startup: bool = True, wait_for_go: bool = True,
                  early_arrow_fn: Optional[Callable[[], Optional[str]]] = None,
                  lane_reached_fn: Optional[Callable[[], None]] = None,
-                 arrow_pending_fn: Optional[Callable[[], bool]] = None):
+                 arrow_pending_fn: Optional[Callable[[], bool]] = None,
+                 center_stage2: bool = False):
         self.stm = stm
         self.input_fn = input_fn
         self.sleep_fn = sleep_fn
@@ -280,6 +316,7 @@ class Task2:
         self.early_arrow_fn = early_arrow_fn
         self.lane_reached_fn = lane_reached_fn
         self.arrow_pending_fn = arrow_pending_fn
+        self.center_stage2 = bool(center_stage2)
         self.frame = tp.WorldFrame(stm)
         self.th = 0.0                 # commanded heading, radians
         self.r = tp.RADIUS_CM
@@ -288,6 +325,12 @@ class Task2:
         # It supplies a measured lower bound on that obstacle's width for the
         # same-side outer-eight handoff. None means obstacle 2 was found by IR.
         self.obs2_us_y: Optional[float] = None
+        # A front-US hit proves that obstacle 2 exists, but its projected y is
+        # only a useful width bound when the chassis is genuinely parallel.
+        # WPOSE heading drift made a 7-degree ray overstate the half-width by
+        # about 10 cm in the 07:15 floor run, after which a real IR edge was
+        # rejected as "contradicting" that projection.
+        self.obs2_us_extent_reliable = True
         # A checked US miss from a farther parallel lane supplies the matching
         # upper half-width bound. Together these bounds avoid treating every
         # medium obstacle as the 90 cm worst case.
@@ -300,6 +343,31 @@ class Task2:
         self._stage2_view_origin: Optional[Pose] = None
         self._stage2_view_segments: Optional[List[Seg]] = None
         self.obs2_front_max: Optional[float] = None
+        self.narrow_scan_side: Optional[float] = None
+        self.stage2_centered = False
+        self._stage2_camera_positioned = False
+
+    def _obs2_known_half(self, course: Course) -> float:
+        """Conservative face half-width established by live sensing."""
+        known = W2_RANGE[0] / 2.0
+        if self.obs2_us_y is not None:
+            known = max(known, abs(self.obs2_us_y - course.obs2_y))
+        if self.obs2_near_y is not None:
+            known = max(known, abs(self.obs2_near_y - course.obs2_y))
+        return min(W2_RANGE[1] / 2.0, known)
+
+    def _obs2_minimum_edge_half(self, course: Course) -> float:
+        """Width lower bound strict enough to reject a later measured edge."""
+        if not self.obs2_us_extent_reliable and self.obs2_near_y is None:
+            return W2_RANGE[0] / 2.0
+        return self._obs2_known_half(course)
+
+    def _record_obs2_us_hit(self, ray_y: float, heading: float) -> None:
+        """Record a hit without turning an oblique projection into width."""
+        self.obs2_us_y = ray_y
+        self.obs2_us_extent_reliable = (
+            abs(math.degrees(math.atan2(math.sin(heading), math.cos(heading))))
+            <= 3.0)
 
     # ── wire ──────────────────────────────────────────────────────────────────
 
@@ -363,14 +431,16 @@ class Task2:
             raise RuntimeError("No ?WPOSE.")
         return Pose(p.x, p.y, self.th)     # the carry-over holds commanded
 
-    def _wait_for_stopped_pose(self, samples: int = 20,
+    def _wait_for_stopped_pose(self, samples: int = 40,
                                interval_s: float = 0.05) -> Optional[Pose]:
         """Return only after two consecutive WPOSE samples are stationary.
 
         RST starts braking but does not wait for the chassis to stop. Planning
         from the first post-RST sample caused the floor run to gain another
-        13 cm before its corner was rechecked. This bounded wait normally
-        finishes in well under a second and replaces the old blind delay.
+        13 cm before its corner was rechecked. Later fast-mode traces coasted
+        for just over one second and became stationary one sample after the
+        old 20-sample limit. Keep the early stationary return, but allow up to
+        two seconds for the deployed firmware to finish coasting.
         """
         previous = None
         stable = 0
@@ -493,173 +563,54 @@ class Task2:
         """Approach and ask. Returns (x1, side) or None."""
         p = self._pose()
         g = self._stable_us()
-        if g is None or not (40.0 <= g <= 200.0):
-            logging.error("Ultrasound reads %s ahead at the start - obstacle 1 "
-                          "should be 60-150 cm off the bay. Is the robot square?", g)
+        if g is None or not math.isfinite(g) or g <= tp.CLEARANCE_FLOOR_CM:
+            logging.error("No safe obstacle-1 ultrasound reading at the start: %s.", g)
             return None
+        if not (40.0 <= g <= 200.0):
+            logging.warning("Obstacle-1 ultrasound %.1f cm is outside the nominal "
+                            "course range; using the live reading.", g)
         x1 = self._front(p) + g
-        course = Course(x1, x1 + tp.OBS1_SIZE_CM + 60.0, CONSERVATIVE_W2,
-                        wall_y=CONSERVATIVE_WALL_Y)
-        lanes = self._obs1_lanes()
-        # The latest place the 45 deg turn can start and still clear it: the
-        # standoff. Same on either side, so it is found before the arrow is.
-        # Too early, the tail is still in the bay mouth; too late, obstacle 1
-        # is in the way - so this is a window, and close to the bay it can
-        # shrink to nothing at the full margin.
-        # Clearance from obstacle 1 only falls as the turn starts later, so
-        # the latest start that keeps it is a binary search; the fences are
-        # then checked once, on that one. They only get closer the earlier it
-        # starts, so if it fails there it fails everywhere at full margin.
-        no_fence = [b for b in course.boxes() if "fence" not in b.name]
-        lane = lanes[0]
-        lead = None
-        best_setup = None
-        for candidate_lane in lanes:
-            kick_segs = kick(candidate_lane, self.r)
-
-            def obs_ok(L: int) -> bool:
-                return _path_clear(p, _straight(L) + kick_segs, self.r,
-                                   no_fence, OBS1_TURN_MIN_CM) is not None
-
-            lo, hi = 0, int(x1 - p.x) - 1
-            candidate_lead = None
-            if hi >= 0 and obs_ok(lo):
-                while lo < hi:
-                    mid = (lo + hi + 1) // 2
-                    if obs_ok(mid):
-                        lo = mid
-                    else:
-                        hi = mid - 1
-                if self._check(p, _straight(lo) + kick_segs,
-                               course) >= OBS1_TURN_MIN_CM:
-                    candidate_lead = lo
-            clear = [(L, self._check(p, _straight(L) + kick_segs, course))
-                     for L in range(0, int(x1 - p.x), 2)]
-            fallback_lead, fallback_clearance = max(
-                clear, key=lambda t: t[1], default=(None, -1.0))
-            if (best_setup is None
-                    or fallback_clearance > best_setup[0]):
-                best_setup = (fallback_clearance, fallback_lead,
-                              candidate_lane)
-            if candidate_lead is not None:
-                lead, lane = candidate_lead, candidate_lane
-                break
-        if lead is None:
-            c, lead, lane = best_setup or (-1.0, None, lanes[0])
-            if lead is None or c < tp.CLEARANCE_FLOOR_CM:
-                logging.error("Obstacle 1 is too close to the bay to get round.")
-                return None
-            logging.warning("Turn past obstacle 1 keeps only %.1f cm (target %.1f) "
-                            "- obstacle 1 is close to the bay.", c,
-                            OBS1_TURN_CLEARANCE_CM)
-        standoff = x1 - (p.x + lead + tp.FRONT_FROM_AXLE_CM)
-        travel = g - standoff
-        bulk = travel - tp.APPROACH_LEAD_CM
-        logging.info("Obstacle 1 face at x=%.1f (%.1f ahead). Standing off at "
-                     "%.1f.", x1, g, standoff)
-        approach_start = p
-        bulk_along = 0.0
-        early_side = self._early_obstacle1_side(p, x1, lane)
-        if early_side is not None:
-            return x1, early_side
-        if bulk >= 5:
-            bulk_cm = int(bulk)
-            before = p
-            before_gap = g
-            stopped_side = []
-
-            def poll_early_arrow() -> bool:
-                self.sleep_fn(SENSOR_POLL_S)
-                q = self.frame.pose()
-                if q is None:
-                    return False
-                side = self._early_obstacle1_side(q, x1, lane, log_blocked=False)
-                if side is None:
-                    return False
-                stopped_side.append(side)
-                self.stm.abort()
-                return True
-
-            logging.info("Continuous obstacle-1 approach: F%d; vision may "
-                         "interrupt it at the first clear lane-change pose.",
-                         bulk_cm)
-            reply = tp.run_polling(self.stm, f"F{bulk_cm}", poll_early_arrow)
-            if reply == "STOPPED" and stopped_side:
-                if self._wait_for_stopped_pose() is None:
-                    return None
-                return x1, stopped_side[0]
-            if reply is None or not reply.startswith("OK"):
-                logging.error("STM answered %r during the continuous obstacle-1 "
-                              "approach.", reply)
-                return None
-
-            p = self._pose()
-            g = self._stable_us()
-            expected_gap = before_gap - bulk_cm
-            bulk_along = ((p.x - before.x) * math.cos(before.th)
-                          + (p.y - before.y) * math.sin(before.th))
-            if g is None:
-                logging.error("Lost obstacle 1 ultrasound after F%d; refusing "
-                              "to continue.", bulk_cm)
-                return None
-            if g > expected_gap + OBS1_APPROACH_US_TOL_CM:
-                logging.error("Obstacle 1 echo changed after F%d: expected %.1f "
-                              "cm, read %.1f cm; refusing to chase a different "
-                              "surface.", bulk_cm, expected_gap, g)
-                return None
-            if abs(bulk_along - bulk_cm) > OBS1_APPROACH_ODO_TOL_CM:
-                logging.error("Obstacle 1 approach pose disagrees with F%d: "
-                              "WPOSE reports %.1f cm; refusing to continue.",
-                              bulk_cm, bulk_along)
-                return None
-            if g <= expected_gap - OBS1_CLOSER_US_TOL_CM:
-                # A farther return may be obstacle 2 or a wall, but a nearer
-                # return on the outbound centreline can only make the current
-                # turn more urgent. The floor run that read 22.7 cm after F67
-                # was already at its intended standoff; rejecting it prevented
-                # a confirmed arrow from ever reaching pass_obstacle1().
-                # Re-anchor the face from live pose + US, do not advance again,
-                # and let pass_obstacle1() validate the complete turn envelope
-                # (including any retreat in the cleared approach lane).
-                x1 = self._front(p) + g
-                logging.warning("Obstacle 1 is %.1f cm closer than the F%d "
-                                "prediction (expected %.1f, read %.1f). "
-                                "Re-anchored face at x=%.1f; no further "
-                                "approach movement will be sent.",
-                                expected_gap - g, bulk_cm, expected_gap, g, x1)
-                self.sleep_fn(OBS_PAUSE_S)
-                return x1, _ask_arrow(self.input_fn, "Obstacle 1")
-            x1 = self._front(p) + g
-
-        early_side = self._early_obstacle1_side(p, x1, lane)
-        if early_side is not None:
-            return x1, early_side
-        remaining = g - standoff
+        # Recognition is deliberately stationary. Live vision used to abort a
+        # moving approach; the deployed RST then coasted far enough that US,
+        # IR and WPOSE all described a different pose. Convert the requested
+        # camera-to-board distance to the equivalent ultrasonic reading and
+        # make one normal, reply-terminated straight move instead.
+        sensor_ahead_of_camera = tp.FRONT_FROM_AXLE_CM - CAMERA_FROM_AXLE_CM
+        target_us_gap = OBS1_CAMERA_CHECKPOINT_CM - sensor_ahead_of_camera
+        if target_us_gap <= 0:
+            logging.error("Invalid obstacle-1 camera checkpoint %.1f cm for "
+                          "the configured camera/US offsets.",
+                          OBS1_CAMERA_CHECKPOINT_CM)
+            return None
+        remaining = g - target_us_gap
         final_move = _straight(remaining)
         if final_move:
-            logging.info("Final obstacle-1 standoff move from ?US: %s",
-                         ",".join(seg.token() for seg in final_move))
+            logging.info("Obstacle-1 camera checkpoint: %s targets %.1f cm "
+                         "camera-to-face (US target %.1f cm).",
+                         ",".join(seg.token() for seg in final_move),
+                         OBS1_CAMERA_CHECKPOINT_CM, target_us_gap)
             if not self._line(final_move):
                 return None
         final_pose = self._pose()
         final_gap = self._stable_us()
-        if final_gap is None or abs(final_gap - standoff) > 6.0:
-            logging.error("Final F move did not reach obstacle 1 safely: "
-                          "wanted %.1f cm, "
-                          "read %s; refusing the bypass turn.",
-                          standoff,
-                          "no echo" if final_gap is None else "%.1f cm" % final_gap)
+        if final_gap is None or not math.isfinite(final_gap):
+            logging.error("Obstacle-1 ultrasound was unavailable after the camera move.")
             return None
-        expected_total = bulk_along + g - final_gap
-        actual_total = ((final_pose.x - approach_start.x) * math.cos(approach_start.th)
-                        + (final_pose.y - approach_start.y) * math.sin(approach_start.th))
-        if abs(actual_total - expected_total) > OBS1_APPROACH_ODO_TOL_CM:
-            logging.error("Obstacle 1 final pose and ultrasound disagree: WPOSE "
-                          "reports %.1f cm travel, sensors imply %.1f cm; refusing "
-                          "the bypass turn.", actual_total, expected_total)
+        if final_gap <= tp.CLEARANCE_FLOOR_CM:
+            logging.error("Obstacle 1 is only %.1f cm from the front sensor.", final_gap)
             return None
+        if final_gap > target_us_gap + 6.0:
+            logging.error("Obstacle-1 echo changed after the camera move: "
+                          "expected %.1f cm, read %.1f cm; refusing to chase "
+                          "a different surface.", target_us_gap, final_gap)
+            return None
+        if abs(final_gap - target_us_gap) > 6.0:
+            logging.warning("Obstacle-1 camera move ended at US %.1f cm instead "
+                            "of %.1f cm; re-anchoring the face from the live "
+                            "reading and continuing.", final_gap, target_us_gap)
         x1 = self._front(final_pose) + final_gap
-        self.sleep_fn(OBS_PAUSE_S)
+        logging.info("Obstacle 1 stable at the %.1f cm camera checkpoint; "
+                     "starting recognition now.", OBS1_CAMERA_CHECKPOINT_CM)
         return x1, _ask_arrow(self.input_fn, "Obstacle 1")
 
     def pass_obstacle1(self, x1: float, side1: float) -> Optional[float]:
@@ -693,17 +644,19 @@ class Task2:
                     break
             if segs is not None:
                 break
-        if segs is None and best_clearance >= OBS1_TURN_FALLBACK_CM:
+        if segs is None and best_clearance >= OBS1_TURN_FALLBACK_MIN_CM:
             segs = best_candidate
             logging.warning("Obstacle-1 lane change has %.1f cm clearance, "
                             "below the preferred %.1f cm but above the %.1f cm "
-                            "measured fallback; taking the best checked route.",
+                            "measured execution fallback; taking the best "
+                            "checked route.",
                             best_clearance, OBS1_TURN_MIN_CM,
-                            OBS1_TURN_FALLBACK_CM)
+                            OBS1_TURN_FALLBACK_MIN_CM)
         if segs is None:
             logging.error("No obstacle-1 lane change keeps the %.1f cm measured "
                           "fallback (%.1f cm preferred; best %.1f cm).",
-                          OBS1_TURN_FALLBACK_CM, OBS1_TURN_MIN_CM, best_clearance)
+                          OBS1_TURN_FALLBACK_MIN_CM, OBS1_TURN_MIN_CM,
+                          best_clearance)
             return None
         if best_clearance < OBS1_TURN_MIN_CM:
             front = self._stable_us()
@@ -711,7 +664,7 @@ class Task2:
             side_floor = (tp.HALF_WIDTH_CM - tp.IR_SIDE_OFFSET_CM
                           + tp.CLEARANCE_FLOOR_CM + IR_FACE_UNCERTAINTY_CM)
             if (front is None or not math.isfinite(front)
-                    or front < LANE_US_MIN_CLEAR_CM
+                    or front < OBS1_LIVE_US_MIN_CM
                     or (side_gap is not None and
                         (not math.isfinite(side_gap) or side_gap < side_floor))):
                 logging.error("Obstacle-1 fallback lacks live clearance "
@@ -728,13 +681,19 @@ class Task2:
         if not self._line(segs):
             return None
         p = self._pose()
-        self._notify_obstacle2_view(p, x1)
+        # Start stage 2 at the first measured pose parallel to obstacle 1.
+        # Do not consume a fixed straight or camera-gate manoeuvre before the
+        # arrow: obstacle 2 may be only 10 cm long.
+        if not self.center_stage2 and not self._stage2_view_open:
+            self._stage2_view_open = True
+            if self.lane_reached_fn is not None:
+                self.lane_reached_fn()
 
-        # An early vision-triggered kick can finish well before the pose from
-        # which the original route located obstacle 2.  Stay on the clear
-        # bypass lane and make up only that missing longitudinal distance.
-        # The target is the same radius-before-obstacle-1 handoff used by the
-        # normal route; it is independent of when the arrow was recognised.
+        # Recognition may finish as soon as the robot becomes parallel, but
+        # that pose is still beside obstacle 1 and its forward ultrasound can
+        # report the wrong surface.  Complete only the checked bypass lead to
+        # the fixed handoff station before locating/planning obstacle 2.  The
+        # arrow remains latched; it must not cancel this safety positioning.
         handoff_x = x1 - self.r
         cruise_cm = int(math.floor(handoff_x - p.x))
         if cruise_cm > 0:
@@ -744,16 +703,12 @@ class Task2:
                 logging.error("The bypass-lane cruise to obstacle 2 keeps only "
                               "%.1f cm clearance; refusing it.", clearance)
                 return None
-            logging.info("Continuous bypass-lane cruise F%d to the obstacle-2 "
-                         "handoff (clearance %.1f cm).", cruise_cm, clearance)
-            # Vision latches its result on its own thread. This checked lead
-            # is needed whether the arrow arrives before or during the move;
-            # interrupting it only adds coast and an earlier planning pose.
+            logging.info("Stage-2 arrow may already be latched; completing "
+                         "checked bypass positioning F%d before branching "
+                         "(clearance %.1f cm).", cruise_cm, clearance)
             if not self._line(cruise):
                 return None
             p = self._pose()
-
-        self._notify_obstacle2_view(p, x1)
 
         g = self._stable_us()
         distance_from_axle = None if g is None else tp.FRONT_FROM_AXLE_CM + g
@@ -761,7 +716,8 @@ class Task2:
               p.x + distance_from_axle * math.cos(p.th))
         gap12 = None if x2 is None else x2 - (x1 + tp.OBS1_SIZE_CM)
         if gap12 is not None and GAP12_RANGE[0] <= gap12 <= GAP12_RANGE[1]:
-            self.obs2_us_y = p.y + distance_from_axle * math.sin(p.th)
+            self._record_obs2_us_hit(
+                p.y + distance_from_axle * math.sin(p.th), p.th)
             logging.info("Obstacle 2 face at x=%.1f, %.1f cm past obstacle 1.",
                          x2, gap12)
             return x2
@@ -775,7 +731,8 @@ class Task2:
                 logging.error("Lane echo overlaps obstacle 1 in the measured "
                               "frame; cannot identify obstacle 2 (x=%.1f).", x2)
                 return None
-            self.obs2_us_y = p.y + distance_from_axle * math.sin(p.th)
+            self._record_obs2_us_hit(
+                p.y + distance_from_axle * math.sin(p.th), p.th)
             self.obs2_front_max = x1 + tp.OBS1_SIZE_CM + 60.0
             logging.warning("Measured spacing %.1f cm is shorter than the brief; "
                             "retaining the closer face x=%.1f from US %.1f cm. "
@@ -789,29 +746,335 @@ class Task2:
                      "obstacle 2 is narrow.", g)
         return NARROW
 
-    def find_narrow(self, x1: float, side1: float) -> Optional[float]:
+    def find_narrow_from_centre(self, x1: float,
+                                side1: float) -> Optional[float]:
+        """Try the centreline before committing to the outward side scan.
+
+        A miss from the obstacle-1 bypass lane only proves that obstacle 2 is
+        narrower than that US ray.  It does not prove the centreline is
+        blocked.  Plan the complete merge against an obstacle at the minimum
+        legal spacing, then use front US to acquire its face head-on.  Tight
+        layouts for which that conservative merge cannot fit retain the
+        existing side-IR/angled-camera fallback.
         """
-        Obstacle 2 is narrow but its distance is unknown. Widen to
-        NARROW_LANE_CM on side1, drive on with the inner IR watching, and RST
-        the moment obstacle 2's end face shows. Returns its face x.
+        p = self._pose()
+        minimum_x2 = x1 + tp.OBS1_SIZE_CM + GAP12_RANGE[0]
+        maximum_x2 = x1 + tp.OBS1_SIZE_CM + GAP12_RANGE[1]
+        narrow_half_bound = min(
+            W2_RANGE[1] / 2.0,
+            abs(p.y) + IR_FACE_UNCERTAINTY_CM)
+        conservative = Course(
+            x1, minimum_x2, 2 * narrow_half_bound,
+            wall_y=CONSERVATIVE_WALL_Y)
+
+        def centre_options(start: Pose, checked: Course):
+            found = []
+            for lead in range(0, 31):
+                candidate = (_straight(lead)
+                             + tp.lane_change(
+                                 start.th,
+                                 checked.obs2_y - start.y, self.r))
+                if not candidate:
+                    continue
+                end = tp.run(start, candidate, self.r, step=1e6)[-1]
+                heading = math.atan2(math.sin(end.th), math.cos(end.th))
+                if (abs(end.y - checked.obs2_y) > 2.0
+                        or abs(math.degrees(heading)) > 5.0):
+                    continue
+                clearance = self._check(start, candidate, checked)
+                if clearance < tp.CLEARANCE_FLOOR_CM:
+                    continue
+                found.append((
+                    tp.motion_cost(candidate, self.r, fast=self.fast),
+                    -clearance, candidate))
+            return found
+
+        options = centre_options(p, conservative)
+        if not options:
+            # The minimum-gap box may reject a merge that is safe at the
+            # actual spacing.  Take one shallow inward US look whose ray
+            # intersects even a 30 cm face throughout the legal range, undo
+            # it exactly, then re-plan with the measured x2.  This avoids the
+            # unnecessary outward turn toward a bullseye on roomy courses.
+            toward = "R" if side1 > 0 else "L"
+            probes = []
+            for lead in range(0, 31):
+                for angle in range(NARROW_RANGING_MIN_ARC_DEG, 31):
+                    candidate = _straight(lead) + [Seg(toward, angle)]
+                    end = tp.run(p, candidate, self.r, step=1e6)[-1]
+                    front = tp.straight(end, tp.FRONT_FROM_AXLE_CM)
+                    if abs(math.cos(end.th)) < 0.2:
+                        continue
+                    ray_ys = [front.y + (face_x - front.x)
+                              * math.tan(end.th)
+                              for face_x in (minimum_x2, maximum_x2)]
+                    if any(abs(y - conservative.obs2_y) > W2_RANGE[0] / 2.0
+                           for y in ray_ys):
+                        continue
+                    clearance = self._check(p, candidate, conservative)
+                    if clearance < tp.CLEARANCE_FLOOR_CM:
+                        continue
+                    probes.append((
+                        tp.motion_cost(candidate, self.r, fast=self.fast),
+                        -clearance, lead, angle, candidate))
+            if probes:
+                _, _, probe_lead, probe_angle, probe = min(
+                    probes, key=lambda item: item[:2])
+                logging.info("Narrow obstacle centre probe: %s.",
+                             ",".join(seg.token() for seg in probe))
+                if not self._line(probe):
+                    return None
+                q = self._pose()
+                g = self._stable_us()
+                front = tp.straight(q, tp.FRONT_FROM_AXLE_CM)
+                if g is not None and math.isfinite(g) and g > 0:
+                    probed_x2 = front.x + g * math.cos(q.th)
+                    ray_y = front.y + g * math.sin(q.th)
+                else:
+                    probed_x2 = None
+                    ray_y = None
+                plausible = (probed_x2 is not None
+                             and minimum_x2 - 6.0 <= probed_x2 <= maximum_x2 + 6.0
+                             and abs(ray_y or 0.0) <= W2_RANGE[0] / 2.0 + 5.0)
+                checked = (Course(x1, probed_x2, 2 * narrow_half_bound,
+                                  wall_y=CONSERVATIVE_WALL_Y)
+                           if plausible else conservative)
+                align = ([Seg(toward.lower(), probe_angle)]
+                         + _straight(-probe_lead))
+                if (self._check(q, align, checked) < tp.CLEARANCE_FLOOR_CM
+                        or not self._line(align)):
+                    return None
+                p = self._pose()
+                if plausible:
+                    conservative = checked
+                    options = centre_options(p, conservative)
+                    if options:
+                        logging.info("Inward US probe located obstacle 2 at "
+                                     "x=%.1f; using its real spacing for the "
+                                     "checked centre merge.", probed_x2)
+            if not options:
+                logging.info("Measured geometry cannot fit a checked merge "
+                             "to the obstacle-2 centreline; using the angled "
+                             "side localisation route.")
+                return None
+
+        preferred = [item for item in options
+                     if -item[1] >= tp.CLEARANCE_CM]
+        if not preferred:
+            logging.info("Centre merge is geometrically possible but keeps "
+                         "less than %.1f cm clearance; retaining the outer "
+                         "localisation route.", tp.CLEARANCE_CM)
+            return None
+        options = preferred
+        _, negative_clearance, merge = min(
+            options, key=lambda item: item[:2])
+        logging.info("Side-lane US missed obstacle 2; merging toward its "
+                     "centre before recognition: %s (clearance %.1f cm).",
+                     ",".join(seg.token() for seg in merge),
+                     -negative_clearance)
+        # Keep the complete pre-photo displacement. If a head-on 30 cm view
+        # leaves too little turning radius after the arrow is known, recovery
+        # must return to the clear side lane, not merely undo the final one
+        # centimetre camera approach.
+        self._stage2_view_origin = p
+        self._stage2_view_segments = list(merge)
+        if not self._line(merge):
+            self._stage2_view_origin = None
+            self._stage2_view_segments = None
+            return None
+        q = self._pose()
+        g = self._stable_us()
+        if g is None or not math.isfinite(g) or g <= 0:
+            logging.info("Centred US still has no obstacle-2 face; retaining "
+                         "the side-IR fallback.")
+            return None
+        distance_from_axle = tp.FRONT_FROM_AXLE_CM + g
+        x2 = q.x + distance_from_axle * math.cos(q.th)
+        gap12 = x2 - (x1 + tp.OBS1_SIZE_CM)
+        if not GAP12_RANGE[0] <= gap12 <= GAP12_RANGE[1]:
+            logging.info("Centred US echo projects to spacing %.1f cm, outside "
+                         "the obstacle-2 range; retaining the side-IR "
+                         "fallback.", gap12)
+            return None
+        self._record_obs2_us_hit(
+            q.y + distance_from_axle * math.sin(q.th), q.th)
+        # The bypass-lane miss supplies an upper width bound at that measured
+        # ray, including IR/pose uncertainty.  Keep the measured bound rather
+        # than the nominal 22 cm cutoff: lateral/radius drift can put the ray
+        # just outside a 50 cm face even though the ideal lane would hit it.
+        self.obs2_half_max = narrow_half_bound
+        logging.info("Centred US located obstacle 2 at x=%.1f, %.1f cm past "
+                     "obstacle 1; the camera can now approach head-on.",
+                     x2, gap12)
+        return x2
+
+    def find_narrow(self, x1: float, side1: float,
+                    side2: Optional[float] = None) -> Optional[float]:
         """
+        Locate a narrow obstacle 2 whose forward face missed the parallel US.
+
+        For opposite arrows, first aim a shallow ray toward the requested
+        side. Across the brief's complete 60..150 cm spacing range that ray
+        crosses the guaranteed 30 cm-wide face, so it supplies x2 before the
+        car consumes the room needed by the diagonal handoff. Re-align and let
+        the normal opposite-arrow planner perform that diagonal immediately.
+
+        If the angled ray is unavailable, or for matching arrows, use the
+        established outward lane and inward side IR. Returns obstacle 2's
+        front-face x.
+        """
+        requested_side = side1 if side2 is None else side2
+        scan_side = requested_side
         p = self._pose()
         course = Course(x1, x1 + tp.OBS1_SIZE_CM + GAP12_RANGE[0],
                         2 * NARROW_HALF_MAX, wall_y=CONSERVATIVE_WALL_Y)
-        widen = tp.lane_change(0.0, side1 * NARROW_LANE_CM - p.y, self.r)
-        if self._first_clear(p, [widen], course, "widening to the narrow lane") is None:
+
+        if requested_side != side1:
+            toward = "L" if requested_side > 0 else "R"
+            min_x2 = x1 + tp.OBS1_SIZE_CM + GAP12_RANGE[0]
+            max_x2 = x1 + tp.OBS1_SIZE_CM + GAP12_RANGE[1]
+            # The simulator and floor odometry reach the parallel pose at
+            # different x coordinates. Search a short lead plus a calibrated
+            # inward angle whose US ray intersects the guaranteed 30 cm face
+            # at both legal spacing extremes. This is geometry, not a fixed
+            # timing/distance guess.
+            probe_options = []
+            for lead in range(0, 31):
+                for probe_angle in range(NARROW_RANGING_MIN_ARC_DEG, 31):
+                    candidate = (_straight(lead)
+                                 + [Seg(toward, probe_angle)])
+                    end = tp.run(p, candidate, self.r, step=1e6)[-1]
+                    front = tp.straight(end, tp.FRONT_FROM_AXLE_CM)
+                    if abs(math.cos(end.th)) < 0.2:
+                        continue
+                    ray_ys = [front.y + (face_x - front.x)
+                              * math.tan(end.th)
+                              for face_x in (min_x2, max_x2)]
+                    if any(abs(y - course.obs2_y) > W2_RANGE[0] / 2.0
+                           for y in ray_ys):
+                        continue
+                    clearance = self._check(p, candidate, course)
+                    if clearance < tp.CLEARANCE_FLOOR_CM:
+                        continue
+                    probe_options.append((tp.motion_cost(candidate, self.r),
+                                          -clearance, lead, probe_angle,
+                                          candidate))
+            probe_options.sort(key=lambda item: (item[0], item[1]))
+            if probe_options:
+                _, _, probe_lead, probe_angle, probe = probe_options[0]
+                checked_probe = probe
+                logging.info(
+                    "Opposite-arrow narrow ranging setup %s: its angled US "
+                    "ray intersects every legal 30 cm face.",
+                    ",".join(seg.token() for seg in probe))
+            else:
+                probe_lead = 0
+                probe_angle = NARROW_RANGING_MIN_ARC_DEG
+                probe = []
+                checked_probe = None
+            if checked_probe is not None and self._line(checked_probe):
+                q = self._pose()
+                gap = self._stable_us()
+                front = tp.straight(q, tp.FRONT_FROM_AXLE_CM)
+                if gap is not None and math.isfinite(gap) and gap > 0:
+                    x2_probe = front.x + gap * math.cos(q.th)
+                    ray_y = front.y + gap * math.sin(q.th)
+                else:
+                    x2_probe = None
+                    ray_y = None
+                plausible = (x2_probe is not None
+                             and min_x2 - 6.0 <= x2_probe <= max_x2 + 6.0
+                             and abs(ray_y or 0.0) <= W2_RANGE[0] / 2.0 + 5.0)
+
+                # Always undo the small ranging turn before either the
+                # diagonal planner or the side-IR fallback. Validate it using
+                # the measured face when one was obtained.
+                align_course = (Course(x1, x2_probe,
+                                       2 * NARROW_HALF_MAX,
+                                       wall_y=CONSERVATIVE_WALL_Y)
+                                if plausible else course)
+                # Retrace the exact setup instead of adding another forward
+                # arc: reversing the arc and then the lead restores the
+                # measured pose and preserves all longitudinal room for the
+                # diagonal.
+                align = ([Seg(toward.lower(), probe_angle)]
+                         + _straight(-probe_lead))
+                if self._check(q, align, align_course) < tp.CLEARANCE_FLOOR_CM:
+                    logging.error("Cannot safely re-align after the inward "
+                                  "narrow-obstacle ranging turn.")
+                    return None
+                if not self._line(align):
+                    return None
+                if plausible:
+                    self._record_obs2_us_hit(ray_y, q.th)
+                    self.narrow_scan_side = side1
+                    aligned = self._pose()
+                    measured = Course(x1, x2_probe,
+                                      2 * NARROW_HALF_MAX,
+                                      wall_y=CONSERVATIVE_WALL_Y)
+                    diagonal = self.select_face_handoff(
+                        aligned, measured, side1, requested_side)
+                    if diagonal is not None and not any(
+                            seg.kind == "B" for seg in diagonal[0]):
+                        logging.info(
+                            "Opposite-arrow inward ray located narrow obstacle "
+                            "2 at x=%.1f, ray y=%.1f; re-aligned for the "
+                            "immediate %s diagonal %s.",
+                            x2_probe, ray_y,
+                            "left" if requested_side > 0 else "right",
+                            ",".join(seg.token() for seg in diagonal[0]))
+                        return x2_probe
+                    logging.info(
+                        "The measured face at x=%.1f is too close for a "
+                        "forward diagonal; using the side-IR route instead.",
+                        x2_probe)
+                    self._handoff_cache = None
+                else:
+                    logging.warning(
+                        "Inward narrow-obstacle ray did not return a plausible "
+                        "face (US=%s, projected x=%s); using the side-IR "
+                        "fallback.", gap,
+                        "none" if x2_probe is None else "%.1f" % x2_probe)
+                p = self._pose()
+
+        widen = tp.lane_change(0.0, scan_side * NARROW_LANE_CM - p.y, self.r)
+        crossing_clearance = self._check(p, widen, course)
+        if (scan_side != side1
+                and crossing_clearance < tp.CLEARANCE_FLOOR_CM):
+            # At the brief's minimum spacing the rear of this crossing can
+            # still overlap obstacle 1 while its front reaches obstacle 2.
+            # Do not force the requested diagonal through that pinched gap.
+            # Locate the short face from the already-cleared side, then the
+            # normal opposite-arrow handoff crosses with x2 measured.
+            logging.info("Immediate narrow-obstacle crossing toward %s keeps "
+                         "only %.1f cm; locating its face temporarily from "
+                         "the cleared %s side first.",
+                         "left" if requested_side > 0 else "right",
+                         crossing_clearance,
+                         "left" if side1 > 0 else "right")
+            scan_side = side1
+            widen = tp.lane_change(
+                0.0, scan_side * NARROW_LANE_CM - p.y, self.r)
+        self.narrow_scan_side = scan_side
+        movement = ("crossing to the obstacle-2 arrow side"
+                    if scan_side != side1 else "widening to the narrow lane")
+        if self._first_clear(p, [widen], course, movement) is None:
             return None
+        logging.info("Narrow obstacle: %s (%s); the %s IR will watch inward.",
+                     movement, ",".join(seg.token() for seg in widen),
+                     "right" if scan_side > 0 else "left")
         if not self._line(widen):
             return None
 
-        # Heading +x on the side1 lane, the centreline is on the right for
-        # side1 = left, and the left for side1 = right.
-        inner = "right" if side1 > 0 else "left"
+        # Heading +x on the selected lane, the centreline is on the right for
+        # the left lane, and on the left for the right lane.
+        inner = "right" if scan_side > 0 else "left"
         far = x1 + tp.OBS1_SIZE_CM + GAP12_RANGE[1] + tp.OBS2_DEPTH_CM
         # Obstacle 2's end face, if it is 30..2*NARROW_HALF_MAX wide.
         expect_min = NARROW_LANE_CM - tp.IR_SIDE_OFFSET_CM - NARROW_HALF_MAX - 4
         expect_max = NARROW_LANE_CM - tp.IR_SIDE_OFFSET_CM - W2_RANGE[0] / 2.0 + 4
         hits = []
+        extended_hits = []
 
         def poll() -> bool:
             # Pair a moving IR sighting with the pose before its serial
@@ -822,21 +1085,53 @@ class Task2:
                 self._notify_obstacle2_view(q, x1)
             g = self._ir(inner)
             if q is None or g is None:
+                extended_hits.clear()
+                self.sleep_fn(SENSOR_POLL_S)
                 return False
-            ir_x = q.x + tp.IR_FROM_AXLE_CM
-            # Obstacle 1 shows first; only take what is past it.
-            if ir_x > x1 + tp.OBS1_SIZE_CM + 15 and expect_min <= g <= expect_max:
+            candidate_x = q.x + tp.IR_FROM_AXLE_CM - tp.IR_LAG_CM
+            # Obstacle 1 and its trailing-edge clutter show first. The brief's
+            # spacing is face-to-face, so a valid obstacle-2 face cannot occur
+            # before obstacle 1's far face plus GAP12_RANGE[0]. The previous
+            # 15 cm gate accepted the logged x=111.7 echo, then reversed 67 cm
+            # to photograph a location where obstacle 2 could not legally be.
+            min_x2 = x1 + tp.OBS1_SIZE_CM + GAP12_RANGE[0]
+            if candidate_x >= min_x2 and expect_min <= g <= expect_max:
                 hits.append((q, g))
                 # The side is only 10 cm thick. Three moving samples can
                 # miss it entirely; brake on evidence and confirm at rest.
                 self.stm.abort()                      # RST: no reply comes
                 self.sleep_fn(0.10)
                 return True
+            if (candidate_x >= min_x2
+                    and expect_max < g <= FRONT_FACE_HARD_MAX_CM):
+                # The physical lane can sit a few centimetres farther from
+                # the board than its nominal geometry.  A single 30-34 cm IR
+                # sample can also be floor clutter, so extend the window only
+                # after two consecutive moving readings agree.  This keeps
+                # the normal close-range trigger immediate while allowing a
+                # real board at the measured 33-34 cm offset to stop F115.
+                extended_hits.append((q, g))
+                extended_hits[:] = extended_hits[-2:]
+                if (len(extended_hits) == 2
+                        and abs(extended_hits[1][1]
+                                - extended_hits[0][1]) <= 3.0):
+                    hits.extend(extended_hits)
+                    self.stm.abort()                  # RST: no reply comes
+                    self.sleep_fn(0.10)
+                    return True
+            else:
+                extended_hits.clear()
+            # The STM's IR conversion does not gain information when queried
+            # hundreds of times per second. Keep the chassis moving, but let
+            # a miss wait for a fresh sensor interval. A valid first hit still
+            # brakes immediately and pays no extra polling delay.
+            self.sleep_fn(SENSOR_POLL_S)
             return False
 
         confirmed = False
         for attempt in range(3):
             hits.clear()
+            extended_hits.clear()
             remaining = int(far - (self._pose().x + tp.IR_FROM_AXLE_CM))
             if remaining <= 0:
                 break
@@ -848,26 +1143,76 @@ class Task2:
                 logging.error("Narrow-lane scan finished without a plausible "
                               "obstacle-2 sighting on the %s IR.", inner)
                 return None
-            if reply == "STOPPED" and self._wait_for_stopped_pose() is None:
-                return None
+            settled = None
+            if reply == "STOPPED":
+                settled = self._wait_for_stopped_pose()
+                if settled is None:
+                    return None
             first_pose, first_gap = hits[0]
+            confirm_max = (FRONT_FACE_HARD_MAX_CM
+                           if first_gap > expect_max else expect_max)
             logging.info("Narrow obstacle candidate on %s IR: %.1f cm; "
                          "confirming at rest (attempt %d/3).",
                          inner, first_gap, attempt + 1)
             # At most four IR queries (0.5s timeout each). Normally the first
             # two agree: only 0.10s braking + 0.06s sample spacing is added.
             consecutive = 0
+            clear_consecutive = 0
+            finite_edge_consecutive = 0
+            # RST currently coasts before stopping. If that measured coast
+            # carries the side sensor beyond obstacle 2's complete 10 cm
+            # depth, a clear IR at rest confirms the trailing edge instead of
+            # disproving the moving hit. Short one-sample spikes still fail
+            # this spatial check and use the bounded retry below.
+            coast = 0.0
+            if settled is not None:
+                coast = ((settled.x - first_pose.x) * math.cos(first_pose.th)
+                         + (settled.y - first_pose.y) * math.sin(first_pose.th))
+            edge_pass = max(4.0, tp.OBS2_DEPTH_CM - tp.IR_LAG_CM)
             for _ in range(4):
                 self.sleep_fn(0.03)
                 gap = self._ir(inner)
-                if (gap is not None and expect_min <= gap <= expect_max
+                if (gap is not None and expect_min <= gap <= confirm_max
                         and abs(gap - first_gap) <= 3.0):
                     consecutive += 1
+                    clear_consecutive = 0
                     if consecutive == 2:
                         confirmed = True
                         break
                 else:
                     consecutive = 0
+                    finite_edge = (gap is not None and math.isfinite(gap)
+                                   and gap > first_gap
+                                   + max(4.0, IR_FACE_UNCERTAINTY_CM))
+                    if gap is None or finite_edge:
+                        clear_consecutive += 1
+                        finite_edge_consecutive = (
+                            finite_edge_consecutive + 1 if finite_edge else 0)
+                        # Two agreeing samples while moving followed by two
+                        # clear samples are the complete near-edge/far-edge
+                        # signature of this 10 cm-deep board.  The 05:17:30
+                        # floor run produced 30,29 cm, then 56,59 cm after
+                        # braking; requiring the whole nominal depth as
+                        # post-RST coast rejected that real board even though
+                        # the beam had already crossed part of it before RST.
+                        moving_edge_pair = (
+                            len(hits) >= 2
+                            and abs(hits[-1][1] - hits[-2][1]) <= 3.0)
+                        if (clear_consecutive == 2
+                                and (coast >= edge_pass
+                                     or moving_edge_pair
+                                     or (finite_edge_consecutive >= 2
+                                         and coast >= 1.0))):
+                            confirmed = True
+                            logging.info(
+                                "Narrow obstacle edge confirmed by %d "
+                                "consistent moving sighting(s), %.1f cm "
+                                "post-RST travel, and clear %s IR.",
+                                len(hits), coast, inner)
+                            break
+                    else:
+                        clear_consecutive = 0
+                        finite_edge_consecutive = 0
             if confirmed:
                 # Keep the first moving pose for the front-edge estimate;
                 # using the braking endpoint would bias it farther forward.
@@ -882,7 +1227,7 @@ class Task2:
                           "not treating an unconfirmed reading as its edge.")
             return None
         x2 = hits[0][0].x + tp.IR_FROM_AXLE_CM - tp.IR_LAG_CM
-        edge_samples = [q.y - side1 * (tp.IR_SIDE_OFFSET_CM + gap)
+        edge_samples = [q.y - scan_side * (tp.IR_SIDE_OFFSET_CM + gap)
                         for q, gap in hits]
         edge_samples.sort()
         self.obs2_near_y = edge_samples[len(edge_samples) // 2]
@@ -903,6 +1248,50 @@ class Task2:
         """
         out = tp._turn_toward(p.th, side1)
         inward = _other(out)
+
+        # When obstacle 2 is far ahead, the old fallback solved the view as a
+        # long parallel lead followed by a small final arc (for example the
+        # floor log's F90,FR25).  That makes the car appear to drive straight
+        # past the board before it ever aims the camera.  Also offer the
+        # geometrically equivalent turn-first family: aim inward immediately,
+        # then approach along that camera ray.
+        for lead in range(0, 41):
+            prefix = _straight(lead)
+            # Start with the requested 45-degree move toward obstacle 2, then
+            # partially straighten so the remaining forward motion follows
+            # the actual camera ray.  This is the visible/continuous S entry
+            # that the floor run expected instead of F90 followed by FR25.
+            for recover in range(15, 45):
+                turn = (prefix + [Seg(inward, KICK_DEG),
+                                  Seg(out, recover)])
+                turned = tp.run(p, turn, self.r, step=1e6)[-1]
+                cam = tp.straight(turned, CAMERA_FROM_AXLE_CM)
+                c, s = math.cos(turned.th), math.sin(turned.th)
+                dx = course.x2 - cam.x
+                dy = course.obs2_y - cam.y
+                ahead = dx * c + dy * s
+                lateral = -dx * s + dy * c
+                if abs(lateral) <= 4.0 and ahead >= PHOTO_MIN_CM - 6.0:
+                    candidate = turn + _straight(ahead - PHOTO_DIST_CM)
+                    yield candidate, math.hypot(ahead, lateral), recover
+            for look in range(15, 61):
+                turn = prefix + [Seg(inward, look)]
+                turned = tp.run(p, turn, self.r, step=1e6)[-1]
+                cam = tp.straight(turned, CAMERA_FROM_AXLE_CM)
+                c, s = math.cos(turned.th), math.sin(turned.th)
+                dx = course.x2 - cam.x
+                dy = course.obs2_y - cam.y
+                ahead = dx * c + dy * s
+                lateral = -dx * s + dy * c
+                # A one-degree integer arc step can leave a few centimetres
+                # of lateral residual on a distant target.  The final camera
+                # check still enforces the angular limit.
+                if (abs(lateral) > 4.0
+                        or ahead < PHOTO_MIN_CM - 6.0):
+                    continue
+                candidate = turn + _straight(ahead - PHOTO_DIST_CM)
+                yield candidate, math.hypot(ahead, lateral), look
+
         k = math.radians(KICK_DEG) * side1
         u = (math.cos(p.th + k), math.sin(p.th + k))   # along the diagonal
         e = (math.cos(p.th), math.sin(p.th))           # along the lead
@@ -930,7 +1319,12 @@ class Task2:
         # any of those: no kick, just on or back and swing in, looking at the
         # arrow from whatever distance that gives. swing - 45 is the angle it
         # looks in from, as above.
-        for look in (45, 35, 25, 15):
+        # A narrow-board side scan stops only about one IR lever-arm beyond
+        # its front edge.  Include a 50-degree inward look: it reaches the
+        # requested 30 cm camera distance with a materially shorter retreat
+        # than the old 45-degree-only choice.  Shallower choices remain for
+        # longer gaps and wall-limited layouts.
+        for look in (50, 45, 35, 25, 15):
             end0 = tp.run(p, [Seg(inward, look)], self.r)[-1]
             cam0 = (end0.x + CAMERA_FROM_AXLE_CM * math.cos(end0.th),
                     end0.y + CAMERA_FROM_AXLE_CM * math.sin(end0.th))
@@ -942,7 +1336,7 @@ class Task2:
                 continue
             lead = (ax * v[1] - ay * v[0]) / det
             dist = (e[0] * ay - e[1] * ax) / det
-            if PHOTO_MIN_CM - 0.01 <= dist <= PHOTO_DIST_CM + 6.0:
+            if PHOTO_MIN_CM - 0.01 <= dist <= PHOTO_DIST_CM + 12.0:
                 yield _straight(lead) + [Seg(inward, look)], dist, look + KICK_DEG
 
     @staticmethod
@@ -960,7 +1354,10 @@ class Task2:
                               obs1_y: float = 0.0) -> None:
         if self._stage2_view_open:
             return
-        if (abs(math.atan2(math.sin(p.th), math.cos(p.th))) > math.radians(5)
+        if self.center_stage2 and not self._stage2_camera_positioned:
+            return
+        if (abs(math.atan2(math.sin(p.th), math.cos(p.th))) >
+                math.radians(STAGE2_MAX_HEADING_DEG)
                 or self._first_board_behind_camera(p, x1, obs1_y)
                 < STAGE2_REAR_EXCLUSION_CM):
             return
@@ -982,14 +1379,12 @@ class Task2:
         direct_clear = self._check(p, direct, course) >= tp.CLEARANCE_FLOOR_CM
         side = 1.0 if p.y >= course.obs1_y else -1.0
         if direct_clear:
-            end = tp.run(p, direct, self.r, step=1e6)[-1]
-            for next_side in (side, -side):
-                join = self.select_face_handoff(end, course, side, next_side)
-                if (join is not None and not join[1]
-                        and all(s.kind in ("F", "L", "R") for s in join[0])):
-                    return direct
-            logging.info("Straight camera view consumes forward handoff room; "
-                         "checking curved views before advancing and reversing.")
+            # This is the minimum checked move that hides obstacle 1 from the
+            # camera.  Planning both possible obstacle-2 arrows here added a
+            # multi-second stop, then had to be repeated from the measured
+            # endpoint anyway.  The eventual handoff is planned from the
+            # measured endpoint without undoing this valid forward motion.
+            return direct
         outward = "L" if side > 0 else "R"
         options = []
         for angle in (15, 30, 45):
@@ -1038,8 +1433,12 @@ class Task2:
     def _prepare_obstacle2_view(self, course: Course) -> None:
         """Reach a checked view that excludes the already-read first board."""
         p = self._pose()
-        if abs(math.atan2(math.sin(p.th), math.cos(p.th))) > math.radians(5):
-            raise RuntimeError("Stage 2 camera gate requires the parallel bypass heading")
+        initial_heading_error = abs(math.degrees(math.atan2(
+            math.sin(p.th), math.cos(p.th))))
+        if initial_heading_error > STAGE2_MAX_HEADING_DEG:
+            logging.warning("Stage 2 starts %.1f deg off the nominal parallel "
+                            "heading; the measured handoff will absorb it.",
+                            initial_heading_error)
         behind = self._first_board_behind_camera(p, course.x1, course.obs1_y)
         if behind < STAGE2_REAR_EXCLUSION_CM:
             segs = self._select_obstacle2_view(p, course)
@@ -1058,10 +1457,17 @@ class Task2:
             if not self._view_line(segs, course):
                 raise RuntimeError("Stage 2 camera-gate advance failed")
             p = self._pose()
-        if abs(math.atan2(math.sin(p.th), math.cos(p.th))) > math.radians(5):
-            raise RuntimeError("Measured stage 2 view is not parallel after camera-gate motion")
-        if self._first_board_behind_camera(p, course.x1, course.obs1_y) < STAGE2_REAR_EXCLUSION_CM:
-            raise RuntimeError("Measured pose has not cleared the stage 2 camera gate")
+        heading_error = abs(math.degrees(math.atan2(
+            math.sin(p.th), math.cos(p.th))))
+        if heading_error > 5.0:
+            logging.warning("Measured stage 2 view is %.1f deg off parallel; "
+                            "retaining continuous motion and absorbing it in "
+                            "the checked handoff.", heading_error)
+        if self._first_board_behind_camera(
+                p, course.x1, course.obs1_y) < STAGE2_REAR_EXCLUSION_CM:
+            logging.warning("Measured stage-2 pose has not reached the nominal "
+                            "camera exclusion plane; vision remains live and "
+                            "the collision-checked handoff continues.")
         self._notify_obstacle2_view(p, course.x1, course.obs1_y)
         # A narrow board is found by driving alongside it. If vision has not
         # already latched its arrow during that cruise, return to a checked
@@ -1152,26 +1558,188 @@ class Task2:
         return True
 
     def photo_obstacle2(self, course: Course, side1: float) -> float:
-        """Pull up for the photo of obstacle 2 and ask its arrow."""
-        self._prepare_obstacle2_view(course)
-        # Manual and simulator callers do not have an asynchronous camera
-        # callback. Ask from the straight bypass lane, which also preserves the
-        # space required by the forward-only obstacle-2 handoff. Production
-        # installs early_arrow_fn and recognises continuously during this lane.
-        if self.early_arrow_fn is None:
-            logging.info("Obstacle 2 recognition from the straight bypass "
-                         "lane; retaining this pose for ROUND_2.")
-            return _ask_arrow(self.input_fn, "Obstacle 2")
-
-        # Production vision has already been running throughout the bypass.
-        # Keep the robot parallel here while the second vote completes.  A
-        # separate 45-degree photo manoeuvre consumed turn room beside the
-        # obstacle and then made ROUND_2 undo that turn before following the
-        # face.  The floor camera sees obstacle 2 from this lane, so this is
-        # both the shortest and the most repeatable handoff pose.
-        logging.info("Obstacle 2 recognition from the parallel bypass lane; "
-                     "waiting here for confirmation without a photo turn.")
+        """Read obstacle 2 at its checked stationary camera pose."""
+        if not self._stage2_view_open:
+            self._stage2_view_open = True
+            if self.lane_reached_fn is not None:
+                self.lane_reached_fn()
+        if self.stage2_centered:
+            logging.info("Obstacle 2 recognition head-on from the course "
+                         "centreline; obstacle 1 is already behind the camera.")
+        elif self.center_stage2:
+            logging.info("Obstacle 2 recognition from the checked angled "
+                         "camera pose; obstacle 1 is behind the lens plane.")
+        else:
+            logging.info("Obstacle 2 recognition at the parallel obstacle-1 "
+                         "pose; no pre-photo straight or camera-gate turn.")
         return _ask_arrow(self.input_fn, "Obstacle 2")
+
+    def position_obstacle2_camera(self, course: Course,
+                                  side1: float) -> bool:
+        """Choose a centred view when it fits, otherwise a checked angled one.
+
+        Obstacle 2 has already been localised before this method runs. Vision
+        remains idle throughout that sensing movement, so neither obstacle 1
+        nor a fleeting parallel view can become the stage-2 answer.
+        """
+        p = self._pose()
+        options = []
+
+        # Preferred route: merge back to y=0, then approach obstacle 2 exactly
+        # as for obstacle 1. At the 60 cm minimum this normally has no valid
+        # candidate; the angled family below is then used automatically.
+        # A centre photo is only useful when the already-collected sensor
+        # evidence also bounds the board width.  With an unknown 30..90 cm
+        # face, a head-on photo can leave no lane that is simultaneously safe
+        # for both the possible obstacle edge and its coupled 50 cm boundary.
+        if (self.obs2_half_max is not None
+                and abs(math.atan2(math.sin(p.th), math.cos(p.th)))
+                <= math.radians(8)):
+            for lead in range(0, 31):
+                merge = (_straight(lead)
+                         + tp.lane_change(p.th, course.obs2_y - p.y, self.r))
+                merged = tp.run(p, merge, self.r, step=1e6)[-1]
+                cam = tp.straight(merged, CAMERA_FROM_AXLE_CM)
+                c, s = math.cos(merged.th), math.sin(merged.th)
+                dx, dy = course.x2 - cam.x, course.obs2_y - cam.y
+                ahead = dx * c + dy * s
+                lateral = -dx * s + dy * c
+                approach = _straight(ahead - PHOTO_DIST_CM)
+                candidate = merge + approach
+                if (not candidate or abs(lateral) > 2.0
+                        or ahead < PHOTO_MIN_CM - 6.0):
+                    continue
+                end = tp.run(p, candidate, self.r, step=1e6)[-1]
+                if self._first_board_behind_camera(
+                        end, course.x1, course.obs1_y) < STAGE2_REAR_EXCLUSION_CM:
+                    continue
+                clearance = self._check(p, candidate, course)
+                if clearance < max(tp.CLEARANCE_CM, 8.0):
+                    continue
+                options.append((0, 0, 0.0, 0.0,
+                                tp.motion_cost(candidate, self.r,
+                                               fast=self.fast),
+                                -clearance, candidate, True))
+
+        # Short courses cannot fit the centre merge. Aim the camera at the
+        # known face centre from the already-cleared side instead. These paths
+        # may reverse after a narrow-board IR scan, but every complete sweep is
+        # collision checked before it is considered.
+        for candidate, _, _ in self.photo_candidates(p, course, side1):
+            if not candidate:
+                continue
+            end = tp.run(p, candidate, self.r, step=1e6)[-1]
+            # An aimed oblique view only needs obstacle 1 fully behind the
+            # lens plane. The additional 6 cm reserve is for a parallel view;
+            # enforcing it here removes the only safe photo pose on a 60 cm
+            # narrow course even though every corner of obstacle 1 is behind
+            # the camera.
+            if self._first_board_behind_camera(
+                    end, course.x1, course.obs1_y) < 0.0:
+                continue
+            clearance = self._check(p, candidate, course)
+            if clearance < tp.CLEARANCE_FLOOR_CM:
+                continue
+            cam = tp.straight(end, CAMERA_FROM_AXLE_CM)
+            target = math.atan2(course.obs2_y - cam.y,
+                                course.x2 - cam.x)
+            view_error = abs(math.degrees(math.atan2(
+                math.sin(end.th - target), math.cos(end.th - target))))
+            leading_straight = (candidate[0].value
+                                if candidate[0].kind in ("F", "B") else 0)
+            clearance_penalty = 0 if clearance >= tp.CLEARANCE_CM else 1
+            options.append((1, clearance_penalty, leading_straight, view_error,
+                            tp.motion_cost(candidate, self.r, fast=self.fast),
+                            -clearance, candidate, False))
+
+        if not options:
+            logging.error("No collision-checked centred or angled camera "
+                          "view of obstacle 2 from %s.", p)
+            return False
+
+        centred_options = [item for item in options if item[7]]
+        if centred_options:
+            chosen = min(centred_options, key=lambda item: item[:6])
+        else:
+            # The arrow is unknown at photo time. The opposite-arrow case is
+            # the one that cannot use the outward same-side sensing lane, so
+            # prefer an aimed pose with a checked all-forward continuation in
+            # that direction. Sample the best route in each lead-distance
+            # band; this catches both tight turn-first views and longer
+            # lead-then-turn views without running the full handoff planner on
+            # hundreds of visually equivalent camera candidates.
+            angled = [item for item in options if not item[7]]
+            shortlist = []
+            for band in sorted(set(int(item[2]) // 8 for item in angled)):
+                members = [item for item in angled if int(item[2]) // 8 == band]
+                shortlist.extend(sorted(members, key=lambda item: item[:6])[:2])
+            base = min(angled, key=lambda item: item[:6])
+            if base not in shortlist:
+                shortlist.append(base)
+            downstream = []
+            saved_cache = self._handoff_cache
+            for item in shortlist:
+                end = tp.run(p, item[6], self.r, step=1e6)[-1]
+                join = self.select_face_handoff(end, course, side1, -side1)
+                if (join is None or join[1]
+                        or any(seg.kind not in ("F", "L", "R")
+                               for seg in join[0])):
+                    continue
+                total = (item[4]
+                         + tp.motion_cost(join[0], self.r, fast=self.fast))
+                downstream.append((item[1], total, item[3], item[5], item,
+                                   join[0]))
+            self._handoff_cache = saved_cache
+            if downstream:
+                _, _, _, _, chosen, join = min(downstream,
+                                                key=lambda item: item[:4])
+                logging.info(
+                    "Camera pose preserves an all-forward opposite-arrow "
+                    "continuation %s; no full photo-route undo is planned.",
+                    ",".join(seg.token() for seg in join))
+            else:
+                chosen = base
+        _, _, _, view_error, _, negative_clearance, segs, centred = chosen
+        if self._stage2_view_origin is None:
+            self._stage2_view_origin = p
+            self._stage2_view_segments = list(segs)
+        else:
+            self._stage2_view_segments = list(
+                self._stage2_view_segments or []) + list(segs)
+        logging.info("Obstacle-2 %s camera route: %s; view error %.1f deg, "
+                     "clearance %.1f cm.",
+                     "centred" if centred else "angled",
+                     ",".join(seg.token() for seg in segs),
+                     view_error,
+                     -negative_clearance)
+        if not self._line(segs):
+            return False
+
+        q = self._pose()
+        cam = tp.straight(q, CAMERA_FROM_AXLE_CM)
+        target_heading = math.atan2(course.obs2_y - cam.y,
+                                    course.x2 - cam.x)
+        heading_error = math.atan2(math.sin(q.th - target_heading),
+                                   math.cos(q.th - target_heading))
+        distance = math.hypot(course.x2 - cam.x, course.obs2_y - cam.y)
+        rear_need = STAGE2_REAR_EXCLUSION_CM if centred else 0.0
+        if (abs(math.degrees(heading_error)) > STAGE2_MAX_HEADING_DEG
+                or not PHOTO_MIN_CM - 6.0 <= distance <= PHOTO_DIST_CM + 12.0
+                or self._first_board_behind_camera(
+                    q, course.x1, course.obs1_y) < rear_need):
+            logging.error("Measured obstacle-2 camera pose is not usable: %s, "
+                          "distance %.1f cm, heading error %.1f deg.", q,
+                          distance, math.degrees(heading_error))
+            return False
+
+        self.stage2_centered = centred
+        self._stage2_camera_positioned = True
+        self._stage2_view_open = True
+        if self.lane_reached_fn is not None:
+            self.lane_reached_fn()
+        logging.info("Obstacle 2 camera is %s and stationary; recognition may "
+                     "start now.", "head-on" if centred else "aimed from an angle")
+        return True
 
     # ── obstacle 2 ────────────────────────────────────────────────────────────
 
@@ -1220,12 +1788,49 @@ class Task2:
             ir_y = end.y + tp.IR_FROM_AXLE_CM * math.sin(end.th)
             # Start over a portion of the face supported by the US hit,
             # not beyond an assumed maximum-width edge.
-            known_half = (abs(self.obs2_us_y - course.obs2_y)
-                          if self.obs2_us_y is not None else W2_RANGE[0] / 2)
+            known_half = self._obs2_known_half(course)
             if (tp.IR_MIN_GAP_CM <= gap <= IR_FACE_MAX_CM - 4
                     and abs(ir_y - course.obs2_y) <= known_half - 4):
                 options.append((abs(gap - FACE_GAP_CM), segs))
         for _, segs in sorted(options, key=lambda item: item[0]):
+            yield segs
+
+    def opposite_direct_candidates(self, p: Pose, course: Course,
+                                   side1: float) -> Iterator[List[Seg]]:
+        """Join the front face with one forward lead and one inward arc.
+
+        A US hit from the bypass lane proves that obstacle 2 reaches that
+        lateral coordinate. Use that evidence instead of always assuming a
+        30 cm face: opposite-arrow runs can keep moving and turn toward the
+        detected arrow without first making an outward S. A small heading
+        range absorbs bypass drift while remaining nearly parallel to the
+        face for the live IR scan.
+        """
+        heading = math.atan2(math.sin(p.th), math.cos(p.th))
+        if abs(heading) > math.radians(STAGE2_MAX_HEADING_DEG):
+            return
+        toward = -side1
+        options = []
+        for target_deg in range(90, 83, -1):
+            target = toward * math.radians(target_deg)
+            delta = math.atan2(math.sin(target - heading),
+                               math.cos(target - heading))
+            angle = int(round(abs(math.degrees(delta))))
+            if not tp.MIN_ARC_DEG <= angle <= 180:
+                continue
+            turn = Seg("L" if delta > 0 else "R", angle)
+            for lead in range(0, 101):
+                segs = _straight(lead) + [turn]
+                end = tp.run(p, segs, self.r, step=1e6)[-1]
+                gap = course.x2 - (end.x + tp.IR_SIDE_OFFSET_CM)
+                if not (tp.IR_MIN_GAP_CM <= gap <= IR_FACE_MAX_CM):
+                    continue
+                if not self._face_handoff_endpoint_valid(
+                        p, segs, course, side1, -side1, False):
+                    continue
+                options.append((tp.motion_cost(segs, self.r, fast=self.fast),
+                                abs(gap - FACE_GAP_CM), segs))
+        for _, _, segs in sorted(options, key=lambda item: (item[0], item[1])):
             yield segs
 
     def same_side_forward_candidates(self, p: Pose, course: Course,
@@ -1424,11 +2029,11 @@ class Task2:
         """
         if self.obs2_us_y is None:
             return course
-        width = max(W2_RANGE[0], min(W2_RANGE[1],
-                                    2.0 * abs(self.obs2_us_y - course.obs2_y)))
+        width = 2.0 * self._obs2_known_half(course)
+        wall_y = width / 2.0 + tp.WALL_CLEARANCE_CM
         return Course(course.x1, course.x2, width,
                       obs1_y=course.obs1_y, walls=course.walls,
-                      wall_y=width / 2.0 + tp.WALL_CLEARANCE_CM,
+                      wall_y=wall_y,
                       obs2_y=course.obs2_y)
 
     def same_side_courses(self, course: Course) -> Iterator[Course]:
@@ -1444,8 +2049,7 @@ class Task2:
                         2.0 * abs(self.obs2_near_y - course.obs2_y)))
             widths = [width]
         elif self.obs2_us_y is not None:
-            minimum = max(W2_RANGE[0],
-                          2.0 * abs(self.obs2_us_y - course.obs2_y))
+            minimum = 2.0 * self._obs2_known_half(course)
             # Wall clearance improves monotonically as width grows, while
             # obstacle clearance worsens. Their respective worst cases are
             # therefore the two endpoints; intermediate widths cannot add a
@@ -1458,9 +2062,10 @@ class Task2:
             yield course
             return
         for width in sorted(set(widths)):
+            wall_y = width / 2.0 + tp.WALL_CLEARANCE_CM
             yield Course(course.x1, course.x2, width,
                          obs1_y=course.obs1_y, walls=course.walls,
-                         wall_y=width / 2.0 + tp.WALL_CLEARANCE_CM,
+                         wall_y=wall_y,
                          obs2_y=course.obs2_y)
 
     def opposite_diagonal_candidates(self, p: Pose, course: Course,
@@ -1537,7 +2142,17 @@ class Task2:
                                 ) -> Iterator[Tuple[List[Seg], bool]]:
         """Include approach alternatives in the same swept-path validation."""
         if side1 != side2:
-            for segs in self.opposite_two_arc_candidates(p, course, side1):
+            # Opposite arrows must cross to the requested side before the
+            # front-face scan.  The one-arc shortcut could win the global
+            # cost sort with a long F lead; on hardware this looked like the
+            # second arrow had been ignored and could carry the robot beyond
+            # obstacle 2 before it turned.  Keep the two-arc/diagonal families
+            # whose complete swept paths explicitly cross the centreline.
+            crossing = list(self.opposite_two_arc_candidates(
+                p, course, side1))
+            crossing.extend(self.opposite_diagonal_candidates(
+                p, course, side1))
+            for segs in crossing:
                 yield segs, False
         approaches = [0]
         heading = math.atan2(math.sin(p.th), math.cos(p.th))
@@ -1671,12 +2286,20 @@ class Task2:
         if side1 == side2 or reverse:
             return True
         end = tp.run(p, segs, self.r, step=1e6)[-1]
+        target_heading = side2 * math.pi / 2.0
+        heading_error = math.atan2(math.sin(end.th - target_heading),
+                                   math.cos(end.th - target_heading))
+        if abs(heading_error) > math.radians(HANDOFF_HEADING_TOL_DEG):
+            return False
         ir_y = end.y + tp.IR_FROM_AXLE_CM * math.sin(end.th)
-        # The edge scan must start with its beam over every obstacle width
-        # allowed by the brief. Otherwise an empty-floor IR value can consume
-        # the entire scan without ever triggering the turn.
+        # The edge scan must start over a face extent known to exist. Before a
+        # sensor hit that is only the guaranteed 30 cm width. A US hit from
+        # the bypass lane is stronger evidence: the face necessarily reaches
+        # that ray, so a direct opposite-arrow turn may use that measured
+        # extent without treating empty-floor IR values as obstacle evidence.
+        known_half = self._obs2_known_half(course)
         return (abs(ir_y - course.obs2_y)
-                <= W2_RANGE[0] / 2.0 - FACE_ENTRY_MIN_VISIBLE_CM)
+                <= known_half - FACE_ENTRY_MIN_VISIBLE_CM)
 
     def select_face_handoff(self, p: Pose, course: Course, side1: float,
                             side2: float
@@ -1725,7 +2348,24 @@ class Task2:
                 return not item[3] and all(seg.kind in ("F", "L", "R")
                                           for seg in item[2])
 
-            options.sort(key=lambda item: (not forward_only(item),
+            def opposite_crossing(item):
+                if side1 == side2:
+                    return False
+                turn_indexes = [index for index, seg in enumerate(item[2])
+                                if seg.kind in ("L", "R")]
+                if len(turn_indexes) < 2:
+                    return False
+                # A real side change contains a visible diagonal between two
+                # arcs.  Merely counting turns also promoted routes whose two
+                # arcs were adjacent (or separated by a token F1/F2); those
+                # looked on hardware like a long straight followed by a late
+                # turn.  Keep those only as geometric fallbacks.
+                first, last = turn_indexes[0], turn_indexes[-1]
+                return any(seg.kind == "F" and seg.value >= 8
+                           for seg in item[2][first + 1:last])
+
+            options.sort(key=lambda item: (not opposite_crossing(item),
+                                           not forward_only(item),
                                            item[0], item[1], item[3]))
             for cost, _, segs, reverse in options:
                 if (fallback is not None and
@@ -1736,7 +2376,7 @@ class Task2:
                            if side1 == side2 and not reverse else [course])
                 clearance = self._handoff_clearance(p, segs, courses, deadline)
                 checked += 1
-                if clearance < minimum:
+                if clearance + 0.01 < minimum:
                     if (fallback is None and not reverse
                             and all(seg.kind in ("F", "L", "R") for seg in segs)
                             and clearance >= HANDOFF_CLEARANCE_CM):
@@ -1772,8 +2412,9 @@ class Task2:
                 minimum_estimated_time_in_family=not timed_out,
                 estimated_s=cost, scope="handoff_only", measured_fallback=True,
                 timed_out=timed_out)
-            logging.info("Forward handoff from measured pose %s uses the configured "
-                         "%.1f cm fallback: %s; %.2fs, %.2f cm clearance.",
+            logging.info("Forward handoff from measured pose %s uses the "
+                         "contextual %.1f cm fallback: %s; %.2fs, %.2f cm "
+                         "clearance.",
                          p, HANDOFF_CLEARANCE_CM,
                          ",".join(seg.token() for seg in segs), cost, clearance)
             return result
@@ -1824,6 +2465,22 @@ class Task2:
                               reverse: bool,
                               planned_clearance: float) -> Optional[bool]:
         """Execute a checked handoff, retaining checkpoints where they matter."""
+        original = list(segs)
+        bounded: List[Seg] = []
+        for seg in segs:
+            limit = (HANDOFF_MAX_STRAIGHT_CM if seg.kind in ("F", "B")
+                     else HANDOFF_MAX_ARC_DEG)
+            parts = max(1, int(math.ceil(seg.value / limit)))
+            total = int(round(seg.value))
+            base, extra = divmod(total, parts)
+            for index in range(parts):
+                # Keep the total exact so token rounding cannot lengthen the
+                # route merely because it was divided into safe primitives.
+                value = base + (1 if index < extra else 0)
+                bounded.append(Seg(seg.kind, value))
+        segs = bounded
+        was_bounded = len(segs) != len(original)
+
         courses = (list(self.same_side_courses(course))
                    if side1 == side2 and not reverse else [course])
         boxes = self._handoff_boxes(courses)
@@ -1832,13 +2489,27 @@ class Task2:
                     if side1 == side2 and not reverse
                     else tp.CLEARANCE_FLOOR_CM)
 
-        # Queue the checked straight/turn transition for either arrow pairing.
-        # Marginal and reversing routes still use measured checkpoints.
-        if (not reverse and all(seg.kind in ("F", "L", "R") for seg in segs)
-                and planned_clearance >= HANDOFF_CONTINUOUS_CLEARANCE_CM):
+        # Queue any fully checked all-forward transition as one continuous
+        # command. Opposite-arrow diagonals need this just as much as the
+        # matching-arrow outer route; stopping between the two halves of an
+        # S-curve amplified steering backlash in the 07:15 floor run.
+        if (not reverse
+                and all(seg.kind in ("F", "L", "R") for seg in segs)
+                and planned_clearance + 0.01 >=
+                HANDOFF_CONTINUOUS_CLEARANCE_CM and not was_bounded):
             chunks = [list(segs)]
         else:
-            chunks = [[seg] for seg in segs]
+            # A direction change still needs a physical stop, but preserve
+            # continuous same-direction runs instead of checkpointing every
+            # individual arc.
+            chunks = []
+            for seg in segs:
+                forward = seg.kind in ("F", "L", "R")
+                if (chunks and
+                        ((chunks[-1][-1].kind in ("F", "L", "R")) == forward)):
+                    chunks[-1].append(seg)
+                else:
+                    chunks.append([seg])
 
         def measured_pose() -> Optional[Pose]:
             measured = self.frame.pose()
@@ -1871,8 +2542,7 @@ class Task2:
                 logging.error("Measured pose leaves only %.2f cm for the "
                               "remaining handoff %s (need %.1f); movement "
                               "withheld.", clearance,
-                              ",".join(s.token() for s in remaining),
-                              required)
+                              ",".join(s.token() for s in remaining), required)
                 return None
             logging.info("Handoff group %d/%d: %s; remaining measured "
                          "clearance %.2f cm.", index, len(chunks),
@@ -1934,6 +2604,8 @@ class Task2:
         forward = not token.upper().startswith("R")
         lead_off = tp.FRONT_FROM_AXLE_CM if forward else tp.REAR_FROM_AXLE_CM
         seen, lost, raw = [], [], []
+        acquisition: List[float] = []
+        face_gap_anchor: List[float] = []
         # The right IR on the floor can alternate between its real face gap,
         # an empty-floor plateau and blank after it passes an edge.  Counting
         # only consecutive misses lets one stale in-range sample erase the
@@ -2002,7 +2674,13 @@ class Task2:
             if seen and g is not None and math.isfinite(g):
                 surface = ir_x + ray_dx * g
                 body_gap = min(facing * (surface - x) for x, _ in tp.footprint(q))
-                if body_gap < tp.CLEARANCE_FLOOR_CM + IR_FACE_UNCERTAINTY_CM:
+                # `surface` is reconstructed from the live IR measurement,
+                # so adding IR_FACE_UNCERTAINTY_CM again double-counts that
+                # uncertainty. The 05:48 floor run had eleven stable 11..13
+                # cm face readings and a measured 5.7 cm body gap, but the
+                # old 6.5 cm inflated threshold aborted it. Keep uncertainty
+                # in route planning; enforce the physical floor on live data.
+                if body_gap < tp.CLEARANCE_FLOOR_CM:
                     front_blocked.append(g)
                     logging.error("Face scan has only %.1f cm measured body clearance.", body_gap)
                     return stop() if moving else True
@@ -2018,13 +2696,38 @@ class Task2:
                 # They are not an edge detector: 29 -> 42 -> 33 can still be
                 # the same face. Only a substantial outward jump or no echo
                 # votes for an edge; a closer surface never does.
+                edge_baseline = (face_gap_anchor[0]
+                                 if face_gap_anchor else baseline)
                 edge_evidence = (g is None or (math.isfinite(g)
-                                 and g > baseline + window + IR_FACE_UNCERTAINTY_CM))
+                                 and g > edge_baseline + window
+                                 + IR_FACE_UNCERTAINTY_CM))
             tracking_hi = tp.IR_MAX_GAP_CM[side] if len(seen) >= 2 else hi
-            valid_face = (g is not None and math.isfinite(g)
-                          and lo <= g <= tracking_hi and steady)
+            if not seen and g is not None and math.isfinite(g):
+                acquisition.append(g)
+                del acquisition[:-3]
+            # The predicted window remains the normal acquisition rule. If
+            # odometry leaves the robot farther off the face, also accept two
+            # consecutive, converged readings inside the calibrated hard
+            # ceiling while moving. This distinguishes an approaching face
+            # (for example 42, 33, 33) from the stationary 30-50 cm empty-floor
+            # plateau, and lets the IR establish the real stopping geometry.
+            converged_acquisition = (
+                moving and len(acquisition) >= 2
+                and lo <= acquisition[-1] <= FRONT_FACE_HARD_MAX_CM
+                and lo <= acquisition[-2] <= FRONT_FACE_HARD_MAX_CM
+                and abs(acquisition[-1] - acquisition[-2]) <= 3.0)
+            valid_face = (g is not None and math.isfinite(g) and steady
+                          and (not seen or not edge_evidence)
+                          and (lo <= g <= tracking_hi
+                               or converged_acquisition))
             if valid_face:
+                if not seen and g > hi:
+                    logging.info("%s IR acquired obstacle 2 at %.1f cm beyond "
+                                 "the %.1f cm predicted window; using the live "
+                                 "face for the edge stop.", side, g, hi)
                 seen.append((edge_y, ir_x + ray_dx * g, g))
+                if not face_gap_anchor:
+                    face_gap_anchor.append(g)
                 ref[0] = edge_y
                 if edge_votes:
                     reacquired += 1
@@ -2362,8 +3065,6 @@ class Task2:
                 return False
             if (i == len(segs) - 1 and (offset > CORNER_RECHECK_CM or angle > 8.0)
                     and any(b.name == "obstacle 2" for b in boxes)):
-                # The final turn has no next loop iteration to revalidate it.
-                # Require independent back-face evidence before a long scan.
                 if abs(math.cos(actual.th)) > math.sin(math.radians(8)):
                     logging.error("Large final-corner error without a square "
                                   "back-face view; withholding further movement.")
@@ -2371,8 +3072,8 @@ class Task2:
                 side = self._ir_facing(actual.th, -1.0)
                 expected_gap = (actual.x - course.x2 - tp.OBS2_DEPTH_CM
                                 + tp.IR_FROM_AXLE_CM * math.cos(actual.th))
-                expected_gap = (expected_gap
-                                / abs(math.sin(actual.th)) - tp.IR_SIDE_OFFSET_CM)
+                expected_gap = (expected_gap / abs(math.sin(actual.th))
+                                - tp.IR_SIDE_OFFSET_CM)
                 hits = [self._ir(side)]
                 self.sleep_fn(SENSOR_POLL_S)
                 hits.append(self._ir(side))
@@ -2492,11 +3193,22 @@ class Task2:
         p = self._pose()
         heading = math.atan2(math.sin(p.th), math.cos(p.th))
         target = min(SENSING_LANE_CM, W2_RANGE[1] / 2.0 - 5.0)
+        courses = list(self.same_side_courses(course))
+        if self.obs2_half_max is not None:
+            edge = max(c.w2 / 2.0 for c in courses)
+            wall = min(c.wall_y for c in courses)
+            low = edge + tp.HALF_WIDTH_CM + tp.CLEARANCE_CM
+            high = wall - tp.HALF_WIDTH_CM - tp.CLEARANCE_CM
+            if low > high:
+                return False
+            # A centred camera pose needs to shift completely beyond the
+            # known narrow-class face.  The fixed 35 cm sensing lane remained
+            # partly over a 38--44 cm board and stranded the centred view.
+            target = min(high, max(target, low + 0.5))
         if side * (p.y - course.obs2_y) >= target - 1.0:
             # A hit in the first sensing lane is not a failure: it proves a
             # wider face and consequently a farther minimum side boundary.
             # Move into the common free corridor of every remaining width.
-            courses = list(self.same_side_courses(course))
             edge = max(c.w2 / 2.0 for c in courses)
             wall = min(c.wall_y for c in courses)
             low = edge + tp.HALF_WIDTH_CM + tp.CLEARANCE_CM
@@ -2512,7 +3224,6 @@ class Task2:
                                 "the measured %.1f deg heading from %s.",
                                 math.degrees(heading), p)
                 return False
-            courses = list(self.same_side_courses(course))
             recovery = None
             # A heading error toward obstacle 1 can make an isolated
             # correction clip its rear corner. Search a short retreat in the
@@ -2546,7 +3257,6 @@ class Task2:
         segs = self._sensing_lane_segments(p, course.obs2_y + side * target)
         if not segs or any(s.kind not in ("F", "L", "R") for s in segs):
             return False
-        courses = list(self.same_side_courses(course))
         clearance = min(self._check(p, segs, c) for c in courses)
         if clearance < SENSING_LANE_MIN_CM:
             # A wide face can need another outward move. Check a minimal
@@ -2580,7 +3290,7 @@ class Task2:
             return False
         if self.obs2_half_max is None:
             return self.prepare_forward_lane(course, side)
-        lower = max(W2_RANGE[0] / 2, abs(self.obs2_us_y - course.obs2_y))
+        lower = self._obs2_known_half(course)
         upper = self.obs2_half_max
         if upper - lower < 4:
             return False
@@ -2639,14 +3349,14 @@ class Task2:
             # Allow for the beam width and pose error. Never move the face
             # forward to the background echo or narrow below the earlier hit.
             upper = abs(ray_y - course.obs2_y) + (4.0 if background else 0.0)
-            if upper <= abs(self.obs2_us_y - course.obs2_y):
+            if upper <= self._obs2_known_half(course):
                 logging.error("Outer ray contradicts the prior obstacle-2 hit; not narrowing.")
                 return False
             self.obs2_half_max = min(upper, self.obs2_half_max or upper)
             logging.info("Forward sensing lane is outside obstacle 2's face; "
                          "measured half-width is %.1f..%.1f cm. Replanning "
                          "from the measured pose.",
-                         abs(self.obs2_us_y - course.obs2_y),
+                         self._obs2_known_half(course),
                          self.obs2_half_max)
             return True
         if (any(g is None or not math.isfinite(g) or g <= 0 for g in hits)
@@ -2661,10 +3371,171 @@ class Task2:
                 and abs(ray_y - course.obs2_y) > self.obs2_half_max):
             logging.error("Sensing ray hit contradicts the prior width bound; not narrowing.")
             return False
-        self.obs2_us_y = ray_y
+        self._record_obs2_us_hit(ray_y, q.th)
         logging.info("Obstacle 2 front reconfirmed at ray y=%.1f; replanning "
                      "the forward route from the measured pose.", self.obs2_us_y)
         return True
+
+    def approach_same_side_until_ir(self, course: Course,
+                                    side: float) -> Optional[Course]:
+        """For matching arrows, advance beside obstacle 2 until inner IR sees it.
+
+        This reactive straight is used only when the lane already occupied is
+        proved clear for every width still compatible with the sensor evidence.
+        Establishing an outer lane can itself consume the short 10 cm face, so
+        this method never adds an S-move.  When there is no safe straight (or
+        the IR has already passed the face), return the unchanged course and
+        let the collision-checked geometric handoff perform that setup.
+        """
+        if self.obs2_near_y is not None:
+            # find_narrow() has already performed this exact live IR stop.
+            return course
+
+        inner = "right" if side > 0 else "left"
+        p = self._pose()
+        heading = math.atan2(math.sin(p.th), math.cos(p.th))
+        if abs(heading) > math.radians(SENSING_RAY_MAX_DEG):
+            logging.info("Matching-arrow IR straight is unavailable from the "
+                         "non-parallel pose %s; using the checked handoff.", p)
+            return course
+        c = max(0.2, math.cos(heading))
+        beam_x_now = (p.x + (tp.IR_FROM_AXLE_CM - tp.IR_LAG_CM)
+                      * math.cos(heading))
+        if beam_x_now >= course.x2 + tp.OBS2_DEPTH_CM:
+            logging.info("Matching-arrow IR has already passed obstacle 2's "
+                         "short face; using the checked handoff.")
+            return course
+        # Carry the forward-mounted IR across the complete 10 cm side.
+        far_axle_x = (course.x2 + tp.OBS2_DEPTH_CM
+                      - tp.IR_FROM_AXLE_CM * c + 6.0)
+        distance = int(math.ceil((far_axle_x - p.x) / c))
+        if distance <= 0:
+            logging.info("Matching-arrow IR has already passed the short "
+                         "obstacle-2 face; using the checked handoff.")
+            return course
+        approach = [Seg("F", distance)]
+        clearance = min(self._check(p, approach, checked)
+                        for checked in self.same_side_courses(course))
+        if clearance < tp.execution_clearance(tp.CLEARANCE_CM):
+            logging.info("Matching-arrow straight is not yet an outside lane "
+                         "(clearance %.1f cm); using the checked handoff.",
+                         clearance)
+            return course
+
+        hits: List[Tuple[Pose, float]] = []
+        first_hit: Optional[Tuple[Pose, float]] = None
+        lo = max(2.0, tp.IR_MIN_GAP_CM - 2.0)
+        hi = min(FRONT_FACE_HARD_MAX_CM, tp.IR_MAX_GAP_CM[inner])
+        # A previous outward US miss may already prove this IR ray lies past
+        # every still-possible face edge. Do not demand an impossible hit;
+        # retain that width bound and let the swept geometric handoff use it.
+        sensor_y_at_face = (p.y + tp.IR_FROM_AXLE_CM * math.sin(heading)
+                            - side * tp.IR_SIDE_OFFSET_CM * math.cos(heading))
+        possible_half = min(W2_RANGE[1] / 2.0,
+                            self.obs2_half_max or W2_RANGE[1] / 2.0)
+        nearest_possible_gap = (side * (sensor_y_at_face - course.obs2_y)
+                                - possible_half)
+        if nearest_possible_gap > hi:
+            logging.info("Matching-arrow IR ray is %.1f cm beyond every "
+                         "possible face edge; using the checked handoff.",
+                         nearest_possible_gap)
+            return course
+
+        def poll() -> bool:
+            nonlocal first_hit
+            q = self.frame.pose()
+            g = self._ir(inner)
+            if q is None or g is None:
+                self.sleep_fn(SENSOR_POLL_S)
+                return False
+            beam_x = (q.x + (tp.IR_FROM_AXLE_CM - tp.IR_LAG_CM)
+                      * math.cos(q.th))
+            # The US face estimate supplies a tight x gate, preventing the
+            # inward sensor from mistaking obstacle 1 or floor clutter for 2.
+            if (course.x2 - 5.0 <= beam_x
+                    <= course.x2 + tp.OBS2_DEPTH_CM + 8.0
+                    and lo <= g <= hi):
+                first_hit = q, g
+                hits.append((q, g))
+                self.stm.abort()              # RST: no reply is expected
+                self.sleep_fn(0.10)
+                return True
+            self.sleep_fn(SENSOR_POLL_S)
+            return False
+
+        logging.info("Matching %s arrows: checked F%d with %s IR live; "
+                     "straight clearance %.1f cm.",
+                     "left" if side > 0 else "right", approach[0].value,
+                     inner, clearance)
+        reply = tp.run_polling(self.stm, approach[0].token(), poll)
+        if reply is None or not (reply.startswith("OK") or reply == "STOPPED"):
+            logging.error("STM answered %r during matching-arrow IR approach.",
+                          reply)
+            return None
+        if first_hit is None:
+            logging.error("Matching-arrow %s IR never observed obstacle 2 "
+                          "during the checked straight.", inner)
+            return None
+
+        settled = self._wait_for_stopped_pose() if reply == "STOPPED" else self._pose()
+        if settled is None:
+            return None
+        first_pose, first_gap = first_hit
+        coast = ((settled.x - first_pose.x) * math.cos(first_pose.th)
+                 + (settled.y - first_pose.y) * math.sin(first_pose.th))
+        consecutive = 0
+        clear_consecutive = 0
+        confirmed = False
+        for _ in range(4):
+            self.sleep_fn(0.03)
+            gap = self._ir(inner)
+            if (gap is not None and lo <= gap <= hi
+                    and abs(gap - first_gap) <= 4.0):
+                hits.append((settled, gap))
+                consecutive += 1
+                clear_consecutive = 0
+                if consecutive >= 2:
+                    confirmed = True
+                    break
+            else:
+                consecutive = 0
+                if gap is None or gap > hi:
+                    clear_consecutive += 1
+                    # The side is only 10 cm deep. Braking may carry the IR
+                    # completely past it; two clear samples plus measured
+                    # coast confirm the moving observation spatially.
+                    if (clear_consecutive >= 2 and coast >=
+                            max(4.0, tp.OBS2_DEPTH_CM - tp.IR_LAG_CM)):
+                        confirmed = True
+                        break
+                else:
+                    clear_consecutive = 0
+        if not confirmed:
+            logging.error("Matching-arrow %s IR sighting %.1f cm was not "
+                          "confirmed at rest.", inner, first_gap)
+            return None
+
+        x2 = (first_pose.x + (tp.IR_FROM_AXLE_CM - tp.IR_LAG_CM)
+              * math.cos(first_pose.th))
+        edge_samples = [q.y - side * (tp.IR_SIDE_OFFSET_CM + gap)
+                        for q, gap in hits]
+        edge_samples.sort()
+        near_y = edge_samples[len(edge_samples) // 2]
+        width = max(W2_RANGE[0], min(W2_RANGE[1],
+                    2.0 * abs(near_y - course.obs2_y)))
+        self.obs2_near_y = near_y
+        self.obs2_half_max = width / 2.0
+        self._handoff_cache = None
+        measured = Course(
+            course.x1, x2, width, obs1_y=course.obs1_y,
+            walls=course.walls,
+            wall_y=width / 2.0 + tp.WALL_CLEARANCE_CM,
+            obs2_y=course.obs2_y)
+        logging.info("Matching-arrow %s IR confirmed obstacle 2 at x=%.1f, "
+                     "%s edge y=%.1f; planning the turn from %s.",
+                     inner, x2, "left" if side > 0 else "right", near_y,
+                     settled)
+        return measured
 
     def around_obstacle2(self, course: Course, side1: float, side2: float
                          ) -> Optional[Course]:
@@ -2681,60 +3552,125 @@ class Task2:
         Both ends are measured in odometry, which has drifted by the time the
         robot gets here, so nothing assumes obstacle 2 sits on the centreline.
         """
+        if side1 == side2 and (self.obs2_us_y is not None
+                               or self.obs2_near_y is not None):
+            measured_approach = self.approach_same_side_until_ir(course, side2)
+            if measured_approach is None:
+                return None
+            course = measured_approach
         p = self._pose()
         # Candidate sequences already include their straight leads. Validate
         # the approach AND turn from this pose before sending either one.
         selected = self.select_face_handoff(p, course, side1, side2)
+        forward_lane_attempted = False
+        forward_lane_succeeded = False
+        if selected is None and side1 == side2:
+            # Do not undo a long camera approach as the first response to a
+            # matching arrow. Correct/advance from the photo pose and search
+            # for a continuous forward join first; exact retracing is only a
+            # fallback when no such checked continuation exists.
+            for _ in range(1):
+                forward_lane_attempted = True
+                if not self.prepare_forward_lane(course, side2):
+                    break
+                forward_lane_succeeded = True
+                measured_approach = self.approach_same_side_until_ir(
+                    course, side2)
+                if measured_approach is None:
+                    return None
+                course = measured_approach
+                p = self._pose()
+                selected = self.select_face_handoff(
+                    p, course, side1, side2)
+                if selected is not None:
+                    logging.info("Same-side arrow continues forward from the "
+                                 "camera pose; full camera-route reversal is "
+                                 "not needed.")
+                    break
         if selected is None and self._stage2_view_origin is not None:
-            # Reading from beyond obstacle 1 must not consume the turn room
-            # that made the bypass lane usable. The arrow is now latched;
-            # Retrace the actual viewing path, not a straight through an S
-            # join's displaced lane. Recheck from the measured stopped pose.
+            # The arrow is latched. Retrace the exact checked camera path if
+            # it consumed the room needed for the requested handoff; never
+            # replace a curved path with a blind straight retreat.
             origin = self._stage2_view_origin
             if self._stage2_view_segments is not None:
                 inverse = {"F": "B", "B": "F", "L": "l", "R": "r",
                            "l": "L", "r": "R"}
-                segs = [Seg(inverse[s.kind], s.value)
-                        for s in reversed(self._stage2_view_segments)]
-                end = tp.run(p, segs, self.r, step=1e6)[-1]
-                heading_error = math.atan2(math.sin(end.th - origin.th),
-                                           math.cos(end.th - origin.th))
-                if (math.hypot(end.x - origin.x, end.y - origin.y) > 3.0
-                        or abs(heading_error) > math.radians(3)):
-                    segs = []
+                recovery = [Seg(inverse[s.kind], s.value)
+                            for s in reversed(self._stage2_view_segments)]
+                end = tp.run(p, recovery, self.r, step=1e6)[-1]
+                position_error = math.hypot(end.x - origin.x,
+                                            end.y - origin.y)
+                heading_error = abs(math.degrees(math.atan2(
+                    math.sin(end.th - origin.th),
+                    math.cos(end.th - origin.th))))
+                if position_error > 3.0 or heading_error > 3.0:
+                    # Hardware drift means an exact inverse rarely lands on
+                    # the old odometry coordinate. That is not a reason to
+                    # discard a fully swept, collision-checked recovery: run
+                    # it, measure the endpoint, then replan from that pose.
+                    logging.info("Camera-route inverse predicts %.1f cm / "
+                                 "%.1f deg return error; accepting it only if "
+                                 "the measured-pose sweep is clear.",
+                                 position_error, heading_error)
             else:
                 retreat = int(round((p.x - origin.x) / math.cos(p.th)))
-                segs = [Seg("B", retreat)] if retreat > 0 else []
-            if (segs and self._check(p, segs, course)
+                recovery = [Seg("B", retreat)] if retreat > 0 else []
+            if (recovery and self._check(p, recovery, course)
                     >= tp.CLEARANCE_FLOOR_CM):
-                logging.info("Stage 2 view consumed handoff room: checked %s restores the bypass planning pose.",
-                             ",".join(s.token() for s in segs))
-                if not self._line(segs):
+                logging.info("Stage 2 view consumed handoff room: checked %s "
+                             "restores the bypass planning pose.",
+                             ",".join(s.token() for s in recovery))
+                if not self._line(recovery):
                     return None
                 p = self._pose()
                 selected = self.select_face_handoff(p, course, side1, side2)
+                # A failed same-side sensing attempt at the angled camera
+                # pose says nothing about the restored parallel lane. Allow
+                # the normal forward sensing/outer-route branch to run from
+                # this newly measured pose instead of treating the earlier
+                # non-parallel rejection as a permanent failure.
+                if selected is None and side1 == side2:
+                    forward_lane_attempted = False
+                    forward_lane_succeeded = False
             self._stage2_view_origin = None
             self._stage2_view_segments = None
         def require_same_side_margin(candidate):
+            # Candidate generation already rejects anything below the hard
+            # collision floor. Do not force another lane change merely to
+            # reach a preferred margin; that created the LL/RR snake motion.
             if (candidate is not None and side1 == side2
-                    and candidate[2] < (HANDOFF_CLEARANCE_CM
-                                        - HANDOFF_MARGIN_TOLERANCE_CM)):
-                logging.warning("Same-side handoff keeps only %.2f cm; widening "
-                                "the sensing lane before executing it.",
+                    and candidate[2] < HANDOFF_CONTINUOUS_CLEARANCE_CM):
+                logging.warning("Same-side handoff keeps %.2f cm; executing "
+                                "the shortest collision-checked route.",
                                 candidate[2])
-                return None
             return candidate
 
         selected = require_same_side_margin(selected)
-        if selected is None and side1 == side2:
-            if self.prepare_forward_lane(course, side2):
+        if (selected is None and side1 == side2
+                and (not forward_lane_attempted or forward_lane_succeeded)):
+            # Stay on the same outward side.  One sensor move identifies a
+            # medium face; a genuinely wide face may need one further outward
+            # move into the measured obstacle/wall corridor.  Never probe back
+            # inward, which was the second half of the RR/LL snake pattern.
+            for _ in range(2):
+                if not self.prepare_forward_lane(course, side2):
+                    break
+                # The sensing turn may have established the clear parallel
+                # lane that was unavailable at the original pose.  Retry the
+                # live inward-IR straight from here before choosing a purely
+                # geometric handoff.  If the 10 cm face was consumed by the
+                # sensing move, the helper returns the unchanged course and
+                # selection remains conservative over every possible width.
+                measured_approach = self.approach_same_side_until_ir(
+                    course, side2)
+                if measured_approach is None:
+                    return None
+                course = measured_approach
                 p = self._pose()
                 selected = require_same_side_margin(
                     self.select_face_handoff(p, course, side1, side2))
-                if selected is None and self.refine_forward_width(course, side2):
-                    p = self._pose()
-                    selected = require_same_side_margin(
-                        self.select_face_handoff(p, course, side1, side2))
+                if selected is not None:
+                    break
         if selected is None:
             logging.error("No checked forward obstacle-2 route available; not moving.")
             return None
@@ -2824,10 +3760,8 @@ class Task2:
                     f"{'R' if reverse else 'F'}{int(round(run))}",
                     course.x2, +1.0, side2, 18.0,
                     check_front=side1 == side2,
-                    minimum_edge_y=course.obs2_y + side2 * max(
-                        W2_RANGE[0] / 2,
-                        abs(self.obs2_us_y - course.obs2_y)
-                        if self.obs2_us_y is not None else 0))
+                    minimum_edge_y=(course.obs2_y + side2
+                                    * self._obs2_minimum_edge_half(course)))
                 if got is None:
                     return None
                 near, x2 = got
@@ -2898,9 +3832,9 @@ class Task2:
                      "off the centreline (odometry).", min(near, far),
                      max(near, far), abs(near - far), centre)
         if not (W2_RANGE[0] - 10 <= abs(near - far) <= W2_RANGE[1] + 10):
-            logging.error("That is outside the brief's 30-90 cm - the IR saw "
-                          "something else.")
-            return None
+            logging.warning("Measured obstacle-2 width %.1f cm is outside the "
+                            "nominal range; retaining the two live IR edges.",
+                            abs(near - far))
         # The brief puts obstacle 2 on the centreline, so where its centre
         # reads is odometry drift - ~3 m of it by now, and the IR fix on
         # obstacle 1 on the way home only looks a window either side of
@@ -2955,15 +3889,60 @@ class Task2:
             x2 = self.pass_obstacle1(x1, side1)
             if x2 is None:
                 return 1
-            w2 = CONSERVATIVE_W2
-            if x2 == NARROW:
-                x2 = self.find_narrow(x1, side1)
-                if x2 is None:
+            if self.center_stage2:
+                w2 = CONSERVATIVE_W2
+                if x2 == NARROW:
+                    # First attempt to reacquire the narrow face head-on.  An
+                    # outward side scan is only the fallback when the checked
+                    # centre merge cannot fit or still sees no valid face.
+                    x2 = self.find_narrow_from_centre(x1, side1)
+                    if x2 is None:
+                        x2 = self.find_narrow(x1, side1)
+                    if x2 is None:
+                        return 1
+                    if self.obs2_near_y is None and self.obs2_half_max is None:
+                        w2 = CONSERVATIVE_W2
+                    elif self.obs2_near_y is None:
+                        w2 = 2 * self.obs2_half_max
+                    else:
+                        # The narrow-lane IR measured the near edge.  Since
+                        # obstacle 2 is centred on the course centreline, use
+                        # that measurement (plus IR uncertainty) instead of
+                        # pretending every narrow board is the maximum 44 cm
+                        # wide.  The old maximum-width box falsely overlapped
+                        # the robot at the scan stop and rejected every safe
+                        # inward camera route.
+                        measured_half = (abs(self.obs2_near_y)
+                                         + IR_FACE_UNCERTAINTY_CM)
+                        w2 = max(W2_RANGE[0], min(
+                            2 * NARROW_HALF_MAX, 2 * measured_half))
+                course = Course(x1, x2, w2,
+                                wall_y=CONSERVATIVE_WALL_Y)
+                if not self.position_obstacle2_camera(course, side1):
                     return 1
-                w2 = 2 * NARROW_HALF_MAX
-            course = Course(x1, x2, w2, wall_y=CONSERVATIVE_WALL_Y)
-            side2 = self.photo_obstacle2(course, side1)
-            course = self.around_obstacle2(course, side1, side2)
+                side2 = self.photo_obstacle2(course, side1)
+            else:
+                provisional_x2 = (x1 + tp.OBS1_SIZE_CM + GAP12_RANGE[0]
+                                  if x2 == NARROW else x2)
+                provisional = Course(x1, provisional_x2, CONSERVATIVE_W2,
+                                     wall_y=CONSERVATIVE_WALL_Y)
+                side2 = self.photo_obstacle2(provisional, side1)
+                w2 = CONSERVATIVE_W2
+                if x2 == NARROW:
+                    x2 = self.find_narrow(x1, side1, side2)
+                    if x2 is None:
+                        return 1
+                    w2 = 2 * NARROW_HALF_MAX
+                course = Course(x1, x2, w2,
+                                wall_y=CONSERVATIVE_WALL_Y)
+            # A centred photo does not erase which side of obstacle 1 led to
+            # this pose. Preserve that side so opposite arrows generate the
+            # diagonal crossing; calling it side2 incorrectly classified
+            # every centred continuation as a same-side outer route.
+            approach_side = (side1 if self.stage2_centered else
+                             (self.narrow_scan_side
+                              if self.narrow_scan_side is not None else side1))
+            course = self.around_obstacle2(course, approach_side, side2)
             if course is None:
                 return 1
             if not tp.ParkRunner(self.stm, self.frame, course).run():
@@ -3027,7 +4006,7 @@ def main() -> int:
     from communications.stm import STM
     stm = STM()
     try:
-        return Task2(stm).run()
+        return Task2(stm, center_stage2=CENTER_STAGE2).run()
     finally:
         try:
             stm.disconnect()

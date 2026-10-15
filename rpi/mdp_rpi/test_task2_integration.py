@@ -37,6 +37,17 @@ class Link:
 
 
 class Coordination(unittest.TestCase):
+    def test_mid_frame_disconnect_is_classified_as_session_end(self):
+        left, right = socket.socketpair()
+        left.sendall(b"abc")
+        left.shutdown(socket.SHUT_WR)
+        with right.makefile("rb") as stream:
+            with self.assertRaisesRegex(server.PeerDisconnected,
+                                        "disconnected during image transfer"):
+                server.exact(stream, 4)
+        left.close()
+        right.close()
+
     def test_parking_completion_uses_same_heading_limit_as_entry(self):
         import math
         import task2t_park as geometry
@@ -280,6 +291,33 @@ class Coordination(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             vision.wait_arrow(8)
 
+    def test_fresh_ignored_frames_extend_arrow_wait(self):
+        vision = Vision(Mock(), Event(), "run")
+        answer = []
+        errors = []
+
+        def wait():
+            try:
+                answer.append(vision.wait_arrow(.05))
+            except Exception as exc:
+                errors.append(exc)
+
+        thread = Thread(target=wait)
+        thread.start()
+        # Keep the camera alive beyond the original total timeout. These
+        # frames may be bullseyes/blanks; neither is an arrow decision.
+        for frame in (b"bullseye-1", b"bullseye-2"):
+            time.sleep(.035)
+            vision.publish(frame)
+        with vision.condition:
+            vision.result = "right"
+            vision.condition.notify_all()
+        thread.join(1)
+
+        self.assertEqual(answer, ["right"])
+        self.assertEqual(errors, [])
+        self.assertFalse(thread.is_alive())
+
     def test_socket_pipeline_two_votes_per_stage_and_evidence(self):
         left, right = socket.socketpair()
         left.settimeout(2)
@@ -288,15 +326,21 @@ class Coordination(unittest.TestCase):
         vision = Vision(link, stop, "test-run")
         stitches = []
         detections = {1: 0, 2: 0}
-        def detector(path, allowed_classes, output_dir, selection_policy):
+        thresholds = {1: [], 2: []}
+        def detector(path, allowed_classes, output_dir, selection_policy,
+                     target_confidence):
             self.assertEqual(allowed_classes, {"left", "right"})
             output_dir.mkdir(exist_ok=True)
             (output_dir / path.name).write_bytes(path.read_bytes())
             stage = 1 if "stage1" in path.name else 2
             self.assertEqual(selection_policy, "nearest" if stage == 1 else "unique_arrow")
+            thresholds[stage].append(target_confidence)
             detections[stage] += 1
             if detections[stage] == 1:
-                return None, .2
+                # Even a high-confidence bullseye is only a marker.  It must
+                # be discarded while the stationary camera keeps looking for
+                # the two matching arrow votes below.
+                return "bullseye", .99
             return ("left" if stage == 1 else "right", .95)
         def guarded(fn):
             try:
@@ -329,6 +373,8 @@ class Coordination(unittest.TestCase):
                 self.assertEqual([path.name for path in raw],
                                  [path.name for path in annotated])
                 self.assertEqual(detections, {1: 3, 2: 3})
+                self.assertEqual(set(thresholds[1]), {0.70})
+                self.assertEqual(set(thresholds[2]), {0.60})
             finally:
                 stop.set()
                 pi.join(1)
@@ -340,6 +386,43 @@ class Coordination(unittest.TestCase):
             self.assertFalse(pi.is_alive())
             self.assertFalse(pc.is_alive())
             self.assertEqual(errors, [])
+
+    def test_stage_two_accepts_two_unique_votes_below_stage_one_threshold(self):
+        pc = Mock()
+        stop = Event()
+        vision = Vision(pc, stop, "run")
+        vision.begin(2)
+        vision.publish(b"first")
+        replies = ["READY,TASK2"]
+        for frame in (1, 2):
+            replies.append("ARROW," + json.dumps({
+                "run_id": "run", "stage": 2, "frame_id": frame,
+                "min_confidence": 0.60, "direction": "left",
+                "confidence": 0.68,
+            }))
+        replies.append("SAVED,2")
+        pc.receive.side_effect = replies
+
+        thread = Thread(target=vision.serve)
+        thread.start()
+        deadline = time.monotonic() + 1
+        while pc.send_image.call_count < 1 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        vision.publish(b"second")
+        deadline = time.monotonic() + 1
+        while vision.result is None and time.monotonic() < deadline:
+            time.sleep(0.01)
+        stop.set()
+        with vision.condition:
+            vision.condition.notify_all()
+        thread.join(1)
+
+        self.assertEqual(vision.result, "left")
+        self.assertFalse(thread.is_alive())
+        requests = [json.loads(call.kwargs["header"].split(",", 1)[1])
+                    for call in pc.send_image.call_args_list]
+        self.assertEqual([request["min_confidence"] for request in requests],
+                         [0.60, 0.60])
 
     def test_mismatched_response_rejected(self):
         pc = Mock()

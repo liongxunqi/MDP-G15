@@ -536,7 +536,9 @@ SAFE entry point is retained as `task2_safe.py` for bench comparison.
 - The camera keeps only its latest frame at 960x540 with a configurable
   5000-microsecond shutter. Capture and inference overlap approach movement;
   there is no fixed two-second per-photo wait. If an arrow is not confirmed
-  at the decision point, movement waits up to `T2_ARROW_TIMEOUT_S`, then fails
+  at the decision point, movement stays stopped while fresh bullseye/blank
+  frames arrive and waits for a valid arrow. `T2_ARROW_TIMEOUT_S` is renewed
+  by every fresh frame and fails only when the camera pipeline becomes inactive
   safely. Continuous capture does not remove STM's own settling logic.
 - The PC must confirm two fresh, matching arrow frames. Run, obstacle and
   frame identifiers reject stale replies. Accepted annotations are stitched

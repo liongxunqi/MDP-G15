@@ -88,7 +88,8 @@ BAY_HALF_WIDTH_CM = _env_f("T2_BAY_WIDTH_CM", 60.0) / 2.0
 FENCE_T_CM = 10.0
 OBS1_SIZE_CM = 10.0
 OBS2_DEPTH_CM = 10.0
-# "Minimum clearance 50 cm" either side of obstacle 2 - there may be a wall.
+# The usable course ends exactly 50 cm beyond either side of obstacle 2.
+# This is a hard route boundary even when no physical wall returns an IR echo.
 WALL_CLEARANCE_CM = 50.0
 ASSUME_WALLS = os.getenv("T2_ASSUME_WALLS", "1") != "0"
 
@@ -118,11 +119,17 @@ CLEARANCE_ENOUGH_CM = _env_f("T2_CLEARANCE_ENOUGH_CM", 12.0)
 # is then 12 cm inside the mouth of the 50 cm-deep bay.
 PARK_GAP_CM = _env_f("T2_PARK_GAP_CM", 15.0)
 PARK_GAP_TOL_CM = _env_f("T2_PARK_GAP_TOL_CM", 2.5)
+PARK_MIN_BACK_GAP_CM = max(
+    CLEARANCE_FLOOR_CM, _env_f("T2_PARK_MIN_BACK_GAP_CM", 8.0))
 PARK_STEP_CM = int(_env_f("T2_PARK_STEP_CM", 8.0))
 PARK_CRUISE_RESERVE_CM = max(PARK_STEP_CM, _env_f("T2_PARK_CRUISE_RESERVE_CM", 10.0))
 PARK_ECHO_TOL_CM = 8.0
 PARK_MAX_STEPS = int(_env_f("T2_PARK_MAX_STEPS", 8.0))
-PARK_MAX_US_CM = _env_f("T2_PARK_MAX_US_CM", 60.0)
+# From just outside the mouth the front sensor can legitimately see the back
+# wall at the 50 cm bay depth plus most of the axle-to-sensor offset.  The old
+# 60 cm default rejected the measured 63.7 cm RR echo by 0.7 cm even though the
+# complete straight sweep was clear.
+PARK_MAX_US_CM = _env_f("T2_PARK_MAX_US_CM", BAY_DEPTH_CM + 15.0)
 PARK_HEADING_TOL_DEG = _env_f("T2_PARK_HEADING_TOL_DEG", 12.0)
 PARK_SIDE_STOP_CM = _env_f("T2_PARK_SIDE_STOP_CM", 10.0)
 RETURN_CHECKPOINT_CM = max(20, int(_env_f("T2_RETURN_CHECKPOINT_CM", 30.0)))
@@ -148,7 +155,7 @@ PARK_FINAL_DIRECT_CM = 20.0
 # Readings that do not add up to the bay's width less the robot's are not the
 # two fences (an IR not inside yet, or reading something else): no correction.
 CENTRE_SUM_TOL_CM = _env_f("T2_CENTRE_SUM_TOL_CM", 10.0)
-CENTRE_MIN_CLEAR_CM = _env_f("T2_CENTRE_MIN_CLEAR_CM", 3.0)
+CENTRE_MIN_CLEAR_CM = _env_f("T2_CENTRE_MIN_CLEAR_CM", 5.0)
 # Parking only has to finish wholly inside the bay. Do not introduce a
 # reverse-plus-S correction merely to make the two side gaps equal when the
 # measured straight sweep already keeps the hard collision floor.
@@ -373,7 +380,7 @@ class Course:
     w2: float              # obstacle 2 width
     obs1_y: float = 0.0    # obstacle 1 centre; on the bay centreline by brief
     walls: bool = ASSUME_WALLS
-    # Wall inner face |y|. None: the brief's minimum, w2/2 + 50. Before the
+    # Hard side boundary |y|. None: w2/2 + exactly 50. Before the
     # width is measured, pass the narrowest case's 65 with w2 = 90 - the
     # conservative box for both at once.
     wall_y: Optional[float] = None
@@ -515,14 +522,19 @@ class FinalPlan:
 
 
 def plan_final(p: Pose, course: Course, r: float = RADIUS_CM,
-               min_clear: float = CLEARANCE_CM, max_lead: int = 40) -> FinalPlan:
+               min_clear: float = CLEARANCE_CM, max_lead: int = 40,
+               allow_reverse: bool = True,
+               log_fallback: bool = True) -> FinalPlan:
     """Minimum estimated time in the finite forward/reverse S-join family."""
     p = Pose(p.x, p.y, HEADING_HOME)
     boxes = course.boxes()
     if path_clearance([p], boxes)[0] < CLEARANCE_FLOOR_CM:
         raise NoPlan("Measured pose already violates the clearance floor: %s" % p)
     options = []
-    for lead in list(range(0, max_lead + 1)) + list(range(-1, -21, -1)):
+    leads = list(range(0, max_lead + 1))
+    if allow_reverse:
+        leads += list(range(-1, -21, -1))
+    for lead in leads:
         prefix = _f(lead) if lead >= 0 else [Seg("B", -lead)]
         segs = prefix + lane_change(p.th, -p.y, r)
         end = run(p, segs, r, step=1e6)[-1]
@@ -540,8 +552,10 @@ def plan_final(p: Pose, course: Course, r: float = RADIUS_CM,
         if fallback is None and gap >= CLEARANCE_FLOOR_CM:
             fallback = candidate
     if fallback is not None:
-        logging.warning("Final join needs the configured clearance floor: %.1f cm to %s.",
-                        fallback.clearance, fallback.closest)
+        if log_fallback:
+            logging.warning("Final join needs the configured clearance floor: "
+                            "%.1f cm to %s.", fallback.clearance,
+                            fallback.closest)
         return fallback
     raise NoPlan(f"No collision-free final S from {p}.")
 
@@ -601,7 +615,12 @@ def shorten_final(p: Pose, course: Course, baseline: FinalPlan,
 
 def plan_direct_return(p: Pose, course: Course,
                        r: float = RADIUS_CM) -> Optional[FinalPlan]:
-    """A checked diagonal ending square with both IRs inside the bay mouth."""
+    """A checked diagonal ending square just outside the bay mouth.
+
+    The diagonal stays outside the side fences.  The measured parking step is
+    the only movement allowed to cross the mouth, so a mirrored return that
+    lands off-centre cannot sweep its final arc into the carpark wall.
+    """
     error = math.atan2(math.sin(p.th - HEADING_HOME),
                        math.cos(p.th - HEADING_HOME))
     if abs(error) > math.radians(10) or abs(p.y) < CENTRE_DEADBAND_CM:
@@ -625,16 +644,17 @@ def plan_direct_return(p: Pose, course: Course,
             segs = prefix + [Seg("F", distance), last]
             end = run(p, segs, r, step=1e6)[-1]
             check_x = IR_FROM_AXLE_CM - CENTRE_CHECK_IN_CM
-            if (not max(0, check_x - 4) <= end.x <= check_x
+            if (not max(0.0, check_x - 4.0) <= end.x <= check_x
                     or abs(end.y) > 0.75):
                 continue
             parking, tokens = park_segments(end)
             options.append((final_cost(segs, end, r), segs,
                             parking, tokens, end))
     boxes = course.boxes()
-    # This shortcut omits the obstacle-1 IR fix. Require extra body clearance,
-    # and retain the independent garage IR/US checks before final entry.
-    margin = max(8.0, CLEARANCE_CM, CLEARANCE_FLOOR_CM)
+    # This shortcut omits the obstacle-1 IR fix, but its complete body sweep is
+    # checked against every obstacle, wall and garage fence.  Retain the normal
+    # planning margin and the independent garage IR/US checks before completion.
+    margin = execution_clearance(CLEARANCE_CM)
     for _, segs, parking, tokens, end in sorted(options, key=lambda x: x[0]):
         poses = run(p, segs + parking, r)
         clearance, closest = path_clearance(poses, boxes)
@@ -656,6 +676,24 @@ def centre_offset(left: Optional[float], right: Optional[float]) -> Optional[flo
     if abs(left + right - expect) > CENTRE_SUM_TOL_CM:
         return None
     return (left - right - IR_LR_BIAS_CM) / 2.0
+
+
+def single_fence_offset(left: Optional[float], right: Optional[float]
+                        ) -> Optional[float]:
+    """Infer bay y from one usable side fence when the other IR is out of range."""
+    if (left is None) == (right is None):
+        return None
+    centre_gap = BAY_HALF_WIDTH_CM - IR_SIDE_OFFSET_CM
+    if left is not None:
+        if not IR_MIN_GAP_CM <= left <= IR_MAX_GAP_CM["left"]:
+            return None
+        y = left - centre_gap - IR_LR_BIAS_CM / 2.0
+    else:
+        if not IR_MIN_GAP_CM <= right <= IR_MAX_GAP_CM["right"]:
+            return None
+        y = centre_gap - right - IR_LR_BIAS_CM / 2.0
+    limit = BAY_HALF_WIDTH_CM - HALF_WIDTH_CM - CLEARANCE_FLOOR_CM
+    return y if abs(y) <= limit else None
 
 
 def plan_centre(p: Pose, course: Course, r: float = RADIUS_CM
@@ -799,7 +837,9 @@ def plan_return(p0: Pose, course: Course, r: float = RADIUS_CM,
             if c_a < min_clear - 0.01:
                 break
             try:
-                final = plan_final(poses_a[-1], course, r, min_clear, max_lead=0)
+                final = plan_final(poses_a[-1], course, r, min_clear,
+                                   max_lead=0, allow_reverse=False,
+                                   log_fallback=False)
             except NoPlan:
                 final = None
             if final is not None and final.clearance >= min_clear - 0.01:
@@ -1083,12 +1123,12 @@ class ParkRunner:
             return False
         heading_error = parking_heading_error(pose.th)
         if heading_error > PARK_HEADING_TOL_DEG:
-            logging.error("Parking heading is %.1f deg off home; refusing a straight "
-                          "approach.", heading_error)
+            logging.error("Parking heading is %.1f deg off home; refusing a "
+                          "straight approach.", heading_error)
             return False
         if gap < PARK_GAP_CM - PARK_GAP_TOL_CM:
-            logging.error("Parking overshot: back-wall gap %.1f cm is below the %.1f "
-                          "cm target.", gap, PARK_GAP_CM)
+            logging.error("Parking overshot: back-wall gap %.1f cm is below "
+                          "the %.1f cm target.", gap, PARK_GAP_CM)
             return False
         if gap <= PARK_GAP_CM + PARK_GAP_TOL_CM:
             logging.info("Parking back-wall gap reached: %.1f cm (target %.1f +/- "
@@ -1097,7 +1137,12 @@ class ParkRunner:
 
         # A robot just outside the mouth can legitimately see slightly more
         # than the bay depth. Larger echoes are a different surface.
-        max_wall_gap = PARK_MAX_US_CM + max(0.0, pose.x) + 3.0
+        # Accept the bay wall from the mouth, or a proportionally farther echo
+        # when WPOSE confirms the axle is still outside it.  Using their sum
+        # admitted a 75 cm background echo from an almost-at-mouth pose.
+        max_wall_gap = max(
+            PARK_MAX_US_CM,
+            BAY_DEPTH_CM + max(0.0, pose.x) + 3.0)
         if gap > max_wall_gap:
             logging.error("Parking ?US reads %.1f cm, too far to identify the %.0f "
                           "cm-deep bay's back wall.", gap, BAY_DEPTH_CM)
@@ -1131,8 +1176,8 @@ class ParkRunner:
             return False
         if not (PARK_GAP_CM - PARK_GAP_TOL_CM
                 <= final_gap <= PARK_GAP_CM + PARK_GAP_TOL_CM):
-            logging.error("Parking completed F%d at %.1f cm from the back wall; no "
-                          "corrective movement is sent.", travel, final_gap)
+            logging.error("Parking completed F%d at %.1f cm from the back wall; "
+                          "no corrective movement is sent.", travel, final_gap)
             return False
         logging.info("Parking back-wall gap reached in one push: %.1f cm (target "
                      "%.1f +/- %.1f cm).", final_gap, PARK_GAP_CM,
@@ -1224,13 +1269,26 @@ class ParkRunner:
             heading_error = abs(math.degrees(math.atan2(
                 math.sin(actual.th - expected.th),
                 math.cos(actual.th - expected.th))))
-            if (index + 1 < len(parts)
+            # Do not abandon a paired S/lane-change after its first arc.  The
+            # intermediate heading is intentionally far from home, and the
+            # return planner assumes the pair has brought it square again.  In
+            # the 012106 run, a harmless 3.1 cm miss after FR45 caused a full
+            # five-second replan from a 135-degree pose; that replan treated it
+            # as 180 degrees and sent F78 in the wrong direction.  Finish the
+            # pair, then assess the measured square pose.
+            next_seg = parts[index + 1] if index + 1 < len(parts) else None
+            paired_arc = (
+                seg.kind in ("L", "R")
+                and next_seg is not None
+                and next_seg.kind in ("L", "R")
+                and seg.kind != next_seg.kind)
+            if (index + 1 < len(parts) and not paired_arc
                     and (position_error > RETURN_REPLAN_ERROR_CM
                          or heading_error > 4.0)):
                 logging.warning("Return checkpoint %s landed %.1f cm / %.1f deg "
-                                "off plan; replanning before the next motion.",
+                                "off nominal; continuing from measured WPOSE. "
+                                "The next primitive is independently checked.",
                                 line, position_error, heading_error)
-                return None
         return True
 
     def _run(self, replans: int) -> bool:
@@ -1251,7 +1309,18 @@ class ParkRunner:
                     pass
         direct_seconds = final_cost(direct.segs, direct.end) if direct is not None else float("inf")
         needs_fix = getattr(self.frame, "needs_lateral_fix", False) is True
-        if direct is not None and (plan is None or (not needs_fix and direct_seconds <= plan.seconds)):
+        direct_clearance = getattr(direct, "clearance", None)
+        direct_has_full_margin = (
+            isinstance(direct_clearance, (int, float))
+            and direct_clearance >= CLEARANCE_CM)
+        # A single-edge obstacle-2 measurement used to force the landmark path
+        # unconditionally.  A direct sweep with the full configured clearance
+        # is already robust to that uncertainty and avoids two extra S-curves.
+        # Marginal shortcuts still retain the obstacle-1 IR correction.
+        direct_beats_fallback = (direct is not None and (
+            plan is None or direct_seconds + LINE_OVERHEAD_S < plan.seconds))
+        if direct is not None and direct_beats_fallback and (
+                not needs_fix or direct_has_full_margin or plan is None):
             logging.info("Return selected by estimated time: direct %.2fs, "
                          "IR-fix route %s; %s, clearance %.1f cm.", direct_seconds,
                          "unavailable" if plan is None else "%.2fs" % plan.seconds,
@@ -1357,6 +1426,11 @@ class ParkRunner:
         time.sleep(0.2)                      # let the IR filters settle
         left, right = self._ir("left"), self._ir("right")
         y = centre_offset(left, right)
+        if y is None:
+            y = single_fence_offset(left, right)
+            if y is not None:
+                logging.info("One bay fence is visible (IR %s / %s); inferred "
+                             "lateral offset %+.1f cm.", left, right, y)
         at = self.frame.pose()
         line_c = None
         if at is None:
@@ -1367,6 +1441,40 @@ class ParkRunner:
                             "using the monitored ?US approach from the mouth.",
                             left, right)
         measured = Pose(at.x, at.y if y is None else y, at.th)
+
+        # A direct return can arrive safely off-centre but a few degrees off
+        # square.  Driving that heading all the way through the bay makes the
+        # footprint drift into a fence; plan_centre used to answer with a
+        # reverse plus two arcs.  Square the heading here with one checked arc
+        # first.  If the resulting straight is clear, this is the only trim
+        # motion before the single ultrasonic parking push.
+        signed_heading_error = math.atan2(
+            math.sin(HEADING_HOME - measured.th),
+            math.cos(HEADING_HOME - measured.th))
+        correction_deg = int(round(abs(math.degrees(signed_heading_error))))
+        if MIN_ARC_DEG <= correction_deg <= PARK_HEADING_TOL_DEG:
+            correction = Seg(
+                "L" if signed_heading_error > 0 else "R", correction_deg)
+            corrected = run(measured, [correction], step=1e6)[-1]
+            corrected_preview, _ = park_segments(corrected)
+            correction_clearance, correction_closest = path_clearance(
+                run(measured, [correction] + corrected_preview),
+                self.course.fence())
+            if correction_clearance >= PARK_STRAIGHT_CLEARANCE_CM:
+                logging.info("Parking heading trim: %s replaces a centring "
+                             "S; checked straight clearance %.1f cm to %s.",
+                             correction.token(), correction_clearance,
+                             correction_closest)
+                if not self._send([correction]):
+                    return False
+                at = self.frame.pose()
+                if at is None:
+                    logging.error("Cannot read world pose after parking heading trim.")
+                    return False
+                left, right = self._ir("left"), self._ir("right")
+                y = centre_offset(left, right)
+                measured = Pose(at.x, at.y if y is None else y, at.th)
+
         preview, _ = park_segments(measured)
         heading_error = parking_heading_error(at.th)
         straight_clearance, straight_closest = path_clearance(

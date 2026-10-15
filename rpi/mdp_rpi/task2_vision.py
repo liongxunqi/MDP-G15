@@ -2,14 +2,27 @@
 import json
 import logging
 import math
+import os
 import time
 from threading import Condition
 
 
 class Vision:
-    def __init__(self, pc, stop, run_id, max_age=2.5, confidence=0.70):
+    def __init__(self, pc, stop, run_id, max_age=2.5, confidence=None):
         self.pc, self.stop, self.run_id = pc, stop, run_id
-        self.max_age, self.confidence = max_age, confidence
+        self.max_age = max_age
+        if confidence is None:
+            # Obstacle 2 is normally much smaller in frame.  Two matching
+            # fresh votes plus the PC's unique-arrow policy still guard the
+            # lower threshold against the already-read obstacle 1.
+            self.confidence = {
+                1: float(os.getenv("T2_STAGE1_CONFIDENCE", "0.70")),
+                2: float(os.getenv("T2_STAGE2_CONFIDENCE", "0.60")),
+            }
+        else:
+            self.confidence = {1: float(confidence), 2: float(confidence)}
+        if any(not 0.5 <= value <= 1.0 for value in self.confidence.values()):
+            raise ValueError("Task 2 confidence thresholds must be between 0.5 and 1.0")
         self.condition = Condition()
         self.latest = None
         self.stage = 0
@@ -38,11 +51,19 @@ class Vision:
 
     def wait_arrow(self, timeout=8.0):
         deadline = time.monotonic() + timeout
+        last_frame_time = self.last_frame_time
         with self.condition:
             while self.result is None and not self.stop.is_set():
+                # This is a camera-inactivity watchdog, not a recognition
+                # deadline. A fresh bullseye/blank frame proves the pipeline
+                # is alive, so keep the stationary robot looking for an arrow.
+                if self.last_frame_time > last_frame_time:
+                    last_frame_time = self.last_frame_time
+                    deadline = time.monotonic() + timeout
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    raise RuntimeError("No confirmed arrow at safe decision point")
+                    raise RuntimeError("No fresh camera frame or confirmed arrow "
+                                       "at safe decision point")
                 self.condition.wait(min(remaining, 0.1))
             if self.stop.is_set():
                 raise RuntimeError("Task 2 cancelled")
@@ -92,7 +113,9 @@ class Vision:
             if epoch != previous_epoch:
                 vote, count = None, 0
                 previous_epoch = epoch
-            request = {"run_id": self.run_id, "stage": stage, "frame_id": frame}
+            threshold = self.confidence[stage]
+            request = {"run_id": self.run_id, "stage": stage, "frame_id": frame,
+                       "min_confidence": threshold}
             self.pc.send_image(jpeg, header="FRAME," + json.dumps(request))
             message = self.pc.receive()
             if not message or not message.startswith("ARROW,"):
@@ -104,11 +127,15 @@ class Vision:
             direction = reply.get("direction")
             conf = float(reply.get("confidence", 0))
             valid = (direction in ("left", "right") and math.isfinite(conf)
-                     and self.confidence <= conf <= 1 and now - captured <= self.max_age)
+                     and threshold <= conf <= 1 and now - captured <= self.max_age)
             with self.condition:
                 if epoch != self.epoch:
                     continue
                 if not valid:
+                    # A bullseye (filtered by the PC to direction=None), a
+                    # blank frame, or an uncertain guess is not a decision.
+                    # Stay at the stationary photo pose and keep requesting
+                    # fresh frames until two valid arrow votes arrive.
                     vote, count = None, 0
                     self.candidate_time = None
                     continue

@@ -7,10 +7,13 @@ import socket
 import struct
 import sys
 import time
-from functools import partial
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
+
+
+class PeerDisconnected(ConnectionError):
+    """The Pi closed a Task 2 session while a framed payload was in flight."""
 
 
 def exact(stream, size):
@@ -18,7 +21,7 @@ def exact(stream, size):
     while len(data) < size:
         chunk = stream.read(size - len(data))
         if not chunk:
-            raise ConnectionError("Image transfer ended early")
+            raise PeerDisconnected("Pi disconnected during image transfer")
         data.extend(chunk)
     return bytes(data)
 
@@ -56,6 +59,10 @@ def serve(sock, detector, directory, mapping, stitch):
             if not isinstance(frame, int) or frame < 1:
                 raise ValueError("Invalid frame ID")
             if verb == "FRAME":
+                target_confidence = request.get("min_confidence")
+                if (not isinstance(target_confidence, (int, float))
+                        or not 0.5 <= target_confidence <= 1.0):
+                    raise ValueError("Invalid target confidence")
                 size = struct.unpack(">I", exact(stream, 4))[0]
                 if not 0 < size <= 8 * 1024 * 1024:
                     raise ValueError("Invalid JPEG size")
@@ -63,11 +70,19 @@ def serve(sock, detector, directory, mapping, stitch):
                 path.write_bytes(exact(stream, size))
                 label, confidence = detector(path, allowed_classes=set(mapping),
                                              output_dir=directory / "annotated",
+                                             target_confidence=target_confidence,
                                              selection_policy=("nearest" if request["stage"] == 1
                                                                else "unique_arrow"))
-                direction = mapping.get(str(label).lower())
-                reply = dict(request, direction=direction, confidence=float(confidence or 0))
+                label_name = (str(label).strip().lower()
+                              if label is not None else None)
+                direction = mapping.get(label_name)
+                reply = dict(request, direction=direction,
+                             confidence=float(confidence or 0))
                 if direction is None:
+                    if label_name == "bullseye":
+                        logging.info("Stage %s frame %s: ignored bullseye; "
+                                     "waiting for a left/right arrow",
+                                     request["stage"], frame)
                     discard_frame(directory, path)
                 else:
                     frames[frame] = (request["stage"], path, direction)
@@ -166,11 +181,16 @@ def main():
             with sock:
                 # Android may start much later; idle time is not a failed connection.
                 sock.settimeout(None)
-                serve(sock, partial(detect, target_confidence=0.70),
-                      directory, mapping, stitch_images)
+                serve(sock, detect, directory, mapping, stitch_images)
             logging.info("Pi session ended; waiting for the next Task 2 run.")
         except KeyboardInterrupt:
             raise
+        except PeerDisconnected as exc:
+            # The mission may have timed out or been stopped while its camera
+            # worker was already sending a frame.  The next Pi run gets a new
+            # connection, so this is a normal session end rather than a PC
+            # detector failure with a misleading traceback.
+            logging.warning("%s; waiting for a new Task 2 run.", exc)
         except (ConnectionError, OSError, ValueError, json.JSONDecodeError):
             logging.exception("Task 2 Pi session failed; waiting for a new run.")
         time.sleep(0.5)
