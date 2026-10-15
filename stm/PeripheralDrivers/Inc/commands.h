@@ -188,9 +188,15 @@ typedef enum
     CMD_Q_ENC,           /* ?ENC   wheel A, wheel B counts since boot */
 
     /* --- Fast mode, protocol 8 --------------------------------------------
-     * Inside the second immediate range: keep CMD_SET_FAST last, or move the
-     * endpoint in Cmd_IsImmediate() with it. */
-    CMD_SET_FAST         /* !FASTn arg = 0 normal, 1 fast - see motion.h */
+     * Inside the second immediate range, which now ends at CMD_SET_IR_EDGE. */
+    CMD_SET_FAST,        /* !FASTn arg = 0 normal, 1 fast - see motion.h */
+
+    /* --- Side-IR timing, protocol 9 -----------------------------------------
+     * Keep CMD_SET_IR_EDGE last, or move the endpoint in Cmd_IsImmediate().
+     * See IR SNAPSHOT AND EDGE LATCH in rpilink.h. */
+    CMD_Q_IRW,           /* ?IRW   IR cm + raw counts + WPOSE, one tick */
+    CMD_Q_IRE,           /* ?IRE   edge latch state and latched pose  */
+    CMD_SET_IR_EDGE      /* !IREn  arm/disarm, n = side*10000+lo*100+hi */
 } CmdOpcode_t;
 
 /* Bumped whenever the wire format changes in a way a sender must care about.
@@ -223,7 +229,9 @@ typedef enum
  * counts and agree with themselves. Additive. */
 /* 8: added !FAST0/1 (MOTION FAST MODE in motion.h). Additive; off at
  * power-on, so a sender that never sends it drives exactly as on 7. */
-#define CMD_PROTOCOL_VERSION    8
+/* 9: added ?IRW, ?IRE and !IRE (IR SNAPSHOT AND EDGE LATCH, rpilink.h).
+ * Additive; the latch is off at power-on. */
+#define CMD_PROTOCOL_VERSION    9
 #define CMD_FIRMWARE_NAME       "MDPG15-STM32"
 
 /* Replies for a primitive that did not complete. Previously a timed-out move

@@ -344,10 +344,20 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
             (Encoder_A_GetDelta() == 0) && (Encoder_B_GetDelta() == 0))
         {
             IMU_TrackBias();
+
+            /* Re-arming a dropped gyro waits for this too, and also for the
+               queue to be empty: between the primitives of one line the
+               robot is idle but about to move again. */
+            IMU_NoteStill((Cmd_QueueCount() == 0U) ? 1U : 0U);
+        }
+        else
+        {
+            IMU_NoteStill(0U);
         }
 
         Motion_Tick();
         Odom_Update();
+        RpiLink_Tick();   /* ?IRW snapshot and IR edge latch: this tick's pose */
         PID_Update();
 
         Btn_Poll();
@@ -827,8 +837,13 @@ static void Display(void)
             snprintf(line, sizeof(line), "addr %02X id %02X",
                      IMU_GetAddress(), IMU_GetWhoAmI());
             ShowLine(24, line);
-            ShowLine(36, "PB12 high?");
-            ShowLine(48, "1.8V rail?");
+            /* Re-arming keeps trying while still - see imu.h. A climbing rc
+               with addr 00 is a bus or wiring fault, not a slow start. */
+            snprintf(line, sizeof(line), "st%lu rc%lu",
+                     (unsigned long)IMU_GetStallCount(),
+                     (unsigned long)IMU_GetRecoveryCount());
+            ShowLine(36, line);
+            ShowLine(48, "PB12? 1.8V?");
         }
         else
         {
@@ -1210,7 +1225,7 @@ int main(void)
     }
     else
     {
-        RpiLink_Log("IMU FAILED - check PB12 high, 1.8V rail\r\n");
+        RpiLink_Log("IMU FAILED - retrying while still; check PB12, 1.8V rail\r\n");
     }
     OLED_Clear();
 

@@ -15,6 +15,7 @@ static int8_t   s_dir;           /* +1 forward, -1 reverse                   */
 static uint8_t  s_arcRight;      /* which way the arc curves                 */
 static uint16_t s_arcServoUs;    /* servo pulse held for the whole arc       */
 static int16_t  s_lastRpm;       /* last speed issued to the odom layer      */
+static uint8_t  s_approaching;   /* fast straight: the down-ramp has begun   */
 static uint32_t s_ticks;
 static uint32_t s_brakeTicks;
 static uint32_t s_alignTicks;
@@ -215,7 +216,6 @@ void    Motion_SetFast(uint8_t on)      { s_fast = on ? 1U : 0U; }
 uint8_t Motion_FastEnabled(void)        { return s_fast; }
 
 static int16_t  cruise_rpm(void)  { return s_fast ? MOTION_FAST_CRUISE_RPM : MOTION_CRUISE_RPM; }
-static float    approach_mm(void) { return s_fast ? MOTION_FAST_APPROACH_MM : MOTION_APPROACH_MM; }
 static uint32_t brake_ticks(void) { return s_fast ? MOTION_FAST_BRAKE_TICKS : MOTION_BRAKE_TICKS; }
 uint8_t Motion_LearningEnabled(void)    { return s_learnOn; }
 
@@ -432,9 +432,14 @@ static void motion_launch(void)
 
     s_ticks      = 0U;
     s_brakeTicks = 0U;
+    /* A fast straight starts at the bottom of its ramp - see FAST MODE in
+     * motion.h. Arcs and normal straights start at full speed, as they
+     * always have: their calibration was measured that way. */
+    s_approaching = 0U;
     s_lastRpm    = (s_kind == MOVE_ARC)
                  ? (int16_t)(s_dir * prof()->rpm)
-                 : (int16_t)(s_dir * cruise_rpm());
+                 : (s_fast ? (int16_t)(s_dir * MOTION_RAMP_START_RPM)
+                           : (int16_t)(s_dir * cruise_rpm()));
     s_state      = MOTION_RUN;
 
     PID_Enable(1);
@@ -638,6 +643,35 @@ static void motion_issue(int16_t rpm)
     Odom_SetSpeed(rpm);
 }
 
+/* Fast-mode straight: this tick's speed. Climbs toward cruise until what is
+ * left is the down-ramp from the speed reached so far plus the tail, then
+ * falls to MOTION_APPROACH_RPM and stays there. The switch latches: while
+ * the wheels lag the ramp the distance left can briefly exceed the shrinking
+ * threshold again, and flipping back to cruise there would surge. */
+static int16_t fast_straight_rpm(float remaining)
+{
+    int16_t now = (s_lastRpm < 0) ? (int16_t)(-s_lastRpm) : s_lastRpm;
+    int16_t want;
+
+    if (!s_approaching &&
+        (remaining <= (MOTION_RAMP_DOWN_MM(now) + MOTION_FAST_TAIL_MM)))
+    {
+        s_approaching = 1U;
+    }
+
+    if (s_approaching)
+    {
+        want = (int16_t)(now - MOTION_RAMP_DOWN_RPM_PER_TICK);
+        if (want < MOTION_APPROACH_RPM) { want = MOTION_APPROACH_RPM; }
+    }
+    else
+    {
+        want = (int16_t)(now + MOTION_RAMP_UP_RPM_PER_TICK);
+        if (want > MOTION_FAST_CRUISE_RPM) { want = MOTION_FAST_CRUISE_RPM; }
+    }
+    return (int16_t)(s_dir * want);
+}
+
 void Motion_Tick(void)
 {
     float   travelled;
@@ -771,9 +805,16 @@ void Motion_Tick(void)
             return;
         }
 
-        want = (remaining <= approach_mm())
-             ? (int16_t)(s_dir * MOTION_APPROACH_RPM)
-             : (int16_t)(s_dir * cruise_rpm());
+        if (s_fast)
+        {
+            want = fast_straight_rpm(remaining);
+        }
+        else
+        {
+            want = (remaining <= MOTION_APPROACH_MM)
+                 ? (int16_t)(s_dir * MOTION_APPROACH_RPM)
+                 : (int16_t)(s_dir * MOTION_CRUISE_RPM);
+        }
 
         /* Only re-issue when the speed actually changes.
          *

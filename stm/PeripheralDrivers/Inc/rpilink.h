@@ -170,4 +170,43 @@ void RpiLink_ClearCalCounts(void);
 /* Last command the executor started. For the OLED. */
 CmdOpcode_t RpiLink_LastOpcode(void);
 
+/* ---------------------------------------------------------------------------
+ * IR SNAPSHOT AND EDGE LATCH  (protocol 9)
+ *
+ * The RPi used to find a side IR's distance and where the robot was with two
+ * queries, ?WPOSE then ?IR, a few milliseconds and possibly a tick apart -
+ * and it had to catch a 10 cm obstacle side in its own polling loop, then
+ * RST, which coasts. Both are fixed here, in the control tick:
+ *
+ *   ?IRW   IRW,<l_cm>,<r_cm>,<l_raw>,<r_raw>,<x_mm>,<y_mm>,<hdg_x10>,<ms>
+ *          Both IR distances (65535 = no reading), the median-filtered raw
+ *          counts behind them, and the world pose (?WPOSE's frame), all from
+ *          the SAME tick, plus HAL_GetTick() of that tick. Raw counts tell a
+ *          65535 apart: HIGH counts mean closer than IR_MIN_VALID_CM, low
+ *          means nothing in range.
+ *
+ *   !IRE<n>  Arm the latch: n = side * 10000 + lo * 100 + hi, side 1 = left,
+ *          2 = right, lo..hi cm within IR_MIN_VALID_CM..IR_MAX_VALID_CM.
+ *          !IRE0 disarms. Arming clears any previous latch. Replies plain OK
+ *          on the movement path like every setter, so send it BEFORE the line
+ *          it is meant to watch, never while one is outstanding.
+ *
+ *   ?IRE   IRE,<state>,<side>,<cm>,<raw>,<x_mm>,<y_mm>,<hdg_x10>,<ms>
+ *          state 0 off, 1 armed and watching, 2 latched. Once latched the
+ *          fields are the FIRST tick of the run that confirmed it, frozen
+ *          until the next !IRE; otherwise they are 0.
+ *
+ * The latch only looks while a primitive is running (Motion_IsBusy()), and
+ * needs RPILINK_IRE_CONFIRM_TICKS in-window readings on consecutive ticks:
+ * the Sharp itself only refreshes every ~38 ms, so one tick is one median
+ * step on a stale measurement, and a single edge spike is not an obstacle.
+ * The pose reported is the first tick of that run - the earliest the median
+ * showed it - so the RPi's IR lag correction still applies to it. It records
+ * only; the move carries on. */
+#define RPILINK_IRE_CONFIRM_TICKS  3U
+
+/* Control tick, after Odom_Update(): take the ?IRW snapshot and run the
+ * latch. Cheap - copies and two compares. */
+void RpiLink_Tick(void);
+
 #endif /* __RPILINK_H */

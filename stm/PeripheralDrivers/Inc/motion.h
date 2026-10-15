@@ -574,17 +574,60 @@ uint16_t Motion_GetCarryClampCount(void);   /* corrections capped since zero */
  * other tasks changes.
  *
  *   straights cruise at MOTION_FAST_CRUISE_RPM instead of MOTION_CRUISE_RPM
- *   they start slowing MOTION_FAST_APPROACH_MM out, so the extra speed is
- *     off before the stop - the last stretch is still MOTION_APPROACH_RPM,
- *     which is what MOTION_BRAKE_MM was measured at
+ *   they RAMP: start at MOTION_RAMP_START_RPM and climb by
+ *     MOTION_RAMP_UP_RPM_PER_TICK, then on the way in fall by
+ *     MOTION_RAMP_DOWN_RPM_PER_TICK to MOTION_APPROACH_RPM - no step change
+ *     in wheel speed anywhere, so no wheelspin off the line and no nose dip
+ *     at the slow-down, both of which kicked the heading
+ *   the slow-down starts as late as it can: when what is left is the
+ *     distance the down-ramp needs FROM THE SPEED ACTUALLY REACHED, plus
+ *     MOTION_FAST_TAIL_MM at MOTION_APPROACH_RPM. A short move that never
+ *     reached cruise brakes later than a long one. From full cruise that is
+ *     MOTION_FAST_APPROACH_MM (computed below, for reference)
+ *   the last stretch is still MOTION_APPROACH_RPM, which is what
+ *     MOTION_BRAKE_MM was measured at - so straight calibration still holds
  *   every move settles MOTION_FAST_BRAKE_TICKS after braking instead of
  *     MOTION_BRAKE_TICKS - still only once the wheels read stopped and the
  *     steering is back on centre (see the BRAKE phase in motion.c)
  *
  * Arcs are unchanged: their speed is the profile's, and their braking model
- * is what calibration measured. */
-#define MOTION_FAST_CRUISE_RPM      150
-#define MOTION_FAST_APPROACH_MM     220.0f
+ * is what calibration measured. Normal mode is unchanged too - no ramp, the
+ * same steps it was tuned and calibrated with.
+ *
+ * Why 200 and not more: the slower motor free-runs at 362 rpm on a full
+ * 12 V with the wheels up. Loaded and on a sagging battery it has far less,
+ * and the PID needs headroom to hold the two wheels together. 200 leaves
+ * ~45%. Past ~250 it starts running out. */
+#define MOTION_FAST_CRUISE_RPM      200
+
+/* Ramps, rpm per 10 ms tick. Up: 60 -> 200 in 0.35 s, ~16 cm. Down is
+ * steeper - the PID can brake harder than the motors can accelerate - and
+ * 200 -> 40 takes 0.27 s, ~11 cm. Start above the ~32 rpm the deadband
+ * duty gives, or the first ticks only wind up the integrator. */
+#define MOTION_RAMP_START_RPM        60
+#define MOTION_RAMP_UP_RPM_PER_TICK   4
+#define MOTION_RAMP_DOWN_RPM_PER_TICK 6
+
+/* Distance driven at MOTION_APPROACH_RPM after the down-ramp, mm. Covers the
+ * wheels lagging the ramp; the stop itself then happens from the steady
+ * 40 rpm MOTION_BRAKE_MM was measured at. */
+#define MOTION_FAST_TAIL_MM         120.0f
+
+/* Wheel travel per rpm, (mm/s)/rpm: pi * WHEEL_DIAMETER_MM (65.9) / 60. */
+#define MOTION_MM_S_PER_RPM         3.4505f
+
+/* Down-ramp distance from rpm r to MOTION_APPROACH_RPM, mm:
+ * v^2 / 2a with v and a both in wheel mm. */
+#define MOTION_RAMP_DOWN_MM(r) \
+    ((MOTION_MM_S_PER_RPM * ((float)(r) * (float)(r) - \
+      (float)MOTION_APPROACH_RPM * (float)MOTION_APPROACH_RPM)) / \
+     (2.0f * (float)MOTION_RAMP_DOWN_RPM_PER_TICK * 100.0f))
+
+/* From full cruise: ~110 + 120 = ~230 mm. For reference - motion.c works it
+ * out from the speed actually reached. */
+#define MOTION_FAST_APPROACH_MM \
+    (MOTION_RAMP_DOWN_MM(MOTION_FAST_CRUISE_RPM) + MOTION_FAST_TAIL_MM)
+
 #define MOTION_FAST_BRAKE_TICKS     20U
 
 void    Motion_SetFast(uint8_t on);

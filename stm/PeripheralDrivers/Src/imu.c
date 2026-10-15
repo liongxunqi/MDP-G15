@@ -66,6 +66,20 @@ static uint32_t s_trackTick;
 static float    s_steadyMean;
 static uint16_t s_steadyTicks;
 
+/* Re-arming - see IMU_REARM_STILL_TICKS. s_configured: the part has been
+ * through imu_bringup() since the bus last failed. s_biasValid: s_bias came
+ * from a proper at-rest measurement, at boot or since. Both survive a stall,
+ * so a dropout mid-run only needs the bus back, not a new bias. */
+static volatile uint8_t  s_configured;
+static uint8_t           s_biasValid;
+static volatile uint16_t s_stillTicks;
+static uint32_t s_recoveries;
+static uint32_t s_lastRecoverMs;
+static uint32_t s_rearmLastMs;
+static uint16_t s_rearmGood;
+static int32_t  s_rearmSum;
+static uint16_t s_rearmGot;
+
 /* ------------------------------------------------------------------ */
 /* Register access                                                     */
 /* ------------------------------------------------------------------ */
@@ -104,6 +118,95 @@ static uint8_t bank_select(uint8_t bank)
 
     s_bank = bank;
     return 1U;
+}
+
+/* ------------------------------------------------------------------ */
+/* Bus recovery                                                        */
+/* ------------------------------------------------------------------ */
+
+/* ~5 us at 168 MHz. Only needs to be slow enough for the RS0102 shifter and
+ * the internal pull-ups to swing the lines; the exact rate does not matter. */
+static void bus_delay(void)
+{
+    volatile uint32_t n = SystemCoreClock / 1000000U;
+    while (n--) { }
+}
+
+/* Free a stuck I2C2 and give the peripheral a clean start.
+ *
+ * Two ways the bus wedges, and neither clears itself:
+ *
+ *   The SENSOR holds SDA low. An MCU-only reset (RESET button, debugger, a
+ *   brown-out the 1.8 V rail rides through) can land mid-read, with the
+ *   ICM-20948 halfway through shifting a byte out. It keeps waiting for
+ *   clocks that never come and holds SDA low forever. Every START then
+ *   fails and the part looks dead until a full power cycle.
+ *
+ *   The PERIPHERAL wedges. A glitch on the lines - motor noise is the usual
+ *   source - can leave the STM32F4 I2C block with BUSY set and no transfer
+ *   in progress (a known STM32F4 I2C erratum). HAL_I2C_* then returns
+ *   HAL_BUSY on every call.
+ *
+ * The cure for the first is up to nine clocks on SCL, as GPIO, until the
+ * sensor finishes its byte and lets SDA go, then a STOP. The cure for the
+ * second is an RCC reset of the block and a fresh HAL_I2C_Init(). Do both,
+ * every time: it costs well under a millisecond.
+ *
+ * The pin setup mirrors MX_I2C2_Init() in main.c - see there for why it is
+ * not in an MspInit. */
+static void i2c_bus_recover(void)
+{
+    GPIO_InitTypeDef g = {0};
+    uint8_t i;
+
+    if ((s_i2c == 0) || (s_i2c->Instance != I2C2)) { return; }
+
+    (void)HAL_I2C_DeInit(s_i2c);
+
+    /* PB10 SCL, PB11 SDA as plain open-drain outputs, both released. */
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_10 | GPIO_PIN_11, GPIO_PIN_SET);
+    g.Pin   = GPIO_PIN_10 | GPIO_PIN_11;
+    g.Mode  = GPIO_MODE_OUTPUT_OD;
+    g.Pull  = GPIO_PULLUP;
+    g.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
+    HAL_GPIO_Init(GPIOB, &g);
+    bus_delay();
+
+    /* Clock until the sensor lets go of SDA. Nine covers a whole byte plus
+     * its ACK slot. */
+    for (i = 0U; i < 9U; i++)
+    {
+        if (HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_11) == GPIO_PIN_SET) { break; }
+        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_10, GPIO_PIN_RESET);
+        bus_delay();
+        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_10, GPIO_PIN_SET);
+        bus_delay();
+    }
+
+    /* STOP: SDA rising while SCL is high. Leaves the sensor idle. */
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_10, GPIO_PIN_RESET);
+    bus_delay();
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_11, GPIO_PIN_RESET);
+    bus_delay();
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_10, GPIO_PIN_SET);
+    bus_delay();
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_11, GPIO_PIN_SET);
+    bus_delay();
+
+    /* Back to the I2C alternate function, as main.c sets it up. */
+    g.Mode      = GPIO_MODE_AF_OD;
+    g.Alternate = GPIO_AF4_I2C2;
+    HAL_GPIO_Init(GPIOB, &g);
+
+    /* Clear a stuck BUSY the only reliable way, then start the block over. */
+    __HAL_RCC_I2C2_FORCE_RESET();
+    __HAL_RCC_I2C2_RELEASE_RESET();
+    __HAL_UNLOCK(s_i2c);
+    s_i2c->State = HAL_I2C_STATE_RESET;
+    (void)HAL_I2C_Init(s_i2c);
+
+    /* The sensor may have lost its bank pointer along with everything else. */
+    s_bank = 0xFF;
 }
 
 /* ------------------------------------------------------------------ */
@@ -207,22 +310,35 @@ uint8_t IMU_Init(I2C_HandleTypeDef *hi2c)
     s_errors     = 0U;
     s_lastGoodMs = HAL_GetTick();
     s_stalls     = 0U;
+    s_configured = 0U;
+    s_biasValid  = 0U;
+    s_recoveries = 0U;
+    s_stillTicks = 0U;
+    s_lastRecoverMs = HAL_GetTick();
 
     /* nCS high selects I2C. Without this the part sits in SPI mode and will
      * not acknowledge at any address. */
     HAL_GPIO_WritePin(GPIOB, GPIO_PIN_12, GPIO_PIN_SET);
     HAL_Delay(50);
 
+    /* Recover the bus before EVERY attempt, the first included: a warm
+     * reset is exactly when the sensor is most likely to be holding SDA, and
+     * retrying a bring-up against a held bus only fails the same way again. */
     for (attempt = 0U; attempt < IMU_INIT_RETRIES; attempt++)
     {
+        i2c_bus_recover();
         if (imu_bringup())
         {
-            s_ready = 1U;
+            s_configured = 1U;
+            s_ready      = 1U;
             break;
         }
         HAL_Delay(100);
     }
 
+    /* Either failure below leaves the gyro off for now, not for good:
+     * IMU_Poll() keeps trying to bring it up and measure its bias while the
+     * robot stands still - see IMU_REARM_STILL_TICKS. */
     if (!s_ready) { return 0U; }
 
     if (!IMU_CalibrateBias())
@@ -230,6 +346,7 @@ uint8_t IMU_Init(I2C_HandleTypeDef *hi2c)
         s_ready = 0U;
         return 0U;
     }
+    s_biasValid = 1U;
 
     /* Start the staleness clock from HERE, not from the top of init. The
      * control tick begins right after this returns and checks staleness on
@@ -297,6 +414,110 @@ uint8_t IMU_CalibrateBias(void)
 }
 
 /* ------------------------------------------------------------------ */
+/* Re-arming                                                           */
+/* ------------------------------------------------------------------ */
+
+/* Called from IMU_Poll() while the gyro is off. Brings it back in three
+ * steps, all only while the robot has been standing still:
+ *
+ *   1. Bus recovery and a full bring-up, at most once per
+ *      IMU_REARM_PERIOD_MS - so a sensor that is really gone costs a few
+ *      milliseconds a second, not the whole main loop.
+ *   2. If the bias was never measured (boot calibration failed), measure it
+ *      here, one sample per 10 ms, without blocking. Any movement starts it
+ *      over, exactly as the boot calibration would want.
+ *   3. IMU_REARM_GOOD_READS clean reads in a row, then ready again.
+ *
+ * Heading is NOT touched. IMU_Tick() stopped integrating when the gyro went
+ * stale, so IMU_GetHeading() still holds the value Odom last differenced;
+ * the first tick after re-arming adds nothing, and the encoder-integrated
+ * pose carries straight across the gap. */
+static void imu_rearm(void)
+{
+    uint32_t now = HAL_GetTick();
+    uint8_t  buf[2];
+    int16_t  raw;
+
+    if (s_stillTicks < IMU_REARM_STILL_TICKS)
+    {
+        /* Moving, or not still for long enough: nothing half-done counts. */
+        s_rearmGood = 0U;
+        s_rearmSum  = 0;
+        s_rearmGot  = 0U;
+        return;
+    }
+
+    if (!s_configured)
+    {
+        if ((now - s_lastRecoverMs) < IMU_REARM_PERIOD_MS) { return; }
+        s_lastRecoverMs = now;
+        s_recoveries++;
+
+        i2c_bus_recover();
+        s_configured = imu_bringup();
+
+        s_rearmGood  = 0U;
+        s_rearmSum   = 0;
+        s_rearmGot   = 0U;
+        s_rearmLastMs = HAL_GetTick();
+        return;
+    }
+
+    /* The part samples at ~102 Hz; reading faster only repeats samples. */
+    if ((now - s_rearmLastMs) < 10U) { return; }
+    s_rearmLastMs = now;
+
+    if (!reg_read(B0_GYRO_ZOUT_H, buf, 2U))
+    {
+        /* Still failing: back to step 1 on the next period. */
+        s_configured = 0U;
+        return;
+    }
+    raw    = (int16_t)(((uint16_t)buf[0] << 8) | buf[1]);
+    s_rawZ = raw;
+
+    if (!s_biasValid)
+    {
+        s_rearmSum += raw;
+        s_rearmGot++;
+        if (s_rearmGot < IMU_BIAS_SAMPLES) { return; }
+
+        {
+            float mean = (float)s_rearmSum / (float)s_rearmGot;
+
+            s_rearmSum = 0;
+            s_rearmGot = 0U;
+
+            /* Same sanity limit as IMU_CalibrateBias(): past it the robot
+             * was being turned, so measure again. */
+            if ((mean > (float)IMU_BIAS_SANITY_LSB) ||
+                (mean < -(float)IMU_BIAS_SANITY_LSB))
+            {
+                return;
+            }
+            s_bias      = mean;
+            s_biasValid = 1U;
+            s_rearmGood = IMU_REARM_GOOD_READS;  /* 200 reads just proved it */
+        }
+    }
+    else
+    {
+        s_rearmGood++;
+    }
+
+    if (s_rearmGood >= IMU_REARM_GOOD_READS)
+    {
+        /* Staleness clock first, so the very next tick does not see the old
+         * timestamp and drop the gyro straight back out. */
+        s_rateDps    = 0.0f;
+        s_lastGoodMs = HAL_GetTick();
+        s_steadyTicks = 0U;
+        s_rearmGood  = 0U;
+        s_ready      = 1U;
+    }
+}
+
+/* ------------------------------------------------------------------ */
 /* Runtime                                                             */
 /* ------------------------------------------------------------------ */
 
@@ -305,7 +526,12 @@ void IMU_Poll(void)
     uint8_t buf[2];
     int16_t raw;
 
-    if (!s_ready) { return; }
+    if (!s_ready)
+    {
+        /* s_i2c is set by IMU_Init(); nothing to recover before that. */
+        if (s_i2c != 0) { imu_rearm(); }
+        return;
+    }
 
     if (!reg_read(B0_GYRO_ZOUT_H, buf, 2U))
     {
@@ -355,8 +581,9 @@ void IMU_Tick(void)
      * heading hold, cross-track, arc termination - acts on it. */
     if ((HAL_GetTick() - s_lastGoodMs) > IMU_STALE_MS)
     {
-        s_rateDps = 0.0f;   /* stop integrating garbage */
-        s_ready   = 0U;     /* odom falls back to the encoders */
+        s_rateDps    = 0.0f;   /* stop integrating garbage */
+        s_ready      = 0U;     /* odom falls back to the encoders */
+        s_configured = 0U;     /* IMU_Poll() recovers the bus and re-arms */
         s_stalls++;
         return;
     }
@@ -465,3 +692,16 @@ int16_t  IMU_GetBias(void)
 int16_t  IMU_GetRawZ(void)       { return s_rawZ; }
 uint32_t IMU_GetErrorCount(void) { return s_errors; }
 uint32_t IMU_GetStallCount(void)  { return s_stalls; }
+uint32_t IMU_GetRecoveryCount(void) { return s_recoveries; }
+
+void IMU_NoteStill(uint8_t still)
+{
+    if (!still)
+    {
+        s_stillTicks = 0U;
+    }
+    else if (s_stillTicks < 0xFFFFU)
+    {
+        s_stillTicks++;
+    }
+}

@@ -60,6 +60,33 @@ static uint32_t s_calRange;
  * answered. */
 static uint8_t s_lineFailed;
 
+/* IR SNAPSHOT AND EDGE LATCH, rpilink.h. One tick's worth of side IR and
+ * world pose. Written only by RpiLink_Tick() in the TIM6 ISR; read in the
+ * main loop with interrupts masked so a reply never mixes two ticks. */
+typedef struct
+{
+    uint16_t l_cm;
+    uint16_t r_cm;
+    uint16_t l_raw;
+    uint16_t r_raw;
+    int32_t  x_mm;
+    int32_t  y_mm;
+    int32_t  hdg_x10;
+    uint32_t ms;
+} IrSnap_t;
+
+static volatile IrSnap_t s_irSnap;
+
+/* Latch: 0 off, 1 armed, 2 latched. Side 1 left, 2 right. s_ireRun counts
+ * consecutive in-window ticks; s_ireFirst holds the first of them. */
+static volatile uint8_t  s_ireState;
+static volatile uint8_t  s_ireSide;
+static volatile uint16_t s_ireLo;
+static volatile uint16_t s_ireHi;
+static volatile uint8_t  s_ireRun;
+static volatile IrSnap_t s_ireFirst;
+static volatile IrSnap_t s_ireHit;
+
 /* ===================================================================
  * Weak sensor stubs.
  *
@@ -220,6 +247,68 @@ static int32_t scaled10(float v)
     return (int32_t)((v * 10.0f) + ((v < 0.0f) ? -0.5f : 0.5f));
 }
 
+/* ------------------------------------------------------------------ */
+/* IR snapshot and edge latch - see rpilink.h                          */
+/* ------------------------------------------------------------------ */
+
+void RpiLink_Tick(void)
+{
+    IrSnap_t    s;
+    Odom_Pose_t p;
+
+    Odom_GetWorldPose(&p);
+    s.l_cm    = IR_LeftCm();
+    s.r_cm    = IR_RightCm();
+    s.l_raw   = IR_LeftFiltered();
+    s.r_raw   = IR_RightFiltered();
+    s.x_mm    = (int32_t)p.x_mm;
+    s.y_mm    = (int32_t)p.y_mm;
+    s.hdg_x10 = scaled10(p.heading_deg);
+    s.ms      = HAL_GetTick();
+    s_irSnap  = s;
+
+    if (s_ireState != 1U) { return; }
+
+    /* Only while driving: a robot parked beside something would otherwise
+     * latch the moment it is armed, before the move it was armed for. */
+    if (!Motion_IsBusy())
+    {
+        s_ireRun = 0U;
+        return;
+    }
+
+    {
+        uint16_t cm = (s_ireSide == 1U) ? s.l_cm : s.r_cm;
+
+        if ((cm != SENSOR_NO_READING) && (cm >= s_ireLo) && (cm <= s_ireHi))
+        {
+            if (s_ireRun == 0U) { s_ireFirst = s; }
+            s_ireRun++;
+            if (s_ireRun >= RPILINK_IRE_CONFIRM_TICKS)
+            {
+                s_ireHit   = s_ireFirst;
+                s_ireState = 2U;
+            }
+        }
+        else
+        {
+            s_ireRun = 0U;
+        }
+    }
+}
+
+/* Copy a tick-written snapshot without tearing it. */
+static IrSnap_t ir_snap_read(const volatile IrSnap_t *src)
+{
+    IrSnap_t out;
+    uint32_t pm = __get_PRIMASK();
+
+    __disable_irq();
+    out = *src;
+    __set_PRIMASK(pm);
+    return out;
+}
+
 static void answer_immediate(const Command_t *c)
 {
     char b[96];
@@ -260,6 +349,68 @@ static void answer_immediate(const Command_t *c)
             snprintf(b, sizeof(b), "WPOSE,%ld,%ld,%ld\n",
                      (long)p.x_mm, (long)p.y_mm, (long)scaled10(p.heading_deg));
         }
+        break;
+
+    case CMD_Q_IRW:
+        {
+            IrSnap_t s = ir_snap_read(&s_irSnap);
+            snprintf(b, sizeof(b), "IRW,%u,%u,%u,%u,%ld,%ld,%ld,%lu\n",
+                     (unsigned)s.l_cm, (unsigned)s.r_cm,
+                     (unsigned)s.l_raw, (unsigned)s.r_raw,
+                     (long)s.x_mm, (long)s.y_mm, (long)s.hdg_x10,
+                     (unsigned long)s.ms);
+        }
+        break;
+
+    case CMD_Q_IRE:
+        {
+            IrSnap_t s;
+            uint8_t  state, side;
+            uint32_t pm = __get_PRIMASK();
+
+            __disable_irq();
+            state = s_ireState;
+            side  = s_ireSide;
+            s     = s_ireHit;
+            __set_PRIMASK(pm);
+
+            if (state != 2U)
+            {
+                (void)memset(&s, 0, sizeof(s));
+            }
+            snprintf(b, sizeof(b), "IRE,%u,%u,%u,%u,%ld,%ld,%ld,%lu\n",
+                     (unsigned)state, (unsigned)side,
+                     (unsigned)((side == 2U) ? s.r_cm : s.l_cm),
+                     (unsigned)((side == 2U) ? s.r_raw : s.l_raw),
+                     (long)s.x_mm, (long)s.y_mm, (long)s.hdg_x10,
+                     (unsigned long)s.ms);
+        }
+        break;
+
+    case CMD_SET_IR_EDGE:
+        {
+            /* Arm or disarm in one go, so the tick never sees a half-set
+               window. Already validated by the parser. */
+            uint32_t pm  = __get_PRIMASK();
+            int16_t  arg = c->arg;
+
+            __disable_irq();
+            s_ireRun = 0U;
+            if (arg == 0)
+            {
+                s_ireState = 0U;
+                s_ireSide  = 0U;
+            }
+            else
+            {
+                s_ireSide  = (uint8_t)(arg / 10000);
+                s_ireLo    = (uint16_t)((arg / 100) % 100);
+                s_ireHi    = (uint16_t)(arg % 100);
+                s_ireState = 1U;
+            }
+            __set_PRIMASK(pm);
+        }
+        snprintf(b, sizeof(b), "%s", CMD_REPLY_OK);
         break;
 
     case CMD_Q_ENC:
@@ -460,9 +611,16 @@ static void answer_immediate(const Command_t *c)
 static void abort_everything(void)
 {
     Cmd_QueueFlush();
-    Motion_Stop();
+    Motion_Stop();            /* PID off, both bridges shorted: braking */
     Motion_ClearState();
-    Motors_Coast();
+
+    /* NO Motors_Coast() here. It used to follow straight after the brake
+     * and undo it within microseconds, so RST released the wheels: on the
+     * floor a robot at ~50 cm/s rolled on 18.5 cm after RST and drifted a
+     * degree, eating the clearance the RPi had just checked. The shorted
+     * bridges stay on - they only resist while the wheels turn, so a parked
+     * robot draws nothing - until the next move's PID takes the motors
+     * back. Matches how a normal stop holds the brake until it settles. */
     Motion_ResyncHeading();   /* whatever was planned no longer applies */
     s_lineActive = 0U;
     s_f0Active   = 0U;

@@ -150,6 +150,20 @@
  * weaves. */
 #define HEADING_KP_US       8.0f
 
+/* Speed the heading and cross-track gains were tuned at, rpm.
+ *
+ * The same steering angle swings the nose round faster the faster the robot
+ * is going - yaw rate is speed x tan(steer) / wheelbase - so a fixed gain
+ * is a loop gain that rises with speed. Tuned at 100 rpm, it was 1.5x as
+ * strong at fast mode's 150, and with the linkage slack that is a weave.
+ * Cross-track is the same again: sideways drift is speed x sin(heading).
+ *
+ * Above this speed both gains are scaled by HEADING_GAIN_REF_RPM / |rpm|,
+ * which holds the loop where it was tuned. At or below it they are left
+ * alone, so normal mode - which never exceeds 100 - behaves exactly as
+ * before. The backlash push is not scaled: slack is slack at any speed. */
+#define HEADING_GAIN_REF_RPM  100.0f
+
 /* Ceiling on the correction, in microseconds either side of centre. Keeps a
  * large error from slamming the steering to full lock mid-run. 150 us is
  * about 8 degrees of steer. */

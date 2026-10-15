@@ -111,7 +111,7 @@ Queued and executed in order. The reply comes when the **last** one finishes.
 | `RR<n>` | degrees | Arc reverse-right |
 | `RL<n>` | degrees | Arc reverse-left |
 | `S` | — | Stop: brake, recentre steering. Replies `OK` |
-| `RST` | — | Emergency abort: drop queue, brake now. **No reply** |
+| `RST` | — | Emergency abort: drop queue, brake now and hold the brake until the next move (it used to release the wheels at once, so the robot rolled on). **No reply** |
 
 Example: `FR90,F20,S\n` → arc right 90°, forward 20 cm, stop → one `OK`.
 
@@ -197,6 +197,8 @@ line; there is no separate `OK`.
 | `?US` | `US,<cm>` | Front distance. `65535` = no reading |
 | `?IR` | `IR,<left_cm>,<right_cm>` | `65535` = out of range |
 | `?IRR` | `IRR,<left>,<right>` | Raw filtered counts, 0–4095 |
+| `?IRW` | `IRW,<l_cm>,<r_cm>,<l_raw>,<r_raw>,<x_mm>,<y_mm>,<hdg_x10>,<ms>` | Both IRs, their raw counts and the `?WPOSE` pose from **one** control tick, plus its `HAL_GetTick()`. A `65535` with **high** raw counts is closer than 10 cm, not clear. **v9** |
+| `?IRE` | `IRE,<state>,<side>,<cm>,<raw>,<x_mm>,<y_mm>,<hdg_x10>,<ms>` | IR edge latch: state 0 off, 1 armed, 2 latched; side 1 left, 2 right. Latched fields are the first tick of the confirming run, else 0. **v9** |
 | `?POSE` | `POSE,<x_mm>,<y_mm>,<hdg_x10>` | Since the last `!ZERO` or move start |
 | `?WPOSE` | `WPOSE,<x_mm>,<y_mm>,<hdg_x10>` | Continuous since boot; unaffected by move starts, FU passes or `!ZERO`. See §12 |
 | `?DIST` | `DIST,<mm>` | Travelled in the current or last move |
@@ -226,7 +228,10 @@ reports 3 after `!PROF0` too).
 
 **`?IMU` is the health check.** `ok` 0 means the gyro has gone stale and
 heading has fallen back to the encoder difference, which is much less
-accurate. `stalls` counts how many times that has happened. `peak` is the
+accurate. `stalls` counts how many times that has happened. The firmware
+recovers the I2C bus and re-arms the gyro by itself once the robot has stood
+still for ~0.5 s (~3 s if its bias was never measured), so `ok` 0 at rest is
+usually temporary; one that stays 0 is a wiring or sensor fault. `peak` is the
 largest raw sample seen — anything approaching **32767** means the gyro is
 clipping and every angle is being under-reported. Normal is 4000–5000.
 
@@ -374,7 +379,8 @@ exactly what was restored — nothing a task does can change it.
 | `?CAL` | now `CAL,<decel_x10>,<lag_ms_x10>,<trim_us>,<gyro_x10000>,<learn>,<steer_left_us>,<steer_right_us>,<last_decel_x10>` (steering v5; `last_decel_x10` v6: the last arc's raw decel measurement, 0 if it gave none) | |
 | `?HDG` | `HDG,<commanded_x10>,<actual_x10>,<last_aim_x10>,<last_turned_x10>,<capped>` | |
 | `?ENC` | `ENC,<counts_a>,<counts_b>` cumulative per-wheel encoder counts since boot; only differences mean anything. **v7** | |
-| `!FAST1` / `!FAST0` | Fast mode on/off: straights cruise at 150 rpm (not 100) and every move settles 200 ms after braking (not 400). Off at power-on; arcs unchanged. Plain `OK` on the movement path, like `!LEARN`. **v8** | `OK` |
+| `!IRE<n>` | Arm the IR edge latch: `n = side*10000 + lo*100 + hi` (side 1 left / 2 right, 10 ≤ lo ≤ hi ≤ 80 cm), e.g. `!IRE11227` = left, 12..27 cm. `!IRE0` disarms. While a primitive runs, the first 3 consecutive ticks in the window latch that side's reading and the pose of the first of them; the move carries on. Arming clears the old latch. Plain `OK` on the movement path - send it before the line it watches. **v9** | `OK` / `RESEND` |
+| `!FAST1` / `!FAST0` | Fast mode on/off: straights ramp up to 200 rpm (not 100), ramp down to the usual 40 rpm approach, and every move settles 200 ms after braking (not 400); heading-hold gains scale down with speed above 100 rpm. Off at power-on; arcs unchanged. Plain `OK` on the movement path, like `!LEARN`. **v8** | `OK` |
 
 **`?WPOSE`, the continuous pose** - the same increments as `?POSE`, never
 reset. Frame, Task 1 usage and host test: §12.

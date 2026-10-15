@@ -13,6 +13,7 @@
   */
 
 #include "commands.h"
+#include "ir.h"          /* IR_MIN_VALID_CM / IR_MAX_VALID_CM for !IRE */
 #include <string.h>
 
 /* Circular queue. Head is the next slot to pop, count is what is in it. */
@@ -121,7 +122,7 @@ uint8_t Cmd_IsImmediate(CmdOpcode_t op)
      * silently handed to the movement parser instead. Append new ones before
      * this endpoint and move the endpoint with them. */
     return (((op >= CMD_Q_US)  && (op <= CMD_SET_CAL_TRIM)) ||
-            ((op >= CMD_Q_HDG) && (op <= CMD_SET_FAST))) ? 1U : 0U;
+            ((op >= CMD_Q_HDG) && (op <= CMD_SET_IR_EDGE))) ? 1U : 0U;
 }
 
 Command_t Cmd_ParseToken(const char *token)
@@ -146,6 +147,8 @@ Command_t Cmd_ParseToken(const char *token)
         if (token_is(token, "?us"))   { cmd.op = CMD_Q_US;   }
         else if (token_is(token, "?ir"))   { cmd.op = CMD_Q_IR;   }
         else if (token_is(token, "?irr"))  { cmd.op = CMD_Q_IRR;  }
+        else if (token_is(token, "?irw"))  { cmd.op = CMD_Q_IRW;  }
+        else if (token_is(token, "?ire"))  { cmd.op = CMD_Q_IRE;  }
         else if (token_is(token, "?pose")) { cmd.op = CMD_Q_POSE; }
         else if (token_is(token, "?wpose")) { cmd.op = CMD_Q_WPOSE; }
         else if (token_is(token, "?enc"))  { cmd.op = CMD_Q_ENC;  }
@@ -224,6 +227,30 @@ Command_t Cmd_ParseToken(const char *token)
             if (!parse_uint(&token[n], &arg)) { return cmd; }
             if (arg > 1)                      { return cmd; }
             cmd.op  = CMD_SET_LEARN;
+            cmd.arg = arg;
+            return cmd;
+        }
+
+        /* !IRE<n>: 0 disarms; otherwise n = side * 10000 + lo * 100 + hi,
+         * side 1 left / 2 right, lo..hi in cm inside the IR's valid span.
+         * One packed number because Command_t carries one argument, and one
+         * setter means one round trip before the move. Anything that does
+         * not decode is a parse failure, like every other setter. */
+        if ((n = token_starts(token, "!ire")) != 0U)
+        {
+            int16_t side, lo, hi;
+
+            if (!parse_uint(&token[n], &arg)) { return cmd; }
+            if (arg != 0)
+            {
+                side = (int16_t)(arg / 10000);
+                lo   = (int16_t)((arg / 100) % 100);
+                hi   = (int16_t)(arg % 100);
+                if ((side < 1) || (side > 2))               { return cmd; }
+                if ((lo < (int16_t)IR_MIN_VALID_CM) || (hi > (int16_t)IR_MAX_VALID_CM)
+                    || (lo > hi))                           { return cmd; }
+            }
+            cmd.op  = CMD_SET_IR_EDGE;
             cmd.arg = arg;
             return cmd;
         }

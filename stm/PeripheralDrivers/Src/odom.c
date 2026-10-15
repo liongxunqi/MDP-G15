@@ -265,6 +265,12 @@ void Odom_Update(void)
     }
     else if (s_holdActive)
     {
+        /* See HEADING_GAIN_REF_RPM: 1 up to the tuned speed, then falling
+         * with speed so the loop gain stays where it was tuned. */
+        float rpm_mag    = (s_holdRpm < 0) ? -(float)s_holdRpm : (float)s_holdRpm;
+        float gain_scale = (rpm_mag > HEADING_GAIN_REF_RPM)
+                         ? (HEADING_GAIN_REF_RPM / rpm_mag) : 1.0f;
+
         /* Aim slightly off the held heading, leaning back toward the line.
          *
          * y_mm is left-positive and heading is counter-clockwise positive, so
@@ -283,7 +289,7 @@ void Odom_Update(void)
              * robot back onto the crooked line the carry-over is correcting. */
             float hr    = s_holdHeading * (3.14159265f / 180.0f);
             float off   = (s_pose.y_mm * cosf(hr)) - (s_pose.x_mm * sinf(hr));
-            float cross = -CROSS_KP_DEG_PER_MM * off;
+            float cross = -CROSS_KP_DEG_PER_MM * gain_scale * off;
 
             cross = clampf(cross, -CROSS_MAX_DEG, CROSS_MAX_DEG);
             if (s_holdRpm < 0) { cross = -cross; }
@@ -300,7 +306,7 @@ void Odom_Update(void)
         }
         else
         {
-            correction = HEADING_KP_US * s_error * (float)HEADING_SIGN;
+            correction = HEADING_KP_US * gain_scale * s_error * (float)HEADING_SIGN;
 
             /* Reversing: the same steering angle bends the path the other
              * way relative to travel, so flip the correction. */

@@ -197,8 +197,34 @@
  * The sensor updates at 102 Hz and the main loop polls far faster, so a
  * 100 ms gap is already dozens of missed reads - comfortably a fault, not
  * jitter. Going stale zeroes the rate, clears ready, and lets odom fall back
- * to the encoders, which is degraded but bounded. */
+ * to the encoders, which is degraded but bounded - until IMU_Poll() re-arms
+ * it, below. */
 #define IMU_STALE_MS            100U
+
+/* Re-arming a gyro that went stale, or never came up at boot.
+ *
+ * Going stale used to be for the rest of the power-on: IMU_Poll() returned
+ * early once ready was clear, so nothing ever read the part again, and one
+ * I2C glitch from motor noise left every later turn on encoder heading. The
+ * same at boot - a warm reset that left the sensor holding SDA, or a nudge
+ * during the bias measurement, and the gyro was off until a power cycle.
+ *
+ * Now IMU_Poll() keeps trying while the gyro is off: recover the bus (see
+ * i2c_bus_recover() in imu.c), bring the part up again, measure the bias if
+ * it never was, and come back once IMU_REARM_GOOD_READS reads in a row have
+ * succeeded. Only while the robot has been still for IMU_REARM_STILL_TICKS -
+ * bring-up blocks the main loop for ~200 ms, and switching heading source is
+ * best done between moves, not inside one. IMU_GetStallCount() still counts
+ * every dropout and IMU_GetRecoveryCount() every bus recovery, so a gyro
+ * that keeps coming back is not hiding a wiring fault.
+ *
+ *   STILL_TICKS   50 ticks = 0.5 s, longer than the 400 ms settle between
+ *                 the primitives of one line.
+ *   PERIOD_MS     between recovery attempts while the part stays dead.
+ *   GOOD_READS    20 reads at ~10 ms = 200 ms of clean data. */
+#define IMU_REARM_STILL_TICKS   50U
+#define IMU_REARM_PERIOD_MS     1000U
+#define IMU_REARM_GOOD_READS    20U
 
 /* Start-up. Call after MX_I2C2_Init(), BEFORE the TIM6 tick is started -
  * it uses HAL_Delay() and takes about 2.5 seconds, most of it bias
@@ -208,8 +234,14 @@ uint8_t IMU_Init(I2C_HandleTypeDef *hi2c);
 /* Re-measure the zero-rate bias. Robot must be stationary. Blocking, ~2 s. */
 uint8_t IMU_CalibrateBias(void);
 
-/* Main loop: one I2C read of the Z gyro. Call as often as you like. */
+/* Main loop: one I2C read of the Z gyro. Call as often as you like. While
+ * the gyro is off it does the re-arming instead - see IMU_REARM_STILL_TICKS. */
 void IMU_Poll(void);
+
+/* Control tick: whether the robot is standing still this tick - no primitive
+ * running or queued, both encoders unchanged. Call every tick; re-arming
+ * waits for IMU_REARM_STILL_TICKS of these in a row. */
+void IMU_NoteStill(uint8_t still);
 
 /* Control tick: integrate the last sample. Call once per tick, from TIM6. */
 void IMU_Tick(void);
@@ -265,6 +297,7 @@ int16_t  IMU_GetRawZ(void);         /* last raw reading, before bias         */
 uint32_t IMU_GetErrorCount(void);   /* failed I2C transactions since boot    */
 uint32_t IMU_GetPollRate(void);     /* successful reads in the last second    */
 uint32_t IMU_GetStallCount(void);   /* times the gyro went stale mid-run     */
+uint32_t IMU_GetRecoveryCount(void);/* bus recoveries while re-arming        */
 int16_t  IMU_GetPeakRaw(void);      /* largest raw magnitude since reset      */
 void     IMU_ResetStats(void);      /* zero the poll rate and peak            */
 
