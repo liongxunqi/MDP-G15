@@ -477,8 +477,11 @@ class STM:
             if not line:
                 continue
 
-            logging.info(f"STM ← stm: {line}")
+            # Hand the reply to whoever is waiting BEFORE logging it. The log
+            # goes to the console and a file; during a 50 Hz ?IR/?WPOSE watch
+            # that write sat between the STM's answer and the Pi acting on it.
             self._dispatch(line)
+            logging.info("STM ← stm: %s", line)
 
     def _dispatch(self, line: str) -> None:
         kind = classify_reply(line)

@@ -403,3 +403,25 @@ A.5 only (`task_a5.py`):
 | `A5_SETTLE_S` | 0.3 | Let the chassis stop rocking before `FU` measures |
 | `A5_ARC_PROFILE` | 0 | Profile `A5_ORBIT` was traced for. Checked against `?STAT`, never set |
 | `A5_ORBIT` | `R20,FR90,FL90,R37,FL90` | One face to the next — **the thing you tune** |
+
+### Task 2 sensor trace (what the IR saw, and when)
+
+Every run writes `logs/sensor_trace_<timestamp>.csv`, one row per face-scan
+poll: both IR channels, the pose paired with the reading, `?IR` / `?WPOSE` /
+`?US` round trips, time since the previous poll, speed, and the decision
+(`face`, `edge_vote`, `ambiguous`, `stop:edge`, `stop:wall_guard`, ...). The
+end of the run log prints median / p95 timings. Line it up with the run video
+to tell "reacting late" (large `poll_dt_ms`, `*_rtt_ms`) from "reacting to the
+wrong thing" (`ir_*` values, `decision`). The per-poll `?IR`/`?WPOSE` lines no
+longer flood the console; the CSV has them.
+
+Tuning knobs in `.env` (defaults shown):
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `T2_SENSOR_TRACE` | `1` | `0` turns the CSV off |
+| `T2_VERBOSE_POLL` | `0` | `1` logs every `?IR`/`?WPOSE` line again |
+| `T2T_FACE_POLL_PERIOD_S` | `T2_SENSOR_POLL_S` (0.02) | Face-scan poll **period**; query time counts toward it |
+| `T2T_IR_LAG_S` | `0.058` | Sensor + filter lag; the edge fix uses `speed × this` |
+| `T2T_STOP_POLL_S` | `0.03` | Interval for "has it stopped after RST" |
+| `T2_POLL_SETTLE_S` | `0.05` | Blind wait after sending a line before polling |
