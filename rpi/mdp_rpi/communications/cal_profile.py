@@ -57,6 +57,10 @@ selected_arc = ARC_PROFILE
 # power-on while it was being handled - and every turn will be off by this
 # much per second. Firmware with the re-baseline repairs it after 3 s still.
 GYRO_REST_MAX_DPS = 1.0
+# The firmware re-arms a dropped gyro once the robot has stood still for
+# ~0.5 s - ~3 s when the bias was never measured (boot calibration failed).
+# A task starting just after a dropout waits this long for it before refusing.
+GYRO_REARM_WAIT_S = float(os.getenv("GYRO_REARM_WAIT_S", "4.0"))
 
 # A profile saved before the gyro scale existed restores as 1.0.
 DEFAULT_GYRO_X10000 = 10000
@@ -190,19 +194,33 @@ def gyro_in_use(stm: STM, what: str = "") -> bool:
     ?IMU: is heading still coming from the gyro?
 
     If the gyro ever goes quiet for 100 ms the firmware falls back to ENCODER
-    heading until power-off - and with the rear wheels scrubbing through every
-    arc, that is degrees out per turn. Nothing else on the wire says so; the
-    robot keeps driving and answering OK.
+    heading - and with the rear wheels scrubbing through every arc, that is
+    degrees out per turn. Nothing else on the wire says so; the robot keeps
+    driving and answering OK. The firmware re-arms it once the robot stands
+    still, so a gyro that is down is given GYRO_REARM_WAIT_S to come back.
     """
     imu = stm.read_imu()
     if imu is None:
         logging.error("?IMU did not answer — cannot confirm the gyro is in use.")
         return False
     if not imu["ready"]:
+        logging.warning(f"The gyro is down ({imu['stalls']} stall(s)){what} - "
+                        f"waiting up to {GYRO_REARM_WAIT_S:.0f} s for the "
+                        "firmware to re-arm it. Keep the robot still.")
+        deadline = time.monotonic() + GYRO_REARM_WAIT_S
+        while not imu["ready"] and time.monotonic() < deadline:
+            time.sleep(0.25)
+            imu = stm.read_imu()
+            if imu is None:
+                logging.error("?IMU did not answer — cannot confirm the gyro is in use.")
+                return False
+    if not imu["ready"]:
         logging.error(
             f"The gyro has dropped out ({imu['stalls']} stall(s)) and the robot "
-            f"is on ENCODER heading until power-off{what}. Power-cycle with the "
-            "robot still on the floor - it measures the gyro bias at boot.")
+            f"is on ENCODER heading - it did not re-arm{what}. Firmware older "
+            "than the I2C recovery never re-arms: "
+            "power-cycle with the robot still on the floor. On current firmware "
+            "check OLED mode 10 - addr 00 with rc climbing is wiring or the 1.8 V rail.")
         return False
     if abs(imu["rate_dps"]) > GYRO_REST_MAX_DPS:
         logging.error(
@@ -381,8 +399,8 @@ class HeadingLog:
         self._csv = csv.DictWriter(self._fh, fieldnames=self.FIELDS)
         self._csv.writeheader()
         self._clamped = 0
-        # Set once the gyro is seen gone; the fallback lasts until power-off,
-        # so there is no coming back from it within a run.
+        # Set once the gyro is seen gone. The firmware re-arms it once the
+        # robot stands still, but every move in between was on encoders.
         self.gyro_lost = False
         logging.info(f"Heading log: {self.path}")
 
@@ -396,10 +414,10 @@ class HeadingLog:
         if not self.gyro_lost:
             self.gyro_lost = True
             logging.error(
-                f"GYRO LOST by {label}: the robot is on ENCODER heading for the "
-                "rest of this power-on, so every turn from here can be degrees "
-                "out and the heading error below is no longer measured by the "
-                "gyro. Power-cycle with the robot still before the next run.")
+                f"GYRO LOST by {label}: the robot is on ENCODER heading until "
+                "the firmware re-arms the gyro (robot still ~0.5 s), so turns "
+                "until then can be degrees out and the heading error below is "
+                "not measured by the gyro. Check ?IMU stalls after the run.")
         return "LOST"
 
     def record(self, label: str) -> Optional[dict]:

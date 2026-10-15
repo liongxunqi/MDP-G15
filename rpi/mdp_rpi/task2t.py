@@ -27,7 +27,7 @@ The route, in the world frame of task2t_park.py (origin the bay mouth, +x out):
      the far side. task2t_park.ParkRunner does the rest - IR fix on obstacle
      1, S onto the centreline, FU off the back fence.
 
-Speed: the firmware's fast mode (!FAST1) runs straights at 150 rpm and
+Speed: the firmware's fast mode (!FAST1) ramps straights up to 200 rpm and
 halves the settle after every move; T2T_FAST=0 turns it off. Each phase is
 one line to the STM, so the robot does not wait on the Pi between moves.
 

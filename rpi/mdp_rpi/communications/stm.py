@@ -177,6 +177,9 @@ WPOSE_MIN_PROTOCOL = 6
 ENC_MIN_PROTOCOL = 7
 # Protocol 8: !FAST0/1, Task 2's fast mode (faster straights, shorter settle).
 FAST_MIN_PROTOCOL = 8
+# Protocol 9: ?IRW (side IR + world pose from one tick) and the IR edge latch
+# (!IRE / ?IRE). See IR SNAPSHOT AND EDGE LATCH in the firmware's rpilink.h.
+IRW_MIN_PROTOCOL = 9
 
 # PROTOCOL.md §5 — every tag the firmware can answer a query with.
 # CAL is protocol 2. It must appear here twice over: once so validate_token()
@@ -184,10 +187,10 @@ FAST_MIN_PROTOCOL = 8
 # "CAL,..." answer to the waiting thread instead of discarding it as banner
 # noise. Missing from either place and the query fails silently.
 QUERY_TAGS = {"US", "IR", "IRR", "POSE", "DIST", "TURN", "STAT", "IMU", "XCHK",
-              "VER", "CAL", "HDG", "WPOSE", "ENC"}
+              "VER", "CAL", "HDG", "WPOSE", "ENC", "IRW", "IRE"}
 
 # This client implements protocol 4. Compared against the ?VER reply at startup.
-PROTOCOL_VERSION = 8
+PROTOCOL_VERSION = 9
 
 # FU before F, exactly as the firmware's own parser orders its prefixes: "fu"
 # would otherwise be eaten by "f" and FU20 read as F with an argument of
@@ -199,6 +202,9 @@ _QUERY_RE = re.compile(r"^\?([A-Z]+)$", re.IGNORECASE)
 # PROF3 is SAFE. Missing here, set_profile(3) was refused before it reached
 # the wire, so no SAFE calibration or SAFE task could ever select SAFE.
 _CONFIG_RE = re.compile(r"^!(PROF[0-3]|ZERO|LEARN[01]|FAST[01])$", re.IGNORECASE)
+# !IRE<n> (protocol 9): 0, or side*10000 + lo*100 + hi - checked in full by
+# ir_edge_token(), which is the only thing that should build one.
+_IRE_RE = re.compile(r"^!IRE(0|[12]\d{4})$", re.IGNORECASE)
 
 # PROTOCOL.md §7 — the three calibration setters, protocol 2. !CALT is the ONLY
 # token anywhere in this protocol that may carry a negative argument: every
@@ -295,7 +301,7 @@ def validate_token(token: str) -> Tuple[bool, str]:
             return False, f"unknown query '?{tag}' — known: {sorted(QUERY_TAGS)}"
         return True, ""
 
-    if _CONFIG_RE.match(tok):
+    if _CONFIG_RE.match(tok) or _IRE_RE.match(tok):
         return True, ""
 
     # PROTOCOL.md §7 — calibration setters, checked before the legacy pattern so
@@ -807,9 +813,10 @@ class STM:
         ?IMU: ready (0/1), heading, rate, stall count, peak raw reading.
 
         ready 0 means the gyro went quiet for 100 ms and the firmware fell
-        back to ENCODER heading for the rest of the power-on - which, with
-        the scrubbing rear wheels, is degrees out per turn. Nothing else on
-        the wire says so.
+        back to ENCODER heading - which, with the scrubbing rear wheels, is
+        degrees out per turn. Nothing else on the wire says so. The firmware
+        re-arms it once the robot has stood still for ~0.5 s (~3 s if the
+        bias was never measured); see cal_profile.gyro_in_use().
         """
         fields = self.query_fields("?IMU", timeout)
         if fields is None or len(fields) < 4:
@@ -859,6 +866,75 @@ class STM:
             return False
         reply = self.wait_reply(timeout)
         return reply is not None and reply.strip().upper() == "OK"
+
+    def read_irw(self, timeout: float = 2.0) -> Optional[dict]:
+        """
+        ?IRW (IRW_MIN_PROTOCOL): both side IRs and the world pose from the
+        same 10 ms control tick. Distances are cm or None (no reading); raw
+        counts tell a None apart - high counts mean closer than the IR's
+        10 cm minimum, low counts mean nothing in range. Pose is ?WPOSE's
+        frame. ms is the firmware's HAL tick of that sample.
+        """
+        fields = self.query_fields("?IRW", timeout)
+        if fields is None or len(fields) < 8:
+            logging.error(f"STM: malformed or missing IRW reply {fields}.")
+            return None
+        try:
+            v = [int(f) for f in fields[:8]]
+        except ValueError:
+            logging.error(f"STM: non-integer field in IRW reply {fields}.")
+            return None
+        none = lambda cm: None if cm == 0xFFFF else cm
+        return {"left_cm": none(v[0]), "right_cm": none(v[1]),
+                "left_raw": v[2], "right_raw": v[3],
+                "x_mm": v[4], "y_mm": v[5], "heading_deg": v[6] / 10.0,
+                "ms": v[7]}
+
+    @staticmethod
+    def ir_edge_token(side: Optional[str], lo_cm: int = 0, hi_cm: int = 0) -> str:
+        """!IRE token: side 'left'/'right' with a lo..hi cm window, or None to
+        disarm. Raises ValueError for a window the firmware would refuse."""
+        if side is None:
+            return "!IRE0"
+        code = {"left": 1, "right": 2}.get(side)
+        if code is None:
+            raise ValueError(f"IR edge side must be left or right, not {side!r}")
+        lo, hi = int(lo_cm), int(hi_cm)
+        if not (10 <= lo <= hi <= 80):
+            raise ValueError(f"IR edge window {lo}..{hi} cm outside 10..80")
+        return f"!IRE{code * 10000 + lo * 100 + hi}"
+
+    def set_ir_edge(self, side: Optional[str], lo_cm: int = 0, hi_cm: int = 0,
+                    timeout: Optional[float] = None) -> bool:
+        """
+        Arm the IR edge latch on one side for lo..hi cm (protocol 9), or
+        disarm with side=None. Arming clears the previous latch. Replies plain
+        OK on the movement path - idle only, BEFORE the line it should watch.
+        """
+        if not self.send_line([self.ir_edge_token(side, lo_cm, hi_cm)]):
+            return False
+        reply = self.wait_reply(timeout)
+        return reply is not None and reply.strip().upper() == "OK"
+
+    def read_ir_edge(self, timeout: float = 2.0) -> Optional[dict]:
+        """
+        ?IRE: {'state': 'off'|'armed'|'latched', 'side', 'cm', 'raw', 'x_mm',
+        'y_mm', 'heading_deg', 'ms'}. Once latched the reading and pose are
+        the FIRST tick of the confirming run, in ?WPOSE's frame.
+        """
+        fields = self.query_fields("?IRE", timeout)
+        if fields is None or len(fields) < 8:
+            logging.error(f"STM: malformed or missing IRE reply {fields}.")
+            return None
+        try:
+            v = [int(f) for f in fields[:8]]
+        except ValueError:
+            logging.error(f"STM: non-integer field in IRE reply {fields}.")
+            return None
+        return {"state": {0: "off", 1: "armed", 2: "latched"}.get(v[0], "?"),
+                "side": {1: "left", 2: "right"}.get(v[1]),
+                "cm": v[2], "raw": v[3], "x_mm": v[4], "y_mm": v[5],
+                "heading_deg": v[6] / 10.0, "ms": v[7]}
 
     def set_learning(self, on: bool, timeout: Optional[float] = None) -> bool:
         """!LEARN1 / !LEARN0. Same OK-collision caveat as set_profile()."""
