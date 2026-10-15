@@ -4,6 +4,7 @@ import androidx.compose.foundation.BorderStroke
 import androidx.compose.material3.CardDefaults
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.aspectRatio
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
@@ -53,6 +54,7 @@ fun ArenaScreen(
     drivingControls: (@Composable () -> Unit)? = null,
     taskControls: (@Composable () -> Unit)? = null,
     belowResetControls: (@Composable () -> Unit)? = null,
+    task2TimerDisplay: (@Composable () -> Unit)? = null,
 ) {
     val state by viewModel.uiState.collectAsState()
     val displayState = if (state.taskMode == TaskMode.TASK2) state.copy(
@@ -79,13 +81,17 @@ fun ArenaScreen(
                     .padding(12.dp),
                 horizontalArrangement = Arrangement.spacedBy(16.dp),
             ) {
-                ArenaCanvas(
-                    state = displayState,
-                    interactions = interactions,
-                    modifier = Modifier
-                        .weight(3f)
-                        .fillMaxHeight(),
-                )
+                if (state.taskMode == TaskMode.TASK2) {
+                    Box(Modifier.weight(3f).fillMaxHeight()) {
+                        task2TimerDisplay?.invoke() ?: Text("Task 2 timer unavailable")
+                    }
+                } else {
+                    ArenaCanvas(
+                        state = displayState,
+                        interactions = interactions,
+                        modifier = Modifier.weight(3f).fillMaxHeight(),
+                    )
+                }
                 Column(Modifier.weight(2f).fillMaxHeight().verticalScroll(rememberScrollState()),
                     verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     ArenaStatusPanel(
@@ -107,11 +113,17 @@ fun ArenaScreen(
                     .padding(12.dp),
                 verticalArrangement = Arrangement.spacedBy(16.dp),
             ) {
-                ArenaCanvas(
-                    state = displayState,
-                    interactions = interactions,
-                    modifier = Modifier.fillMaxWidth().weight(3f),
-                )
+                if (state.taskMode == TaskMode.TASK2) {
+                    Box(Modifier.fillMaxWidth().weight(3f)) {
+                        task2TimerDisplay?.invoke() ?: Text("Task 2 timer unavailable")
+                    }
+                } else {
+                    ArenaCanvas(
+                        state = displayState,
+                        interactions = interactions,
+                        modifier = Modifier.fillMaxWidth().weight(3f),
+                    )
+                }
                 Column(Modifier.fillMaxWidth().weight(2f).verticalScroll(rememberScrollState()),
                     verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     ArenaStatusPanel(
@@ -233,11 +245,8 @@ private fun ArenaStatusPanel(
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
             taskControls?.invoke()
-            if (state.taskMode == TaskMode.TASK2) {
-                Text("Task 2: obstacles are discovered by the robot. Saved Task 1 markers are hidden and not sent.",
-                    style = MaterialTheme.typography.bodySmall)
-            }
-            Text("Arena status", style = MaterialTheme.typography.titleLarge)
+            Text(if (state.taskMode == TaskMode.TASK2) "Task 2 status" else "Arena status",
+                style = MaterialTheme.typography.titleLarge)
             Text("Latest action", style = MaterialTheme.typography.labelLarge)
             Text(
                 text = state.feedback,
@@ -248,51 +257,55 @@ private fun ArenaStatusPanel(
                 },
                 style = MaterialTheme.typography.bodyMedium,
             )
-            if (state.latestReceived.isNotEmpty()) {
+            if (state.taskMode == TaskMode.TASK1 && state.latestReceived.isNotEmpty()) {
                 StatusValue("Last received", state.latestReceived)
             }
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+            if (state.taskMode == TaskMode.TASK2) {
+                StatusValue("Robot status", robotStatus?.takeIf(String::isNotBlank) ?: state.status)
+            } else {
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                    StatusValue(
+                        "Robot status",
+                        robotStatus?.takeIf(String::isNotBlank) ?: state.status,
+                        Modifier.weight(1f),
+                    )
+                    StatusValue(
+                        "Robot pose",
+                        state.arena.robot?.let {
+                            val source = when (it.source) {
+                                PoseSource.REPORTED -> "RPi reported"
+                                PoseSource.OPERATOR -> "operator placed"
+                                PoseSource.ESTIMATED -> "estimated"
+                            }
+                            val warning = when {
+                                !RobotFootprint.fitsArena(it, state.arena.config) -> " · outside arena"
+                                state.arena.obstacles.values.any { obstacle ->
+                                    RobotFootprint.overlapsCell(it, state.arena.config, obstacle.position)
+                                } -> " · overlaps obstacle"
+                                else -> ""
+                            }
+                            String.format(java.util.Locale.US, "(%.2f, %.2f) • %s • %s",
+                                it.x, it.y, it.readableHeading(), source) + warning
+                        } ?: "Not available",
+                        Modifier.weight(1f),
+                    )
+                    StatusValue(
+                        "Obstacles",
+                        "${state.arena.obstacles.size}/${state.arena.config.maxObstacles}",
+                        Modifier.weight(0.6f),
+                    )
+                }
                 StatusValue(
-                    "Robot status",
-                    robotStatus?.takeIf(String::isNotBlank) ?: state.status,
-                    Modifier.weight(1f),
-                )
-                StatusValue(
-                    "Robot pose",
-                    state.arena.robot?.let {
-                        val source = when (it.source) {
-                            PoseSource.REPORTED -> "RPi reported"
-                            PoseSource.OPERATOR -> "operator placed"
-                            PoseSource.ESTIMATED -> "estimated"
+                    "Selected obstacle",
+                    selected?.let {
+                        buildString {
+                            append("#${it.id} • (${it.position.x}, ${it.position.y})")
+                            append(" • face ${it.targetFace?.wireValue ?: "unset"}")
+                            it.targetId?.let { target -> append(" • target $target") }
                         }
-                        val warning = when {
-                            !RobotFootprint.fitsArena(it, state.arena.config) -> " · outside arena"
-                            state.arena.obstacles.values.any { obstacle ->
-                                RobotFootprint.overlapsCell(it, state.arena.config, obstacle.position)
-                            } -> " · overlaps obstacle"
-                            else -> ""
-                        }
-                        String.format(java.util.Locale.US, "(%.2f, %.2f) • %s • %s",
-                            it.x, it.y, it.readableHeading(), source) + warning
-                    } ?: "Not available",
-                    Modifier.weight(1f),
-                )
-                StatusValue(
-                    "Obstacles",
-                    "${state.arena.obstacles.size}/${state.arena.config.maxObstacles}",
-                    Modifier.weight(0.6f),
+                    } ?: "None",
                 )
             }
-            StatusValue(
-                "Selected obstacle",
-                selected?.let {
-                    buildString {
-                        append("#${it.id} • (${it.position.x}, ${it.position.y})")
-                        append(" • face ${it.targetFace?.wireValue ?: "unset"}")
-                        it.targetId?.let { target -> append(" • target $target") }
-                    }
-                } ?: "None",
-            )
 
             if (state.taskMode == TaskMode.TASK1) {
                 HorizontalDivider()
@@ -344,7 +357,7 @@ private fun ArenaStatusPanel(
                     Text("Reset arena")
                 }
             }
-            belowResetControls?.invoke()
+            if (state.taskMode == TaskMode.TASK1) belowResetControls?.invoke()
             if (state.taskMode == TaskMode.TASK1) {
                 ResyncOnReconnectControl(
                     phase = state.task1Phase,

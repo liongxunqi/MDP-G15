@@ -124,7 +124,7 @@ class ArenaViewModel(
             status = "Awaiting robot status", statusHistory = listOf("Awaiting robot status"),
             lastPoseReceivedAtMillis = null, manualStatus = "Confirm robot position",
             plannerInfo = DEFAULT_PLANNER_INFO,
-            feedback = if (mode == TaskMode.TASK2) "Task 2 uses live obstacle detection; saved map entries are ignored."
+            feedback = if (mode == TaskMode.TASK2) "Waiting for Task 2 readiness."
                 else "Task 1 obstacle map restored.",
             feedbackIsError = false,
         )
@@ -209,7 +209,7 @@ class ArenaViewModel(
         if (_uiState.value.taskMode == TaskMode.TASK2 && connected) requestTask2Status()
         setFeedback(if (_uiState.value.taskMode == TaskMode.TASK1)
             "Previous image results cleared. Obstacle layout retained."
-            else "Task 2 attempt ready. Saved Task 1 map retained.", false)
+            else "Task 2 attempt prepared. Waiting for robot readiness.", false)
     }
 
     fun rejectUnsafeCustomMessage() = setFeedback("Send one command at a time; movement must pass the arena checks.", true)

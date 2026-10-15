@@ -29,6 +29,7 @@ import androidx.compose.ui.geometry.Offset
 import com.mdp.g15.arena.view.ArenaGeometry
 import com.mdp.g15.arena.domain.ArenaConfig
 import com.mdp.g15.arena.domain.GridCoordinate
+import com.mdp.g15.arena.presentation.DEFAULT_PLANNER_INFO
 import androidx.compose.ui.test.performTextInput
 import androidx.compose.ui.test.performClick
 import kotlinx.coroutines.flow.MutableSharedFlow
@@ -66,28 +67,73 @@ class IntegratedControllerScreenTest {
     }
 
     @Test
-    fun task2StartsWithEmptyArenaWithoutRemovingTask1Controls() {
+    fun task2ShowsLargeTimerInsteadOfGridWithoutRemovingTask1Controls() {
         connected = true
         setScreen()
         composeRule.onNodeWithText("Arena").performClick()
         composeRule.onNodeWithText("Start Task 1").assertIsNotEnabled()
+        composeRule.onNodeWithTag("arena_grid").assertIsDisplayed()
         composeRule.onNodeWithText("Task 2").performClick()
-        composeRule.onNodeWithText("00:00").assertIsDisplayed()
+        composeRule.onNodeWithTag("arena_grid").assertDoesNotExist()
+        composeRule.onNodeWithTag("task2_timer_panel").assertIsDisplayed()
+        composeRule.onNodeWithText("00:00:00").assertIsDisplayed()
+        composeRule.onNodeWithText("Task 2 status").assertIsDisplayed()
+        composeRule.onNodeWithText("Latest action").assertIsDisplayed()
+        composeRule.onNodeWithText("Robot status").assertIsDisplayed()
+        composeRule.onNodeWithText("Arena status").assertDoesNotExist()
+        composeRule.onNodeWithText("Robot pose").assertDoesNotExist()
+        composeRule.onNodeWithText("Obstacles").assertDoesNotExist()
+        composeRule.onNodeWithText("Selected obstacle").assertDoesNotExist()
+        composeRule.onNodeWithText("▲ Forward").assertDoesNotExist()
+        composeRule.onNodeWithText("■ Stop").assertDoesNotExist()
+        composeRule.onNodeWithText("Amd tool").assertDoesNotExist()
+        composeRule.onNodeWithText("Task 2: obstacles are discovered", substring = true).assertDoesNotExist()
         composeRule.onNodeWithText("Start Task 2").assertIsNotEnabled()
         composeRule.runOnIdle { assertTrue(incoming.tryEmit("TASK2,READY")) }
         composeRule.waitForIdle()
         composeRule.onNodeWithText("Start Task 2").assertIsEnabled().performClick()
         composeRule.runOnIdle { assertEquals(listOf("BEGIN"), movement) }
-        composeRule.onNodeWithText("Start Task 2").assertIsNotEnabled()
+        composeRule.onNodeWithText("Start Task 2").assertDoesNotExist()
+        composeRule.onNodeWithText("Stop Task 2").assertIsDisplayed().assertIsEnabled()
         composeRule.onNodeWithText("Task 2 • Start requested — awaiting robot").assertIsDisplayed()
         composeRule.waitUntil(timeoutMillis = 5_000) {
-            composeRule.onAllNodesWithText("00:00").fetchSemanticsNodes().isEmpty()
+            composeRule.onAllNodesWithText("00:00:00").fetchSemanticsNodes().isEmpty()
         }
         capture("task2-timer-running")
         composeRule.runOnIdle { assertTrue(incoming.tryEmit("STATUS,DONE")) }
         composeRule.waitForIdle()
         composeRule.onNodeWithContentDescription("Task 2 completed in", substring = true).assertIsDisplayed()
         capture("task2-timer-complete")
+    }
+
+    @Test
+    fun task1SetupShowsOnlyTheCurrentStartBlocker() {
+        setScreen()
+        composeRule.onNodeWithText("Arena").performClick()
+        composeRule.onNodeWithText("Connect to the robot before starting.").assertIsDisplayed()
+        composeRule.onNodeWithText(DEFAULT_PLANNER_INFO).assertDoesNotExist()
+        composeRule.runOnIdle { connected = true }
+        composeRule.waitForIdle()
+        composeRule.onNodeWithText("Connect to the robot before starting.").assertDoesNotExist()
+        composeRule.onNodeWithText("Task 1 needs 4–8 obstacles (0 placed).").assertIsDisplayed()
+    }
+
+    @Test
+    fun task2KeepsOnlyDedicatedStopDuringRun() {
+        connected = true
+        setScreen()
+        composeRule.onNodeWithText("Arena").performClick()
+        composeRule.onNodeWithText("Task 2").performClick()
+        composeRule.runOnIdle { assertTrue(incoming.tryEmit("TASK2,READY")) }
+        composeRule.waitForIdle()
+        composeRule.onNodeWithText("Start Task 2").performClick()
+        composeRule.onNodeWithText("Start Task 2").assertDoesNotExist()
+        composeRule.onNodeWithText("Stop Task 2").assertIsEnabled().performClick()
+        composeRule.runOnIdle { assertEquals(listOf("BEGIN", "s"), movement) }
+        composeRule.onNodeWithContentDescription("Task 2 Stop requested at", substring = true)
+            .assertIsDisplayed()
+        composeRule.onNodeWithText("Stop Task 2").assertDoesNotExist()
+        composeRule.onNodeWithText("New attempt").assertIsDisplayed()
     }
 
     @Test
@@ -124,7 +170,8 @@ class IntegratedControllerScreenTest {
         composeRule.onNodeWithText("Task 1 needs 4–8 obstacles (0 placed).").assertIsDisplayed()
         repeat(4) { addAt(it, 0) }
         composeRule.onNodeWithText("Start Task 1").assertIsNotEnabled()
-        composeRule.onNodeWithText("Choose an image face for obstacle(s): 1, 2, 3, 4.").assertIsDisplayed()
+        composeRule.onNodeWithText("Choose an image face for obstacle(s): 1, 2, 3, 4.")
+            .performScrollTo().assertIsDisplayed()
         composeRule.runOnIdle { assertTrue(incoming.tryEmit("PLANNER,READY")) }
         composeRule.waitForIdle()
         composeRule.onAllNodesWithText("RPi reports path ready — map version unverified").assertCountEquals(2)
@@ -133,8 +180,9 @@ class IntegratedControllerScreenTest {
             clickGridCell(it, 0)
             composeRule.onNodeWithText("N").performScrollTo().performClick()
         }
-        composeRule.onNodeWithText("Planning confirmation unavailable — Start can proceed once setup is complete").assertIsDisplayed()
-        composeRule.onNodeWithText("Start Task 1").assertIsEnabled().performClick()
+        composeRule.onNodeWithText("Planning confirmation unavailable — Start can proceed once setup is complete").assertDoesNotExist()
+        composeRule.onNodeWithText("Start Task 1").performScrollTo().assertIsDisplayed()
+            .assertIsEnabled().performClick()
         composeRule.runOnIdle { assertEquals(listOf("BEGIN"), movement) }
     }
 
@@ -148,17 +196,20 @@ class IntegratedControllerScreenTest {
         setupTask1()
         repeat(3) { composeRule.onNodeWithText("+ Zoom in").performClick() }
         composeRule.onNodeWithText("Prepare Path").assertDoesNotExist()
-        composeRule.onNodeWithText("Start Task 1").assertIsEnabled().performClick()
+        composeRule.onNodeWithText("Start Task 1").performScrollTo().assertIsDisplayed()
+            .assertIsEnabled().performClick()
         composeRule.onNodeWithText("Start Task 1").assertIsNotEnabled()
         composeRule.runOnIdle { assertEquals(listOf("BEGIN"), movement) }
         composeRule.runOnIdle { assertTrue(incoming.tryEmit("STATUS,RUNNING,1,2\nTARGET,1,20\nSTATUS,DONE")) }
         composeRule.waitForIdle()
-        composeRule.onNodeWithText("Task 1 • Completed — results retained").assertIsDisplayed()
+        composeRule.onNodeWithText("Task 1 • Completed — results retained")
+            .performScrollTo().assertIsDisplayed()
         composeRule.onNodeWithTag("arena_grid").assertIsDisplayed()
         capture("task1-completed")
         composeRule.runOnIdle { connected = false }
         composeRule.waitForIdle()
-        composeRule.onNodeWithText("Task 1 • Completed — results retained").assertIsDisplayed()
+        composeRule.onNodeWithText("Task 1 • Completed — results retained")
+            .performScrollTo().assertIsDisplayed()
         composeRule.onNodeWithText("New attempt").performClick()
         composeRule.onNodeWithText("Cancel").performClick()
         composeRule.onNodeWithText(" • target 20", substring = true).performScrollTo().assertIsDisplayed()

@@ -2,8 +2,8 @@ package com.example.mdp
 
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.TextButton
@@ -25,6 +25,7 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.ui.platform.LocalView
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
@@ -32,10 +33,15 @@ import androidx.compose.runtime.produceState
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.platform.testTag
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontWeight
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.mdp.g15.arena.domain.ManualCommand
 import com.mdp.g15.arena.integration.ArenaOutboundSink
@@ -45,6 +51,7 @@ import com.mdp.g15.arena.presentation.TaskMode
 import com.mdp.g15.arena.presentation.ArenaViewModel
 import com.mdp.g15.arena.presentation.AndroidTask2TimerClock
 import com.mdp.g15.arena.presentation.Task2Timer
+import com.mdp.g15.arena.presentation.DEFAULT_PLANNER_INFO
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.delay
 import java.util.Locale
@@ -206,7 +213,18 @@ fun IntegratedControllerScreen(
 
                 ControllerTab.ARENA -> ArenaScreen(
                     viewModel = arenaViewModel,
-                    robotStatus = arenaState.manualStatus ?: arenaState.status,
+                    robotStatus = if (arenaState.taskMode == TaskMode.TASK2) {
+                        when {
+                            !isConnected && arenaState.task1Phase == Task1Phase.UNKNOWN ->
+                                "Unknown — Bluetooth disconnected"
+                            !isConnected && arenaState.task1Phase !in setOf(
+                                Task1Phase.COMPLETED, Task1Phase.FAILED, Task1Phase.STOPPED) ->
+                                "Bluetooth disconnected"
+                            arenaState.task1Phase == Task1Phase.STOPPED ->
+                                arenaState.manualStatus ?: arenaState.status
+                            else -> arenaState.status
+                        }
+                    } else arenaState.manualStatus ?: arenaState.status,
                     modifier = Modifier.fillMaxSize(),
                     belowResetControls = {
                         NewlineModeButtons(
@@ -221,7 +239,7 @@ fun IntegratedControllerScreen(
                         TaskControls(
                             mode = arenaState.taskMode,
                             phase = arenaState.task1Phase,
-                            task2Timer = arenaState.task2Timer,
+                            connected = isConnected,
                             canRequest = if (arenaState.taskMode == TaskMode.TASK1)
                                 arenaViewModel.canRequestTask1() else arenaViewModel.canRequestTask2(),
                             startIssue = if (arenaState.taskMode == TaskMode.TASK1)
@@ -235,19 +253,25 @@ fun IntegratedControllerScreen(
                             canSelectTask = !arenaState.autonomousRunning && !arenaState.manualPending && !arenaState.manualAnimating,
                             onSelectTask = arenaViewModel::selectTask,
                             onStart = beginSelectedTask,
+                            onStop = { arenaViewModel.stopManual(onStop) },
                             onNewAttempt = arenaViewModel::newAttempt,
                         )
                     },
                     drivingControls = {
-                        ArenaDrivePad(
-                            status = arenaState.manualStatus ?: arenaState.status,
-                            connected = isConnected,
-                            allowed = allowedCommands,
-                            onMove = { command ->
-                                arenaViewModel.drive(command, movementCallbacks.getValue(command))
-                            },
-                            onStop = { arenaViewModel.stopManual(onStop) },
-                        )
+                        if (arenaState.taskMode == TaskMode.TASK1) {
+                            ArenaDrivePad(
+                                status = arenaState.manualStatus ?: arenaState.status,
+                                connected = isConnected,
+                                allowed = allowedCommands,
+                                onMove = { command ->
+                                    arenaViewModel.drive(command, movementCallbacks.getValue(command))
+                                },
+                                onStop = { arenaViewModel.stopManual(onStop) },
+                            )
+                        }
+                    },
+                    task2TimerDisplay = {
+                        Task2TimerPanel(arenaState.task2Timer, arenaState.task1Phase)
                     },
                 )
             }
@@ -277,7 +301,7 @@ private fun NewlineModeButtons(appendNewline: Boolean, enabled: Boolean, onChang
 private fun TaskControls(
     mode: TaskMode,
     phase: Task1Phase,
-    task2Timer: Task2Timer,
+    connected: Boolean,
     canRequest: Boolean,
     hasResults: Boolean,
     canNewAttempt: Boolean,
@@ -286,6 +310,7 @@ private fun TaskControls(
     canSelectTask: Boolean,
     onSelectTask: (TaskMode) -> Unit,
     onStart: () -> Unit,
+    onStop: () -> Unit,
     onNewAttempt: () -> Unit,
 ) {
     var confirmNewAttempt by rememberSaveable { mutableStateOf(false) }
@@ -301,15 +326,31 @@ private fun TaskControls(
                 FilterChip(selected = mode == task, onClick = { onSelectTask(task) },
                     enabled = canSelectTask, label = { Text(if (task == TaskMode.TASK1) "Task 1" else "Task 2") })
             }
-            if (mode == TaskMode.TASK2) {
-                Spacer(Modifier.weight(1f))
-                Task2TimerBadge(task2Timer, phase)
-            }
         }
         Text("${if (mode == TaskMode.TASK1) "Task 1" else "Task 2"} • $phaseLabel",
             style = MaterialTheme.typography.titleSmall)
-        if (phase in setOf(Task1Phase.COMPLETED, Task1Phase.FAILED, Task1Phase.STOPPED) ||
-            (mode == TaskMode.TASK2 && phase == Task1Phase.UNKNOWN) ||
+        val task2Active = mode == TaskMode.TASK2 && phase in setOf(
+            Task1Phase.START_REQUESTED, Task1Phase.RUNNING, Task1Phase.UNKNOWN)
+        if (mode == TaskMode.TASK2) {
+            if (task2Active) {
+                Button(onClick = onStop, enabled = connected,
+                    colors = androidx.compose.material3.ButtonDefaults.buttonColors(
+                        containerColor = MaterialTheme.colorScheme.error),
+                    modifier = Modifier.fillMaxWidth()) {
+                    Text("Stop Task 2")
+                }
+            }
+            if (phase in setOf(Task1Phase.COMPLETED, Task1Phase.FAILED, Task1Phase.STOPPED,
+                    Task1Phase.UNKNOWN)) {
+                OutlinedButton(onClick = { confirmNewAttempt = true }, enabled = canNewAttempt) {
+                    Text("New attempt")
+                }
+            } else if (!task2Active) {
+                Button(onClick = onStart, enabled = canRequest, modifier = Modifier.fillMaxWidth()) {
+                    Text("Start Task 2")
+                }
+            }
+        } else if (phase in setOf(Task1Phase.COMPLETED, Task1Phase.FAILED, Task1Phase.STOPPED) ||
             (hasResults && phase in setOf(Task1Phase.SETUP, Task1Phase.PATH_REQUESTED))) {
             OutlinedButton(onClick = { confirmNewAttempt = true }, enabled = canNewAttempt) {
                 Text("New attempt")
@@ -317,12 +358,14 @@ private fun TaskControls(
         } else {
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 Button(onClick = onStart, enabled = canRequest, modifier = Modifier.weight(1f)) {
-                    Text(if (mode == TaskMode.TASK1) "Start Task 1" else "Start Task 2")
+                    Text("Start Task 1")
                 }
             }
         }
         if (phase in setOf(Task1Phase.SETUP, Task1Phase.PATH_REQUESTED, Task1Phase.START_REQUESTED)) {
-            if (mode == TaskMode.TASK1) Text(plannerInfo, style = MaterialTheme.typography.bodySmall)
+            if (mode == TaskMode.TASK1 && plannerInfo != DEFAULT_PLANNER_INFO) {
+                Text(plannerInfo, style = MaterialTheme.typography.bodySmall)
+            }
             if (startIssue != null && phase != Task1Phase.START_REQUESTED) {
                 Text(startIssue, style = MaterialTheme.typography.bodySmall)
             }
@@ -334,7 +377,7 @@ private fun TaskControls(
             title = { Text("Prepare a new attempt?") },
             text = { Text(if (mode == TaskMode.TASK1)
                 "Save the result-map screenshot first. Previous image results will be cleared; obstacle positions and faces will be kept. No command will be sent to the robot."
-                else "Before another Task 2 attempt, verify the robot is stationary and the previous run has ended. Saved Task 1 markers and results will be kept. Preparing does not send BEGIN or STOP. For local tests, restart the Task 2 Pi and PC programs, then wait for READY before Start. Competition retries are shared across tasks; confirm eligibility with the supervisor.") },
+                else "Before another Task 2 attempt, verify the robot is stationary and the previous run has ended. Saved Task 1 markers and results will be kept. Preparing does not send BEGIN or STOP. For local tests, restart the Task 2 Pi; leave the PC service running and wait for READY before Start. Competition retries are shared across tasks; confirm eligibility with the supervisor.") },
             confirmButton = {
                 TextButton(enabled = canNewAttempt, onClick = {
                     confirmNewAttempt = false
@@ -347,37 +390,67 @@ private fun TaskControls(
 }
 
 @Composable
-private fun Task2TimerBadge(timer: Task2Timer, phase: Task1Phase) {
+private fun Task2TimerPanel(timer: Task2Timer, phase: Task1Phase) {
     val elapsed by produceState(initialValue = timer.elapsedMillis(AndroidTask2TimerClock), timer) {
         while (timer.startedAtElapsedMillis != null && timer.stoppedAtElapsedMillis == null &&
             !timer.timeUnavailable) {
-            delay(250)
+            delay(20)
             value = timer.elapsedMillis(AndroidTask2TimerClock)
         }
     }
-    val seconds = (elapsed ?: 0L) / 1_000L
-    val display = if (elapsed == null) "--:--" else String.format(Locale.US, "%02d:%02d", seconds / 60, seconds % 60)
+    val elapsedMillis = elapsed
+    val display = formatTask2Elapsed(elapsedMillis)
     val label = when {
-        elapsed == null -> "Task 2 time unavailable"
+        elapsedMillis == null -> "Task 2 time unavailable"
+        !timer.started -> "Task 2 ready; elapsed time $display"
         phase == Task1Phase.COMPLETED -> "Task 2 completed in $display"
         phase == Task1Phase.FAILED -> "Task 2 failed after $display"
         phase == Task1Phase.STOPPED -> "Task 2 Stop requested at $display; robot stop unconfirmed"
         phase == Task1Phase.UNKNOWN -> "Task 2 elapsed $display; run status unknown"
         else -> "Task 2 elapsed $display"
     }
+    val heading = when (phase) {
+        Task1Phase.COMPLETED -> "Completed"
+        Task1Phase.FAILED -> "Failed"
+        Task1Phase.STOPPED -> "Stop requested"
+        Task1Phase.UNKNOWN -> "Run status unknown"
+        Task1Phase.RUNNING -> "Running"
+        Task1Phase.START_REQUESTED -> "Start requested"
+        else -> "Ready to start"
+    }
     val color = when {
-        seconds >= 180 -> MaterialTheme.colorScheme.error
-        elapsed == null || seconds >= 150 -> MaterialTheme.colorScheme.errorContainer
+        elapsedMillis != null && elapsedMillis >= 180_000L -> MaterialTheme.colorScheme.error
+        elapsedMillis == null || elapsedMillis >= 150_000L -> MaterialTheme.colorScheme.errorContainer
         else -> MaterialTheme.colorScheme.surfaceVariant
     }
     val contentColor = when {
-        seconds >= 180 -> MaterialTheme.colorScheme.onError
-        elapsed == null || seconds >= 150 -> MaterialTheme.colorScheme.onErrorContainer
+        elapsedMillis != null && elapsedMillis >= 180_000L -> MaterialTheme.colorScheme.onError
+        elapsedMillis == null || elapsedMillis >= 150_000L -> MaterialTheme.colorScheme.onErrorContainer
         else -> MaterialTheme.colorScheme.onSurfaceVariant
     }
-    Surface(shape = RoundedCornerShape(8.dp), color = color, contentColor = contentColor,
-        modifier = Modifier.semantics { contentDescription = label }) {
-        Text(display, modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
-            style = MaterialTheme.typography.titleMedium, maxLines = 1)
+    Surface(shape = RoundedCornerShape(12.dp), color = color, contentColor = contentColor,
+        modifier = Modifier.fillMaxSize().semantics { contentDescription = label }
+            .testTag("task2_timer_panel")) {
+        BoxWithConstraints(Modifier.fillMaxSize().padding(16.dp), contentAlignment = Alignment.Center) {
+            val fontScale = LocalDensity.current.fontScale
+            val size = minOf(112f,
+                maxWidth.value / (display.length * 0.65f * fontScale),
+                maxHeight.value / (2.4f * fontScale)).coerceAtLeast(1f)
+            Column(horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text("Task 2 • $heading", style = MaterialTheme.typography.titleMedium)
+                Text(display, fontSize = size.sp, fontFamily = FontFamily.Monospace,
+                    fontWeight = FontWeight.Bold, maxLines = 1, softWrap = false)
+                Text("minutes : seconds : hundredths", style = MaterialTheme.typography.labelMedium)
+                Text("Tablet elapsed time", style = MaterialTheme.typography.labelSmall)
+            }
+        }
     }
+}
+
+internal fun formatTask2Elapsed(elapsedMillis: Long?): String {
+    if (elapsedMillis == null) return "--:--:--"
+    val hundredths = elapsedMillis.coerceAtLeast(0L) / 10L
+    return String.format(Locale.US, "%02d:%02d:%02d",
+        hundredths / 6_000L, hundredths / 100L % 60L, hundredths % 100L)
 }
