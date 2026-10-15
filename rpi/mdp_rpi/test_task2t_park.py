@@ -2409,8 +2409,44 @@ class MotionOptimisation(unittest.TestCase):
         self.assertTrue(all(seg.kind in ("F", "L", "R") for seg in segs))
         self.assertGreaterEqual(clearance,
                                 route_module.HANDOFF_CONTINUOUS_CLEARANCE_CM)
-        self.assertFalse(any(seg.kind in ("B", "l", "r")
-                             for seg in sent[0]))
+        # The complete camera move is checked; depending on available space
+        # it may include a short final readjustment to create the turn pocket.
+        self.assertGreaterEqual(route._check(
+            Pose(59.0, 34.7, math.radians(-7.3)), sent[0], course),
+            t2.CLEARANCE_FLOOR_CM)
+
+    def test_0733_camera_standoff_absorbs_logged_hardware_drift(self):
+        import task2t as route_module
+
+        route = route_module.Task2(
+            Mock(), startup=False, center_stage2=True)
+        route.r = 30.0
+        course = Course(60.6, 149.9, 90,
+                        wall_y=route_module.CONSERVATIVE_WALL_Y)
+        state = [Pose(78.2, 23.8, math.radians(-1.3))]
+        route._record_obs2_us_hit(21.1, state[0].th)
+        route._pose = lambda: state[0]
+
+        def move(segs):
+            state[0] = t2.run(state[0], segs, route.r, step=1e6)[-1]
+            return True
+
+        route._line = move
+        self.assertTrue(route.position_obstacle2_camera(course, 1.0))
+
+        # 07:33: nominal-to-measured camera error was +6.6 cm x, +4.8 cm y,
+        # and -2 degrees. The old 30 cm pose had no route from this error.
+        measured = Pose(state[0].x + 6.6, state[0].y + 4.8,
+                        state[0].th - math.radians(2.0))
+        route._handoff_cache = None
+        selected = route.select_face_handoff(
+            measured, course, 1.0, -1.0)
+
+        self.assertIsNotNone(selected)
+        segs, reverse, clearance = selected
+        self.assertFalse(reverse)
+        self.assertTrue(all(seg.kind in ("F", "L", "R") for seg in segs))
+        self.assertGreaterEqual(clearance, 10.0)
 
     def test_short_handoff_preserves_narrow_face_and_clearance_both_sides(self):
         import task2t as route_module

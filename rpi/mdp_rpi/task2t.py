@@ -85,10 +85,12 @@ KICK_DEG = 45
 # geometry permits. They expand the search; measured-angle corrections remain
 # available because quantising every recovery can remove its only clear path.
 CALIBRATED_TURN_ANGLES = (45, 90, 135, 180)
-# Photo of obstacle 2: recognition is reliable 20-30 cm in front of the box.
-# Prefer 30 cm head-on; only a short inter-obstacle gap should force the
-# collision-checked angled family, which may step down as far as 20 cm.
-PHOTO_DIST_CM = tp._env_f("T2T_PHOTO_DIST_CM", 30.0)
+# Photo of obstacle 2: keep enough space after recognition for the calibrated
+# 30 cm-radius steering arc. A 30 cm camera standoff put the axle/body too
+# close to the face after ordinary floor drift; 40 cm retains a usable image
+# while leaving a robust turning pocket. Tight courses may still step down to
+# the collision-checked 20 cm minimum.
+PHOTO_DIST_CM = tp._env_f("T2T_PHOTO_DIST_CM", 40.0)
 PHOTO_MIN_CM = tp._env_f("T2T_PHOTO_MIN_CM", 20.0)
 PHOTO_SWINGS = (90, 80, 70, 60)       # 90 = looking in from 45 deg
 CAMERA_FROM_AXLE_CM = tp._env_f("T2_CAMERA_FROM_AXLE_CM", tp.FRONT_FROM_AXLE_CM)
@@ -1673,6 +1675,14 @@ class Task2:
             for band in sorted(set(int(item[2]) // 8 for item in angled)):
                 members = [item for item in angled if int(item[2]) // 8 == band]
                 shortlist.extend(sorted(members, key=lambda item: item[:6])[:2])
+                forward_members = [
+                    item for item in members
+                    if all(seg.kind in ("F", "L", "R") for seg in item[6])]
+                if forward_members:
+                    best_forward = min(forward_members,
+                                       key=lambda item: item[:6])
+                    if best_forward not in shortlist:
+                        shortlist.append(best_forward)
             base = min(angled, key=lambda item: item[:6])
             if base not in shortlist:
                 shortlist.append(base)
@@ -1687,12 +1697,14 @@ class Task2:
                     continue
                 total = (item[4]
                          + tp.motion_cost(join[0], self.r, fast=self.fast))
-                downstream.append((item[1], total, item[3], item[5], item,
-                                   join[0]))
+                camera_reverses = any(
+                    seg.kind not in ("F", "L", "R") for seg in item[6])
+                downstream.append((item[1], camera_reverses, total,
+                                   item[3], item[5], item, join[0]))
             self._handoff_cache = saved_cache
             if downstream:
-                _, _, _, _, chosen, join = min(downstream,
-                                                key=lambda item: item[:4])
+                _, _, _, _, _, chosen, join = min(
+                    downstream, key=lambda item: item[:5])
                 logging.info(
                     "Camera pose preserves an all-forward opposite-arrow "
                     "continuation %s; no full photo-route undo is planned.",
