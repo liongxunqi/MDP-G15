@@ -19,6 +19,7 @@ import androidx.compose.ui.test.performScrollTo
 import androidx.compose.ui.test.junit4.StateRestorationTester
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onNodeWithTag
+import androidx.compose.ui.test.onNodeWithContentDescription
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.onAllNodesWithText
 import androidx.compose.ui.test.assertCountEquals
@@ -71,6 +72,7 @@ class IntegratedControllerScreenTest {
         composeRule.onNodeWithText("Arena").performClick()
         composeRule.onNodeWithText("Start Task 1").assertIsNotEnabled()
         composeRule.onNodeWithText("Task 2").performClick()
+        composeRule.onNodeWithText("00:00").assertIsDisplayed()
         composeRule.onNodeWithText("Start Task 2").assertIsNotEnabled()
         composeRule.runOnIdle { assertTrue(incoming.tryEmit("TASK2,READY")) }
         composeRule.waitForIdle()
@@ -78,6 +80,14 @@ class IntegratedControllerScreenTest {
         composeRule.runOnIdle { assertEquals(listOf("BEGIN"), movement) }
         composeRule.onNodeWithText("Start Task 2").assertIsNotEnabled()
         composeRule.onNodeWithText("Task 2 • Start requested — awaiting robot").assertIsDisplayed()
+        composeRule.waitUntil(timeoutMillis = 5_000) {
+            composeRule.onAllNodesWithText("00:00").fetchSemanticsNodes().isEmpty()
+        }
+        capture("task2-timer-running")
+        composeRule.runOnIdle { assertTrue(incoming.tryEmit("STATUS,DONE")) }
+        composeRule.waitForIdle()
+        composeRule.onNodeWithContentDescription("Task 2 completed in", substring = true).assertIsDisplayed()
+        capture("task2-timer-complete")
     }
 
     @Test

@@ -3,6 +3,8 @@ package com.example.mdp
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.Button
@@ -15,6 +17,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.PrimaryTabRow
 import androidx.compose.material3.Tab
 import androidx.compose.material3.Text
+import androidx.compose.material3.Surface
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.DisposableEffect
@@ -25,9 +28,13 @@ import androidx.compose.ui.platform.LocalView
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.mdp.g15.arena.domain.ManualCommand
@@ -36,7 +43,11 @@ import com.mdp.g15.arena.presentation.ArenaScreen
 import com.mdp.g15.arena.presentation.Task1Phase
 import com.mdp.g15.arena.presentation.TaskMode
 import com.mdp.g15.arena.presentation.ArenaViewModel
+import com.mdp.g15.arena.presentation.AndroidTask2TimerClock
+import com.mdp.g15.arena.presentation.Task2Timer
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.delay
+import java.util.Locale
 
 private enum class ControllerTab(val title: String) {
     CONTROLS("Controls"),
@@ -210,6 +221,7 @@ fun IntegratedControllerScreen(
                         TaskControls(
                             mode = arenaState.taskMode,
                             phase = arenaState.task1Phase,
+                            task2Timer = arenaState.task2Timer,
                             canRequest = if (arenaState.taskMode == TaskMode.TASK1)
                                 arenaViewModel.canRequestTask1() else arenaViewModel.canRequestTask2(),
                             startIssue = if (arenaState.taskMode == TaskMode.TASK1)
@@ -265,6 +277,7 @@ private fun NewlineModeButtons(appendNewline: Boolean, enabled: Boolean, onChang
 private fun TaskControls(
     mode: TaskMode,
     phase: Task1Phase,
+    task2Timer: Task2Timer,
     canRequest: Boolean,
     hasResults: Boolean,
     canNewAttempt: Boolean,
@@ -287,6 +300,10 @@ private fun TaskControls(
             TaskMode.entries.forEach { task ->
                 FilterChip(selected = mode == task, onClick = { onSelectTask(task) },
                     enabled = canSelectTask, label = { Text(if (task == TaskMode.TASK1) "Task 1" else "Task 2") })
+            }
+            if (mode == TaskMode.TASK2) {
+                Spacer(Modifier.weight(1f))
+                Task2TimerBadge(task2Timer, phase)
             }
         }
         Text("${if (mode == TaskMode.TASK1) "Task 1" else "Task 2"} • $phaseLabel",
@@ -326,5 +343,41 @@ private fun TaskControls(
             },
             dismissButton = { TextButton(onClick = { confirmNewAttempt = false }) { Text("Cancel") } },
         )
+    }
+}
+
+@Composable
+private fun Task2TimerBadge(timer: Task2Timer, phase: Task1Phase) {
+    val elapsed by produceState(initialValue = timer.elapsedMillis(AndroidTask2TimerClock), timer) {
+        while (timer.startedAtElapsedMillis != null && timer.stoppedAtElapsedMillis == null &&
+            !timer.timeUnavailable) {
+            delay(250)
+            value = timer.elapsedMillis(AndroidTask2TimerClock)
+        }
+    }
+    val seconds = (elapsed ?: 0L) / 1_000L
+    val display = if (elapsed == null) "--:--" else String.format(Locale.US, "%02d:%02d", seconds / 60, seconds % 60)
+    val label = when {
+        elapsed == null -> "Task 2 time unavailable"
+        phase == Task1Phase.COMPLETED -> "Task 2 completed in $display"
+        phase == Task1Phase.FAILED -> "Task 2 failed after $display"
+        phase == Task1Phase.STOPPED -> "Task 2 Stop requested at $display; robot stop unconfirmed"
+        phase == Task1Phase.UNKNOWN -> "Task 2 elapsed $display; run status unknown"
+        else -> "Task 2 elapsed $display"
+    }
+    val color = when {
+        seconds >= 180 -> MaterialTheme.colorScheme.error
+        elapsed == null || seconds >= 150 -> MaterialTheme.colorScheme.errorContainer
+        else -> MaterialTheme.colorScheme.surfaceVariant
+    }
+    val contentColor = when {
+        seconds >= 180 -> MaterialTheme.colorScheme.onError
+        elapsed == null || seconds >= 150 -> MaterialTheme.colorScheme.onErrorContainer
+        else -> MaterialTheme.colorScheme.onSurfaceVariant
+    }
+    Surface(shape = RoundedCornerShape(8.dp), color = color, contentColor = contentColor,
+        modifier = Modifier.semantics { contentDescription = label }) {
+        Text(display, modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+            style = MaterialTheme.typography.titleMedium, maxLines = 1)
     }
 }

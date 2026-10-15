@@ -45,6 +45,26 @@ and Task 2 Pi programs on the same Bluetooth/PC sockets simultaneously.
 
 ## Exact Bluetooth messages and where they appear
 
+### Compact tablet timer
+
+Task 2 shows a small `MM:SS` badge in the existing task-mode row; it does not
+take space from the map or add a panel. It starts at the accepted Start tap,
+resets if BEGIN was definitely not queued or the Pi rejects it as NOT_READY,
+and freezes on DONE, FAILED, or a queued Stop request. The Stop time is labelled
+as a request, not physical braking confirmation. The elapsed count continues
+through Bluetooth loss because the autonomous Pi may still be running. A fresh
+New attempt clears the previous time. At 2:30 it changes to a warning colour;
+at 3:00 it changes to an error colour but never sends a command to the robot.
+
+The badge uses Android elapsed realtime rather than counting UI ticks, so
+backgrounding and rotation do not pause or reset it. Saved state restores it
+within the same device boot; after a reboot or incompatible clock restoration
+it displays `--:--` instead of a fabricated result. It is tablet elapsed time
+from Start tap to received terminal status, including transmission delay; the
+judge's official time and the Pi's exact motion duration may differ. If a DONE
+message is lost, the app cannot infer its receipt time and keeps the outcome
+unknown until the operator resolves the attempt.
+
 | Direction | Message | Android behavior |
 | --- | --- | --- |
 | Android → Pi | No `CLEAR` or `OBSTACLE` in Task 2 | The Pi discovers obstacles live; saved Task 1 map stays local. |

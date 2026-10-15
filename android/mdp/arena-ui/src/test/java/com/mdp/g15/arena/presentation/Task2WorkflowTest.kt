@@ -22,11 +22,13 @@ class Task2WorkflowTest {
     private val dispatcher = StandardTestDispatcher()
     private val handle = SavedStateHandle()
     private val outbound = mutableListOf<String>()
+    private val clock = FakeTimerClock()
     private lateinit var vm: ArenaViewModel
 
     @Before fun setup() {
         Dispatchers.setMain(dispatcher)
-        vm = ArenaViewModel(handle, ArenaOutboundSink(outbound::add), useRpiMapSync = true)
+        vm = ArenaViewModel(handle, ArenaOutboundSink(outbound::add), useRpiMapSync = true,
+            task2TimerClock = clock)
     }
 
     @After fun teardown() = Dispatchers.resetMain()
@@ -93,7 +95,8 @@ class Task2WorkflowTest {
         assertEquals(beforeReconnect + "TASK2,STATUS?", outbound)
         vm.selectTask(TaskMode.TASK1)
         assertEquals(TaskMode.TASK2, vm.uiState.value.taskMode)
-        val restored = ArenaViewModel(handle, ArenaOutboundSink(outbound::add), useRpiMapSync = true)
+        val restored = ArenaViewModel(handle, ArenaOutboundSink(outbound::add), useRpiMapSync = true,
+            task2TimerClock = clock)
         restored.connectionChanged(true)
         assertEquals(TaskMode.TASK2, restored.uiState.value.taskMode)
         assertEquals(Task1Phase.UNKNOWN, restored.uiState.value.task1Phase)
@@ -172,7 +175,7 @@ class Task2WorkflowTest {
         assertEquals(Task1Phase.STOPPED, vm.uiState.value.task1Phase)
         vm.newAttempt()
         assertEquals(Task1Phase.SETUP, vm.uiState.value.task1Phase)
-        assertEquals("A", vm.uiState.value.arena.obstacles.getValue(1).targetId)
+        assertEquals("20", vm.uiState.value.arena.obstacles.getValue(1).targetId)
         assertFalse(vm.canRequestTask2())
         vm.selectTask(TaskMode.TASK1)
         assertFalse(vm.canRequestTask1())
@@ -235,7 +238,139 @@ class Task2WorkflowTest {
         vm.accept("TASK2,READY\nSTATUS,RUNNING,0,5")
         advanceUntilIdle()
         assertEquals(Task1Phase.UNKNOWN, vm.uiState.value.task1Phase)
+        assertTrue(vm.uiState.value.task2Timer.timeUnavailable)
         assertFalse(vm.canRequestTask2())
         assertFalse(vm.startRun { fail("must not enqueue second BEGIN") })
+    }
+
+    @Test fun `task2 timer starts on accepted tap and freezes on done`() = runTest(dispatcher) {
+        vm.selectTask(TaskMode.TASK2)
+        vm.connectionChanged(true)
+        vm.accept("TASK2,READY")
+        advanceUntilIdle()
+        assertTrue(vm.startRun { outbound.add("BEGIN") })
+        assertEquals(0L, vm.uiState.value.task2Timer.elapsedMillis(clock))
+        clock.advance(12_345)
+        vm.accept("STATUS,RUNNING,0,5")
+        advanceUntilIdle()
+        assertEquals(12_345L, vm.uiState.value.task2Timer.elapsedMillis(clock))
+        clock.advance(7_655)
+        vm.accept("STATUS,DONE")
+        advanceUntilIdle()
+        assertEquals(20_000L, vm.uiState.value.task2Timer.elapsedMillis(clock))
+        clock.advance(30_000)
+        vm.accept("STATUS,DONE\nSTATUS,RUNNING,1,5")
+        advanceUntilIdle()
+        assertEquals(20_000L, vm.uiState.value.task2Timer.elapsedMillis(clock))
+    }
+
+    @Test fun `task2 timer rejects failed start and rejected begin`() = runTest(dispatcher) {
+        vm.selectTask(TaskMode.TASK2)
+        vm.connectionChanged(true)
+        vm.accept("TASK2,READY")
+        advanceUntilIdle()
+        assertFalse(vm.startRun { throw CommandQueueRejected() })
+        assertFalse(vm.uiState.value.task2Timer.started)
+        assertTrue(vm.startRun { outbound.add("BEGIN") })
+        clock.advance(4_000)
+        vm.accept("TASK2,NOT_READY")
+        advanceUntilIdle()
+        assertFalse(vm.uiState.value.task2Timer.started)
+        assertEquals(0L, vm.uiState.value.task2Timer.elapsedMillis(clock))
+    }
+
+    @Test fun `task2 timer keeps running through disconnect and same boot restoration`() = runTest(dispatcher) {
+        vm.selectTask(TaskMode.TASK2)
+        vm.connectionChanged(true)
+        vm.accept("TASK2,READY")
+        advanceUntilIdle()
+        vm.startRun { outbound.add("BEGIN") }
+        clock.advance(25_000)
+        vm.connectionChanged(false)
+        assertEquals(25_000L, vm.uiState.value.task2Timer.elapsedMillis(clock))
+        clock.advance(10_000)
+        val restored = ArenaViewModel(handle, ArenaOutboundSink(outbound::add), useRpiMapSync = true,
+            task2TimerClock = clock)
+        assertEquals(Task1Phase.UNKNOWN, restored.uiState.value.task1Phase)
+        assertEquals(35_000L, restored.uiState.value.task2Timer.elapsedMillis(clock))
+        restored.connectionChanged(true)
+        restored.accept("STATUS,DONE")
+        advanceUntilIdle()
+        assertEquals(35_000L, restored.uiState.value.task2Timer.elapsedMillis(clock))
+    }
+
+    @Test fun `task2 timer freezes failed and queued stop but not a rejected stop`() = runTest(dispatcher) {
+        vm.selectTask(TaskMode.TASK2)
+        vm.connectionChanged(true)
+        vm.accept("TASK2,READY")
+        advanceUntilIdle()
+        vm.startRun { outbound.add("BEGIN") }
+        clock.advance(3_000)
+        vm.stopManual { throw CommandQueueRejected() }
+        clock.advance(2_000)
+        assertEquals(5_000L, vm.uiState.value.task2Timer.elapsedMillis(clock))
+        vm.stopManual { outbound.add("s") }
+        clock.advance(2_000)
+        assertEquals(5_000L, vm.uiState.value.task2Timer.elapsedMillis(clock))
+        vm.newAttempt()
+        assertFalse(vm.uiState.value.task2Timer.started)
+        vm.accept("TASK2,READY")
+        advanceUntilIdle()
+        vm.startRun { outbound.add("BEGIN") }
+        clock.advance(6_000)
+        vm.accept("STATUS,FAILED")
+        advanceUntilIdle()
+        clock.advance(1_000)
+        assertEquals(6_000L, vm.uiState.value.task2Timer.elapsedMillis(clock))
+    }
+
+    @Test fun `task2 timer reports unavailable after reboot instead of inventing time`() = runTest(dispatcher) {
+        vm.selectTask(TaskMode.TASK2)
+        vm.connectionChanged(true)
+        vm.accept("TASK2,READY")
+        advanceUntilIdle()
+        vm.startRun { outbound.add("BEGIN") }
+        clock.advance(5_000)
+        clock.elapsed = 1_000 // A new boot resets elapsedRealtime.
+        val restored = ArenaViewModel(handle, ArenaOutboundSink(outbound::add), useRpiMapSync = true,
+            task2TimerClock = clock)
+        assertTrue(restored.uiState.value.task2Timer.timeUnavailable)
+        assertNull(restored.uiState.value.task2Timer.elapsedMillis(clock))
+    }
+
+    @Test fun `task2 timer detects a new boot even when uptime exceeds old start`() = runTest(dispatcher) {
+        vm.selectTask(TaskMode.TASK2)
+        vm.connectionChanged(true)
+        vm.accept("TASK2,READY")
+        advanceUntilIdle()
+        vm.startRun { outbound.add("BEGIN") }
+        clock.advance(90_000)
+        clock.elapsed = 110_000 // New boot has passed the old start uptime.
+        val restored = ArenaViewModel(handle, ArenaOutboundSink(outbound::add), useRpiMapSync = true,
+            task2TimerClock = clock)
+        assertTrue(restored.uiState.value.task2Timer.timeUnavailable)
+    }
+
+    @Test fun `completed task2 duration survives later reboot`() = runTest(dispatcher) {
+        vm.selectTask(TaskMode.TASK2)
+        vm.connectionChanged(true)
+        vm.accept("TASK2,READY")
+        advanceUntilIdle()
+        vm.startRun { outbound.add("BEGIN") }
+        clock.advance(42_000)
+        vm.accept("STATUS,DONE")
+        advanceUntilIdle()
+        clock.elapsed = 1_000
+        val restored = ArenaViewModel(handle, ArenaOutboundSink(outbound::add), useRpiMapSync = true,
+            task2TimerClock = clock)
+        assertEquals(42_000L, restored.uiState.value.task2Timer.elapsedMillis(clock))
+    }
+
+    private class FakeTimerClock : Task2TimerClock {
+        var elapsed = 100_000L
+        private var wall = 1_700_000_000_000L
+        override fun elapsedMillis(): Long = elapsed
+        override fun wallMillis(): Long = wall
+        fun advance(millis: Long) { elapsed += millis; wall += millis }
     }
 }

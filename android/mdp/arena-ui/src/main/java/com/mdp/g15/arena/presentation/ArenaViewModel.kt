@@ -44,6 +44,7 @@ class ArenaViewModel(
     private val reducer: ArenaReducer = ArenaReducer(),
     private val codec: ArenaMessageCodec = CsvArenaMessageCodec(),
     private val useRpiMapSync: Boolean = false,
+    private val task2TimerClock: Task2TimerClock = AndroidTask2TimerClock,
 ) : ViewModel(), ArenaInboundConsumer {
     private val undoHistory = ArrayDeque<ArenaEditSnapshot>()
     private val redoHistory = ArrayDeque<ArenaEditSnapshot>()
@@ -116,6 +117,7 @@ class ArenaViewModel(
         redoHistory.clear()
         _uiState.value = _uiState.value.copy(
             taskMode = mode, task1Phase = Task1Phase.SETUP, task2Ready = false,
+            task2Timer = Task2Timer(),
             forceMapResyncOnReconnect = false,
             placementMode = false, canUndo = false, canRedo = false,
             arena = _uiState.value.arena.copy(robot = null, reportedRobot = null, selectedObstacleId = null),
@@ -157,6 +159,8 @@ class ArenaViewModel(
         // Reserve synchronously: a second tap must never enqueue another BEGIN.
         _uiState.value = _uiState.value.copy(autonomousRunning = true,
             task1Phase = Task1Phase.START_REQUESTED, placementMode = false,
+            task2Timer = if (_uiState.value.taskMode == TaskMode.TASK2)
+                Task2Timer().start(task2TimerClock) else _uiState.value.task2Timer,
             manualStatus = "Start requested — awaiting robot")
         persist(transmitMap = false)
         return try {
@@ -165,7 +169,9 @@ class ArenaViewModel(
             true
         } catch (error: CommandQueueRejected) {
             _uiState.value = _uiState.value.copy(autonomousRunning = false,
-                task1Phase = Task1Phase.SETUP, manualStatus = "Start was not queued — check Bluetooth")
+                task1Phase = Task1Phase.SETUP,
+                task2Timer = if (_uiState.value.taskMode == TaskMode.TASK2) Task2Timer() else _uiState.value.task2Timer,
+                manualStatus = "Start was not queued — check Bluetooth")
             persist(transmitMap = false)
             setFeedback("BEGIN was not queued. Check Bluetooth before trying again.", true)
             false
@@ -193,6 +199,7 @@ class ArenaViewModel(
                 obstacles = _uiState.value.arena.obstacles.mapValues { (_, obstacle) -> obstacle.copy(targetId = null) },
             ) else _uiState.value.arena,
             task1Phase = Task1Phase.SETUP, task2Ready = false, autonomousRunning = false,
+            task2Timer = Task2Timer(),
             plannerInfo = DEFAULT_PLANNER_INFO, status = "Awaiting robot status",
             statusHistory = listOf("Awaiting robot status"), latestReceived = "",
             canUndo = false, canRedo = false, placementMode = false,
@@ -279,6 +286,8 @@ class ArenaViewModel(
         }
         _uiState.value = _uiState.value.copy(manualPending = false, autonomousRunning = false,
             task1Phase = if (_uiState.value.autonomousRunning) Task1Phase.STOPPED else _uiState.value.task1Phase,
+            task2Timer = if (_uiState.value.taskMode == TaskMode.TASK2 && _uiState.value.autonomousRunning)
+                _uiState.value.task2Timer.stop(task2TimerClock) else _uiState.value.task2Timer,
             manualStatus = "Stop requested — verify robot stationary")
         setFeedback("Stop queued — verify the robot is stationary before another attempt.", false)
         persist(transmitMap = false)
@@ -387,14 +396,16 @@ class ArenaViewModel(
                 val rejectedStart = _uiState.value.task1Phase == Task1Phase.START_REQUESTED
                 _uiState.value = _uiState.value.copy(task2Ready = false,
                     autonomousRunning = if (rejectedStart) false else _uiState.value.autonomousRunning,
-                    task1Phase = if (rejectedStart) Task1Phase.SETUP else _uiState.value.task1Phase)
+                    task1Phase = if (rejectedStart) Task1Phase.SETUP else _uiState.value.task1Phase,
+                    task2Timer = if (rejectedStart) Task2Timer() else _uiState.value.task2Timer)
                 setFeedback(if (rejectedStart) "Robot rejected BEGIN: Task 2 is not ready. Wait for READY."
                     else "Task 2 robot is not ready yet.", true)
                 persist(transmitMap = false)
             }
             "TASK2,RUNNING" -> if (_uiState.value.task1Phase == Task1Phase.SETUP) {
                 _uiState.value = _uiState.value.copy(task2Ready = false,
-                    autonomousRunning = true, task1Phase = Task1Phase.UNKNOWN)
+                    autonomousRunning = true, task1Phase = Task1Phase.UNKNOWN,
+                    task2Timer = Task2Timer(timeUnavailable = true))
                 setFeedback("Robot reports a Task 2 run already in progress. Start disabled.", true)
                 persist(transmitMap = false)
             }
@@ -620,6 +631,7 @@ class ArenaViewModel(
                         "START", "RUNNING" -> {
                             _uiState.value = _uiState.value.copy(task2Ready = false,
                                 autonomousRunning = true, task1Phase = Task1Phase.UNKNOWN,
+                                task2Timer = Task2Timer(timeUnavailable = true),
                                 status = "Task 2 run already active",
                                 statusHistory = (_uiState.value.statusHistory + "Task 2 run already active")
                                     .takeLast(MAX_STATUS_HISTORY))
@@ -668,6 +680,9 @@ class ArenaViewModel(
                     manualPending = manualDrive.pending != null,
                     autonomousRunning = autonomous,
                     task1Phase = phase,
+                    task2Timer = if (_uiState.value.taskMode == TaskMode.TASK2 &&
+                        !terminal && tag in setOf("DONE", "FAILED"))
+                        _uiState.value.task2Timer.stop(task2TimerClock) else _uiState.value.task2Timer,
                     placementMode = if (autonomous) false else _uiState.value.placementMode,
                     manualStatus = when (if (controlStatus) event.text else "") {
                         "FAILED" -> "Movement failed — pose unconfirmed"
@@ -794,9 +809,18 @@ class ArenaViewModel(
             TaskMode.entries.firstOrNull { it.name == name }
         } ?: TaskMode.TASK1
         val active = savedPhase in setOf(Task1Phase.START_REQUESTED, Task1Phase.RUNNING, Task1Phase.UNKNOWN)
+        val savedTask2Timer = Task2Timer(
+            startedAtElapsedMillis = savedStateHandle[KEY_TASK2_TIMER_START],
+            bootWallOffsetMillis = savedStateHandle[KEY_TASK2_TIMER_BOOT_OFFSET],
+            stoppedAtElapsedMillis = savedStateHandle[KEY_TASK2_TIMER_STOPPED],
+            timeUnavailable = savedStateHandle[KEY_TASK2_TIMER_UNAVAILABLE] ?: false,
+        ).validateAfterRestore(task2TimerClock)
         return ArenaUiState(
             task1Phase = if (active) Task1Phase.UNKNOWN else savedPhase,
             taskMode = savedMode,
+            task2Timer = if (savedMode != TaskMode.TASK2) Task2Timer()
+                else if (active && !savedTask2Timer.started) Task2Timer(timeUnavailable = true)
+                else savedTask2Timer,
             autonomousRunning = active,
             arena = ArenaState(
                 robot = null,
@@ -830,6 +854,10 @@ class ArenaViewModel(
         savedStateHandle[KEY_STATUS] = state.status
         savedStateHandle[KEY_TASK1] = state.task1Phase.name
         savedStateHandle[KEY_MODE] = state.taskMode.name
+        savedStateHandle[KEY_TASK2_TIMER_START] = state.task2Timer.startedAtElapsedMillis
+        savedStateHandle[KEY_TASK2_TIMER_BOOT_OFFSET] = state.task2Timer.bootWallOffsetMillis
+        savedStateHandle[KEY_TASK2_TIMER_STOPPED] = state.task2Timer.stoppedAtElapsedMillis
+        savedStateHandle[KEY_TASK2_TIMER_UNAVAILABLE] = state.task2Timer.timeUnavailable
     }
 
     private fun encodeObstacle(obstacle: Obstacle): String = listOf(
@@ -876,5 +904,9 @@ class ArenaViewModel(
         private const val KEY_TASK1 = "arena.task1.phase"
         private const val KEY_MODE = "arena.task.mode"
         private const val KEY_STATUS = "arena.status"
+        private const val KEY_TASK2_TIMER_START = "arena.task2.timer.start"
+        private const val KEY_TASK2_TIMER_BOOT_OFFSET = "arena.task2.timer.bootOffset"
+        private const val KEY_TASK2_TIMER_STOPPED = "arena.task2.timer.stopped"
+        private const val KEY_TASK2_TIMER_UNAVAILABLE = "arena.task2.timer.unavailable"
     }
 }
