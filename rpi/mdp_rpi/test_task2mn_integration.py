@@ -288,12 +288,16 @@ class Coordination(unittest.TestCase):
         vision = Vision(link, stop, "test-run")
         stitches = []
         detections = {1: 0, 2: 0}
-        def detector(path, allowed_classes, output_dir, selection_policy):
+        thresholds = {1: [], 2: []}
+        # pc/task2_pc.py (task2-working) passes each frame's min_confidence on.
+        def detector(path, allowed_classes, output_dir, selection_policy,
+                     target_confidence):
             self.assertEqual(allowed_classes, {"left", "right"})
             output_dir.mkdir(exist_ok=True)
             (output_dir / path.name).write_bytes(path.read_bytes())
             stage = 1 if "stage1" in path.name else 2
             self.assertEqual(selection_policy, "nearest" if stage == 1 else "unique_arrow")
+            thresholds[stage].append(target_confidence)
             detections[stage] += 1
             if detections[stage] == 1:
                 return None, .2
@@ -319,6 +323,8 @@ class Coordination(unittest.TestCase):
                         time.sleep(.025)
                     self.assertEqual(vision.wait_arrow(.1), expected)
                     vision.idle()
+                self.assertEqual(set(thresholds[1]), {vision.confidence[1]})
+                self.assertEqual(set(thresholds[2]), {vision.confidence[2]})
                 self.assertEqual(set(stitches[-1]), {1, 2})
                 self.assertEqual(len(stitches), 2)
                 run = Path(directory)

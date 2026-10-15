@@ -205,7 +205,18 @@ typedef enum
     CMD_SET_K,           /* !K<key>=<n>  set one table value          */
     CMD_SET_K_CLR,       /* !KCLR        clear the table (protocol 9)  */
     CMD_Q_K,             /* ?K<move><anchor> / ?KG  read a table row  */
-    CMD_Q_MV             /* ?MV          report on the last move       */
+    CMD_Q_MV,            /* ?MV          report on the last move       */
+
+    /* --- Task 2 on the STM, protocol 11 -------------------------------------
+     * Inside the second immediate range, which now ends at CMD_T2_LATERAL.
+     * Only meaningful while !t2go runs (task2fw.h): answered with no reply
+     * then, RESEND otherwise. */
+    CMD_T2_ARROW,        /* !t2a<n><d>   arg = n*10 + d, d 0 left 1 right */
+    CMD_T2_LATERAL,      /* !t2y<n><ddd> arg = n*1000 + ddd, mm + 500     */
+
+    /* Outside both immediate ranges, and refused inside a multi-token line
+     * by Cmd_ParseLine(): RpiLink_Poll() runs it alone. */
+    CMD_T2_GO            /* !t2go<s>     run the course, s seconds 1..180 */
 } CmdOpcode_t;
 
 /* Bumped whenever the wire format changes in a way a sender must care about.
@@ -244,7 +255,11 @@ typedef enum
  * caltab.h) and the move report (?MV - motion.h). Additive: a token without
  * V and an empty table drive exactly as on 9, and the table is empty at
  * power-on. */
-#define CMD_PROTOCOL_VERSION    10
+/* 11: the Task 2 course on the STM - !t2go, !t2a, !t2y, the P / D lines
+ * and FAIL,STOP / DEADLINE / GYRO / NOEDGE / NOARROW (task2fw.h, PROTOCOL.md
+ * section 14). Additive: nothing changes for a sender that never sends
+ * !t2go. */
+#define CMD_PROTOCOL_VERSION    11
 #define CMD_FIRMWARE_NAME       "MDPG15-STM32"
 
 /* Replies for a primitive that did not complete. Previously a timed-out move

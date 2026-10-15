@@ -8,9 +8,21 @@ from threading import Condition
 
 
 class Vision:
-    def __init__(self, pc, stop, run_id, max_age=2.5, confidence=0.70):
+    def __init__(self, pc, stop, run_id, max_age=2.5, confidence=None):
         self.pc, self.stop, self.run_id = pc, stop, run_id
-        self.max_age, self.confidence = max_age, confidence
+        self.max_age = max_age
+        # Per stage, as origin/task2-working's task2_vision.py: obstacle 2 is
+        # much smaller in frame. Sent with every frame as min_confidence -
+        # the current pc/task2_pc.py refuses a frame without it.
+        if confidence is None:
+            self.confidence = {
+                1: float(os.getenv("T2_STAGE1_CONFIDENCE", "0.70")),
+                2: float(os.getenv("T2_STAGE2_CONFIDENCE", "0.60")),
+            }
+        else:
+            self.confidence = {1: float(confidence), 2: float(confidence)}
+        if any(not 0.5 <= value <= 1.0 for value in self.confidence.values()):
+            raise ValueError("Task 2 confidence thresholds must be between 0.5 and 1.0")
         self.condition = Condition()
         self.latest = None
         self.stage = 0
@@ -132,7 +144,9 @@ class Vision:
             if epoch != previous_epoch:
                 vote, count = None, 0
                 previous_epoch = epoch
-            request = {"run_id": self.run_id, "stage": stage, "frame_id": frame}
+            threshold = self.confidence[stage]
+            request = {"run_id": self.run_id, "stage": stage, "frame_id": frame,
+                       "min_confidence": threshold}
             self.pc.send_image(jpeg, header="FRAME," + json.dumps(request))
             message = self.pc.receive()
             if not message or not message.startswith("ARROW,"):
@@ -144,7 +158,7 @@ class Vision:
             direction = reply.get("direction")
             conf = float(reply.get("confidence", 0))
             valid = (direction in ("left", "right") and math.isfinite(conf)
-                     and self.confidence <= conf <= 1 and now - captured <= self.max_age)
+                     and threshold <= conf <= 1 and now - captured <= self.max_age)
             with self.condition:
                 if epoch != self.epoch:
                     continue

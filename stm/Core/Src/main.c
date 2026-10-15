@@ -78,6 +78,7 @@
 #include "imu.h"
 #include "commands.h"
 #include "rpilink.h"
+#include "task2fw.h"
 #include "oled.h"
 #include <stdio.h>
 
@@ -173,6 +174,11 @@ I2C_HandleTypeDef  hi2c2;    /* ICM-20948  PB10/PB11       */
 DMA_HandleTypeDef  hdma_adc1;
 
 static volatile uint8_t  g_evtShort = 0, g_evtLong = 0;
+
+/* A long press aborts the Task 2 course too (task2fw.h), which blocks the
+   main loop while it runs. Not cleared here: the main loop's own long-press
+   handling still runs once the course has stopped. */
+uint8_t Task2Fw_BoardAbort(void) { return g_evtLong; }
 
 /* Boots into IMU (mode 10): the gyro's health is the first thing to see
    after power-on, and a stray short press there only zeroes the display -

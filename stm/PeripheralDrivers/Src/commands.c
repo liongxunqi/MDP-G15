@@ -123,7 +123,7 @@ uint8_t Cmd_IsImmediate(CmdOpcode_t op)
      * silently handed to the movement parser instead. Append new ones before
      * this endpoint and move the endpoint with them. */
     return (((op >= CMD_Q_US)  && (op <= CMD_SET_CAL_TRIM)) ||
-            ((op >= CMD_Q_HDG) && (op <= CMD_Q_MV))) ? 1U : 0U;
+            ((op >= CMD_Q_HDG) && (op <= CMD_T2_LATERAL))) ? 1U : 0U;
 }
 
 Command_t Cmd_ParseToken(const char *token)
@@ -312,6 +312,46 @@ Command_t Cmd_ParseToken(const char *token)
             return cmd;
         }
 
+        /* Task 2 on the STM, protocol 11 (task2fw.h). "!t2go" before
+         * "!t2a"/"!t2y" only for readability - they differ at the fourth
+         * character. */
+        if ((n = token_starts(token, "!t2go")) != 0U)
+        {
+            if (!parse_uint(&token[n], &arg))     { return cmd; }
+            if ((arg < 1) || (arg > 180))         { return cmd; }
+            cmd.op  = CMD_T2_GO;
+            cmd.arg = arg;
+            return cmd;
+        }
+
+        if ((n = token_starts(token, "!t2a")) != 0U)
+        {
+            /* exactly two digits: obstacle 1|2, arrow 0|1 */
+            if ((token[n] != '1') && (token[n] != '2'))         { return cmd; }
+            if ((token[n + 1U] != '0') && (token[n + 1U] != '1')) { return cmd; }
+            if (token[n + 2U] != '\0')                          { return cmd; }
+            cmd.op  = CMD_T2_ARROW;
+            cmd.arg = (int16_t)((token[n] - '0') * 10 + (token[n + 1U] - '0'));
+            return cmd;
+        }
+
+        if ((n = token_starts(token, "!t2y")) != 0U)
+        {
+            /* obstacle 1|2 then exactly three digits, mm + 500 */
+            uint8_t k;
+
+            if ((token[n] != '1') && (token[n] != '2')) { return cmd; }
+            for (k = 1U; k <= 3U; k++)
+            {
+                if ((token[n + k] < '0') || (token[n + k] > '9')) { return cmd; }
+            }
+            if (token[n + 4U] != '\0') { return cmd; }
+            cmd.op  = CMD_T2_LATERAL;
+            cmd.arg = (int16_t)((token[n] - '0') * 1000 + (token[n + 1U] - '0') * 100 +
+                                (token[n + 2U] - '0') * 10 + (token[n + 3U] - '0'));
+            return cmd;
+        }
+
         if ((n = token_starts(token, "!fast")) != 0U)
         {
             if (!parse_uint(&token[n], &arg)) { return cmd; }
@@ -456,6 +496,10 @@ uint8_t Cmd_ParseLine(const char *line)
                  * winner. The caller handles a lone immediate token before it
                  * ever reaches here. */
                 if (Cmd_IsImmediate(staged[nstaged].op)) { return 0U; }
+
+                /* The Task 2 course owns the robot and the line until it
+                 * ends: alone on its line or not at all. */
+                if (staged[nstaged].op == CMD_T2_GO) { return 0U; }
 
                 nstaged++;
                 tlen = 0U;

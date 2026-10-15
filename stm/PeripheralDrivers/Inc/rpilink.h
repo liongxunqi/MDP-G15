@@ -138,6 +138,16 @@ void RpiLink_RxCallback(void);
  * never gated, because a suppressed OK hangs the host forever. */
 void RpiLink_Log(const char *s);
 
+/* A protocol line out, never gated - the Task 2 course's P / D lines
+ * (task2fw.h). */
+void RpiLink_Send(const char *s);
+
+/* The link while the Task 2 course runs (task2fw.c calls it continuously):
+ * re-arms reception, answers queries, hands !t2a / !t2y to the course, turns
+ * rst into an abort, and answers RESEND to anything else - nothing but the
+ * course moves the robot while it runs. */
+void RpiLink_Service(void);
+
 /* 1 once the console has latched off. */
 uint8_t RpiLink_IsQuiet(void);
 

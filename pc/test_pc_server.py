@@ -1,3 +1,4 @@
+import logging
 import socket
 import struct
 import sys
@@ -7,8 +8,18 @@ from pathlib import Path
 
 # Keep this test server on port 5001, but share the exact detector used by
 # the full Task 1 server. This prevents the two test paths from using different
-# model paths, crops, class mappings, or selection rules.
+# model paths, class mappings, or selection rules.
 PC_SIDE_DIR = Path(__file__).resolve().parent
+REPO_ROOT = PC_SIDE_DIR.parent
+sys.path.insert(0, str(REPO_ROOT / "rpi" / "mdp_rpi"))
+import run_log  # noqa: E402
+
+run_log.setup(
+    "test_pc_server",
+    "%(asctime)s [PC-TEST] %(levelname)s — %(message)s",
+    log_dir=str(PC_SIDE_DIR / "logs"),
+)
+
 sys.path.insert(0, str(PC_SIDE_DIR))
 from image_recognition.detect import detect  # noqa: E402
 
@@ -39,7 +50,7 @@ def recv_exact(conn, num_bytes):
 
 
 def handle_client(conn, addr):
-    print(f"Connection from {addr}")
+    logging.info("Connection from %s", addr)
 
     # ── Receive image ────────────────────────────────────────────────
     size_bytes = recv_exact(
@@ -59,18 +70,16 @@ def handle_client(conn, addr):
     filename = SAVE_DIR / f"{time.time_ns()}.jpg"
     with filename.open("wb") as f:
         f.write(image_bytes)
-    print(
-        f"Saved image to {filename} "
-        f"({image_size} bytes)"
-    )
+    logging.info("Saved image to %s (%d bytes)", filename, image_size)
 
-    # Use the same crop, model, confidence threshold, class mapping, and
-    # annotation behavior as the full Task 1 detector.
+    # Use the same model, confidence threshold, class mapping, and annotation
+    # behavior as the full Task 1 detector.
     result_label, confidence = detect(str(filename))
     result_label = result_label or "none"
-    print(
-        f"Detected: {result_label}"
-        + (f" ({confidence:.3f})" if confidence is not None else "")
+    logging.info(
+        "Detected: %s%s",
+        result_label,
+        f" ({confidence:.3f})" if confidence is not None else "",
     )
     # ── Send result to RPi ───────────────────────────────────────────
     response = (
@@ -95,9 +104,7 @@ def main():
             (HOST, PORT)
         )
         server.listen(1)
-        print(
-            f"Listening on {HOST}:{PORT} ..."
-        )
+        logging.info("Listening on %s:%d ...", HOST, PORT)
 
         while True:
             conn, addr = server.accept()
@@ -107,11 +114,8 @@ def main():
                         conn,
                         addr
                     )
-                except Exception as e:
-                    print(
-                        f"Error handling client "
-                        f"{addr}: {e}"
-                    )
+                except Exception:
+                    logging.exception("Error handling client %s", addr)
 
 
 if __name__ == "__main__":

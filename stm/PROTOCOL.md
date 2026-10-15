@@ -573,3 +573,153 @@ cc -Istm/tests -Istm/PeripheralDrivers/Inc stm/tests/test_world_pose.c \
 /tmp/mdp-test-world-pose
 python3 -B -m unittest rpi/mdp_rpi/test_instruction_mission.py -v
 ```
+
+## 14. Task 2 on the STM (protocol 11)
+
+The whole Task 2 course runs on the STM: approach obstacle 1, the S past it,
+the turn round obstacle 2 on the side IR, home and into the carpark on the
+ultrasonic. The Pi only starts it and answers the arrows. Ported from the
+MDP_WORKING_2 firmware, whose car ran this course end to end
+(`task2_mission.c`); the robot side is `task2fw.c`, the constants
+`task2_params.h`, the Pi side `rpi/mdp_rpi/task2fw.py`.
+
+**Every move the course makes is an ordinary `Motion_DriveDistanceV` /
+`Motion_DriveArcV`**, so it runs on the calibration table (protocol 10)
+exactly like `F` / `FR` / `FL` sent over the wire. Restore it first
+(`cal_profile.prepare_for_task`). The course plans every turn on the table's
+`radius` for FL / FR at the arc speed, or 30.0 cm if the table has none, and
+does not re-measure it during the run.
+
+| Direction | Line | Meaning |
+|---|---|---|
+| RPi → STM | `!T2GO<s>` | Run the course, s = mission seconds 1..180. **Alone on its line**, refused with `RESEND` while anything else is running. One reply when it ends |
+| STM → RPi | `P,<n>` | Photograph obstacle n (1 or 2). Sent before the robot drives up to it, repeated every 1.5 s until answered |
+| RPi → STM | `!T2A<n><d>` | Obstacle n's arrow, d `0` left / `1` right. **No reply.** Send it again if the prompt repeats |
+| RPi → STM | `!T2Y<n><ddd>` | Optional: where that arrow sat sideways in the photo, ddd − 500 mm from the camera's centre line, left positive (`!T2Y1580` = 8 cm left). Before its `!T2A`. No reply |
+| STM → RPi | `D,<step>,...` | The run log, one line per decision, ending `x,y,heading` in cm / degrees from the start pose |
+| RPi → STM | `RST` | Abort: brake now. The `!T2GO` line then replies `FAIL,STOP` |
+
+Replies to `!T2GO`:
+
+| Reply | Meaning |
+|---|---|
+| `OK` | Parked |
+| `FAIL,STOP` | `RST`, or a long press on the board |
+| `FAIL,DEADLINE` | The `<s>` seconds ran out - the STM stops on its own, whatever the Pi is doing |
+| `FAIL,NOARROW` | No `!T2A` for a prompted obstacle within 20 s. **The STM never guesses** |
+| `FAIL,NOECHO` | No usable ultrasonic reading for an approach |
+| `FAIL,NOEDGE` | Drove 200 cm along obstacle 2 without the side IR finding its end |
+| `FAIL,GYRO` | The gyro was not ready, or went stale mid-run |
+| `FAIL,TIMEOUT` / `WRONGWAY` / `SHORT` | A move failed, as for a movement line (§3) |
+
+While the course runs, **queries are still answered** (`?US`, `?WPOSE`, ...);
+`!` setters and movement lines get `RESEND` - nothing else moves the robot,
+and nothing changes its calibration between two of the course's moves.
+
+`!T2A` / `!T2Y` outside a run answer `RESEND`. Without `!T2GO` nothing else in
+the protocol changes.
+
+The arrow names its obstacle so a late repeat for obstacle 1 can never be
+read as obstacle 2's.
+
+### Side IRs: obstacle 2 and the carpark
+
+The side IRs are used the way the RPi's Task 2 uses them (`task2mn_park.py`,
+`task2mn_gordon.py`), with their constants in `task2_params.h`:
+
+- **Per-side ranges.** A reading counts only inside 10..65 cm on the left and
+  10..50 cm on the right (the right unit is the weaker one). A no-reading
+  with a high raw count is "closer than 10 cm", never "clear".
+- **Obstacle 2's end and width (Gordon's face scan).** The leg along
+  obstacle 2's face ends where the side IR loses it; that point, moved back
+  `T2_IR_LAG_CM` for the sensor's lag and forward to the lens, is obstacle
+  2's near end (`D,end2_y`). Mirrored about obstacle 1's line it gives the
+  far end and the width (`D,width2`; `D,walls` is where the arena walls must
+  be at least). With the ends known, the leg behind obstacle 2 stops past
+  the far end even if the IR never sees the back face (`D,back_capped`, no
+  `FAIL,NOEDGE`), and the way home keeps clear of obstacle 2 as well as
+  obstacle 1, driving on along the leg first if the turn home would clip
+  its end (`D,home_clear2`).
+- **Centring at the carpark mouth (`task2mn_park` `_park_from_mouth`).** At
+  the entry pose the ultrasound finds the back wall (`D,bay` = the mouth's
+  x). The robot drives in until the side IRs are 5 cm inside the mouth and
+  reads its offset from the side walls: half the difference of the two,
+  else from one wall, else from an IR inside its 10 cm floor (`D,bay_both`
+  / `bay_left` / `bay_right` / `bay_near_l` / `bay_near_r`, offset ×10 mm).
+  Off by more than 4 cm, or more than 5° crooked, it backs out straight if it
+  needs the room (`D,centre_back`) and makes one lane change onto the
+  centreline (`D,centre`), then reads again. `D,parked_off` is the offset it
+  parked at.
+- **Side-safety stop.** Every forward move into the carpark stops if either
+  side IR reads under 10 cm (`D,side_stop`), and the robot centres from there.
+- **No IR shortcut at obstacle 2.** The 90 away from obstacle 2 is always
+  finished; the face scan, with the IR square on to the face, decides where
+  the end is. The original cut the 90 short when the IR read clear part-way
+  round (`T2_WATCH_CUT 1` brings it back): on the floor (2026-09-14 13:22)
+  the right IR read the black face as clear 21° off square from ~14 cm, the
+  course took obstacle 2 for short, and its turn back (`D,cut_blind`, a 161°
+  right) drove through it. A face scan that starts already past the end
+  drives `T2_PAST_RUN_CM` on before the 180 (the end may be right at the
+  lens), and one whose lens is further from the face than the IR reaches
+  (`D,past_unsure`) goes on past the widest obstacle 2 there can be (90 cm).
+
+- **Obstacle 2's ends, both ways.** A face scan that starts already past the
+  end backs up along the face until the IR sees it (`D,seek_back`,
+  `ir_seen_back`), so the end is read rather than assumed; the leg behind
+  obstacle 2 reads the far end the same way. Each end read updates the span
+  (`D,width2`) and where the walls can be (`D,wall_lo` / `D,wall_hi`).
+- **The arena walls**, which can stand as near as 50 cm past either end of
+  obstacle 2. Until an end is read the wall is taken where the narrowest
+  obstacle 2 would put it. The 180 round the end starts with the axle
+  `T2_TURN_AXLE_SHORT_CM` short of the read end and moves up to 20 cm sooner
+  if the wall needs it (`D,wall_180`); the turn home moves along the leg, up
+  to 30 cm either way, to clear both obstacle 2's end and the wall
+  (`D,home_shift`); every route home is checked against the walls.
+  `D,wall_tight` means nothing fitted and the turn went ahead as planned.
+- **The carpark from its fences.** Before moving, the side IRs place the
+  carpark's centreline (`D,bay_y`, ×10 mm); on the way out the first side IR
+  to lose its fence marks the mouth (`D,mouth`). The way home aims at that
+  centreline, straightens up with the nose 6 cm outside the mouth, and keeps
+  off the fences' ends.
+
+### Before a floor run
+
+The course logic was proven in the original car's simulator and, re-derived
+for this robot, in `stm/tests/test_task2_mission.c`: 1677 of 1728 arena
+layouts with the planned 30 cm radius off by up to ±2 cm (6 collisions, the
+rest swinging further than 90 cm past obstacle 2's end - see below), all 16
+starts 5-8 cm off the bay's centreline parked within 4 cm of it, and with the
+robot at the back of the carpark, obstacle 1 34 cm past the mouth and gaps of
+56-105 cm (`-DSTART_TAIL_CM=2`), 132 of 144 with no collision - the same with
+an IR blind to black more than 15° off square (`-DIR_OBLIQUE_DEG=15`), which
+the old shortcut drops to 54. Measure on this robot, then update
+`task2_params.h` and re-run that test:
+
+0. **The arena walls.** In the simulator the robot swings up to ~96 cm past
+   obstacle 2's end (shortest obstacle 2, the same arrow twice, squared up
+   off the line). If the walls are closer than that, it needs a tighter round
+   for that case.
+
+1. **The turn radius** on the arc profile and speed Task 2 uses (SAFE),
+   per side - `calibrate.py radius`, stored as the table's FL / FR radius.
+2. **How far the side IR sees obstacle 2** (it is black), square on: the
+   course wants a reading of `T2_IR_SEEN_CM` (32) or less from ~32 cm. If it
+   only sees to 28 cm the simulator completes 1497 of 1728 (`-DIR_SEE_CM=28`),
+   at 20 cm under half - the most sensitive number on the robot.
+3. **The carpark** (`T2_BAY_DEPTH_CM` 50, `T2_BAY_HALF_CM` 30) and the left -
+   right IR bias with the robot centred in it by hand (`T2_IR_LR_BIAS_CM`).
+4. **How far a deliberate stop rolls** after `Motion_Stop()` at
+   `T2_EDGE_RPM` and at arc speed - the simulator's `EDGE_OVERRUN_CM` /
+   `WATCH_OVERRUN_DEG` / `GUARD_OVERRUN_CM` / `SIDE_OVERRUN_CM`, and the IR
+   lag (`T2_IR_LAG_CM`, 2 cm, not measured).
+5. The car's real outline (`T2_NOSE_*`, `T2_HALF_WIDTH_CM`).
+
+Host test (no hardware; any C compiler, the RPi included):
+
+```sh
+cc -std=c11 -O2 -Wall -Wextra -Istm/tests -Istm/PeripheralDrivers/Inc \
+  stm/tests/test_task2_mission.c stm/PeripheralDrivers/Src/task2_mission.c \
+  stm/PeripheralDrivers/Src/commands.c stm/PeripheralDrivers/Src/caltab.c \
+  -lm -o /tmp/test_task2_mission && /tmp/test_task2_mission
+python3 -B -m unittest rpi/mdp_rpi/test_task2fw.py -v
+```

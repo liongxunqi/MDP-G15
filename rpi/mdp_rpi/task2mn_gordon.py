@@ -48,12 +48,18 @@ THE ROUTE (world frame of task2mn_park.py: origin the bay mouth, +x out)
   5. At the mouth: ParkRunner._park_from_mouth(), unchanged - side-fence
      centring and the ultrasound-checked final F at precision speed.
 
-PROTOCOL 10 (firmware with ?VER >= 10, PROTOCOL.md section 13): the same
-lines, sent as moves with their own speed that roll into each other without
-stopping (task2mn_gordon_link.speedify) - arcs at TIGHT's calibrated V15,
-straights at V20 - checked for clearance on the path they actually fly,
-hand-over spirals included. Only the measuring RSTs, the bay mouth and the
-parking F stop. Older firmware gets the plain tokens.
+CONTINUOUS LINES (the V/C firmware, T2G_CONTINUOUS=1): the same lines, sent
+as moves with their own speed that roll into each other without stopping
+(task2mn_gordon_link.speedify) - arcs at TIGHT's calibrated V15, straights at
+V20 - checked for clearance on the path they actually fly, hand-over spirals
+included. Only the measuring RSTs, the bay mouth and the parking F stop.
+
+That firmware was set aside (git stash, "protocol 10 V/C continuous lines");
+the stm/ firmware's protocol 10 became the calibration table instead, which
+has V but no C suffix and no ?SEG - it answers RESEND to every continuous
+line. So ?VER alone no longer says which one is flashed, and the default is
+the plain tokens, one stop per primitive, which every firmware from 9 up
+accepts and which still run on the restored calibration table.
 
 Anything gordon cannot plan hands over to task2mn's own around_obstacle2()
 and ParkRunner from wherever the robot stopped.
@@ -163,6 +169,10 @@ POLL_S = _env("T2G_POLL_S", 0.0)
 ARC_V = int(_env("T2G_ARC_V", 15))
 STRAIGHT_V = int(_env("T2G_STRAIGHT_V", 20))
 SCAN_V = int(_env("T2G_SCAN_V", 15))
+# 1 only with the V/C continuous-line firmware flashed (see the module
+# docstring). The stm/ firmware - protocol 10 calibration table, 11 Task 2 -
+# RESENDs those lines.
+CONTINUOUS = os.getenv("T2G_CONTINUOUS", "0").strip() == "1"
 
 HALF_W2_MAX = route.W2_RANGE[1] / 2.0
 HALF_W2_MIN = route.W2_RANGE[0] / 2.0
@@ -945,6 +955,8 @@ class GordonRoute(route.Task2):
 
     def _detect_p10(self) -> bool:
         if self.p10 is None and self._force_p9:
+            self.p10 = False
+        if self.p10 is None and not CONTINUOUS:
             self.p10 = False
         if self.p10 is None:
             try:

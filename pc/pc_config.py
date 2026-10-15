@@ -1,4 +1,4 @@
-# pc_side/pc_config.py
+# pc/pc_config.py
 # ─────────────────────
 # Edit these to match your setup before running task1_pc.py
 

@@ -8,6 +8,7 @@
 #include "ir.h"
 #include "ultrasonic.h"
 #include "caltab.h"
+#include "task2fw.h"
 #include <string.h>
 #include <stdio.h>
 
@@ -132,6 +133,8 @@ static void link_reply(const char *s)
 
     (void)HAL_UART_Transmit(s_uart, (uint8_t *)s, (uint16_t)strlen(s), 100U);
 }
+
+void RpiLink_Send(const char *s) { link_reply(s); }
 
 /* Human-readable telemetry. Silent once the RPi has spoken. */
 void RpiLink_Log(const char *s)
@@ -917,12 +920,106 @@ static uint8_t dispatch(Command_t c)
     }
 }
 
+/* Take the received line: lowercased, surrounding whitespace trimmed. Returns
+ * the start of the text inside line[]. */
+static char *take_line(char *line)
+{
+    char     *p = line;
+    uint16_t  i;
+
+    (void)memcpy(line, s_pending, CMD_LINE_MAX);
+    s_lineReady = 0U;
+
+    /* Lowercase on receive, so sender casing is irrelevant everywhere
+     * downstream. */
+    for (i = 0U; i < CMD_LINE_MAX; i++)
+    {
+        if (line[i] == '\0') { break; }
+        if ((line[i] >= 'A') && (line[i] <= 'Z'))
+        {
+            line[i] = (char)(line[i] - 'A' + 'a');
+        }
+    }
+
+    /* Trim surrounding whitespace before the single-token tests. Cmd_ParseLine()
+     * treats spaces as delimiters and skips empty runs, so movement lines never
+     * cared - but RST and the immediate opcodes are matched against the WHOLE
+     * line, and "?US " with a trailing space would otherwise fall through to
+     * RESEND. Confusing, and trivial to prevent. */
+    {
+        uint16_t end;
+
+        while ((*p == ' ') || (*p == '\t')) { p++; }
+
+        end = (uint16_t)strlen(p);
+        while ((end > 0U) && ((p[end - 1U] == ' ') || (p[end - 1U] == '\t')))
+        {
+            p[end - 1U] = '\0';
+            end--;
+        }
+    }
+    return p;
+}
+
+/* Reception torn down by a line error: re-arm it. See RpiLink_Poll(). */
+static void rearm_rx(void)
+{
+    if ((s_uart != 0) && (s_uart->RxState == HAL_UART_STATE_READY))
+    {
+        s_rearms++;
+        (void)HAL_UART_Receive_IT(s_uart, &s_rxByte, 1U);
+    }
+}
+
+void RpiLink_Service(void)
+{
+    char      line[CMD_LINE_MAX];
+    char     *p;
+    Command_t c;
+
+    rearm_rx();
+
+    if (s_overrun)
+    {
+        s_overrun = 0U;
+        link_reply(CMD_REPLY_RESEND);
+    }
+
+    if (!s_lineReady) { return; }
+
+    p = take_line(line);
+    c = Cmd_ParseToken(p);
+
+    if (strcmp(p, "rst") == 0)
+    {
+        /* The !t2go line answers it, FAIL,STOP - RST's own silence stands. */
+        Task2Fw_Abort();
+    }
+    else if (c.op == CMD_T2_ARROW)
+    {
+        Task2Fw_Answer((uint8_t)(c.arg / 10), ((c.arg % 10) == 1) ? 'R' : 'L');
+    }
+    else if (c.op == CMD_T2_LATERAL)
+    {
+        Task2Fw_Lateral((uint8_t)(c.arg / 1000), (int16_t)((c.arg % 1000) - 500));
+    }
+    else if ((p[0] == '?') && Cmd_IsImmediate(c.op))
+    {
+        /* Queries only. A setter mid-course would change the calibration
+         * between two of its moves. */
+        answer_immediate(&c);
+    }
+    else
+    {
+        link_reply(CMD_REPLY_RESEND);
+    }
+}
+
 void RpiLink_Poll(void)
 {
     char      line[CMD_LINE_MAX];
     char     *p = line;
     Command_t next;
-    uint16_t  i;
 
     /* ---- 0. re-arm reception if it has been torn down ----
      *
@@ -940,11 +1037,7 @@ void RpiLink_Poll(void)
      *
      * The counter is the point: silent recovery hides the underlying fault, so
      * anything other than zero here means go and look at the wiring. */
-    if ((s_uart != 0) && (s_uart->RxState == HAL_UART_STATE_READY))
-    {
-        s_rearms++;
-        (void)HAL_UART_Receive_IT(s_uart, &s_rxByte, 1U);
-    }
+    rearm_rx();
 
     /* ---- 1. a dropped line still owes the sender an answer ---- */
     if (s_overrun)
@@ -956,38 +1049,7 @@ void RpiLink_Poll(void)
     /* ---- 2. new line in ---- */
     if (s_lineReady)
     {
-        (void)memcpy(line, s_pending, sizeof(line));
-        s_lineReady = 0U;
-
-        /* Lowercase on receive, so sender casing is irrelevant everywhere
-         * downstream. */
-        for (i = 0U; i < CMD_LINE_MAX; i++)
-        {
-            if (line[i] == '\0') { break; }
-            if ((line[i] >= 'A') && (line[i] <= 'Z'))
-            {
-                line[i] = (char)(line[i] - 'A' + 'a');
-            }
-        }
-
-        /* Trim surrounding whitespace before the single-token tests below.
-         * Cmd_ParseLine() treats spaces as delimiters and skips empty runs, so
-         * movement lines never cared - but RST and the immediate opcodes are
-         * matched against the WHOLE line, and "?US " with a trailing space
-         * would otherwise fall through to RESEND. Confusing, and trivial to
-         * prevent. */
-        {
-            uint16_t end;
-
-            while ((*p == ' ') || (*p == '\t')) { p++; }
-
-            end = (uint16_t)strlen(p);
-            while ((end > 0U) && ((p[end - 1U] == ' ') || (p[end - 1U] == '\t')))
-            {
-                p[end - 1U] = '\0';
-                end--;
-            }
-        }
+        p = take_line(line);
 
         if (strcmp(p, "rst") == 0)
         {
@@ -995,6 +1057,23 @@ void RpiLink_Poll(void)
              * replies NOTHING. The silence is part of the frozen protocol -
              * do not "helpfully" add an OK here. */
             abort_everything();
+        }
+        else if (Cmd_ParseToken(p).op == CMD_T2_GO)
+        {
+            /* The Task 2 course (task2fw.h). Blocks here until it ends -
+             * RpiLink_Service() keeps the link alive meanwhile - and answers
+             * the line once. Refused while anything else owns the robot. */
+            Command_t go = Cmd_ParseToken(p);
+
+            s_quiet = 1U;
+            if (s_lineActive || Motion_IsBusy() || (s_fuState != FU_OFF))
+            {
+                link_reply(CMD_REPLY_RESEND);
+            }
+            else
+            {
+                link_reply(Task2Fw_Run((uint16_t)go.arg));
+            }
         }
         else if (Cmd_IsImmediate(Cmd_ParseToken(p).op))
         {
