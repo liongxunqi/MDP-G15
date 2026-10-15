@@ -165,6 +165,14 @@ PARK_STRAIGHT_FLOOR_CM = max(CLEARANCE_FLOOR_CM, CENTRE_MIN_CLEAR_CM)
 # PARK_HEADING_TOL_DEG (12) stays what the parking CHECK accepts; entering
 # 12 deg crooked swings the body ~5 cm across the bay.
 PARK_ALIGN_TOL_DEG = _env_f("T2MN_PARK_ALIGN_TOL_DEG", 6.0)
+# Centre whenever the side IRs put the robot more than this far off the bay's
+# centreline. The clearance check above could not do it alone: its straight
+# entry ends PARK_GAP_CM (15) off the back fence, so the back fence capped
+# the measured clearance at 15 and a robot 5-6 cm off centre always passed -
+# the 2026-09-14 floor run parked 6 cm off. Precision only: when no centring
+# line fits, a straight entry that is still safe goes ahead.
+PARK_CENTRE_TOL_CM = max(CENTRE_DEADBAND_CM,
+                         _env_f("T2MN_PARK_CENTRE_TOL_CM", 4.0))
 # Left IR minus right IR with the robot centred and square in the bay by hand.
 # The two units are fitted separately (ir.h) and need not agree; whatever
 # this is, the robot parks half of it off centre unless it is set here.
@@ -1441,11 +1449,15 @@ class ParkRunner:
         measured = Pose(at.x, at.y if y is None else y, at.th)
         preview, _ = park_segments(measured)
         heading_error = parking_heading_error(at.th)
+        # Side fences only: the straight entry stops PARK_GAP_CM off the back
+        # fence by design, which is the ?US loop's business, not an offset.
         straight_clearance, straight_closest = path_clearance(
-            run(measured, preview), self.course.fence())
-        needs_alignment = (
-            heading_error > PARK_ALIGN_TOL_DEG
-            or straight_clearance < PARK_STRAIGHT_CLEARANCE_CM)
+            run(measured, preview),
+            [b for b in self.course.fence() if b.name != "back fence"])
+        unsafe = (heading_error > PARK_ALIGN_TOL_DEG
+                  or straight_clearance < PARK_STRAIGHT_CLEARANCE_CM)
+        off_centre = y is not None and abs(y) > PARK_CENTRE_TOL_CM
+        needs_alignment = unsafe or off_centre
         if not needs_alignment:
             logging.info("In the mouth: left IR %s, right IR %s -> %s; straight "
                          "garage entry keeps %.1f cm to %s, so Line C is "
@@ -1455,10 +1467,15 @@ class ParkRunner:
                          straight_clearance, straight_closest)
         if needs_alignment:
             plan = plan_centre(measured, self.course)
-            if plan is None:
+            if plan is None and unsafe:
                 logging.error("Off centre by %+.1f cm with no clear parking "
                               "correction; refusing final approach.", measured.y)
                 return False
+            if plan is None:
+                logging.warning("%+.1f cm off centre but no centring line fits; "
+                                "the straight entry keeps %.1f cm to %s, so "
+                                "parking straight.", measured.y,
+                                straight_clearance, straight_closest)
             else:
                 segs, park_tokens, c = plan
                 # `park_tokens` is the old odometry-only final drive. The

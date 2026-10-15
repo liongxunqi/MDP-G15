@@ -93,6 +93,16 @@ PHOTO_SWINGS = (90, 80, 70, 60)       # 90 = looking in from 45 deg
 CAMERA_FROM_AXLE_CM = tp._env_f("T2_CAMERA_FROM_AXLE_CM", tp.FRONT_FROM_AXLE_CM)
 # Position reserve after the entire first board is behind the forward camera.
 STAGE2_REAR_EXCLUSION_CM = max(0.0, tp._env_f("T2_STAGE2_REAR_EXCLUSION_CM", 6.0))
+# Both obstacles sit on the centreline, so from the bypass lane obstacle 2's
+# arrow is seen ~15 deg off-axis. Set this (e.g. 25) and, once obstacle 1 is
+# behind the lens, the view ends with one small arc pointing the camera at
+# obstacle 2's face centre - the arrow head-on, in the same movement line.
+# OFF by default: every route round obstacle 2 from the lane starts by
+# turning OUTWARD, so the inward arc has to be undone. Simulated over 108
+# layouts it made 80 of them 20-97 cm longer and none more than 4 cm shorter.
+AIM_OBS2_MAX_DEG = max(0, int(tp._env_f("T2MN_AIM_OBS2_MAX_DEG", 0)))
+# How much further a straight view may go so the aiming arc clears obstacle 1.
+AIM_OBS2_EXTRA_CM = max(0, int(tp._env_f("T2MN_AIM_OBS2_EXTRA_CM", 16)))
 # Stand-in for recognition time when the arrow comes off a prompt.
 OBS_PAUSE_S = tp._env_f("T2T_OBS_PAUSE_S", 0.0)
 # Running along obstacle 2's face: the IR this far off it.
@@ -139,6 +149,8 @@ HOME_GAP_CM = tp._env_f("T2T_HOME_GAP_CM", 15.0)
 END_MARGIN_CM = tp._env_f("T2T_END_MARGIN_CM", 2.0)
 # Measurement uncertainty, not a signed correction to either IR calibration.
 IR_FACE_UNCERTAINTY_CM = max(0.0, tp._env_f("T2T_IR_FACE_UNCERTAINTY_CM", 3.0))
+# The side IRs' shortest reading; anything closer comes back blank (65535).
+IR_RANGE_MIN_CM = 10.0
 # RST on the deployed firmware can coast about 16 cm even at precision speed.
 # Extra edge seeking is bounded and reserves stopping room, not just travel.
 FACE_EXTENSION_MAX_CM = 30
@@ -303,6 +315,8 @@ class Task2:
         self._stage2_view_open = False
         self._stage2_view_origin: Optional[Pose] = None
         self._stage2_view_segments: Optional[List[Seg]] = None
+        # The arc ending the stage 2 view that points the camera at the arrow.
+        self._stage2_aim: Optional[Seg] = None
         self.obs2_front_max: Optional[float] = None
 
     # ── wire ──────────────────────────────────────────────────────────────────
@@ -1078,10 +1092,11 @@ class Task2:
                     for y in (obs1_y - half, obs1_y + half))
 
     def _notify_obstacle2_view(self, p: Pose, x1: float,
-                              obs1_y: float = 0.0) -> None:
+                              obs1_y: float = 0.0, aimed: bool = False) -> None:
         if self._stage2_view_open:
             return
-        if (abs(math.atan2(math.sin(p.th), math.cos(p.th))) > math.radians(5)
+        if ((not aimed and abs(math.atan2(math.sin(p.th), math.cos(p.th)))
+             > math.radians(5))
                 or self._first_board_behind_camera(p, x1, obs1_y)
                 < STAGE2_REAR_EXCLUSION_CM):
             return
@@ -1156,17 +1171,78 @@ class Task2:
                      -reachable, cost)
         return segs
 
+    def _aim_at_obstacle2(self, p: Pose, segs: List[Seg],
+                          course: Course) -> List[Seg]:
+        """
+        The arc that, after segs, points the camera at obstacle 2's face
+        centre - or [] when it is already within a few degrees, the arc would
+        bring obstacle 1 back into view, or it costs clearance. A direct F view
+        is lengthened rather than give up the aim to obstacle 1.
+        """
+        if AIM_OBS2_MAX_DEG < tp.MIN_ARC_DEG:
+            return []
+        if self.early_arrow_fn is not None and self.early_arrow_fn() is not None:
+            return []                       # already read: nothing to look at
+        segs = list(segs)
+        straight = all(s.kind == "F" for s in segs)
+        base = sum(s.value for s in segs) if straight else 0
+        # Never pay for the view with clearance: floor runs touched obstacle 1
+        # at a modelled 6.4 cm, and the arc is taken right beside it.
+        need = max(tp.execution_clearance(tp.CLEARANCE_CM),
+                   min(tp.CLEARANCE_CM, self._check(p, segs, course)))
+        for _ in range(AIM_OBS2_EXTRA_CM // 2 + 3):
+            end = tp.run(p, segs, self.r, step=1e6)[-1] if segs else p
+
+            def error(q: Pose) -> float:
+                cx = q.x + CAMERA_FROM_AXLE_CM * math.cos(q.th)
+                cy = q.y + CAMERA_FROM_AXLE_CM * math.sin(q.th)
+                bearing = math.atan2(course.obs2_y - cy, course.x2 - cx)
+                return math.atan2(math.sin(bearing - q.th), math.cos(bearing - q.th))
+
+            if abs(math.degrees(error(end))) < tp.MIN_ARC_DEG:
+                return []
+            turn = "L" if error(end) > 0 else "R"
+            deg = min(range(tp.MIN_ARC_DEG, AIM_OBS2_MAX_DEG + 1),
+                      key=lambda d: abs(error(tp.run(end, [Seg(turn, d)],
+                                                     self.r, step=1e6)[-1])))
+            aim = [Seg(turn, deg)]
+            aimed = tp.run(end, aim, self.r, step=1e6)[-1]
+            # Turning in swings obstacle 1 toward the lens and the body's
+            # inner side toward obstacle 1: a plain straight view goes on a
+            # little first, at most AIM_OBS2_EXTRA_CM past what it needed.
+            short = (STAGE2_REAR_EXCLUSION_CM
+                     - self._first_board_behind_camera(aimed, course.x1, course.obs1_y))
+            clear = short <= 0 and self._check(p, segs + aim, course) >= need - 0.05
+            if clear:
+                return segs + aim
+            done = sum(s.value for s in segs) - base
+            step = max(2, math.ceil(short) + 1)
+            if not straight or done + step > AIM_OBS2_EXTRA_CM:
+                return []
+            segs = _straight(sum(s.value for s in segs) + step)
+        return []
+
     def _prepare_obstacle2_view(self, course: Course) -> None:
-        """Reach a checked view that excludes the already-read first board."""
+        """Reach a checked view that excludes the already-read first board,
+        pointed at obstacle 2's arrow."""
         p = self._pose()
         if abs(math.atan2(math.sin(p.th), math.cos(p.th))) > math.radians(5):
             raise RuntimeError("Stage 2 camera gate requires the parallel bypass heading")
         behind = self._first_board_behind_camera(p, course.x1, course.obs1_y)
+        segs: List[Seg] = []
         if behind < STAGE2_REAR_EXCLUSION_CM:
             segs = self._select_obstacle2_view(p, course)
             if segs is None:
                 raise RuntimeError(
                     "No stage 2 camera-gate route keeps clearance and forward handoff room")
+        aimed = self._aim_at_obstacle2(p, segs, course)
+        aiming = bool(aimed)
+        if aiming:
+            logging.info("Stage 2 view ends pointed at obstacle 2's arrow: %s.",
+                         ",".join(s.token() for s in aimed))
+            segs = aimed
+            self._stage2_aim = aimed[-1]
+        if segs:
             self._stage2_view_origin = p
             self._stage2_view_segments = list(segs)
             clearance = self._check(p, segs, course)
@@ -1179,11 +1255,12 @@ class Task2:
             if not self._view_line(segs, course):
                 raise RuntimeError("Stage 2 camera-gate advance failed")
             p = self._pose()
-        if abs(math.atan2(math.sin(p.th), math.cos(p.th))) > math.radians(5):
+        if (not aiming
+                and abs(math.atan2(math.sin(p.th), math.cos(p.th))) > math.radians(5)):
             raise RuntimeError("Measured stage 2 view is not parallel after camera-gate motion")
         if self._first_board_behind_camera(p, course.x1, course.obs1_y) < STAGE2_REAR_EXCLUSION_CM:
             raise RuntimeError("Measured pose has not cleared the stage 2 camera gate")
-        self._notify_obstacle2_view(p, course.x1, course.obs1_y)
+        self._notify_obstacle2_view(p, course.x1, course.obs1_y, aimed=aiming)
         # A narrow board is found by driving alongside it. If vision has not
         # already latched its arrow during that cruise, return to a checked
         # view of its FRONT, rather than wait with the lens beyond the board.
@@ -1210,8 +1287,11 @@ class Task2:
                     raise RuntimeError("Measured recovery did not establish a stage 2 front view")
 
     def _view_line(self, segs: Sequence[Seg], course: Course) -> bool:
-        """Use the existing straight past obstacle 1 for an IR lateral fix."""
-        if (self.frame.origin is None or len(segs) != 1 or segs[0].kind != "F"):
+        """Use the existing straight past obstacle 1 for an IR lateral fix.
+        An aiming arc may follow it in the same line; the fix only samples
+        while the heading is still parallel."""
+        if (self.frame.origin is None or not segs or segs[0].kind != "F"
+                or any(s.kind not in ("L", "R") for s in segs[1:])):
             return self._line(segs)
         start = self._pose()
         if abs(math.sin(start.th)) > math.sin(math.radians(5)):
@@ -1239,10 +1319,19 @@ class Task2:
                 hits.append((beam_x, measured_y - q.y))
             return False
 
-        reply = tp.run_polling(self.stm, segs[0].token(), poll)
+        reply = tp.run_polling(self.stm, ",".join(s.token() for s in segs), poll)
         if reply is None or not reply.startswith("OK"):
             logging.error("Camera-view straight returned %r.", reply)
             return False
+        self._track(segs)
+        # A beam that slips past the box edge reads the floor far behind it:
+        # the 2026-09-14 run got [-37.6, -2.5, -2.5, -1.6] and threw all four
+        # away. Drop readings off the median; keep the fix if most agree.
+        if len(hits) >= 2:
+            middle = sorted(shift for _, shift in hits)[len(hits) // 2]
+            agree = [h for h in hits if abs(h[1] - middle) <= 1.5]
+            if len(agree) * 2 >= len(hits):
+                hits = agree
         if len(hits) < 2 or max(x for x, _ in hits) - min(x for x, _ in hits) < 2:
             return True
         shifts = sorted(shift for _, shift in hits)
@@ -2121,11 +2210,24 @@ class Task2:
             ir_y = (q.y + tp.IR_FROM_AXLE_CM * math.sin(q.th)
                     + tp.IR_SIDE_OFFSET_CM * ray_dy)
             if seen and g is not None and math.isfinite(g):
-                surface = ir_x + ray_dx * g
-                body_gap = min(facing * (surface - x) for x, _ in tp.footprint(q))
-                if body_gap < tp.CLEARANCE_FLOOR_CM + IR_FACE_UNCERTAINTY_CM:
+                # One low sample is IR noise as often as it is the face: the
+                # 2026-09-14 floor run read 13,13,...,11 and was aborted on
+                # the 11 with ~8 cm of real clearance. Stop on the median of
+                # the last three; a single reading still stops at the floor,
+                # or at the IR's 10 cm minimum - one step closer it reads
+                # blank, which this scan would take for the obstacle's edge.
+                recent = sorted(v for v in raw[-3:]
+                                if v is not None and math.isfinite(v))
+                body = tp.footprint(q)
+                body_gap = min(facing * (ir_x + ray_dx * g - x) for x, _ in body)
+                typical_gap = min(facing * (ir_x + ray_dx * recent[len(recent) // 2] - x)
+                                  for x, _ in body)
+                if (body_gap < tp.CLEARANCE_FLOOR_CM or g <= IR_RANGE_MIN_CM
+                        or typical_gap < tp.CLEARANCE_FLOOR_CM + IR_FACE_UNCERTAINTY_CM):
                     front_blocked.append(g)
-                    logging.error("Face scan has only %.1f cm measured body clearance.", body_gap)
+                    logging.error("Face scan has only %.1f cm measured body "
+                                  "clearance (%.1f cm on the last %d readings).",
+                                  body_gap, typical_gap, len(recent))
                     return stop() if moving else True
             edge_y = ir_y + (g if g is not None and math.isfinite(g)
                             else seen[-1][2] if seen else 0.0) * ray_dy
@@ -2806,6 +2908,20 @@ class Task2:
         # Candidate sequences already include their straight leads. Validate
         # the approach AND turn from this pose before sending either one.
         selected = self.select_face_handoff(p, course, side1, side2)
+        if selected is None and self._stage2_aim is not None:
+            # The arc that pointed the camera at the arrow may be all that is
+            # in the way: back round it alone before retracing the whole view.
+            aim, self._stage2_aim = self._stage2_aim, None
+            undo = [Seg({"L": "l", "R": "r"}[aim.kind], aim.value)]
+            if self._check(p, undo, course) >= tp.CLEARANCE_FLOOR_CM:
+                logging.info("No handoff from the aimed view; %s undoes the aim.",
+                             undo[0].token())
+                if not self._line(undo):
+                    return None
+                p = self._pose()
+                if self._stage2_view_segments:
+                    self._stage2_view_segments = self._stage2_view_segments[:-1]
+                selected = self.select_face_handoff(p, course, side1, side2)
         if selected is None and self._stage2_view_origin is not None:
             # Reading from beyond obstacle 1 must not consume the turn room
             # that made the bypass lane usable. The arrow is now latched;
