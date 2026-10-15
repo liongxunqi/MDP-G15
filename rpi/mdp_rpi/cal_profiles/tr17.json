@@ -1,0 +1,102 @@
+{
+  "note": "",
+  "verified": false,
+  "arc_profile": 0,
+  "checks": {
+    "straight": {
+      "converged": false,
+      "drift_cm": [
+        -2.3,
+        -0.66,
+        -6.53,
+        2.02,
+        -2.25,
+        -0.51
+      ],
+      "distance_err_pct": -0.83,
+      "trim_us": 55
+    },
+    "gyro": {
+      "ratios": [
+        1.00096,
+        0.99759
+      ],
+      "asymmetry_pct": 0.337,
+      "from": 1.005,
+      "to": 1.00427
+    },
+    "radius": {
+      "target_cm": 29.1,
+      "rounds": [
+        {
+          "steer_l": 404,
+          "steer_r": 607,
+          "radius_r_cm": 29.02,
+          "radius_rf_cm": 29.02,
+          "radius_rr_cm": 29.03,
+          "home_r_cm": 3.5,
+          "radius_l_cm": 29.67,
+          "radius_lf_cm": 30.9,
+          "radius_lr_cm": 28.45,
+          "home_l_cm": 3.6
+        }
+      ]
+    },
+    "brakes": {
+      "worst_deg": 1.2,
+      "by_direction": {
+        "FR": -0.1,
+        "RR": -0.7,
+        "FL": 1.2,
+        "RL": 1.0
+      },
+      "all": [
+        [
+          "FR90",
+          -0.1
+        ],
+        [
+          "RR90",
+          -0.7
+        ],
+        [
+          "FL90",
+          1.2
+        ],
+        [
+          "RL90",
+          1.0
+        ]
+      ]
+    },
+    "square": {
+      "side_cm": 50,
+      "worst_corner_deg": 1.5,
+      "gyro_heading_err_deg": 1.5,
+      "floor_angle_deg": 0.0,
+      "gap_cm": 0.0,
+      "passed": false,
+      "when": "2026-09-13T07:49:52"
+    }
+  },
+  "decel_x10": 5651,
+  "lag_ms_x10": 44,
+  "trim_us": 55,
+  "gyro_x10000": 10043,
+  "steer_left_us": 404,
+  "steer_right_us": 607,
+  "taken": "2026-09-13T07:48:07",
+  "name": "tr17",
+  "spread": {
+    "decel_x10": {
+      "sd": 264.1,
+      "min": 5414,
+      "max": 6193
+    },
+    "lag_ms_x10": {
+      "sd": 32.0,
+      "min": 0,
+      "max": 85
+    }
+  }
+}

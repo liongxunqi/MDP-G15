@@ -332,6 +332,13 @@
  * original line. If they turn the same way you nudged, flip this. */
 #define HEADING_SIGN        (-1)
 
+/* ODOM_LAUNCH_KEEP_TRIM  (A/B switch, 2026-10 calibration fixes)
+ *   1  Odom_DriveHeading() starts the straight with the servo at centre +
+ *      trim - where motion.c's align phase has just settled it.
+ *   0  it sends bare SERVO_CENTER_US, and the first Odom_Update() puts the
+ *      trim back 10 ms later, as before. */
+#define ODOM_LAUNCH_KEEP_TRIM   1
+
 typedef struct
 {
     float x_mm;         /* forward from the start pose   */
@@ -502,6 +509,34 @@ void Odom_LearnTrim(void);
  * that silently taught nothing can otherwise be saved into a calibration
  * profile as though it had been measured. */
 uint8_t Odom_TrimWasUpdated(void);
+
+/* ---------------------------------------------------------------------------
+ * Protocol 10 - the calibration table (caltab.h) and the move report.
+ *
+ * Odom_SetTrimOverride: the trim a straight drives on, when the table has one
+ * for its direction and speed (on = 1); on = 0 goes back to the learned /
+ * restored trim above. Set by the motion layer when each straight is queued.
+ * Odom_LearnTrim() still only ever moves the learned trim.
+ *
+ * Odom_GetMeanCorrection / Odom_GetMaxHeadingError: what this straight's
+ * steering loop had to do, past the warm-up - read before Odom_LearnTrim()
+ * clears it.
+ *
+ * Odom_SetWheelRatio: right (B) / left (A) ground travel per encoder count.
+ * Two tyres a fraction of a millimetre apart in diameter cover different
+ * ground at the same count rate, so the speed loop - which holds the COUNT
+ * rates equal - drives the robot in a gentle curve and the steering has to
+ * hold it straight against its own rear axle. With the ratio known, B's
+ * counts are scaled into ground in the odometry and B's speed target is
+ * divided by it, so both wheels cover the same ground. 0.9..1.1, else
+ * refused. 1.0 at power-on.
+ * ------------------------------------------------------------------------- */
+void    Odom_SetTrimOverride(uint8_t on, float us);
+float   Odom_GetEffectiveTrim(void);
+float   Odom_GetMeanCorrection(void);
+float   Odom_GetMaxHeadingError(void);
+uint8_t Odom_SetWheelRatio(float r);
+float   Odom_GetWheelRatio(void);
 
 /* ------------------------------------------------------------------ */
 /* Calibration helper                                                  */

@@ -7,6 +7,7 @@
 #include "imu.h"
 #include "ir.h"
 #include "ultrasonic.h"
+#include "caltab.h"
 #include <string.h>
 #include <stdio.h>
 
@@ -309,9 +310,33 @@ static IrSnap_t ir_snap_read(const volatile IrSnap_t *src)
     return out;
 }
 
+/* Push the table's hardware globals into the layers that use them. After
+ * every !KG set and !KCLR - cheap, and it means no layer can hold a stale
+ * copy. 0 = compiled constant throughout. */
+static void apply_globals(void)
+{
+    int16_t w = CalTab_Global(CTG_WHEEL);
+
+    (void)Odom_SetWheelRatio((w != 0) ? ((float)w / 10000.0f) : 1.0f);
+    PID_SetMotorModel(0U, CalTab_Global(CTG_FFAF), CalTab_Global(CTG_FFAR),
+                      CalTab_Global(CTG_DBA));
+    PID_SetMotorModel(1U, CalTab_Global(CTG_FFBF), CalTab_Global(CTG_FFBR),
+                      CalTab_Global(CTG_DBB));
+}
+
+/* One table value for ?K: the number, or "-" when unset. */
+static int fmt_k(char *out, int room, uint8_t move, uint8_t anchor, uint8_t field)
+{
+    int16_t v;
+
+    if (!CalTab_FieldAllowed(move, field)) { return snprintf(out, (size_t)room, ",."); }
+    if (!CalTab_Get(move, anchor, field, &v)) { return snprintf(out, (size_t)room, ",-"); }
+    return snprintf(out, (size_t)room, ",%d", (int)v);
+}
+
 static void answer_immediate(const Command_t *c)
 {
-    char b[96];
+    char b[256];
 
     switch (c->op)
     {
@@ -534,6 +559,87 @@ static void answer_immediate(const Command_t *c)
                  (unsigned)Motion_GetArcSteerSideUs(0U),
                  (unsigned)Motion_GetArcSteerSideUs(1U),
                  (int)scaled10(Motion_GetLastDecelMeas()));
+        break;
+
+    case CMD_Q_MV:
+    {
+        /* MOVE REPORT in motion.h. Floats x10 where a tenth matters. */
+        const MotionReport_t *r = Motion_GetReport();
+
+        snprintf(b, sizeof(b),
+                 "MV,%u,%u,%u,%d,%u,%ld,%ld,%u,%d,%d,%d,%d,%d,%d,%ld,%ld,"
+                 "%d,%d,%d,%d,%d,%ld,%ld,%u,%d,%ld\n",
+                 (unsigned)r->seq, (unsigned)r->move, (unsigned)r->result,
+                 (int)r->rpm, (unsigned)r->ticks,
+                 (long)r->enc_a, (long)r->enc_b, (unsigned)r->n,
+                 (int)scaled10(r->rpm_a), (int)scaled10(r->rpm_b),
+                 (int)(r->duty_a + 0.5f), (int)(r->duty_b + 0.5f),
+                 (int)scaled10(r->corr), (int)scaled10(r->max_err),
+                 (long)scaled10(r->dist_brake), (long)scaled10(r->dist),
+                 (int)scaled10(r->aim), (int)scaled10(r->turned),
+                 (int)scaled10(r->brake_rate), (int)scaled10(r->brake_ang),
+                 (int)scaled10(r->decel_meas),
+                 (long)scaled10(r->x), (long)scaled10(r->y),
+                 (unsigned)r->servo, (int)scaled10(r->trim),
+                 (long)scaled10(r->target));
+        break;
+    }
+
+    case CMD_Q_K:
+    {
+        /* K,<move>,<anchor>,<rpm>,<trim>,<coast>,<dist>,<steer>,<decel>,
+               <lag>,<radius>,<boost>   - "-" unset, "." not this move's
+           KG,<wheel>,<ffaf>,<ffar>,<ffbf>,<ffbr>,<dba>,<dbb>,<vs>,<va> */
+        int     n;
+        uint8_t f;
+
+        if (c->kmove == (uint8_t)CT_GLOBAL)
+        {
+            n = snprintf(b, sizeof(b), "KG");
+            for (f = 0U; f < (uint8_t)CTG_COUNT; f++)
+            {
+                n += snprintf(&b[n], sizeof(b) - (size_t)n, ",%d",
+                              (int)CalTab_Global((CtGlobal_t)f));
+            }
+        }
+        else
+        {
+            n = snprintf(b, sizeof(b), "K,%s,%u", CalTab_MoveName(c->kmove),
+                         (unsigned)c->kanchor);
+            for (f = 0U; f < (uint8_t)CTF_COUNT; f++)
+            {
+                n += fmt_k(&b[n], (int)sizeof(b) - n, c->kmove, c->kanchor, f);
+            }
+        }
+        snprintf(&b[n], sizeof(b) - (size_t)n, "\n");
+        break;
+    }
+
+    case CMD_SET_K:
+    case CMD_SET_K_CLR:
+        /* Same guard as the !CAL* setters below: a move in flight latched
+           its values when it was queued, but the next one on the line has
+           not, and a table changing between two moves of one line is a
+           calibration nobody asked for. */
+        if (Motion_IsBusy() || s_lineActive)
+        {
+            s_calBusy++;
+            snprintf(b, sizeof(b), "%s", CMD_REPLY_RESEND);
+        }
+        else
+        {
+            uint8_t ok = 1U;
+
+            if (c->op == CMD_SET_K_CLR) { CalTab_Clear(); }
+            else { ok = CalTab_Set(c->kmove, c->kanchor, c->kfield, c->arg); }
+
+            if (ok && (c->op == CMD_SET_K_CLR || c->kmove == (uint8_t)CT_GLOBAL))
+            {
+                apply_globals();
+            }
+            if (ok) { s_calOk++; } else { s_calRange++; }
+            snprintf(b, sizeof(b), "%s", ok ? CMD_REPLY_OK : CMD_REPLY_RESEND);
+        }
         break;
 
     case CMD_SET_CAL_DECEL:
@@ -763,7 +869,8 @@ static uint8_t dispatch(Command_t c)
         }
         else
         {
-            Motion_DriveDistance((int32_t)c.arg * 10);   /* cm -> mm */
+            /* cm -> mm; speed 0 is the protocol 9 move, exactly. */
+            Motion_DriveDistanceV((int32_t)c.arg * 10, (int16_t)(c.speed * 10U));
         }
         return 1U;
 
@@ -785,13 +892,13 @@ static uint8_t dispatch(Command_t c)
         return 0U;
 
     case CMD_REVERSE:
-        Motion_DriveDistance(-((int32_t)c.arg * 10));
+        Motion_DriveDistanceV(-((int32_t)c.arg * 10), (int16_t)(c.speed * 10U));
         return 1U;
 
-    case CMD_ARC_FWD_RIGHT: Motion_DriveArc(c.arg, 1U, 1U); return 1U;
-    case CMD_ARC_FWD_LEFT:  Motion_DriveArc(c.arg, 1U, 0U); return 1U;
-    case CMD_ARC_REV_RIGHT: Motion_DriveArc(c.arg, 0U, 1U); return 1U;
-    case CMD_ARC_REV_LEFT:  Motion_DriveArc(c.arg, 0U, 0U); return 1U;
+    case CMD_ARC_FWD_RIGHT: Motion_DriveArcV(c.arg, 1U, 1U, (int16_t)(c.speed * 10U)); return 1U;
+    case CMD_ARC_FWD_LEFT:  Motion_DriveArcV(c.arg, 1U, 0U, (int16_t)(c.speed * 10U)); return 1U;
+    case CMD_ARC_REV_RIGHT: Motion_DriveArcV(c.arg, 0U, 1U, (int16_t)(c.speed * 10U)); return 1U;
+    case CMD_ARC_REV_LEFT:  Motion_DriveArcV(c.arg, 0U, 0U, (int16_t)(c.speed * 10U)); return 1U;
 
     case CMD_STOP:
         Motion_Stop();

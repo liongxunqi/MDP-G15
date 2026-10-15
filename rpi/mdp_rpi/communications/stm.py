@@ -180,6 +180,9 @@ FAST_MIN_PROTOCOL = 8
 # Protocol 9: ?IRW (side IR + world pose from one tick) and the IR edge latch
 # (!IRE / ?IRE). See IR SNAPSHOT AND EDGE LATCH in the firmware's rpilink.h.
 IRW_MIN_PROTOCOL = 9
+# Protocol 10: per-move speed (V<n> suffix), the calibration table (!K, !KCLR,
+# ?K - the firmware's caltab.h) and the move report (?MV). PROTOCOL.md §13.
+TABLE_MIN_PROTOCOL = 10
 
 # PROTOCOL.md §5 — every tag the firmware can answer a query with.
 # CAL is protocol 2. It must appear here twice over: once so validate_token()
@@ -187,17 +190,18 @@ IRW_MIN_PROTOCOL = 9
 # "CAL,..." answer to the waiting thread instead of discarding it as banner
 # noise. Missing from either place and the query fails silently.
 QUERY_TAGS = {"US", "IR", "IRR", "POSE", "DIST", "TURN", "STAT", "IMU", "XCHK",
-              "VER", "CAL", "HDG", "WPOSE", "ENC", "IRW", "IRE"}
+              "VER", "CAL", "HDG", "WPOSE", "ENC", "IRW", "IRE", "MV", "K", "KG"}
 
 # This client implements protocol 4. Compared against the ?VER reply at startup.
-PROTOCOL_VERSION = 9
+PROTOCOL_VERSION = 10
 
 # FU before F, exactly as the firmware's own parser orders its prefixes: "fu"
 # would otherwise be eaten by "f" and FU20 read as F with an argument of
 # "U20", which does not parse at all.
 # No leading zeros - the firmware refuses them, because one byte lost off
 # "F100" leaves "F00", which would otherwise run as F0 (drive to obstacle).
-_MOVE_RE = re.compile(r"^(FR|FL|FU|RR|RL|F|R)(0|[1-9]\d*)$", re.IGNORECASE)
+_MOVE_RE = re.compile(r"^(FR|FL|FU|RR|RL|F|R)(0|[1-9]\d*)(?:V([1-9]\d*))?$",
+                      re.IGNORECASE)
 _QUERY_RE = re.compile(r"^\?([A-Z]+)$", re.IGNORECASE)
 # PROF3 is SAFE. Missing here, set_profile(3) was refused before it reached
 # the wire, so no SAFE calibration or SAFE task could ever select SAFE.
@@ -205,6 +209,78 @@ _CONFIG_RE = re.compile(r"^!(PROF[0-3]|ZERO|LEARN[01]|FAST[01])$", re.IGNORECASE
 # !IRE<n> (protocol 9): 0, or side*10000 + lo*100 + hi - checked in full by
 # ir_edge_token(), which is the only thing that should build one.
 _IRE_RE = re.compile(r"^!IRE(0|[12]\d{4})$", re.IGNORECASE)
+
+# Protocol 10 - the calibration table (PROTOCOL.md §13). The keys and ranges
+# mirror caltab.c; CAL_TABLE_* is the one copy on this side, and k_token()
+# the only thing that should build a setter.
+#   per move:  !K<move><anchor>.<field>=<n>   move F R FR FL RR RL, anchor 0..2
+#   global:    !KG.<field>=<n>
+#   !KCLR      clear the whole table (back to protocol 9 behaviour)
+#   ?K<move><anchor> -> "K,<move>,<anchor>,<rpm>,<trim>,<coast>,<dist>,<steer>,
+#                        <decel>,<lag>,<radius>,<boost>"  ("-" unset, "." n/a)
+#   ?KG              -> "KG,<wheel>,<ffaf>,<ffar>,<ffbf>,<ffbr>,<dba>,<dbb>,<vs>,<va>"
+#   ?MV              -> the move report, see read_mv()
+CAL_TABLE_MOVES = ("F", "R", "FR", "FL", "RR", "RL")
+CAL_TABLE_ANCHORS = 3
+CAL_TABLE_FIELDS = ("rpm", "trim", "coast", "dist", "steer", "decel", "lag",
+                    "radius", "boost")
+CAL_TABLE_STRAIGHT_FIELDS = ("rpm", "trim", "coast", "dist")
+CAL_TABLE_ARC_FIELDS = ("rpm", "steer", "decel", "lag", "radius", "boost")
+CAL_TABLE_GLOBALS = ("wheel", "ffaf", "ffar", "ffbf", "ffbr", "dba", "dbb",
+                     "vs", "va")
+# (lo, hi, zero_allowed) - zero means "unset" where it is allowed.
+CAL_TABLE_LIMITS = {
+    "rpm": (40, 250, True), "trim": (-80, 80, False), "coast": (0, 400, False),
+    "dist": (8000, 12000, False), "decel": (501, 29999, False),
+    "lag": (0, 2500, False), "radius": (150, 1000, False),
+    "boost": (100, 250, False),
+    "wheel": (9000, 11000, False), "ffaf": (150, 600, True),
+    "ffar": (150, 600, True), "ffbf": (150, 600, True), "ffbr": (150, 600, True),
+    "dba": (300, 900, True), "dbb": (300, 900, True),
+    "vs": (40, 250, True), "va": (60, 170, True),
+}
+# steer: never past the servo on that side (SERVO_* in motors.h).
+CAL_TABLE_STEER = {"FR": (300, 626), "RR": (300, 626),
+                   "FL": (300, 574), "RL": (300, 574)}
+# V<n> suffix bounds, x10 rpm (commands.h CMD_V_*).
+V_STRAIGHT = (4, 25)
+V_ARC = (6, 17)
+
+_K_SET_RE = re.compile(r"^!K(FR|FL|RR|RL|F|R)([0-2])\.([A-Z]+)=(-?\d+)$",
+                       re.IGNORECASE)
+_KG_SET_RE = re.compile(r"^!KG\.([A-Z]+)=(-?\d+)$", re.IGNORECASE)
+_K_QUERY_RE = re.compile(r"^\?K(FR|FL|RR|RL|F|R)([0-2])$", re.IGNORECASE)
+
+
+def k_field_ok(move: Optional[str], field: str, value: int) -> Tuple[bool, str]:
+    """Is `field`=`value` legal on this row? move None = the global row."""
+    field = field.lower()
+    if move is None:
+        if field not in CAL_TABLE_GLOBALS:
+            return False, f"'{field}' is not a global (known: {CAL_TABLE_GLOBALS})"
+    else:
+        move = move.upper()
+        allowed = (CAL_TABLE_ARC_FIELDS if move in CAL_TABLE_STEER
+                   else CAL_TABLE_STRAIGHT_FIELDS)
+        if field not in allowed:
+            return False, f"'{field}' does not belong to {move} (allowed: {allowed})"
+    if field == "steer":
+        lo, hi = CAL_TABLE_STEER[move]
+        zero_ok = False
+    else:
+        lo, hi, zero_ok = CAL_TABLE_LIMITS[field]
+    if value == 0 and zero_ok:
+        return True, ""
+    if not (lo <= value <= hi):
+        return False, f"{field}={value} is outside {lo}..{hi}"
+    return True, ""
+
+
+def k_token(move: Optional[str], anchor: int, field: str, value: int) -> str:
+    """The !K setter for one table value; move None for the global row."""
+    if move is None:
+        return f"!KG.{field.upper()}={int(value)}"
+    return f"!K{move.upper()}{int(anchor)}.{field.upper()}={int(value)}"
 
 # PROTOCOL.md §7 — the three calibration setters, protocol 2. !CALT is the ONLY
 # token anywhere in this protocol that may carry a negative argument: every
@@ -273,6 +349,16 @@ def validate_token(token: str) -> Tuple[bool, str]:
         op, digits = m.group(1).upper(), m.group(2)
         value = int(digits)
 
+        # Protocol 10: V<n>, this move's cruise in tens of rpm.
+        if m.group(3) is not None:
+            v = int(m.group(3))
+            lo, hi = V_ARC if op in ("FR", "FL", "RR", "RL") else V_STRAIGHT
+            if op == "FU" or (op == "F" and value == 0):
+                return False, f"'{tok}': FU and F0 take no speed suffix"
+            if not (lo <= v <= hi):
+                return False, (f"'{tok}': V{v} is outside V{lo}..V{hi} for "
+                               f"{op} (PROTOCOL.md §13)")
+
         # PROTOCOL.md §4.1: FU's argument is a standoff to HOLD, not a distance
         # to travel, and it is the one movement argument with a meaningful
         # floor as well as a ceiling. Tested before the zero rule below so
@@ -294,6 +380,19 @@ def validate_token(token: str) -> Tuple[bool, str]:
         if value == 0 and op != "F":
             return False, f"zero argument is only valid for F (got '{tok}')"
         return True, ""
+
+    if _K_QUERY_RE.match(tok) or upper == "?KG":
+        return True, ""
+
+    if upper == "!KCLR":
+        return True, ""
+
+    m = _K_SET_RE.match(tok)
+    if m:
+        return k_field_ok(m.group(1), m.group(3), int(m.group(4)))
+    m = _KG_SET_RE.match(tok)
+    if m:
+        return k_field_ok(None, m.group(1), int(m.group(2)))
 
     if _QUERY_RE.match(tok):
         tag = upper.lstrip("?")
@@ -654,6 +753,9 @@ class STM:
             return None
 
         tag = tok.upper().lstrip("?")
+        # ?K<move><anchor> answers "K,...": the row is in the fields, not the tag.
+        if _K_QUERY_RE.match(tok):
+            tag = "K"
         mailbox: "Queue[str]" = Queue(maxsize=1)
 
         with self._query_lock:
@@ -1039,3 +1141,83 @@ class STM:
                 all_ok = False
 
         return all_ok
+
+    # ── Protocol 10: calibration table and move report (PROTOCOL.md §13) ──────
+
+    def set_k(self, move: Optional[str], anchor: int, field: str, value: int,
+              retries: int = 3, retry_delay: float = 0.2) -> bool:
+        """One table value (!K / !KG). Same OK-collision caveat as set_cal()."""
+        ok, reason = k_field_ok(move, field, int(value))
+        if not ok:
+            logging.error(f"STM: not sending table value - {reason}.")
+            return False
+        return self._send_cal_token(k_token(move, anchor, field, value),
+                                    retries, retry_delay)
+
+    def clear_k(self, retries: int = 3, retry_delay: float = 0.2) -> bool:
+        """!KCLR: empty the table - every move drives as on protocol 9."""
+        return self._send_cal_token("!KCLR", retries, retry_delay)
+
+    def read_k(self, move: Optional[str], anchor: int = 0,
+               timeout: float = 2.0) -> Optional[dict]:
+        """
+        ?K<move><anchor> / ?KG as {field: int or None}. Fields that do not
+        belong to the move are left out; unset ones are None.
+        """
+        if move is None:
+            fields = self.query_fields("?KG", timeout)
+            names = CAL_TABLE_GLOBALS
+            body = fields
+        else:
+            fields = self.query_fields(f"?K{move.upper()}{int(anchor)}", timeout)
+            names = CAL_TABLE_FIELDS
+            body = fields[2:] if fields is not None else None
+        if body is None or len(body) < len(names):
+            logging.error(f"STM: malformed or missing table reply {fields}.")
+            return None
+        out = {}
+        for name, f in zip(names, body):
+            if f == ".":
+                continue
+            if f == "-":
+                out[name] = None
+                continue
+            try:
+                out[name] = int(f)
+            except ValueError:
+                logging.error(f"STM: non-integer table field {f!r} in {fields}.")
+                return None
+        return out
+
+    MV_FIELDS = ("seq", "move", "result", "rpm", "ticks", "enc_a", "enc_b", "n",
+                 "rpm_a", "rpm_b", "duty_a", "duty_b", "corr", "max_err",
+                 "dist_brake", "dist", "aim", "turned", "brake_rate",
+                 "brake_ang", "decel_meas", "x", "y", "servo", "trim", "target")
+    # Sent x10; everything else is an integer as it stands.
+    _MV_X10 = {"rpm_a", "rpm_b", "corr", "max_err", "dist_brake", "dist", "aim",
+               "turned", "brake_rate", "brake_ang", "decel_meas", "x", "y",
+               "trim", "target"}
+    MV_RESULTS = {0: "ok", 1: "timeout", 2: "wrongway", 3: "missed", 4: "rst"}
+
+    def read_mv(self, timeout: float = 2.0) -> Optional[dict]:
+        """
+        ?MV: the firmware's report on the last move (MOVE REPORT, motion.h).
+        Distances in mm, angles in degrees, rpm at the wheel, duty 0..1000.
+        "move" is the name ("F" .. "RL"), "result" "ok" / "timeout" / ....
+        """
+        fields = self.query_fields("?MV", timeout)
+        if fields is None or len(fields) < len(self.MV_FIELDS):
+            logging.error(f"STM: malformed or missing MV reply {fields}.")
+            return None
+        out = {}
+        try:
+            for name, f in zip(self.MV_FIELDS, fields):
+                v = int(f)
+                out[name] = v / 10.0 if name in self._MV_X10 else v
+        except ValueError:
+            logging.error(f"STM: non-integer field in MV reply {fields}.")
+            return None
+        mv = out["move"]
+        out["move"] = CAL_TABLE_MOVES[mv - 1] if 1 <= mv <= 6 else None
+        out["result"] = self.MV_RESULTS.get(out["result"], str(out["result"]))
+        return out

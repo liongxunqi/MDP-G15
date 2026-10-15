@@ -379,6 +379,60 @@ typedef struct
     float       diff_boost;    /* 1.0 = pure geometry, no assist     */
 } ArcProfile_t;
 
+/* ---------------------------------------------------------------------------
+ * A/B SWITCHES FOR THE 2026-10 CALIBRATION FIXES
+ *
+ * Each is 1 for the new behaviour, 0 for exactly what was flashed before, so
+ * they can be compared on the floor one at a time.
+ *
+ * MOTION_ARC_GEOMETRIC_SPLIT
+ *   1  every arc splits the rear wheels by pure geometry, diff_boost 1.0,
+ *      whatever the profile or the calibration table says. The steering then
+ *      sets the radius on its own and the rear tyres follow it instead of
+ *      scrubbing against it, so the radius stops moving with floor, battery
+ *      and direction. It is also what lets the encoder-vs-gyro cross-check
+ *      run (it is skipped above MOTION_XCHECK_MAX_BOOST).
+ *      A table radius is still used if one is set, but radii measured with a
+ *      boost are NOT valid here - re-measure (floor chord) per side and
+ *      direction. With no table radius, MOTION_ARC_GEOM_RADIUS_MM is used.
+ *   0  the profile's / table's diff_boost, as before.
+ *
+ * MOTION_ARC_GEOM_RADIUS_MM
+ *   Wheel-split radius when the table has none. 318 is CLEAN's floor-chord
+ *   measurement - the same 575 us steer at boost 1.0 - so it is the best
+ *   number there is until TIGHT and SAFE are chorded at 1.0 themselves. */
+#define MOTION_ARC_GEOMETRIC_SPLIT  1
+#define MOTION_ARC_GEOM_RADIUS_MM   318.0f
+
+/* MOTION_ARC_TAPER
+ *   1  the arc's speed falls with the angle left -
+ *          rpm = clamp(MOTION_ARC_TAPER_RPM_PER_DEG * togo,
+ *                      MOTION_ARC_TAPER_MIN_RPM, cruise)
+ *      - so the turn arrives at a crawl and the brake has almost nothing to
+ *      coast (coast goes with speed squared: 25 rpm coasts ~1/16 of what
+ *      100 rpm does). The predicted lead is still used, it is just tiny.
+ *      Needs PID_LOW_DUTY 1, or the inner wheel cannot hold the floor speed.
+ *   0  cruise, then the profile's approach_rpm for the last approach_deg,
+ *      then brake on the predicted coast, as before.
+ *
+ * Speeds are axle-centre rpm, like every other arc speed. At the floor the
+ *   outer wheel runs ~1.2x and the inner ~0.8x of it on a ~318 mm radius.
+ * MOTION_ARC_TAPER_MIN_LEAD_DEG replaces MOTION_ARC_MIN_LEAD_DEG while the
+ *   taper is on: 2 degrees of forced lead at a crawl would stop every turn
+ *   short by most of it. */
+#define MOTION_ARC_TAPER                1
+#define MOTION_ARC_TAPER_RPM_PER_DEG    4.0f
+#define MOTION_ARC_TAPER_MIN_RPM        25
+#define MOTION_ARC_TAPER_MIN_LEAD_DEG   0.3f
+
+/* MOTION_ALIGN_SKIP_FIX
+ *   1  a move whose steering is already in place goes straight to its
+ *      target pulse. The old code sent the servo SERVO_APPROACH_US below the
+ *      target first and then skipped the wait that brings it back up, so it
+ *      launched with the servo swinging away and back.
+ *   0  as before. */
+#define MOTION_ALIGN_SKIP_FIX           1
+
 #define MOTION_ARC_PROFILE_COUNT  4
 
 #define MOTION_PROFILE_TIGHT      0U
@@ -450,6 +504,84 @@ void Motion_DriveDistance(int32_t mm);
  * The steering side is set by 'right' alone; the resulting body rotation is
  * set by both. */
 void Motion_DriveArc(int16_t degrees, uint8_t forward, uint8_t right);
+
+/* ---------------------------------------------------------------------------
+ * PER-MOVE SPEED AND THE CALIBRATION TABLE, protocol 10
+ *
+ * The same two moves with their own cruise, rpm at the axle centre. rpm 0
+ * means "no V": the table's vs / va default if set, otherwise exactly the
+ * protocol 9 move (profile speed for arcs, !FAST or normal for straights).
+ *
+ * Every move looks up its calibration at its cruise speed when it is queued
+ * (caltab.h), and holds those values to the end:
+ *
+ *   straights  trim (steering centre for this direction), coast (replaces
+ *              MOTION_BRAKE_MM), dist (odometry scale)
+ *   arcs       steer (replaces the per-side deflection), decel and lag
+ *              (replace the learned braking model), radius and boost
+ *              (replace the profile's wheel split)
+ *
+ * Anything the table does not have comes from where protocol 9 got it.
+ *
+ * A V straight ramps like fast mode (MOTION_RAMP_*) up to its cruise and
+ * back down to MOTION_APPROACH_RPM for the last MOTION_FAST_TAIL_MM, so its
+ * stop is the same 40 rpm stop whatever the cruise. A V arc runs at its
+ * cruise and slows to the lower of the profile's approach_rpm and its own
+ * cruise for the last approach_deg.
+ * ------------------------------------------------------------------------- */
+void Motion_DriveDistanceV(int32_t mm, int16_t rpm);
+void Motion_DriveArcV(int16_t degrees, uint8_t forward, uint8_t right, int16_t rpm);
+
+/* ---------------------------------------------------------------------------
+ * MOVE REPORT, protocol 10 (?MV)
+ *
+ * Calibration used to see a move through three numbers: where the gyro said
+ * it stopped, the learned decel, and a tape. Everything in between - which
+ * wheel worked harder, how much steering the straight needed, how fast it
+ * was turning when it braked - was thrown away at the end of the move.
+ *
+ * Now every move fills one of these, kept until the next move starts, so one
+ * run answers many questions at once and calibrate10.py can fit the table
+ * from the robot's own sensors and only ask for a tape where nothing on
+ * board can know the answer (absolute distance, the radius once per move).
+ *
+ * "Cruise" means the steady part: past MOTION_REPORT_WARMUP_TICKS, at the
+ * move's cruise speed, before any slow-down. Per-wheel rpm and duty there
+ * are what the motor model is fitted from.
+ * ------------------------------------------------------------------------- */
+#define MOTION_REPORT_WARMUP_TICKS  30U     /* 0.3 s */
+
+typedef struct
+{
+    uint16_t seq;        /* +1 per move launched, so a stale report shows   */
+    uint8_t  move;       /* CtMove_t + 1 (1 F .. 6 RL), 0 = no move yet     */
+    uint8_t  result;     /* 0 ok, 1 timeout, 2 wrong way, 3 missed, 4 RST   */
+    int16_t  rpm;        /* cruise it was asked for                         */
+    uint16_t ticks;      /* RUN + BRAKE, 10 ms                              */
+    int32_t  enc_a;      /* counts, launch to settle, signed                */
+    int32_t  enc_b;
+    uint16_t n;          /* cruise samples                                  */
+    float    rpm_a;      /* mean |rpm| per wheel in cruise                  */
+    float    rpm_b;
+    float    duty_a;     /* mean |duty| per wheel in cruise, 0..1000        */
+    float    duty_b;
+    float    corr;       /* straights: mean steering correction, us        */
+    float    max_err;    /* straights: worst |heading error| held, deg     */
+    float    dist_brake; /* odometry mm when the brake went on              */
+    float    dist;       /* odometry mm at settle                           */
+    float    aim;        /* arcs: deg aimed for (after carry-over), signed  */
+    float    turned;     /* arcs: deg turned at settle, signed              */
+    float    brake_rate; /* arcs: |yaw rate| at brake onset, deg/s          */
+    float    brake_ang;  /* arcs: |angle| at brake onset, deg               */
+    float    decel_meas; /* arcs: decel this coast implies (lag in force), 0 = none */
+    float    x;          /* pose at settle in the move's own frame, mm      */
+    float    y;
+    uint16_t servo;      /* arcs: pulse held; straights: centre + trim      */
+    float    trim;       /* straights: trim in force, us                    */
+    float    target;     /* odometry mm (straights) / deg (arcs) aimed for  */
+} MotionReport_t;
+
+const MotionReport_t *Motion_GetReport(void);
 
 /* Abort now: brake, recentre steering, go to IDLE. */
 void Motion_Stop(void);
@@ -629,6 +761,13 @@ uint16_t Motion_GetCarryClampCount(void);   /* corrections capped since zero */
     (MOTION_RAMP_DOWN_MM(MOTION_FAST_CRUISE_RPM) + MOTION_FAST_TAIL_MM)
 
 #define MOTION_FAST_BRAKE_TICKS     20U
+
+/* Wheel distance to ramp down from `from` to `to` rpm at the fast-mode rate,
+ * mm. MOTION_RAMP_DOWN_MM is this with `to` fixed at MOTION_APPROACH_RPM. */
+#define MOTION_RAMP_DOWN_MM_TO(from, to) \
+    ((MOTION_MM_S_PER_RPM * ((float)(from) * (float)(from) - \
+      (float)(to) * (float)(to))) / \
+     (2.0f * (float)MOTION_RAMP_DOWN_RPM_PER_TICK * 100.0f))
 
 void    Motion_SetFast(uint8_t on);
 uint8_t Motion_FastEnabled(void);

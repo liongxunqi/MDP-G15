@@ -29,8 +29,10 @@ import time
 from datetime import datetime
 from typing import Optional
 
-from communications.stm import (FAST_MIN_PROTOCOL, FROZEN_CAL_MIN_PROTOCOL,
-                                 STEER_CAL_MIN_PROTOCOL, STM)
+from communications.stm import (CAL_TABLE_ANCHORS, CAL_TABLE_GLOBALS,
+                                 CAL_TABLE_MOVES, FAST_MIN_PROTOCOL,
+                                 FROZEN_CAL_MIN_PROTOCOL, STEER_CAL_MIN_PROTOCOL,
+                                 STM, TABLE_MIN_PROTOCOL, k_field_ok)
 
 _HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PROFILE_DIR = os.path.join(_HERE, "cal_profiles")
@@ -144,6 +146,106 @@ def firmware_protocol(stm: STM) -> Optional[int]:
         return None
 
 
+# ── Protocol 10 calibration table ─────────────────────────────────────────────
+#
+# A profile may carry "table": the per-move, per-speed values calibrate10.py
+# measured (PROTOCOL.md §13, the firmware's caltab.h):
+#
+#   "table": {
+#       "FR": [ {"rpm": 150, "steer": 610, "decel": 5170, "lag": 0, ...},
+#               {"rpm": 90,  "steer": 590, ...} ],      up to 3 anchors
+#       "F":  [ {"rpm": 100, "trim": 40, "coast": 80, "dist": 10450} ],
+#       "G":  {"wheel": 10032, "ffaf": 371, ...}         hardware globals
+#   }
+#
+# Anything missing simply is not sent, and the firmware falls back to the
+# protocol 9 value for it - so an empty table restores exactly protocol 9.
+
+def table_of(p: dict) -> dict:
+    """The profile's table, {} if it has none."""
+    return p.get("table") or {}
+
+
+def table_entries(table: dict):
+    """Every (move, anchor, field, value) to send, rpm first per anchor - the
+    firmware refuses a field on an anchor with no speed yet. Globals first,
+    with move None."""
+    out = []
+    for field in CAL_TABLE_GLOBALS:
+        v = (table.get("G") or {}).get(field)
+        if v:
+            out.append((None, 0, field, int(v)))
+    for move in CAL_TABLE_MOVES:
+        anchors = table.get(move) or []
+        if len(anchors) > CAL_TABLE_ANCHORS:
+            raise ValueError(f"{move} has {len(anchors)} anchors; the firmware "
+                             f"holds {CAL_TABLE_ANCHORS}")
+        seen = set()
+        for a, entry in enumerate(anchors):
+            rpm = entry.get("rpm")
+            if not rpm:
+                raise ValueError(f"{move} anchor {a} has no rpm")
+            if rpm in seen:
+                raise ValueError(f"{move} has two anchors at {rpm} rpm")
+            seen.add(rpm)
+            out.append((move, a, "rpm", int(rpm)))
+            for field, v in entry.items():
+                if field == "rpm" or v is None:
+                    continue
+                out.append((move, a, field, int(v)))
+    for move, a, field, v in out:
+        ok, reason = k_field_ok(move, field, v)
+        if not ok:
+            raise ValueError(f"{move or 'G'}{'' if move is None else a}: {reason}")
+    return out
+
+
+def push_table(stm: STM, table: dict) -> bool:
+    """!KCLR, then every value, then read every row back. Robot idle."""
+    try:
+        entries = table_entries(table)
+    except ValueError as exc:
+        logging.error(f"Calibration table is not valid: {exc}.")
+        return False
+    if not stm.clear_k():
+        logging.error("!KCLR refused - table not restored.")
+        return False
+    for move, a, field, v in entries:
+        if not stm.set_k(move, a, field, v):
+            logging.error(f"Table value {move or 'G'}{a if move else ''}."
+                          f"{field}={v} refused.")
+            return False
+    # Read back: what the firmware holds must be exactly what was sent.
+    want = {}
+    for move, a, field, v in entries:
+        want.setdefault((move, a), {})[field] = v
+    for (move, a), fields in want.items():
+        back = stm.read_k(move, a)
+        if back is None:
+            return False
+        for field, v in fields.items():
+            if back.get(field) != v:
+                logging.error(f"Table read-back mismatch at {move or 'G'}"
+                              f"{a if move else ''}.{field}: firmware holds "
+                              f"{back.get(field)}, sent {v}.")
+                return False
+    if entries:
+        logging.info(f"Calibration table restored: {len(entries)} values "
+                     f"({describe_table(table)}).")
+    return True
+
+
+def describe_table(table: dict) -> str:
+    parts = []
+    for move in CAL_TABLE_MOVES:
+        anchors = table.get(move) or []
+        if anchors:
+            parts.append(f"{move}@" + "/".join(str(e.get("rpm")) for e in anchors))
+    if table.get("G"):
+        parts.append("G:" + ",".join(sorted(k for k, v in table["G"].items() if v)))
+    return " ".join(parts) or "empty"
+
+
 def push(stm: STM, p: dict, proto: Optional[int] = None) -> bool:
     """
     Send a profile's values and read them back. Robot must be idle.
@@ -185,6 +287,18 @@ def push(stm: STM, p: dict, proto: Optional[int] = None) -> bool:
     if got != want:
         logging.error(f"Read-back mismatch: firmware holds {got}, "
                       f"expected {want}.")
+        return False
+
+    # Protocol 10: the per-move table. Always sent on a protocol 10 board -
+    # an empty one clears whatever a calibration session left behind.
+    table = table_of(p)
+    if proto >= TABLE_MIN_PROTOCOL:
+        return push_table(stm, table)
+    if table:
+        logging.error(
+            f"This profile carries a protocol 10 calibration table "
+            f"({describe_table(table)}) but the firmware is protocol {proto}. "
+            "Flash the current build.")
         return False
     return True
 

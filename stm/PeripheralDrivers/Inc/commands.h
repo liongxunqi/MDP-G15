@@ -196,7 +196,16 @@ typedef enum
      * See IR SNAPSHOT AND EDGE LATCH in rpilink.h. */
     CMD_Q_IRW,           /* ?IRW   IR cm + raw counts + WPOSE, one tick */
     CMD_Q_IRE,           /* ?IRE   edge latch state and latched pose  */
-    CMD_SET_IR_EDGE      /* !IREn  arm/disarm, n = side*10000+lo*100+hi */
+    CMD_SET_IR_EDGE,     /* !IREn  arm/disarm, n = side*10000+lo*100+hi */
+
+    /* --- Calibration table and move report, protocol 10 ---------------------
+     * Inside the second immediate range, which now ends at CMD_Q_MV. See
+     * CALIBRATION TABLE in caltab.h and MOVE REPORT in motion.h. The V speed
+     * suffix needs no opcode: it rides on the F/R/FR/FL/RR/RL tokens. */
+    CMD_SET_K,           /* !K<key>=<n>  set one table value          */
+    CMD_SET_K_CLR,       /* !KCLR        clear the table (protocol 9)  */
+    CMD_Q_K,             /* ?K<move><anchor> / ?KG  read a table row  */
+    CMD_Q_MV             /* ?MV          report on the last move       */
 } CmdOpcode_t;
 
 /* Bumped whenever the wire format changes in a way a sender must care about.
@@ -231,7 +240,11 @@ typedef enum
  * power-on, so a sender that never sends it drives exactly as on 7. */
 /* 9: added ?IRW, ?IRE and !IRE (IR SNAPSHOT AND EDGE LATCH, rpilink.h).
  * Additive; the latch is off at power-on. */
-#define CMD_PROTOCOL_VERSION    9
+/* 10: per-move speed (V<n> suffix), the calibration table (!K, !KCLR, ?K -
+ * caltab.h) and the move report (?MV - motion.h). Additive: a token without
+ * V and an empty table drive exactly as on 9, and the table is empty at
+ * power-on. */
+#define CMD_PROTOCOL_VERSION    10
 #define CMD_FIRMWARE_NAME       "MDPG15-STM32"
 
 /* Replies for a primitive that did not complete. Previously a timed-out move
@@ -279,13 +292,42 @@ typedef enum
  * because one line may only ever produce one reply. */
 uint8_t Cmd_IsImmediate(CmdOpcode_t op);
 
+/* ===========================================================================
+ * PER-MOVE SPEED, protocol 10
+ * ===========================================================================
+ * Any F/R/FR/FL/RR/RL token may end in V<n>: cruise for THIS move at
+ * n x 10 rpm at the axle centre (FR90V12 = a right arc at 120 rpm).
+ *
+ *   straights  V4..V25  (40-250 rpm). Ramp up to it, ramp down to the
+ *              40 rpm approach, brake - so the stop is the calibrated one
+ *              whatever the cruise.
+ *   arcs       V6..V17  (60-170 rpm). A TIGHT arc's outer wheel runs ~1.44x
+ *              the centre and the motors run out of headroom past ~250.
+ *              The last approach_deg still slow to the profile's approach
+ *              speed (or V, if that is lower).
+ *
+ * The calibration table (caltab.h) is looked up at the move's speed, which
+ * is the point: a value measured at V8 and one at V15 both apply where they
+ * were measured, and a V12 move gets the interpolation of the two.
+ *
+ * Without V a token is exactly its protocol 9 self, unless the table's vs /
+ * va default speeds are set. F0 and FU take no V. */
+#define CMD_V_MIN_STRAIGHT       4    /*  40 rpm */
+#define CMD_V_MAX_STRAIGHT      25    /* 250 rpm */
+#define CMD_V_MIN_ARC            6    /*  60 rpm */
+#define CMD_V_MAX_ARC           17    /* 170 rpm */
+
 typedef struct
 {
     CmdOpcode_t op;
     int16_t     arg;    /* cm or degrees, positive - direction lives in the
-                         * opcode. The ONE exception is CMD_SET_CAL_TRIM,
-                         * which is a signed servo offset and has no opcode
-                         * to carry its sign. */
+                         * opcode. The exceptions are CMD_SET_CAL_TRIM, a
+                         * signed servo offset with no opcode to carry its
+                         * sign, and CMD_SET_K, whose value may be negative. */
+    uint8_t     speed;  /* protocol 10: V suffix, x10 rpm; 0 = none       */
+    uint8_t     kmove;  /* protocol 10, !K / ?K: CtMove_t (caltab.h)      */
+    uint8_t     kanchor;
+    uint8_t     kfield; /* CtField_t, or CtGlobal_t for the g row         */
 } Command_t;
 
 

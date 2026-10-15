@@ -1,0 +1,114 @@
+{
+  "note": "trv2 floor, battery",
+  "checks": {
+    "straight": {
+      "converged": false,
+      "drift_cm": [
+        -3.0,
+        -0.7,
+        -1.2,
+        -2.5,
+        -2.1,
+        -1.8
+      ],
+      "distance_err_pct": 0.2,
+      "trim_us": 10
+    },
+    "gyro": {
+      "ratios": [
+        1.00303,
+        0.98976
+      ],
+      "asymmetry_pct": 1.332,
+      "from": 1.0,
+      "to": 0.99639
+    },
+    "radius": {
+      "target_cm": 29.1,
+      "rounds": [
+        {
+          "steer_l": 574,
+          "steer_r": 574,
+          "radius_l_cm": 22.43,
+          "radius_r_cm": 32.61
+        },
+        {
+          "steer_l": 514,
+          "steer_r": 626,
+          "radius_l_cm": 24.82,
+          "radius_r_cm": 28.85
+        },
+        {
+          "steer_l": 454,
+          "steer_r": 626,
+          "radius_l_cm": 28.03,
+          "radius_r_cm": 29.05
+        },
+        {
+          "steer_l": 437,
+          "steer_r": 626,
+          "radius_l_cm": 29.02,
+          "radius_r_cm": 28.97
+        }
+      ]
+    },
+    "brakes": {
+      "worst_deg": 2.3,
+      "by_direction": {
+        "FR": -0.2,
+        "RR": -2.3,
+        "FL": 0.7,
+        "RL": 1.3
+      },
+      "all": [
+        [
+          "FR90",
+          -0.2
+        ],
+        [
+          "RR90",
+          -2.3
+        ],
+        [
+          "FL90",
+          0.7
+        ],
+        [
+          "RL90",
+          1.3
+        ]
+      ]
+    },
+    "square": {
+      "side_cm": 50,
+      "worst_corner_deg": 0.4,
+      "gyro_heading_err_deg": -0.3,
+      "floor_angle_deg": 26.0,
+      "gap_cm": 2.9,
+      "passed": false,
+      "when": "2026-09-12T17:58:58"
+    }
+  },
+  "verified": false,
+  "taken": "2026-09-12T18:01:41",
+  "steer_left_us": 437,
+  "steer_right_us": 626,
+  "spread": {
+    "decel_x10": {
+      "sd": 78.7,
+      "min": 5361,
+      "max": 5582
+    },
+    "lag_ms_x10": {
+      "sd": 25.0,
+      "min": 20,
+      "max": 90
+    }
+  },
+  "decel_x10": 5457,
+  "lag_ms_x10": 51,
+  "trim_us": 10,
+  "gyro_x10000": 9964,
+  "name": "trv2",
+  "arc_profile": 0
+}

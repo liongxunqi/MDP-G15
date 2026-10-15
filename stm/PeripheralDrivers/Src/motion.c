@@ -3,6 +3,7 @@
 #include "pid.h"
 #include "motors.h"
 #include "encoders.h"
+#include "caltab.h"
 #include <math.h>
 
 typedef enum { MOVE_STRAIGHT = 0, MOVE_ARC } MoveKind_t;
@@ -21,6 +22,26 @@ static uint32_t s_brakeTicks;
 static uint32_t s_alignTicks;
 static uint16_t s_startServoUs;
 static float    s_arcTargetDeg;   /* signed, unwrapped, relative to launch */
+
+/* Protocol 10 - PER-MOVE SPEED AND THE CALIBRATION TABLE in motion.h. Set
+ * when a move is queued, held to its end. A field the table did not have is
+ * filled from wherever protocol 9 took it, so the tick reads only these. */
+static CtMove_t s_move;           /* which row of the table               */
+static int16_t  s_vRpm;           /* V cruise, 0 = protocol 9 speed       */
+static int16_t  s_cruiseRpm;      /* the cruise actually used, |rpm|      */
+static float    s_mDecel;         /* arcs, from the table when s_mDecelTab */
+static float    s_mLag;
+static uint8_t  s_mDecelTab;      /* 0: live s_arcDecel, as protocol 9    */
+static uint8_t  s_mLagTab;
+static float    s_mRadius;        /* arcs: wheel split                    */
+static float    s_mBoost;
+static uint8_t  s_mTrimOn;        /* straights: the table set the trim    */
+
+/* MOVE REPORT in motion.h. Filled as the move runs, final at settle. */
+static MotionReport_t s_rep;
+static int32_t  s_encA0;
+static int32_t  s_encB0;
+static float    s_sumRpmA, s_sumRpmB, s_sumDutyA, s_sumDutyB;
 static uint16_t s_settleTarget;   /* servo angle being settled onto        */
 
 /* ---------------------------------------------------------------------------
@@ -374,6 +395,17 @@ static void motion_begin_align(uint16_t servo_us)
                  ? MOTION_ALIGN_TICKS
                  : 0U;
 
+#if MOTION_ALIGN_SKIP_FIX
+    /* Skipping the settle also skips the halfway step that brings the servo
+     * back UP onto the target, so the approach above would launch the move
+     * with the servo on its way to target - SERVO_APPROACH_US. Go to the
+     * target itself instead. See MOTION_ALIGN_SKIP_FIX in motion.h. */
+    if (s_alignTicks != 0U)
+    {
+        Servo_SetMicroseconds(servo_us);
+    }
+#endif
+
     s_ticks = 0U;
     s_state = MOTION_ALIGN;
 }
@@ -396,6 +428,94 @@ static float carry_error(void)
     return 0.0f;
 #endif
 }
+
+/* MOVE REPORT: start a fresh one. Called at launch, after the reset. */
+static void report_begin(void)
+{
+    uint16_t seq = (uint16_t)(s_rep.seq + 1U);
+    uint8_t  i;
+    uint8_t *p = (uint8_t *)&s_rep;
+
+    for (i = 0U; i < (uint8_t)sizeof(s_rep); i++) { p[i] = 0U; }
+
+    s_rep.seq    = seq;
+    s_rep.move   = (uint8_t)(s_move + 1U);
+    s_rep.rpm    = s_cruiseRpm;
+    s_rep.target = (s_kind == MOVE_ARC) ? s_arcTargetDeg : s_targetMm;
+    s_rep.servo  = (s_kind == MOVE_ARC)
+                 ? s_arcServoUs
+                 : (uint16_t)((float)SERVO_CENTER_US + Odom_GetEffectiveTrim() + 0.5f);
+    s_encA0      = Encoder_A_GetCount();
+    s_encB0      = Encoder_B_GetCount();
+    s_sumRpmA    = 0.0f;
+    s_sumRpmB    = 0.0f;
+    s_sumDutyA   = 0.0f;
+    s_sumDutyB   = 0.0f;
+}
+
+/* One tick of the steady part - see "Cruise" in MOVE REPORT. */
+static void report_sample(void)
+{
+    int32_t ra, rb;
+    int16_t da, db;
+    int16_t now = (s_lastRpm < 0) ? (int16_t)(-s_lastRpm) : s_lastRpm;
+
+    if ((s_ticks <= MOTION_REPORT_WARMUP_TICKS) || (now != s_cruiseRpm) ||
+        (s_rep.n >= 0xFFFFU))
+    {
+        return;
+    }
+
+    ra = Encoder_A_GetRPM();
+    rb = Encoder_B_GetRPM();
+    da = PID_GetOutputA();
+    db = PID_GetOutputB();
+
+    s_sumRpmA  += (float)((ra < 0) ? -ra : ra);
+    s_sumRpmB  += (float)((rb < 0) ? -rb : rb);
+    s_sumDutyA += (float)((da < 0) ? -da : da);
+    s_sumDutyB += (float)((db < 0) ? -db : db);
+    s_rep.n++;
+}
+
+/* Close the report. Straights must call this BEFORE Odom_LearnTrim(), which
+ * clears the correction it reads. */
+static void report_finish(uint8_t result)
+{
+    Odom_Pose_t p;
+
+    Odom_GetPose(&p);
+    s_rep.result = result;
+    s_rep.ticks  = (uint16_t)((s_ticks > 0xFFFFU) ? 0xFFFFU : s_ticks);
+    s_rep.enc_a  = Encoder_A_GetCount() - s_encA0;
+    s_rep.enc_b  = Encoder_B_GetCount() - s_encB0;
+    if (s_rep.n > 0U)
+    {
+        s_rep.rpm_a  = s_sumRpmA  / (float)s_rep.n;
+        s_rep.rpm_b  = s_sumRpmB  / (float)s_rep.n;
+        s_rep.duty_a = s_sumDutyA / (float)s_rep.n;
+        s_rep.duty_b = s_sumDutyB / (float)s_rep.n;
+    }
+    s_rep.dist = Odom_GetDistance();
+    s_rep.x    = p.x_mm;
+    s_rep.y    = p.y_mm;
+
+    if (s_kind == MOVE_ARC)
+    {
+        s_rep.aim        = s_arcTargetDeg;
+        s_rep.turned     = Odom_GetHeadingTotal();
+        s_rep.brake_rate = s_brakeRate;
+        s_rep.brake_ang  = s_brakeAngle;
+    }
+    else
+    {
+        s_rep.corr    = Odom_GetMeanCorrection();
+        s_rep.max_err = Odom_GetMaxHeadingError();
+        s_rep.trim    = Odom_GetEffectiveTrim();
+    }
+}
+
+const MotionReport_t *Motion_GetReport(void) { return &s_rep; }
 
 /* Settle finished: zero the odometry now, then start driving. */
 static void motion_launch(void)
@@ -436,18 +556,30 @@ static void motion_launch(void)
      * motion.h. Arcs and normal straights start at full speed, as they
      * always have: their calibration was measured that way. */
     s_approaching = 0U;
-    s_lastRpm    = (s_kind == MOVE_ARC)
-                 ? (int16_t)(s_dir * prof()->rpm)
-                 : (s_fast ? (int16_t)(s_dir * MOTION_RAMP_START_RPM)
-                           : (int16_t)(s_dir * cruise_rpm()));
+    if (s_vRpm > 0)
+    {
+        /* A V move: arcs start at their speed, as arcs always have;
+         * straights from the bottom of the fast ramp. */
+        s_lastRpm = (s_kind == MOVE_ARC)
+                  ? (int16_t)(s_dir * s_vRpm)
+                  : (int16_t)(s_dir * ((s_vRpm < MOTION_RAMP_START_RPM)
+                                       ? s_vRpm : MOTION_RAMP_START_RPM));
+    }
+    else
+    {
+        s_lastRpm = (s_kind == MOVE_ARC)
+                  ? (int16_t)(s_dir * prof()->rpm)
+                  : (s_fast ? (int16_t)(s_dir * MOTION_RAMP_START_RPM)
+                            : (int16_t)(s_dir * cruise_rpm()));
+    }
     s_state      = MOTION_RUN;
 
+    report_begin();
     PID_Enable(1);
 
     if (s_kind == MOVE_ARC)
     {
-        Odom_DriveArc(s_lastRpm, s_arcServoUs, prof()->radius_mm,
-                      s_arcRight, prof()->diff_boost);
+        Odom_DriveArc(s_lastRpm, s_arcServoUs, s_mRadius, s_arcRight, s_mBoost);
     }
     else
     {
@@ -510,7 +642,15 @@ void Motion_Init(void)
 
 void Motion_DriveDistance(int32_t mm)
 {
+    Motion_DriveDistanceV(mm, 0);
+}
+
+void Motion_DriveDistanceV(int32_t mm, int16_t rpm)
+{
     float    target;
+    float    v;
+    float    coast = MOTION_BRAKE_MM;
+    float    ratio = 1.0f;
     uint32_t pm;
 
     if (mm == 0) { return; }
@@ -519,8 +659,22 @@ void Motion_DriveDistance(int32_t mm)
 
     s_kind = MOVE_STRAIGHT;
     s_dir  = (mm < 0) ? -1 : 1;
+    s_move = (mm < 0) ? CT_R : CT_F;
 
-    target = (float)((mm < 0) ? -mm : mm) - MOTION_BRAKE_MM;
+    /* V, else the table's default, else protocol 9 (0). */
+    s_vRpm      = (rpm > 0) ? rpm : CalTab_Global(CTG_VS);
+    s_cruiseRpm = (s_vRpm > 0) ? s_vRpm
+                : (s_fast ? (int16_t)MOTION_FAST_CRUISE_RPM : (int16_t)MOTION_CRUISE_RPM);
+
+    /* This direction's calibration at this speed (caltab.h). */
+    if (CalTab_Lookup(s_move, CTF_COAST, (float)s_cruiseRpm, &v)) { coast = v / 10.0f; }
+    if (CalTab_Lookup(s_move, CTF_DIST,  (float)s_cruiseRpm, &v)) { ratio = v / 10000.0f; }
+    s_mTrimOn = CalTab_Lookup(s_move, CTF_TRIM, (float)s_cruiseRpm, &v);
+    Odom_SetTrimOverride(s_mTrimOn, s_mTrimOn ? v : 0.0f);
+
+    /* dist is true / odometry, so the odometry has to read target / ratio
+     * when the robot has really gone the distance asked for. */
+    target = ((float)((mm < 0) ? -mm : mm) / ratio) - coast;
     if (target < 0.0f) { target = 0.0f; }
     s_targetMm = target;
 
@@ -531,7 +685,7 @@ void Motion_DriveDistance(int32_t mm)
      * for a positive trim, from above for a negative one, so the run's
      * behaviour flipped whenever the trim crossed zero. */
     {
-        float t = Odom_GetHeadingTrim();
+        float t = Odom_GetEffectiveTrim();
         int32_t us = (int32_t)SERVO_CENTER_US
                    + (int32_t)((t >= 0.0f) ? (t + 0.5f) : (t - 0.5f));
 
@@ -543,8 +697,15 @@ void Motion_DriveDistance(int32_t mm)
 
 void Motion_DriveArc(int16_t degrees, uint8_t forward, uint8_t right)
 {
+    Motion_DriveArcV(degrees, forward, right, 0);
+}
+
+void Motion_DriveArcV(int16_t degrees, uint8_t forward, uint8_t right, int16_t rpm)
+{
     float    rad;
     float    arc_mm;
+    float    v;
+    float    steer;
     uint32_t pm;
 
     if (degrees <= 0) { return; }
@@ -554,11 +715,35 @@ void Motion_DriveArc(int16_t degrees, uint8_t forward, uint8_t right)
     s_kind     = MOVE_ARC;
     s_dir      = forward ? 1 : -1;
     s_arcRight = right ? 1U : 0U;
+    s_move     = forward ? (right ? CT_FR : CT_FL) : (right ? CT_RR : CT_RL);
 
-    /* Each side's own deflection - see PER-SIDE ARC STEERING in motion.h. */
+    s_vRpm      = (rpm > 0) ? rpm : CalTab_Global(CTG_VA);
+    s_cruiseRpm = (s_vRpm > 0) ? s_vRpm : prof()->rpm;
+
+    /* This arc's calibration at this speed (caltab.h); protocol 9's values
+     * for anything the table does not have. The deflection falls back to
+     * the side's own - see PER-SIDE ARC STEERING. */
+    steer = (float)Motion_GetArcSteerSideUs(right ? 1U : 0U);
+    if (CalTab_Lookup(s_move, CTF_STEER, (float)s_cruiseRpm, &v)) { steer = v; }
     s_arcServoUs = right
-                 ? (uint16_t)(SERVO_CENTER_US + Motion_GetArcSteerSideUs(1U))
-                 : (uint16_t)(SERVO_CENTER_US - Motion_GetArcSteerSideUs(0U));
+                 ? (uint16_t)((float)SERVO_CENTER_US + steer + 0.5f)
+                 : (uint16_t)((float)SERVO_CENTER_US - steer + 0.5f);
+
+    s_mDecelTab = CalTab_Lookup(s_move, CTF_DECEL, (float)s_cruiseRpm, &v);
+    s_mDecel    = s_mDecelTab ? (v / 10.0f) : 0.0f;
+    s_mLagTab   = CalTab_Lookup(s_move, CTF_LAG, (float)s_cruiseRpm, &v);
+    s_mLag      = s_mLagTab ? (v / 10000.0f) : 0.0f;
+#if MOTION_ARC_GEOMETRIC_SPLIT
+    /* Pure geometry - see MOTION_ARC_GEOMETRIC_SPLIT in motion.h. */
+    s_mRadius   = CalTab_Lookup(s_move, CTF_RADIUS, (float)s_cruiseRpm, &v)
+                ? v : MOTION_ARC_GEOM_RADIUS_MM;
+    s_mBoost    = 1.0f;
+#else
+    s_mRadius   = CalTab_Lookup(s_move, CTF_RADIUS, (float)s_cruiseRpm, &v)
+                ? v : prof()->radius_mm;
+    s_mBoost    = CalTab_Lookup(s_move, CTF_BOOST, (float)s_cruiseRpm, &v)
+                ? (v / 100.0f) : prof()->diff_boost;
+#endif
 
     /* Which way the BODY rotates.
      *
@@ -602,7 +787,7 @@ void Motion_DriveArc(int16_t degrees, uint8_t forward, uint8_t right)
     /* Distance is not the termination condition any more, but keep a
      * generous arc-length estimate so Motion_GetRemaining() and the OLED
      * still show something sensible. */
-    arc_mm     = prof()->radius_mm * ((float)degrees * (3.14159265f / 180.0f));
+    arc_mm     = s_mRadius * ((float)degrees * (3.14159265f / 180.0f));
     s_targetMm = arc_mm;
 
     /* An arc needs a much bigger steering movement than a straight line, so
@@ -615,6 +800,11 @@ void Motion_DriveArc(int16_t degrees, uint8_t forward, uint8_t right)
 void Motion_Stop(void)
 {
     uint32_t pm = crit_enter();
+
+    if ((s_state == MOTION_RUN) || (s_state == MOTION_BRAKE))
+    {
+        report_finish(4U);
+    }
 
     motion_halt();
 
@@ -672,6 +862,41 @@ static int16_t fast_straight_rpm(float remaining)
     return (int16_t)(s_dir * want);
 }
 
+/* One ramp step from `now` toward `target`, rpm, positive, at the fast-mode
+ * ramp rates. */
+static int16_t ramp_toward(int16_t now, int16_t target)
+{
+    if (now < target)
+    {
+        now = (int16_t)(now + MOTION_RAMP_UP_RPM_PER_TICK);
+        return (now > target) ? target : now;
+    }
+    if (now > target)
+    {
+        now = (int16_t)(now - MOTION_RAMP_DOWN_RPM_PER_TICK);
+        return (now < target) ? target : now;
+    }
+    return now;
+}
+
+/* V straight: this tick's speed. Up toward its own cruise, then down in time
+ * to run the last MOTION_FAST_TAIL_MM at MOTION_APPROACH_RPM - the same tail
+ * as a fast straight, so the stop is the calibrated one. Latches like fast
+ * mode. */
+static int16_t v_straight_rpm(float remaining)
+{
+    int16_t now  = (s_lastRpm < 0) ? (int16_t)(-s_lastRpm) : s_lastRpm;
+    float   down = (now > MOTION_APPROACH_RPM)
+                 ? MOTION_RAMP_DOWN_MM_TO(now, MOTION_APPROACH_RPM) : 0.0f;
+
+    if (!s_approaching && (remaining <= (down + MOTION_FAST_TAIL_MM)))
+    {
+        s_approaching = 1U;
+    }
+    return (int16_t)(s_dir * ramp_toward(now, s_approaching
+                                              ? (int16_t)MOTION_APPROACH_RPM : s_vRpm));
+}
+
 void Motion_Tick(void)
 {
     float   travelled;
@@ -705,6 +930,7 @@ void Motion_Tick(void)
     {
         /* Wheel stalled, or the encoder stopped counting. Give up cleanly
          * rather than sit here forever. */
+        report_finish(1U);
         motion_halt();
         s_state = MOTION_TIMEOUT;
         Motion_ResyncHeading();   /* the plan no longer describes the robot */
@@ -716,6 +942,8 @@ void Motion_Tick(void)
 
     if (s_state == MOTION_RUN)
     {
+        report_sample();
+
         /* An arc ends on ANGLE, a straight line on DISTANCE. */
         if (s_kind == MOVE_ARC)
         {
@@ -735,11 +963,21 @@ void Motion_Tick(void)
 
                 /* Quadratic term is the coast once braking; linear term is
                  * the distance covered during the engagement lag. */
-                lead = ((w * w) / (2.0f * s_arcDecel)) + (w * s_arcLag);
+                lead = ((w * w) / (2.0f * (s_mDecelTab ? s_mDecel : s_arcDecel)))
+                     + (w * (s_mLagTab ? s_mLag : s_arcLag));
+#if MOTION_ARC_TAPER
+                /* Arriving at a crawl, the forced 2 degree lead would stop
+                 * the turn short by most of it - see MOTION_ARC_TAPER. */
+                if (lead < MOTION_ARC_TAPER_MIN_LEAD_DEG)
+                {
+                    lead = MOTION_ARC_TAPER_MIN_LEAD_DEG;
+                }
+#else
                 if (lead < MOTION_ARC_MIN_LEAD_DEG)
                 {
                     lead = MOTION_ARC_MIN_LEAD_DEG;
                 }
+#endif
 
                 /* Brake on whichever tick is NEARER the ideal point. The
                  * robot turns w*dt between ticks (~0.7 deg at approach), so
@@ -757,6 +995,7 @@ void Motion_Tick(void)
                     s_brakeRate  = (Odom_GetRateDps() < 0.0f)
                                  ? -Odom_GetRateDps() : Odom_GetRateDps();
                     s_brakeAngle = (turned < 0.0f) ? -turned : turned;
+                    s_rep.dist_brake = Odom_GetDistance();
 
                     motion_halt_arc();
                     s_brakeTicks = 0U;
@@ -775,6 +1014,7 @@ void Motion_Tick(void)
 
                 if (togo > (target_mag + MOTION_ARC_WRONGWAY_DEG))
                 {
+                    report_finish(2U);
                     motion_halt();
                     s_wrongWay = 1U;
                     s_state    = MOTION_TIMEOUT;
@@ -783,9 +1023,40 @@ void Motion_Tick(void)
                 }
             }
 
-            want = (togo <= prof()->approach_deg)
-                 ? (int16_t)(s_dir * prof()->approach_rpm)
-                 : (int16_t)(s_dir * prof()->rpm);
+#if MOTION_ARC_TAPER
+            {
+                /* Speed falls with the angle left, down to a crawl floor -
+                 * see MOTION_ARC_TAPER in motion.h. The cruise is this
+                 * move's V if it has one, else the profile's. */
+                int16_t cruise = (s_vRpm > 0) ? s_vRpm : prof()->rpm;
+                float   v      = MOTION_ARC_TAPER_RPM_PER_DEG * togo;
+                int16_t floor_rpm = (cruise < MOTION_ARC_TAPER_MIN_RPM)
+                                  ? cruise : (int16_t)MOTION_ARC_TAPER_MIN_RPM;
+
+                if (v > (float)cruise)    { v = (float)cruise; }
+                if (v < (float)floor_rpm) { v = (float)floor_rpm; }
+
+                want = (int16_t)(s_dir * (int16_t)(v + 0.5f));
+            }
+#else
+            if (s_vRpm > 0)
+            {
+                /* This move's speed; the last approach_deg still slow to
+                 * the profile's approach (or V, if lower), which is what the
+                 * braking model is measured from. */
+                int16_t apr = (prof()->approach_rpm < s_vRpm)
+                            ? prof()->approach_rpm : s_vRpm;
+
+                want = (togo <= prof()->approach_deg)
+                     ? (int16_t)(s_dir * apr) : (int16_t)(s_dir * s_vRpm);
+            }
+            else
+            {
+                want = (togo <= prof()->approach_deg)
+                     ? (int16_t)(s_dir * prof()->approach_rpm)
+                     : (int16_t)(s_dir * prof()->rpm);
+            }
+#endif
 
             if (want != s_lastRpm)
             {
@@ -799,13 +1070,18 @@ void Motion_Tick(void)
         {
             /* Target reached. Brake and let it settle before declaring done -
              * reading the distance mid-coast would give a short answer. */
+            s_rep.dist_brake = Odom_GetDistance();
             motion_halt();
             s_brakeTicks = 0U;
             s_state      = MOTION_BRAKE;
             return;
         }
 
-        if (s_fast)
+        if (s_vRpm > 0)
+        {
+            want = v_straight_rpm(remaining);
+        }
+        else if (s_fast)
         {
             want = fast_straight_rpm(remaining);
         }
@@ -882,7 +1158,7 @@ void Motion_Tick(void)
                 s_xcheckErrPct = 0.0f;
                 s_xcheckFailed = 0U;
 
-                if (prof()->diff_boost <= MOTION_XCHECK_MAX_BOOST)
+                if (s_mBoost <= MOTION_XCHECK_MAX_BOOST)
                 {
                     float arc  = Odom_GetDistance() - s_arcStartDist;
                     float gyro = Odom_GetHeadingTotal();
@@ -892,9 +1168,9 @@ void Motion_Tick(void)
                     /* Below about 20 degrees the two agree to within their
                      * own noise, so a comparison says nothing useful. */
                     if ((arc > 1.0f) && (gyro > 20.0f) &&
-                        (prof()->radius_mm > 1.0f))
+                        (s_mRadius > 1.0f))
                     {
-                        s_xcheckDeg = (arc / prof()->radius_mm)
+                        s_xcheckDeg = (arc / s_mRadius)
                                     * (180.0f / 3.14159265f);
 
                         s_xcheckErrPct = ((s_xcheckDeg - gyro) / gyro) * 100.0f;
@@ -912,7 +1188,13 @@ void Motion_Tick(void)
             /* Straight runs: fold this run's mean heading error into the
              * steering centre trim. Once per move, after it has finished, so
              * it cannot interfere with the loop while it is running. */
-            if ((s_kind == MOVE_STRAIGHT) && s_learnOn)
+            /* The report reads the straight's correction, which the trim
+             * learner clears - so it goes first. */
+            report_finish(0U);
+
+            /* Not while the table set the trim: the correction is then
+             * relative to the table's value, not to the learned one. */
+            if ((s_kind == MOVE_STRAIGHT) && s_learnOn && !s_mTrimOn)
             {
                 Odom_LearnTrim();
             }
@@ -935,7 +1217,7 @@ void Motion_Tick(void)
              * Only while learning is switched on - see Motion_SetLearning().
              * During a task the braking model is exactly what was restored. */
             /* Not from a missed arc: its coast says nothing about braking. */
-            if ((s_kind == MOVE_ARC) && s_learnOn && !s_arcMissed)
+            if ((s_kind == MOVE_ARC) && !s_arcMissed)
             {
                 float ended = Odom_GetHeadingTotal();
                 float coast;
@@ -952,7 +1234,8 @@ void Motion_Tick(void)
                  * puts the latency in BOTH terms, and the two learners then
                  * fight over the same degrees - which is why lag scattered
                  * by a quarter and decel never sat still. */
-                coast = (ended - s_brakeAngle) - (s_brakeRate * s_arcLag);
+                coast = (ended - s_brakeAngle)
+                      - (s_brakeRate * (s_mLagTab ? s_mLag : s_arcLag));
 
                 if ((coast > 0.5f) && (s_brakeRate > 5.0f))
                 {
@@ -966,8 +1249,16 @@ void Motion_Tick(void)
                     {
                         /* Raw, for calibrate.py to average itself - the
                          * filtered value below still carries the prior. */
-                        s_lastDecelMeas = meas;
+                        s_lastDecelMeas  = meas;
+                        s_rep.decel_meas = meas;
 
+                        /* Measured on every arc for the report; LEARNED only
+                         * while learning is on, and never over a table value
+                         * - the table is what was asked for. */
+                        if (!s_learnOn || s_mDecelTab)
+                        {
+                        }
+                        else
 #if MOTION_ARC_SEED_FIRST
                         /* The first valid arc of a power-on is a direct
                          * measurement of THIS floor. What it is being
@@ -994,6 +1285,7 @@ void Motion_Tick(void)
                     }
 
 #if MOTION_ARC_LEARN_LAG
+                    if (s_learnOn && !s_mLagTab)
                     /* Whatever error survives alpha is latency. Positive
                      * means overshoot, so the lag is bigger than believed
                      * and the brakes need to go on sooner. Dividing by the
@@ -1042,6 +1334,7 @@ void Motion_Tick(void)
                  * describes the robot: fail it like any other move that did
                  * not happen as asked. */
                 s_state = MOTION_TIMEOUT;
+                s_rep.result = 3U;
                 Motion_ResyncHeading();
             }
             else

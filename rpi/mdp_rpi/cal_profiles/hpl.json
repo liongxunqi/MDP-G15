@@ -1,0 +1,72 @@
+{
+  "note": "",
+  "checks": {
+    "gyro": {
+      "ratios": [
+        1.00362,
+        0.99861
+      ],
+      "asymmetry_pct": 0.501,
+      "from": 1.0055,
+      "to": 1.00662
+    },
+    "brakes": {
+      "worst_deg": 2.5,
+      "by_direction": {
+        "FR": -0.2,
+        "RR": -2.5,
+        "FL": 0.8,
+        "RL": -0.3
+      },
+      "all": [
+        [
+          "FR90",
+          -0.2
+        ],
+        [
+          "RR90",
+          -2.5
+        ],
+        [
+          "FL90",
+          0.8
+        ],
+        [
+          "RL90",
+          -0.3
+        ]
+      ]
+    },
+    "square": {
+      "side_cm": 50,
+      "worst_corner_deg": 1.2,
+      "gyro_heading_err_deg": -1.2,
+      "floor_angle_deg": -2.5,
+      "gap_cm": -2.0,
+      "passed": false,
+      "when": "2026-09-12T19:14:51"
+    }
+  },
+  "verified": false,
+  "taken": "2026-09-12T19:11:12",
+  "decel_x10": 5138,
+  "lag_ms_x10": 51,
+  "trim_us": 22,
+  "gyro_x10000": 10066,
+  "steer_left_us": 425,
+  "steer_right_us": 586,
+  "name": "hpl",
+  "arc_profile": 0,
+  "spread": {
+    "decel_x10": {
+      "sd": 139.2,
+      "min": 4952,
+      "max": 5375
+    },
+    "lag_ms_x10": {
+      "sd": 37.2,
+      "min": 0,
+      "max": 118
+    }
+  }
+}
