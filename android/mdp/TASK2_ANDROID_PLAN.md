@@ -29,26 +29,29 @@ and Task 2 Pi programs on the same Bluetooth/PC sockets simultaneously.
    placement, a setup phase, and explicit Task 2 READY. It queues `BEGIN` only
    once. A definite Bluetooth queue rejection returns to setup. A possibly
    partial send or disconnected active run remains uncertain and is not replayed.
-   The existing Bluetooth newline toggle remains available in both tasks; the
-   shared Pi receiver accepts commands with or without a trailing newline.
-   The Pi still terminates its replies with newline; the toggle only changes
-   Android-to-Pi commands.
+   The existing Bluetooth newline selection carries into Task 2; its control
+   stays on the Task 1 screen, where manual driving uses it. The shared Pi
+   receiver accepts commands with or without a trailing newline. The Pi still
+   terminates its replies with newline; the selection only changes Android-to-Pi
+   commands.
 4. A Pi rejection `TASK2,NOT_READY` after BEGIN returns the app to setup; wait
    for a new READY before trying again. RUNNING/DONE/FAILED and arrow reports
    appear in status/history, while raw TX/RX stays in Logs. Task 2 arrow reports
    do not change saved Task 1 target labels.
 5. New attempt can be used repeatedly in local tests. It retains the Task 1
    map/results, clears Task 2 run state, and asks the Pi for fresh readiness.
-   The Task 2 Pi and PC programs each serve one mission and exit; restart both
-   before another physical run. In competition, obtain supervisor approval and
+   The Task 2 Pi program serves one mission and exits; restart it before another
+   physical run. The PC service stays up and accepts the next Pi connection.
+   In competition, obtain supervisor approval and
    respect the shared retry rule before pressing Start again.
 
 ## Exact Bluetooth messages and where they appear
 
-### Compact tablet timer
+### Task 2 tablet timer
 
-Task 2 shows a small `MM:SS` badge in the existing task-mode row; it does not
-take space from the map or add a panel. It starts at the accepted Start tap,
+Task 2 replaces its empty grid with a large `MM:SS:CC` timer (minutes, seconds,
+hundredths). Task 1 keeps the grid and its controls. The timer takes no space
+from the Task 2 status and control panel. It starts at the accepted Start tap,
 resets if BEGIN was definitely not queued or the Pi rejects it as NOT_READY,
 and freezes on DONE, FAILED, or a queued Stop request. The Stop time is labelled
 as a request, not physical braking confirmation. The elapsed count continues
@@ -56,14 +59,22 @@ through Bluetooth loss because the autonomous Pi may still be running. A fresh
 New attempt clears the previous time. At 2:30 it changes to a warning colour;
 at 3:00 it changes to an error colour but never sends a command to the robot.
 
-The badge uses Android elapsed realtime rather than counting UI ticks, so
+The display uses Android elapsed realtime rather than counting UI ticks, so
 backgrounding and rotation do not pause or reset it. Saved state restores it
 within the same device boot; after a reboot or incompatible clock restoration
-it displays `--:--` instead of a fabricated result. It is tablet elapsed time
+it displays `--:--:--` instead of a fabricated result. It is tablet elapsed time
 from Start tap to received terminal status, including transmission delay; the
 judge's official time and the Pi's exact motion duration may differ. If a DONE
 message is lost, the app cannot infer its receipt time and keeps the outcome
-unknown until the operator resolves the attempt.
+unknown until the operator resolves the attempt. The hundredths display is
+derived from elapsed realtime while visible; it may skip digits between screen
+refreshes but does not accumulate timing error.
+
+Task 2 shows Start during setup and replaces it with a red Stop button while a
+run is requested, active, or uncertain. Stop queues `s`; it is not confirmation
+of physical braking. The Task 2 status panel shows only Latest action and
+Robot status. Task 1 retains map details and the manual D-pad. The default
+Task 1 planner placeholder is hidden; only an actual planner report is shown.
 
 | Direction | Message | Android behavior |
 | --- | --- | --- |
@@ -110,8 +121,9 @@ for Task 1 and does not display Task 2 evidence.
    A fresh READY response is required before Start is enabled again; a RUNNING
    response returns the display to unknown and keeps Start disabled.
 4. If `TASK2,NOT_READY` follows BEGIN, wait for the next READY. If `FAILED`
-   arrives, check Pi and PC logs and restart their one-run programs before a
-   local New attempt. After `s`, physically verify the robot has stopped.
+   arrives, check Pi and PC logs and restart the Pi program before a local New
+   attempt; the PC service keeps waiting for the next connection. After `s`,
+   physically verify the robot has stopped.
 5. Rehearse both arrow directions, same/opposite combinations, obstacle length
    and gap changes, camera/model loss, Bluetooth loss, restart after completion,
    and evidence viewing. Check full parking and automatic stop inside three
