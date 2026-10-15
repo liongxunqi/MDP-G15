@@ -50,7 +50,7 @@ this class owns a single reader thread: it is the only thing that touches
 serial.readline(). Movement replies go to a queue consumed by the caller's
 segment pump; query replies are handed back to whichever thread asked.
 
-CAUTION: config commands (§6, !PROF0/1/2 and !ZERO) and the calibration setters
+CAUTION: config commands (§6, !PROF0/1/2, !ZERO and !FAST0/1) and the calibration setters
 (§7, !CALD/!CALL/!CALT) reply plain "OK", which is indistinguishable from a
 movement OK. They are therefore sent down the MOVEMENT path, not the query path,
 and must not be issued while a move is outstanding.
@@ -163,6 +163,10 @@ FU_MIN_PROTOCOL = 3
 FROZEN_CAL_MIN_PROTOCOL = 4
 # Protocol 5: per-side arc deflection (!CALSL / !CALSR), two more ?CAL fields.
 STEER_CAL_MIN_PROTOCOL = 5
+# Fast mode is capability-probed with !FAST1 at Task 2 startup. Keep this
+# constant for the standalone Task 2 runner's compatibility check.
+FAST_MIN_PROTOCOL = 5
+WPOSE_MIN_PROTOCOL = 5
 
 # PROTOCOL.md §5 — every tag the firmware can answer a query with.
 # CAL is protocol 2. It must appear here twice over: once so validate_token()
@@ -170,7 +174,7 @@ STEER_CAL_MIN_PROTOCOL = 5
 # "CAL,..." answer to the waiting thread instead of discarding it as banner
 # noise. Missing from either place and the query fails silently.
 QUERY_TAGS = {"US", "IR", "IRR", "POSE", "DIST", "TURN", "STAT", "IMU", "XCHK",
-              "VER", "CAL", "HDG"}
+              "VER", "CAL", "HDG", "WPOSE"}
 
 # This client implements protocol 4. Compared against the ?VER reply at startup.
 PROTOCOL_VERSION = 5
@@ -180,7 +184,7 @@ PROTOCOL_VERSION = 5
 # "U20", which does not parse at all.
 _MOVE_RE = re.compile(r"^(FR|FL|FU|RR|RL|F|R)(\d+)$", re.IGNORECASE)
 _QUERY_RE = re.compile(r"^\?([A-Z]+)$", re.IGNORECASE)
-_CONFIG_RE = re.compile(r"^!(PROF[012]|ZERO|LEARN[01])$", re.IGNORECASE)
+_CONFIG_RE = re.compile(r"^!(PROF[012]|ZERO|LEARN[01]|FAST[01])$", re.IGNORECASE)
 
 # PROTOCOL.md §7 — the three calibration setters, protocol 2. !CALT is the ONLY
 # token anywhere in this protocol that may carry a negative argument: every
@@ -393,6 +397,8 @@ class STM:
         # Queries are deliberately exempt — they bypass the firmware queue (§5).
         self._inflight = False
         self._inflight_lock = threading.Lock()
+        self._abort_generation = 0
+        self._reply_sync_required = False
 
     @property
     def awaiting_reply(self) -> bool:
@@ -487,7 +493,11 @@ class STM:
         kind = classify_reply(line)
 
         if kind == "movement":
-            self._movement_replies.put(line)
+            with self._inflight_lock:
+                if self._reply_sync_required:
+                    logging.info("STM: discarded pre-reset movement reply %r.", line)
+                else:
+                    self._movement_replies.put(line)
             return
 
         if kind == "query":
@@ -546,6 +556,27 @@ class STM:
             return False
 
         with self._inflight_lock:
+            generation = self._abort_generation
+            needs_sync = self._reply_sync_required
+        if needs_sync:
+            # Firmware handles RST and tagged queries in input order. Reading
+            # VER after RST fences off any old OK still in transit; draining only
+            # the Python queue cannot do that. Keep the reader unlocked here.
+            synced = self.query("?VER") is not None
+            if not synced:
+                with self._inflight_lock:
+                    if generation != self._abort_generation:
+                        return False
+                logging.warning("STM: retrying post-RST version query once.")
+                synced = self.query("?VER") is not None
+            if not synced:
+                logging.error("STM: reset reply synchronization failed; not sending %s.", tokens)
+                return False
+
+        with self._inflight_lock:
+            if generation != self._abort_generation:
+                logging.warning("STM: another RST interrupted reply synchronization; not sending %s.", tokens)
+                return False
             if self._inflight:
                 # PROTOCOL.md §2 — see the note in __init__. Dropping the line is
                 # always better than desyncing the reply stream, because a desync
@@ -556,6 +587,10 @@ class STM:
                     "queue and return a single OK for two lines (PROTOCOL.md §2)."
                 )
                 return False
+            if needs_sync:
+                self._discard_movement_replies()
+                self._reply_sync_required = False
+                logging.info("STM: post-RST reply synchronization complete.")
             self._write_line(",".join(t.strip() for t in tokens))
             self._inflight = True
         return True
@@ -566,11 +601,22 @@ class STM:
         immediately, and is the ONE command that replies nothing at all — so this
         never waits for a reply.
         """
-        self._write_line("RST")
-        # RST drops the firmware queue, so the outstanding line will never be
-        # answered. Release the guard or nothing could ever be sent again.
-        self._clear_inflight()
+        with self._inflight_lock:
+            self._abort_generation += 1
+            self._reply_sync_required = True
+            self._write_line("RST")
+            self._inflight = False
+            self._discard_movement_replies()
         logging.warning("STM: RST sent (emergency abort) — no reply expected.")
+
+    def _discard_movement_replies(self) -> None:
+        """Discard queued completions while holding _inflight_lock."""
+        while True:
+            try:
+                reply = self._movement_replies.get_nowait()
+            except Empty:
+                return
+            logging.info("STM: discarded queued pre-reset movement reply %r.", reply)
 
     # ── Receiving ─────────────────────────────────────────────────────────────
 
@@ -602,6 +648,19 @@ class STM:
     # Back-compat alias: the segment pump used to call wait_receive().
     def wait_receive(self, timeout: Optional[float] = None) -> Optional[str]:
         return self.wait_reply(timeout)
+
+    def read_wpose(self, timeout: float = 2.0) -> Optional[dict]:
+        """Raw firmware world pose: millimetres and counter-clockwise degrees."""
+        fields = self.query_fields("?WPOSE", timeout)
+        try:
+            import math
+            x, y, heading = map(float, fields)
+            if not all(math.isfinite(v) for v in (x, y, heading)):
+                return None
+            return {"x_mm": x, "y_mm": y, "heading_deg": heading / 10.0}
+        except (TypeError, ValueError):
+            logging.error("STM: invalid WPOSE reply: %r", fields)
+            return None
 
     def receive(self) -> Optional[str]:
         """Non-blocking pop of a movement reply, or None if none pending."""
@@ -670,6 +729,13 @@ class STM:
             logging.error(f"STM: invalid profile {profile} — must be 0, 1 or 2.")
             return False
         if not self.send_line([f"!PROF{profile}"]):
+            return False
+        reply = self.wait_reply(timeout)
+        return reply is not None and reply.strip().upper() == "OK"
+
+    def set_fast(self, on: bool, timeout: Optional[float] = None) -> bool:
+        """Enable or disable firmware fast mode. Never call during movement."""
+        if not self.send_line([f"!FAST{1 if on else 0}"]):
             return False
         reply = self.wait_reply(timeout)
         return reply is not None and reply.strip().upper() == "OK"
