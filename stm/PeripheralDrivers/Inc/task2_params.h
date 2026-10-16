@@ -176,7 +176,6 @@
 #define T2_SQUARE_MIN_DEG     5.0f
 #define T2_HOME_SHORTEN_CM    15.0f
 #define T2_HOME_CLEAR_CM      6.0f
-#define T2_PARK_STOP_CM       20.0f  /* bumper -> carpark back wall             */
 #define T2_WAYPOINT_TOL_CM    8.0f
 #define T2_WAYPOINT_TRIES     1
 
@@ -191,6 +190,10 @@
 /* The widest obstacle 2 is taken to be when the IR cannot say: half of
  * task2mn's 90 cm width cap. */
 #define T2_OBST2_MAX_HALF_CM  45.0f
+/* An end the side IR reads further out than this (plus the offset) is not
+ * obstacle 2 but whatever stands past it - a wall, a box. The rules give no
+ * maximum width (the course sim runs to 140 cm); 2 x 80 cm is beyond any. */
+#define T2_OBST2_PLAUSIBLE_HALF_CM 80.0f
 /* 1: the 90 away from obstacle 2 stops early when the side IR reads clear
  * past T2_WATCH_CHECK_DEG (the original's short-obstacle cut). 0: the 90 is
  * always finished and the face scan decides. On the floor (2026-09-14
@@ -227,21 +230,33 @@
 #define T2_WALL_PAST_CM       50.0f
 
 /* ---- the carpark, as task2mn_park.py has it ------------------------------
- * The firmware does not know where the carpark is; the ultrasound at the
- * entry finds the back wall, and the mouth is BAY_DEPTH out from it. The side
- * IRs are read CHECK_IN inside the mouth, where each sees a side wall; half
- * their difference is the robot's offset from the bay's centreline. Off by
- * more than CENTRE_TOL, a lane change squares it up first (backing out up to
- * CENTRE_BACK_MAX for the room). Entering, a side IR under SIDE_STOP stops
- * the robot and it centres again from there. */
+ * The way home lines up on the carpark's line (bay_y, the side IRs at the
+ * start) facing in, within ENTRY_ALIGN on the odometry - re-planning deeper,
+ * or moving along the lane first for room, until it is (line_up in task2_mission.c). The park
+ * is then one straight in on the ultrasonic until it reads PARK_US, a look
+ * and a nudge more if it is short by over PARK_TOL. No centring: lined up
+ * that close the car has ~15 cm each side. A side IR under SIDE_STOP stops
+ * the drive in; then, and only then, one lane change off that fence, backing
+ * out up to CENTRE_BACK_MAX for the room. */
 #define T2_BAY_DEPTH_CM       50.0f  /* T2_BAY_DEPTH_CM                         */
 #define T2_BAY_HALF_CM        30.0f  /* T2_BAY_WIDTH_CM / 2                     */
-#define T2_CENTRE_CHECK_IN_CM 5.0f   /* T2_CENTRE_CHECK_IN_CM                   */
-#define T2_CENTRE_TOL_CM      4.0f   /* T2MN_PARK_CENTRE_TOL_CM                 */
 #define T2_CENTRE_SUM_TOL_CM  10.0f  /* T2_CENTRE_SUM_TOL_CM                    */
 #define T2_NEAR_FENCE_GAP_CM  8.0f   /* task2mn_park NEAR_FENCE_GAP_CM          */
 #define T2_PARK_SIDE_STOP_CM  10.0f  /* T2_PARK_SIDE_STOP_CM                    */
 #define T2_CENTRE_BACK_MAX_CM 40.0f
+#define T2_PARK_US_CM         10.0f  /* the ultrasonic's reading, parked        */
+#define T2_PARK_TOL_CM        3.0f   /* short of it by more: one more nudge     */
+#define T2_PARK_LOOKS         3      /* drive in, then up to two nudges         */
+/* The back wall is no deeper than BAY_DEPTH in from the mouth (or from the
+ * start nose, the car having started inside), less this for the odometry. A
+ * reading past that is not the back wall: on the floor (2026-09-14 14:39) one
+ * of 142 cm from 50 cm off the line drove the car on past the carpark. */
+#define T2_PARK_BACK_SLACK_CM 10.0f
+/* The entry: on the carpark's line by this or less, on the odometry. */
+#define T2_ENTRY_ALIGN_CM     5.0f
+#define T2_LINE_UP_TRIES      6
+#define T2_LINE_UP_LEG_CM     60.0f  /* a longer straight is re-planned near its end */
+#define T2_LINE_UP_SHIFT_CM   40.0f  /* no S fits: along the lane, either way  */
 /* The mouth, measured on the way OUT (mouth_watch): the side IRs read the
  * carpark's side fences - each under FENCE_SEEN, ~25 cm when centred - and
  * the point where both go clear is the mouth. The way home then straightens
@@ -252,7 +267,6 @@
 #define T2_FENCE_SEEN_CM      40.0f
 #define T2_ENTRY_CLEAR_CM     6.0f
 #define T2_FENCE_CLEAR_CM     3.0f
-#define T2_CENTRE_TRIES       2
 
 /* ---- the run ------------------------------------------------------------ */
 #define T2_MAX_SECONDS        180    /* !t2go<s> ceiling                        */

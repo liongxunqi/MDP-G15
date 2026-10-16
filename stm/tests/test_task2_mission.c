@@ -260,6 +260,13 @@ static void step_straight(double cm)
   int n = (int)ceil(fabs(cm));
   double d = n ? cm / n : 0.0;
   for (int i = 0; i < n && !sim.collided; ++i) {
+#ifdef DRIFT_DEG_PER_M
+    /* -DDRIFT_DEG_PER_M=5: a straight that wanders off its heading, the gyro
+     * seeing it (2026-09-14 14:39: 3 degrees CCW over the 62 cm home run) -
+     * on the way home only, facing the carpark */
+    if (fabs(remainder(sim.heading, 360.0)) > 135.0)
+      sim.heading += fabs(d) * DRIFT_DEG_PER_M / 100.0;
+#endif
     sim.x += d * cos(RAD(sim.heading));
     sim.y += d * sin(RAD(sim.heading));
     Task2Odom_Step(&odom, d, world_heading(sim.heading));
@@ -403,8 +410,11 @@ static int op_edge_leg(int right_sensor, int may_be_past, double max_cm, double 
 /* seek_edge as task2fw runs it: back along the leg until the IR sees it. */
 static int op_seek_edge(int right_sensor, double max_cm, double at[3])
 {
+  int passing = ir_beside(right_sensor);   /* seeing something: past it first */
   for (double back = 0.0; back < max_cm; back += 1.0) {
-    if (ir_beside(right_sensor)) {
+    if (passing) {
+      passing = ir_beside(right_sensor);
+    } else if (ir_beside(right_sensor)) {
       at[0] = odom.x;
       at[1] = odom.y;
       at[2] = world_heading(sim.heading);
@@ -560,9 +570,16 @@ static void arena(double gap1, double gap2, double len2, char a1, char a2, doubl
     {-BAY_DEPTH - 10, -BAY_DEPTH, -BAY_HALF - 10, BAY_HALF + 10, "carpark back wall"},
     {-BAY_DEPTH, 0, BAY_HALF, BAY_HALF + 10, "carpark left wall"},
     {-BAY_DEPTH, 0, -BAY_HALF - 10, -BAY_HALF, "carpark right wall"},
-    /* the arena's side walls: as near as the rules allow past obstacle 2's ends */
+    /* the arena's side walls: as near as the rules allow past obstacle 2's ends.
+     * -DWALL_BOX: a box there instead, in line with obstacle 2 - the floor
+     * test of 2026-09-14 14:28, where the IR took it for obstacle 2's end */
+#ifdef WALL_BOX
+    {o2, o2 + 10, lat + len2 / 2 + WALL_SIM_CM, lat + len2 / 2 + WALL_SIM_CM + 30, "left wall box"},
+    {o2, o2 + 10, lat - len2 / 2 - WALL_SIM_CM - 30, lat - len2 / 2 - WALL_SIM_CM, "right wall box"},
+#else
     {-BAY_DEPTH - 10, o2 + 300, lat + len2 / 2 + WALL_SIM_CM, lat + len2 / 2 + WALL_SIM_CM + 10, "left wall"},
     {-BAY_DEPTH - 10, o2 + 300, lat - len2 / 2 - WALL_SIM_CM - 10, lat - len2 / 2 - WALL_SIM_CM, "right wall"},
+#endif
   };
   memcpy(sim.box, b, sizeof b);
   sim.n_box = (int)(sizeof b / sizeof *b);
@@ -643,9 +660,12 @@ static void test_wrap(void)
 
 static double widest_swing, widest_landing;
 static double worst_park_off;        /* over every course: cm off the bay's centreline, parked */
-/* Parked within the centring tolerance, and this much more for the S's own
- * error - the sim's turns stray from the planned radius. */
-#define PARK_OFF_SLACK_CM 2.0
+static double worst_park_us;         /* ...and the furthest the ultrasonic read from PARK_US */
+/* Parked: inside the carpark, the body at least FENCE_ROOM off either side
+ * fence, and the ultrasonic within PARK_US_SLACK of PARK_US (short of it by
+ * no more than the nudge tolerance). */
+#define FENCE_ROOM_CM 3.0
+#define PARK_US_SLACK_CM 1.5
 
 static void test_plan_csc(void)
 {
@@ -701,8 +721,18 @@ static int run_course(double gap1, double gap2, double len2, char a1, char a2, d
           "%s: odometry (%.1f,%.1f) drifted from truth (%.1f,%.1f)", label, odom.x, odom.y,
           sim.x - x0, sim.y - sim.start_y);
     if (fabs(sim.y) > worst_park_off) worst_park_off = fabs(sim.y);
-    CHECK(fabs(sim.y) <= T2_CENTRE_TOL_CM + PARK_OFF_SLACK_CM,
-          "%s: parked %.1f cm off the bay's centreline", label, sim.y);
+    double side = 0.0;
+    for (int k = 0; k < 4; ++k) {
+      double wx, wy;
+      car_point(k & 1 ? FRONT_CM : -REAR_CM, k & 2 ? HALF_WID_CM : -HALF_WID_CM, &wx, &wy);
+      side = fmax(side, fabs(wy));
+    }
+    CHECK(side <= BAY_HALF - FENCE_ROOM_CM, "%s: parked %.1f cm off the bay's centreline, %.1f cm off a fence",
+          label, sim.y, BAY_HALF - side);
+    const double us = bumper_gap() - ULTRA_OFFSET_CM - T2_PARK_US_CM;
+    if (fabs(us) > fabs(worst_park_us)) worst_park_us = us;
+    CHECK(us >= -PARK_US_SLACK_CM - 2.0 && us <= T2_PARK_TOL_CM + PARK_US_SLACK_CM,
+          "%s: parked with the ultrasonic at %.1f cm", label, us + T2_PARK_US_CM);
   }
   return failures == before;
 }
@@ -745,8 +775,9 @@ static void test_courses(void)
   matrix_short = passed < MIN_COURSES;
   printf("courses completed: %d / %d; widest swing past obstacle 2's end %.0f cm; "
          "furthest off the line after the swerve %.1f cm\n", passed, total, widest_swing, widest_landing);
-  printf("modelled time: mean %.1f s, worst %.1f s; parked at most %.1f cm off centre\n",
-         time_sum / (passed ? passed : 1), time_max, worst_park_off);
+  printf("modelled time: mean %.1f s, worst %.1f s; parked at most %.1f cm off centre, "
+         "the ultrasonic at most %+.1f cm off %.0f\n",
+         time_sum / (passed ? passed : 1), time_max, worst_park_off, worst_park_us, T2_PARK_US_CM);
 }
 
 static void test_photo_gaps(void)
@@ -799,7 +830,7 @@ static void test_stale_ultrasonic(void)
 }
 
 /* Started off the bay's centreline - the odometry says centred - the side
- * IRs at the mouth must see it and centre the car before it parks. */
+ * IRs at the start must see it, and the car park clear of both fences. */
 static void test_centring(void)
 {
   int ok = 0, n = 0;
@@ -812,7 +843,7 @@ static void test_centring(void)
       ok += run_course(105, 105, 60, a & 1 ? 'L' : 'R', a & 2 ? 'L' : 'R', 0);
     }
   start_y_all = 0.0;
-  printf("off-centre starts: %d / %d parked centred\n", ok, n);
+  printf("off-centre starts: %d / %d parked clear of the fences\n", ok, n);
 }
 
 static void test_bad_echoes(void)

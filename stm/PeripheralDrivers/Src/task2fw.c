@@ -407,11 +407,14 @@ static int op_edge_leg(int right_sensor, int may_be_past, double max_cm, double 
  * first clear reading was. */
 /* Back along the leg until the side IR sees the obstacle (task2_mission.h
  * seek_edge): straight in reverse at T2_EDGE_RPM, stopped on the confirming
- * sample. Reversing, a reading describes the robot T2_IR_LAG_CM back along
- * its path - forward of where it is - so `at` is moved that way. */
+ * sample. Seeing something as it starts - the box past obstacle 2 it has
+ * just rejected - it first waits for clear, then for the next thing seen.
+ * Reversing, a reading describes the robot T2_IR_LAG_CM back along its path
+ * - forward of where it is - so `at` is moved that way. */
 static int op_seek_edge(int right_sensor, double max_cm, double at[3])
 {
-    int      hits = 0, found = 0;
+    int      hits = 0, found = 0, clears = 0;
+    int      passing = ir_seen(right_sensor);
     uint32_t tick;
     double   first[3] = {0.0, 0.0, 0.0};
 
@@ -424,6 +427,12 @@ static int op_seek_edge(int right_sensor, double max_cm, double at[3])
         pump();
         if (found || (HAL_GetTick() - tick < 10U)) { continue; }
         tick = HAL_GetTick();
+        if (passing)
+        {
+            clears = ir_seen(right_sensor) ? 0 : clears + 1;
+            if (clears >= IR_EDGE_CONFIRM) { passing = 0; }
+            continue;
+        }
         if (!ir_seen(right_sensor)) { hits = 0; continue; }
         if (hits == 0)
         {

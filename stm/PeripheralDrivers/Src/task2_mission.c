@@ -74,6 +74,12 @@ static double wall_lo, wall_hi;
 static double bay_y;
 static int have_mouth;
 static double mouth_x;
+/* Squared up off obstacle 1's line (peek_tight) with the ultrasound straight
+ * ahead hearing nothing at obstacle 2's face: obstacle 2 does not reach the
+ * car's line, so its end on that side is no further out than us_end_bound -
+ * the car's y, half the beam's spread at that range in from it. */
+static int have_end_bound;
+static double us_end_bound;
 
 /* ------------------------------------------------------------ pure helpers -- */
 
@@ -1067,6 +1073,22 @@ static double lens_y(const Task2Ops *ops, double y, double h_raw)
   return y + T2_IR_AHEAD_CM * sin(RAD(Task2_WrapDeg(h_raw - ops->odom->h0)));
 }
 
+/* Can y be obstacle 2's end, on the side dir (+1 / -1) of obstacle 1's line?
+ * Not further out than the widest obstacle 2, nor than us_end_bound when the
+ * ultrasound bounded that side. Anything further is something else - a wall,
+ * a box - seen by the side IR. */
+static int bound_on(double dir)
+{
+  return have_end_bound && dir * (us_end_bound - axis_y) > 0.0;
+}
+
+static int end_plausible(double y, double dir)
+{
+  if (dir * (y - axis_y) > T2_OBST2_PLAUSIBLE_HALF_CM + T2_OBST2_OFFSET_CM + T2_LATERAL_ERR_CM)
+    return 0;
+  return !bound_on(dir) || dir * (y - us_end_bound) <= T2_END_MARGIN_CM + T2_LATERAL_ERR_CM;
+}
+
 /* The arena walls as the car keeps off them: everything past wall_lo /
  * wall_hi, T2_WALL_CLEAR_CM in. */
 static Box2 wall_box(int hi)
@@ -1109,7 +1131,14 @@ static int back_leg(const Task2Ops *ops, int right_sensor)
   if (r == EDGE_CAPPED)
     step(ops, "back_capped", 0);
   else if (r == EDGE_FOUND)
-    record_end2(ops, lens_y(ops, at[1], at[2])); /* the far end, read: the wall past it too */
+  {
+    /* the far end, read: the wall past it too - if it can be obstacle 2's */
+    const double e = lens_y(ops, at[1], at[2]), side = heading(ops) > 0.0 ? 1.0 : -1.0;
+    if (end_plausible(e, side))
+      record_end2(ops, e);
+    else
+      step(ops, "end_reject", lround(e));
+  }
   step(ops, "far_end2", 0);
   return !ops->failed() && r != EDGE_FAILED;
 }
@@ -1212,22 +1241,60 @@ static int round_obstacle2(const Task2Ops *ops, char arrow, double face2)
      * round. Not seen even there, the IR cannot see this face: obstacle 2 is
      * taken as wide as it can be (assume_max2). */
     double at[3];
-    const int r = ops->edge_leg(right_sensor, 1, 0.0, at);
+    const double lens0 = lens_y(ops, o->y, ops->heading());
+    int r;
+    if (bound_on(dir) && dir * (lens0 - us_end_bound) > T2_END_MARGIN_CM + T2_LATERAL_ERR_CM)
+    {
+      /* The ultrasound already put obstacle 2's end inward of where the IR
+       * is: anything it sees here is not obstacle 2. No face scan. */
+      step(ops, "past_bound", lround(us_end_bound));
+      r = EDGE_CAPPED;
+      record_end2(ops, us_end_bound);
+    }
+    else
+      r = ops->edge_leg(right_sensor, 1, 0.0, at);
     if (ops->failed() || r == EDGE_FAILED)
       return 0;
     if (r == EDGE_FOUND)
-      record_end2(ops, lens_y(ops, at[1], at[2]));
-    else if (r == EDGE_PAST)
     {
-      const double lens = lens_y(ops, o->y, ops->heading());
+      const double e = lens_y(ops, at[1], at[2]);
+      if (end_plausible(e, dir))
+        record_end2(ops, e);
+      else
+      {
+        /* Not obstacle 2 - past where it can reach. Look back for the real
+         * end, past whatever this was, as far as the nearest it can be. */
+        step(ops, "end_reject", lround(e));
+        r = EDGE_PAST;
+      }
+    }
+    if (r == EDGE_PAST)
+    {
       const double nearest = axis_y + dir * (T2_OBST2_MIN_HALF_CM - T2_OBST2_OFFSET_CM - T2_END_MARGIN_CM);
-      const double back = dir * (lens - nearest);
-      step(ops, "seek_back", lround(back));
-      const int k = back > 0.5 ? ops->seek_edge(right_sensor, back, at) : EDGE_CAPPED;
-      if (ops->failed() || k == EDGE_FAILED)
-        return 0;
-      if (k == EDGE_FOUND)
+      int k = EDGE_CAPPED, found = 0;
+      /* Each seek stops on the next thing the IR sees; one that cannot be
+       * obstacle 2 (the box past it) is passed by the next seek. */
+      for (int tries = 0; tries < 3 && !found; ++tries)
+      {
+        const double back = dir * (lens_y(ops, o->y, ops->heading()) - nearest);
+        step(ops, "seek_back", lround(back));
+        k = back > 0.5 ? ops->seek_edge(right_sensor, back, at) : EDGE_CAPPED;
+        if (ops->failed() || k == EDGE_FAILED)
+          return 0;
+        if (k != EDGE_FOUND)
+          break;
+        if (end_plausible(lens_y(ops, at[1], at[2]), dir))
+          found = 1;
+        else
+          step(ops, "end_reject", lround(lens_y(ops, at[1], at[2])));
+      }
+      if (found)
         record_end2(ops, lens_y(ops, at[1], at[2]));
+      else if (bound_on(dir))
+      {
+        step(ops, "seek_bound", lround(us_end_bound));
+        record_end2(ops, us_end_bound);
+      }
       else
       {
         step(ops, "seek_blind", 0);
@@ -1403,17 +1470,145 @@ static int home_direct(const Task2Ops *ops, double *entry_x, const Box2 *box1, c
   return 0;
 }
 
-/* In on the ultrasonic from the entry pose, forward only - it never backs out
- * - braking hard into the stop: the car can stay at full speed longer, and a
- * skid in the carpark costs nothing, the run being over.
+/* ...off box b, which carries `margin` of clearance on every side - keeping
+ * at least what clearance the car has now, if it is already inside that
+ * margin. A straight home that wandered 14 cm off its line (course sim,
+ * 5 degrees a metre) left the car 4.6 cm off the nearest a wall can be:
+ * against the full 5 cm every plan from there failed, and the car drove in
+ * from 43 cm off the carpark's line. */
+static int plan_clear_now(const double from[3], const double plan[3], const double r[2], const Box2 *b,
+                          float margin)
+{
+  Box2 c = *b;
+  const float x = (float)from[0], y = (float)from[1], h = (float)RAD(from[2]);
+  for (float m = 0.0f; m < margin && car_hits(x, y, h, &c); m += 1.0f)
+  {
+    c.x0 += 1.0f;
+    c.x1 -= 1.0f;
+    c.y0 += 1.0f;
+    c.y1 -= 1.0f;
+  }
+  return plan_clear_err(from, plan, r, &c);
+}
+
+/* Does a plan from `from` keep off everything the way home must: obstacle 1,
+ * obstacle 2 once placed, the walls and the carpark's fences' ends? */
+static int route_clear(const double from[3], const double plan[3], const double r[2],
+                       const Box2 *box1, const Box2 *box2)
+{
+  const Box2 wl = wall_box(0), wh = wall_box(1);
+  if (!plan_clear_now(from, plan, r, box1, T2_HOME_CLEAR_CM) ||
+      (box2 && !plan_clear_now(from, plan, r, box2, T2_HOME_CLEAR_CM)) ||
+      !plan_clear_now(from, plan, r, &wl, T2_WALL_CLEAR_CM) || !plan_clear_now(from, plan, r, &wh, T2_WALL_CLEAR_CM))
+    return 0;
+  if (!have_mouth)
+    return 1;
+  const float c = T2_FENCE_CLEAR_CM, x0 = (float)(mouth_x - T2_BAY_DEPTH_CM - 10.0), x1 = (float)mouth_x + c;
+  const Box2 fl = {x0, x1, (float)(bay_y + T2_BAY_HALF_CM) - c, (float)(bay_y + T2_BAY_HALF_CM + 10.0)};
+  const Box2 fr = {x0, x1, (float)(bay_y - T2_BAY_HALF_CM - 10.0), (float)(bay_y - T2_BAY_HALF_CM) + c};
+  return plan_clear_now(from, plan, r, &fl, c) && plan_clear_now(from, plan, r, &fr, c);
+}
+
+/* The entry depth for an S from `from` onto the carpark's line: want_x
+ * first, then 2 cm at a time down to PARK_ENTRY_MIN, the first one a plan
+ * reaches without a near-full circle and route_clear. */
+static int entry_plan(const double from[3], double want_x, const Box2 *box1, const Box2 *box2, double *tx,
+                      double plan[3])
+{
+  const double r[2] = {arc(1, 0), arc(0, 0)};
+  for (double x = fmin(want_x, from[0] - 2.0); x >= T2_PARK_ENTRY_MIN_CM - 0.01; x -= 2.0)
+  {
+    const double to[3] = {x, bay_y, 180.0};
+    if (Task2_PlanCSC(from, to, r, r, plan) && fabs(plan[0]) + fabs(plan[2]) <= T2_MAX_PLAN_TURN_DEG &&
+        route_clear(from, plan, r, box1, box2))
+    {
+      *tx = x;
+      return 1;
+    }
+  }
+  return 0;
+}
+
+/* Onto the carpark's line facing in, within ENTRY_ALIGN on the odometry:
+ * the park drives straight in from there, and an entry off the line drives on
+ * past the carpark beside its fence. On the floor (2026-09-14 14:39) the home
+ * run's straight drifted 3 degrees, the lane's S no longer fitted the room
+ * left, goto_pose refused it (plan_loop 357) and squared up 51 cm off the
+ * line; the park drove in from there.
  *
- * The car started inside the carpark, so the carpark reaches at least as far
- * out as its nose did then. A stop that leaves its tail further out than that
- * stopped on something short of the back wall: on the floor (2026-10-15 05:32)
- * an echo 24 cm short, off the carpark's side with the car 9 cm off its line,
- * parked it 22 cm short with its tail out of the carpark. Look again from
- * there and go on in. A missed echo on that second look leaves it where it
- * is: it must not fault a car that has parked. */
+ * Now the S goes to the shallowest depth entry_plan finds. With none from
+ * here, facing home, the car first moves along the lane - on past obstacle 1,
+ * or back the way it came for room - by the least (4 cm steps, LINE_UP_SHIFT
+ * either way) from which one fits. Then it looks again from wherever the S
+ * left it.
+ *
+ * A plan with a straight over LINE_UP_LEG drives its first turn and the
+ * straight bar half of LINE_UP_LEG, then plans the rest again: the straights
+ * wander off their heading on the floor (2026-09-14: 2-3 degrees over the
+ * ~60 cm home run, every run), and over a 2 m diagonal that is a fence. */
+static int line_up(const Task2Ops *ops, double want_x, const Box2 *box1, const Box2 *box2)
+{
+  volatile Task2Odom *o = ops->odom;
+  const double r[2] = {arc(1, 0), arc(0, 0)};
+  for (int k = 0; k < T2_LINE_UP_TRIES; ++k)
+  {
+    const double from[3] = {o->x, o->y, heading(ops)};
+    const double crooked = Task2_TurnToward(from[2], 180.0);
+    double tx = want_x, plan[3];
+    if (k && fabs(o->y - bay_y) <= T2_ENTRY_ALIGN_CM && fabs(crooked) < T2_SQUARE_MIN_DEG)
+      return 1;
+    const int found = entry_plan(from, want_x, box1, box2, &tx, plan);
+    if (found && plan[1] > T2_LINE_UP_LEG_CM && k + 1 < T2_LINE_UP_TRIES)
+    {
+      step(ops, "line_leg", lround(plan[1]));
+      set_speed(ops, 0);
+      if (!turn_by(ops, plan[0]))
+        return 0;
+      ops->straight(plan[1] - T2_LINE_UP_LEG_CM / 2.0);
+      if (ops->failed())
+        return 0;
+      continue;
+    }
+    if (!found && fabs(crooked) < 30.0)
+    {
+      int shifted = 0;
+      const uint32_t t0 = ops->now_ms();
+      for (int j = 1; j <= 2 * (int)(T2_LINE_UP_SHIFT_CM / 4.0f) && !shifted; ++j)
+      {
+        const double e = (j & 1 ? 4.0 : -4.0) * (double)((j + 1) / 2), h = RAD(from[2]);
+        ops->wait_ms(1); /* a search of up to ~300 plans: keep the gyro and the link serviced */
+        const double at[3] = {from[0] + e * cos(h), from[1] + e * sin(h), from[2]};
+        const double leg[3] = {0.0, fabs(e), 0.0};
+        if (!route_clear(e > 0.0 ? from : at, leg, r, box1, box2) ||
+            !entry_plan(at, want_x, box1, box2, &tx, plan))
+          continue;
+        step(ops, "line_ms", (long)(ops->now_ms() - t0));
+        step(ops, "line_shift", lround(e));
+        ops->straight(e);
+        if (ops->failed())
+          return 0;
+        shifted = 1;
+      }
+      if (shifted)
+        continue;
+      step(ops, "line_ms", (long)(ops->now_ms() - t0));
+      tx = want_x; /* nothing fits: as goto_pose plans it */
+    }
+    step(ops, "line_up", lround(tx));
+    if (!goto_pose(ops, tx, bay_y, 180.0, 0, 0))
+      return 0;
+  }
+  /* Still off the line after every try: in, if the car fits between the
+   * fences from here with FENCE_CLEAR to spare; otherwise it stays out -
+   * FAIL,STOP - rather than drive into a fence's end. */
+  const double off = o->y - bay_y;
+  if (fabs(off) > T2_ENTRY_ALIGN_CM)
+    step(ops, "line_off", lround(off * 10.0));
+  if (fabs(off) > T2_BAY_HALF_CM - T2_HALF_WIDTH_CM - T2_FENCE_CLEAR_CM)
+    return 0;
+  return !ops->failed();
+}
+
 /* One side IR as a median of five readings a control tick or two apart,
  * standing still: 1 with *cm, else 0 and *near if most said "closer than
  * 10 cm". */
@@ -1490,92 +1685,103 @@ static int bay_offset(const Task2Ops *ops, double *y)
   return 1;
 }
 
-/* In from the entry pose (task2mn_park.ParkRunner._park_from_mouth):
- *   1. the ultrasound finds the back wall; the mouth is BAY_DEPTH out from it;
- *   2. in until the side IRs are CENTRE_CHECK_IN inside the mouth, each seeing
- *      a side wall, and the offset from the bay's centreline read off them;
- *   3. off by more than CENTRE_TOL (or crooked by more than SQUARE_MIN), one
- *      lane change onto the centreline - backing out first, straight, if the
- *      bay has not the depth left for it (plan_centre) - and read again;
- *   4. in on the ultrasonic, forward only, with the side IRs guarding.
- * A side IR under PARK_SIDE_STOP stops any of those moves, and the robot
- * centres again from there. With no back wall in range it goes in on the
- * ultrasonic as before; with no wall readable it trusts the odometry.
+/* A side IR under PARK_SIDE_STOP on the way in: one lane change onto the
+ * carpark's line as the side IRs read it, backing out first, straight, if the
+ * bay has not the room left for the S before stop_front. */
+static int park_side_fix(const Task2Ops *ops, double stop_front)
+{
+  volatile Task2Odom *o = ops->odom;
+  const double r = fmax(arc(1, 0), arc(0, 0));
+  double y;
+  ops->wait_ms(100); /* the IR medians full of standing samples */
+  if (!bay_offset(ops, &y))
+    return !ops->failed();
+  const double sb = s_bend(y, r) + 2.0, room = (o->x - T2_FRONT_CM) - stop_front;
+  if (room < sb)
+  {
+    const double back = fmin(sb - room, T2_CENTRE_BACK_MAX_CM);
+    step(ops, "centre_back", lround(back));
+    ops->straight(-back);
+    if (ops->failed())
+      return 0;
+  }
+  step(ops, "centre", lround(-y * 10.0));
+  return goto_pose(ops, o->x - sb, o->y - y, 180.0, 0, 0);
+}
+
+/* In from the entry pose - line_up has put it on the carpark's line - on the
+ * ultrasonic, forward only, until it reads PARK_US: one straight, then a look
+ * and a nudge more while it is short by over PARK_TOL. The side IRs only
+ * guard: one under PARK_SIDE_STOP stops the car, and park_side_fix moves it
+ * off that fence once. No centring otherwise - on the floor (2026-09-14
+ * 14:38) it backed out 23 cm and changed lanes for a 4.5 cm offset, with 15 cm
+ * to spare each side.
  *
- * The car started inside the carpark, so the carpark reaches at least as far
- * out as its nose did then. A stop that leaves its tail further out than that
+ * A reading past the deepest the back wall can be is not the back wall: the
+ * car drives to that depth and no further.
+ *
+ * The mouth is where the mouth watch saw it, else no nearer than the start
+ * nose (the car started inside). A stop that leaves the tail out past it
  * stopped on something short of the back wall: on the floor (2026-10-15 05:32)
  * an echo 24 cm short parked the car 22 cm short with its tail out of the
- * carpark. Look again from there and go on in. A missed echo on that second
- * look leaves it where it is: it must not fault a car that has parked. */
+ * carpark. Look once more from there. A missed echo after the first look
+ * leaves it where it is: it must not fault a car that has parked. */
 static int park(const Task2Ops *ops, int *no_range)
 {
   volatile Task2Odom *o = ops->odom;
-  double back_wall, gap;
-  int ok, missed = 0;
+  const double stop = T2_PARK_US_CM + ULTRA_OFFSET_CM; /* the bumper gap at that reading */
+  const double mouth = have_mouth ? fmax(mouth_x, T2_FRONT_CM) : T2_FRONT_CM;
+  const double back_min = mouth - T2_BAY_DEPTH_CM - T2_PARK_BACK_SLACK_CM;
+  int ok = 1, fixed = 0, out = 0;
   ops->brake_hard(1);
-  if (range_ahead(ops, 0, &gap, &missed))
+  for (int k = 0; k < T2_PARK_LOOKS + fixed + out; ++k)
   {
-    const double back_x = o->x - T2_FRONT_CM - gap; /* facing in: forward is -x */
-    const double mouth_x = back_x + T2_BAY_DEPTH_CM;
-    const double stop_front = back_x + T2_PARK_STOP_CM;
-    const double r = fmax(arc(1, 0), arc(0, 0));
-    step(ops, "bay", lround(mouth_x));
-    for (int k = 0; k < T2_CENTRE_TRIES; ++k)
+    double gap;
+    int missed = 0;
+    if (!range_ahead(ops, 0, &gap, &missed))
     {
-      /* the lens CHECK_IN inside the mouth; the lens is IR_AHEAD ahead */
-      const double in = o->x - (mouth_x - T2_CENTRE_CHECK_IN_CM + T2_IR_AHEAD_CM);
-      double y;
-      if (in > 0.5)
-      {
-        ops->side_guard(T2_PARK_SIDE_STOP_CM);
-        ops->straight(in);
-        ops->side_guard(0.0);
-        if (ops->failed())
-          return 0;
-        if (ops->side_guarded())
-          step(ops, "side_stop", 0);
-      }
-      ops->wait_ms(100); /* the IR medians full of standing samples */
-      if (!bay_offset(ops, &y))
-        break; /* no wall readable: the odometry's line it is */
-      const double crooked = Task2_TurnToward(heading(ops), 180.0);
-      if (fabs(y) <= T2_CENTRE_TOL_CM && fabs(crooked) < T2_SQUARE_MIN_DEG)
+      if (!k)
+        *no_range = 1, ok = 0;
+      break;
+    }
+    const double most = o->x - T2_FRONT_CM - back_min;
+    if (gap > most)
+    {
+      step(ops, "park_far", lround(gap));
+      gap = most;
+    }
+    const double back_x = o->x - T2_FRONT_CM - gap; /* facing in: forward is -x */
+    if (!k)
+      step(ops, "bay", lround(back_x + T2_BAY_DEPTH_CM));
+    const double travel = gap - stop;
+    if (travel <= T2_PARK_TOL_CM)
+    {
+      if (out || o->x + T2_REAR_CM <= mouth)
         break;
-      /* A lane change of -y: the S's forward room, backing out for it */
-      const double sb = s_bend(y, r) + 2.0;
-      const double room = (o->x - T2_FRONT_CM) - stop_front;
-      if (room < sb)
-      {
-        const double back = fmin(sb - room, T2_CENTRE_BACK_MAX_CM);
-        step(ops, "centre_back", lround(back));
-        ops->straight(-back);
-        if (ops->failed())
-          return 0;
-      }
-      step(ops, "centre", lround(-y * 10.0));
-      if (!goto_pose(ops, o->x - (s_bend(y, r) + 2.0), o->y - y, 180.0, 0, 0))
-        return 0;
+      out = 1;
+      step(ops, "park_out", lround(o->x + T2_REAR_CM - mouth));
+      continue;
     }
     ops->side_guard(T2_PARK_SIDE_STOP_CM);
-    ok = approach(ops, T2_PARK_STOP_CM, 0, 1, -1e9, &back_wall, no_range);
+    ops->straight(travel);
     ops->side_guard(0.0);
-    if (ok && ops->side_guarded())
-      step(ops, "side_stop", 1);
-  }
-  else
-  {
-    /* no back wall in range: in on the ultrasonic as before */
-    ok = approach(ops, T2_PARK_STOP_CM, 0, 1, -1e9, &back_wall, no_range);
-  }
-  if (ok && o->x + T2_REAR_CM > T2_FRONT_CM)
-  {
-    missed = 0;
-    step(ops, "park_out", lround(o->x + T2_REAR_CM - T2_FRONT_CM));
-    ops->side_guard(T2_PARK_SIDE_STOP_CM);
-    approach(ops, T2_PARK_STOP_CM, 0, 1, -1e9, &back_wall, &missed);
-    ops->side_guard(0.0);
-    ok = !ops->failed();
+    if (ops->failed())
+    {
+      ok = 0;
+      break;
+    }
+    if (ops->side_guarded())
+    {
+      step(ops, "side_stop", k);
+      if (fixed)
+        continue;
+      fixed = 1;
+      if (!park_side_fix(ops, back_x + stop))
+      {
+        ok = 0;
+        break;
+      }
+    }
   }
   if (ok)
   {
@@ -1663,7 +1869,7 @@ static int go_home(const Task2Ops *ops, double face1, int *no_range)
   }
   if (direct)
   {
-    if (!goto_pose(ops, entry_x, bay_y, 180.0, 0, 0))
+    if (!line_up(ops, entry_x, &box1, box2))
       return 0;
     step(ops, "entry", 0);
     return park(ops, no_range);
@@ -1705,7 +1911,7 @@ static int go_home(const Task2Ops *ops, double face1, int *no_range)
     if (ops->failed())
       return 0;
   }
-  if (!goto_pose(ops, o->x - sb - 2.0, bay_y, 180.0, 0, 0))
+  if (!line_up(ops, o->x - sb - 2.0, &box1, box2))
     return 0;
   step(ops, "entry", 0);
   return park(ops, no_range);
@@ -1722,7 +1928,7 @@ int Task2Mission_Run(const Task2Ops *ops)
   speed_open = 0;
   face2_peek = face2_far = 1e9;
   peek_tight = 0;
-  have_end2 = assume_max2 = have_mouth = 0;
+  have_end2 = assume_max2 = have_mouth = have_end_bound = 0;
   bay_y = mouth_x = 0.0;
   meas_lo = meas_hi = NO_END;
   face2_x = end2_lo = end2_hi = 0.0;
@@ -1783,6 +1989,7 @@ int Task2Mission_Run(const Task2Ops *ops)
   const double tol2 = T2_NUDGE_MIN_CM / 2.0; /* aim tol2 past the stop: the window is [stop, stop + NUDGE_MIN] */
   double gap2;
   const double peek_gap = face2_peek - (ops->odom->x + T2_FRONT_CM);
+  int missed = 0;
   if (!range_ahead(ops, 0, &gap2, &no_range))
   {
     /* off the line, the beam can pass a short obstacle 2 with no echo */
@@ -1790,11 +1997,24 @@ int Task2Mission_Run(const Task2Ops *ops)
       return no_range ? T2M_NO_ULTRASONIC : T2M_FAULT;
     no_range = 0;
     gap2 = peek_gap;
+    missed = 1;
   }
   if (peek_tight && gap2 > peek_gap + T2_RECHECK_MAX_CM)
   {
     step(ops, "peek_wins", lround(peek_gap)); /* the echo looked past it */
     gap2 = peek_gap;
+    missed = 1;
+  }
+  if (missed && fabs(ops->odom->y - axis_y) > T2_OBST2_MIN_HALF_CM - T2_OBST2_OFFSET_CM)
+  {
+    /* The beam missed obstacle 2 from off its line: its end on this side is
+     * inward of the car's line, by half the beam's spread at that range
+     * (on 2026-09-14 14:28 the IR then took a box 50 cm further out for
+     * obstacle 2's end). */
+    const double in = ops->odom->y > axis_y ? -1.0 : 1.0;
+    have_end_bound = 1;
+    us_end_bound = ops->odom->y + in * 0.5 * fmax(peek_gap, 0.0) * tan(RAD(T2_ULTRA_CONE_DEG));
+    step(ops, "end_bound", lround(us_end_bound));
   }
   /* Off the line the cone can catch obstacle 2's end, up to its depth beyond
    * the face (course sim: 5 cm long, and the stop that close put the back face

@@ -640,18 +640,28 @@ The side IRs are used the way the RPi's Task 2 uses them (`task2mn_park.py`,
   `FAIL,NOEDGE`), and the way home keeps clear of obstacle 2 as well as
   obstacle 1, driving on along the leg first if the turn home would clip
   its end (`D,home_clear2`).
-- **Centring at the carpark mouth (`task2mn_park` `_park_from_mouth`).** At
-  the entry pose the ultrasound finds the back wall (`D,bay` = the mouth's
-  x). The robot drives in until the side IRs are 5 cm inside the mouth and
-  reads its offset from the side walls: half the difference of the two,
-  else from one wall, else from an IR inside its 10 cm floor (`D,bay_both`
-  / `bay_left` / `bay_right` / `bay_near_l` / `bay_near_r`, offset ×10 mm).
-  Off by more than 4 cm, or more than 5° crooked, it backs out straight if it
-  needs the room (`D,centre_back`) and makes one lane change onto the
-  centreline (`D,centre`), then reads again. `D,parked_off` is the offset it
-  parked at.
-- **Side-safety stop.** Every forward move into the carpark stops if either
-  side IR reads under 10 cm (`D,side_stop`), and the robot centres from there.
+- **Lining up on the carpark (`D,line_up`).** The way home must reach the
+  carpark's line (`bay_y`) facing in, within 5 cm on the odometry, before it
+  drives in. If no S fits from where the car is, the entry goes deeper (to
+  35 cm) and the car moves along the lane first, up to 40 cm either way, on
+  past obstacle 1 or back for room (`D,line_shift`; `D,line_ms` is how long
+  the search took). A plan with a straight over 60 cm stops 30 cm short and
+  plans the rest again (`D,line_leg`), because the straights home drift 2-3°.
+  Still off after every try (`D,line_off`, ×10 mm) by more than the car fits
+  between the fences with 3 cm to spare, it stays outside and the reply is
+  `FAIL,STOP`. On the floor (2026-09-14 14:39) the S no longer fitted after
+  that drift (`D,plan_loop,357`) and the car drove in from 51 cm off the line,
+  past the carpark.
+- **Parking: in on the ultrasonic to 10 cm.** One straight in until the
+  ultrasonic reads `T2_PARK_US_CM` (10), then a look and a nudge more while it
+  is over 3 cm short. No centring: lined up within 5 cm, the car has ~15 cm
+  each side. A reading past the deepest the back wall can be (the mouth, or
+  the start nose, + 50 cm + 10) is not the back wall, and the car goes only
+  that far (`D,park_far`). `D,bay` is the mouth's x from the first reading,
+  and `D,parked_off` is the offset from the fences when it stopped.
+- **Side-safety stop.** The drive in stops if either side IR reads under
+  10 cm (`D,side_stop`). Then, and only then, one lane change off that fence
+  (`D,centre_back` if it backs out for room, `D,centre`), and on in.
 - **No IR shortcut at obstacle 2.** The 90 away from obstacle 2 is always
   finished; the face scan, with the IR square on to the face, decides where
   the end is. The original cut the 90 short when the IR read clear part-way
@@ -668,6 +678,15 @@ The side IRs are used the way the RPi's Task 2 uses them (`task2mn_park.py`,
   `ir_seen_back`), so the end is read rather than assumed; the leg behind
   obstacle 2 reads the far end the same way. Each end read updates the span
   (`D,width2`) and where the walls can be (`D,wall_lo` / `D,wall_hi`).
+- **Not everything the IR sees is obstacle 2.** An end read further than
+  80 cm (+8) out from obstacle 1's line is something else - a wall, a box -
+  and is rejected (`D,end_reject`); the robot then backs up along the face,
+  past it, to the real end. Squared up off the line with the ultrasound
+  straight ahead hearing nothing at obstacle 2's face (`peek_wins`), the end
+  on that side is bounded inward of the car (`D,end_bound`): an IR end beyond
+  it is rejected too, and a face scan that would start already past it is
+  skipped (`D,past_bound`). On the floor (2026-09-14 14:28) a box 50 cm past
+  obstacle 2 was taken for its end and rounded instead.
 - **The arena walls**, which can stand as near as 50 cm past either end of
   obstacle 2. Until an end is read the wall is taken where the narrowest
   obstacle 2 would put it. The 180 round the end starts with the axle
@@ -688,11 +707,17 @@ The course logic was proven in the original car's simulator and, re-derived
 for this robot, in `stm/tests/test_task2_mission.c`: 1677 of 1728 arena
 layouts with the planned 30 cm radius off by up to ±2 cm (6 collisions, the
 rest swinging further than 90 cm past obstacle 2's end - see below), all 16
-starts 5-8 cm off the bay's centreline parked within 4 cm of it, and with the
+starts 5-8 cm off the bay's centreline parked clear of both fences, and with the
 robot at the back of the carpark, obstacle 1 34 cm past the mouth and gaps of
 56-105 cm (`-DSTART_TAIL_CM=2`), 132 of 144 with no collision - the same with
 an IR blind to black more than 15° off square (`-DIR_OBLIQUE_DEG=15`), which
-the old shortcut drops to 54. Measure on this robot, then update
+the old shortcut drops to 54. With the walls 50 cm past obstacle 2 it now
+completes 1650 of 1728, every finished course parked clear of the fences with
+the ultrasonic within 0.5 cm of 10. `-DDRIFT_DEG_PER_M=5` (or `-5`) makes every
+straight facing home wander off its heading the way the floor runs did; with
+it, every finished course still parks inside the carpark (1583 of 1728 from the
+back; the misses are walls or obstacles hit on the long lane straight, not the
+carpark). Measure on this robot, then update
 `task2_params.h` and re-run that test:
 
 0. **The arena walls.** In the simulator the robot swings up to ~96 cm past
@@ -708,6 +733,8 @@ the old shortcut drops to 54. Measure on this robot, then update
    at 20 cm under half - the most sensitive number on the robot.
 3. **The carpark** (`T2_BAY_DEPTH_CM` 50, `T2_BAY_HALF_CM` 30) and the left -
    right IR bias with the robot centred in it by hand (`T2_IR_LR_BIAS_CM`).
+   And where the ultrasonic reads 10 cm: the nose that close to the back wall
+   must leave the tail inside the mouth (`T2_PARK_US_CM`).
 4. **How far a deliberate stop rolls** after `Motion_Stop()` at
    `T2_EDGE_RPM` and at arc speed - the simulator's `EDGE_OVERRUN_CM` /
    `WATCH_OVERRUN_DEG` / `GUARD_OVERRUN_CM` / `SIDE_OVERRUN_CM`, and the IR
