@@ -1,5 +1,6 @@
 package com.mdp.g15.arena.presentation
 
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.Box
@@ -16,10 +17,12 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.LocalContentColor
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -67,27 +70,28 @@ fun ArenaScreen(
         }
     }
 
-    BoxWithConstraints(modifier = modifier.fillMaxSize()) {
-        if (maxWidth >= maxHeight) {
-            Row(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .padding(12.dp),
-                horizontalArrangement = Arrangement.spacedBy(16.dp),
-            ) {
-                if (state.taskMode == TaskMode.TASK2) {
-                    Box(Modifier.weight(3f).fillMaxHeight()) {
-                        task2TimerDisplay?.invoke() ?: Text("Task 2 timer unavailable")
+    // Panels set their own light text; anything placed straight on the sky backdrop is ink.
+    BoxWithConstraints(modifier = modifier.fillMaxSize().background(SpiderMap.Sky)) {
+        CompositionLocalProvider(LocalContentColor provides SpiderMap.Ink) {
+            if (maxWidth >= maxHeight) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .padding(12.dp),
+                    horizontalArrangement = Arrangement.spacedBy(16.dp),
+                ) {
+                    if (state.taskMode == TaskMode.TASK2) {
+                        Box(Modifier.weight(3f).fillMaxHeight()) {
+                            task2TimerDisplay?.invoke() ?: Text("Task 2 timer unavailable")
+                        }
+                    } else {
+                        ArenaCanvas(
+                            state = displayState,
+                            interactions = interactions,
+                            modifier = Modifier.weight(3f).fillMaxHeight(),
+                        )
                     }
-                } else {
-                    ArenaCanvas(
-                        state = displayState,
-                        interactions = interactions,
-                        modifier = Modifier.weight(3f).fillMaxHeight(),
-                    )
-                }
-                Column(Modifier.weight(2f).fillMaxHeight().verticalScroll(rememberScrollState()),
-                    verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    // The panel's frame stays put; only its contents scroll.
                     ArenaStatusPanel(
                         state = displayState,
                         robotStatus = robotStatus,
@@ -95,31 +99,29 @@ fun ArenaScreen(
                         onReset = { confirmReset = true },
                         taskControls = taskControls,
                         belowResetControls = belowResetControls,
-                        modifier = Modifier.fillMaxWidth(),
+                        drivingControls = drivingControls,
+                        modifier = Modifier.weight(2f).fillMaxHeight(),
                     )
-                    drivingControls?.invoke()
                 }
-            }
-        } else {
-            Column(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .padding(12.dp),
-                verticalArrangement = Arrangement.spacedBy(16.dp),
-            ) {
-                if (state.taskMode == TaskMode.TASK2) {
-                    Box(Modifier.fillMaxWidth().weight(3f)) {
-                        task2TimerDisplay?.invoke() ?: Text("Task 2 timer unavailable")
+            } else {
+                Column(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .padding(12.dp),
+                    verticalArrangement = Arrangement.spacedBy(16.dp),
+                ) {
+                    if (state.taskMode == TaskMode.TASK2) {
+                        Box(Modifier.fillMaxWidth().weight(3f)) {
+                            task2TimerDisplay?.invoke() ?: Text("Task 2 timer unavailable")
+                        }
+                    } else {
+                        ArenaCanvas(
+                            state = displayState,
+                            interactions = interactions,
+                            modifier = Modifier.fillMaxWidth().weight(3f),
+                        )
                     }
-                } else {
-                    ArenaCanvas(
-                        state = displayState,
-                        interactions = interactions,
-                        modifier = Modifier.fillMaxWidth().weight(3f),
-                    )
-                }
-                Column(Modifier.fillMaxWidth().weight(2f).verticalScroll(rememberScrollState()),
-                    verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    // The panel's frame stays put; only its contents scroll.
                     ArenaStatusPanel(
                         state = displayState,
                         robotStatus = robotStatus,
@@ -127,9 +129,9 @@ fun ArenaScreen(
                         onReset = { confirmReset = true },
                         taskControls = taskControls,
                         belowResetControls = belowResetControls,
-                        modifier = Modifier.fillMaxWidth(),
+                        drivingControls = drivingControls,
+                        modifier = Modifier.fillMaxWidth().weight(2f),
                     )
-                    drivingControls?.invoke()
                 }
             }
         }
@@ -216,12 +218,16 @@ private fun ArenaStatusPanel(
     onReset: () -> Unit,
     taskControls: (@Composable () -> Unit)? = null,
     belowResetControls: (@Composable () -> Unit)? = null,
+    drivingControls: (@Composable () -> Unit)? = null,
     modifier: Modifier = Modifier,
 ) {
     val selected = state.arena.selectedObstacle
     SpiderMapPanel(modifier = modifier) {
         Column(
-            modifier = Modifier.fillMaxWidth().padding(16.dp),
+            // Inset by the 4 dp border before scrolling, so contents scroll beneath the
+            // frame's inner edge instead of over it.
+            modifier = Modifier.fillMaxWidth().padding(4.dp)
+                .verticalScroll(rememberScrollState()).padding(12.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
             taskControls?.invoke()
@@ -344,6 +350,7 @@ private fun ArenaStatusPanel(
                     onCancel = viewModel::cancelMapResyncOnReconnect,
                 )
             }
+            drivingControls?.invoke()
 
         }
     }

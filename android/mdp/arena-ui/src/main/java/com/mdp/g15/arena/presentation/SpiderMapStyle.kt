@@ -17,27 +17,38 @@ import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.font.Font
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.mdp.g15.arena.R
 
 /**
- * Spider-Society map look for the arena: navy blueprint panels in a thick sky-blue frame,
- * chunky outlined buttons in green / orange / coral, and a monospace "pixel" type.
+ * Spider-Society map look for the arena: a navy blueprint map in frame-blue panels,
+ * chunky outlined buttons in green / orange / coral with pixel-font labels, monospace elsewhere.
  * Colours here mirror res/values/colors.xml, which the grid view draws with.
  */
 internal object SpiderMap {
+    /** Screen backdrop behind the panels, like the reference's light blue surround. */
+    val Sky = Color(0xFFB8E4FF)
+    val Ink = Color(0xFF0A1630)
+    /** Panel fill and its darker inner edge, sampled from the reference's outer frame. */
+    val PanelBlue = Color(0xFF22A1E4)
+    val PanelEdge = Color(0xFF0F7CBD)
     val Navy = Color(0xFF0B2350)
     val NavyDeep = Color(0xFF071838)
     val Frame = Color(0xFF29A9F0)
     val FrameDark = Color(0xFF0E5FA8)
-    val Ink = Color(0xFF0A1630)
-    val Text = Color(0xFFE6F4FF)
-    val TextDim = Color(0xFF9CC7EE)
-    val Warning = Color(0xFFFF8B78)
-
+    // Text sits on PanelBlue, so it is dark: ink for content, deep blue for labels.
+    val Text = Ink
+    val TextDim = Color(0xFF0B2E55)
+    val Warning = Color(0xFF8E1B0E)
+    /** Readable type for titles, labels, status and explanations. */
     val Font = FontFamily.Monospace
+    /** Press Start 2P (SIL OFL 1.1, see arena-ui/fonts/): button labels only, where text is short. */
+    val PixelFont = FontFamily(Font(R.font.press_start_2p))
     val Title = TextStyle(fontFamily = Font, fontWeight = FontWeight.Bold, fontSize = 18.sp,
         letterSpacing = 1.sp, color = Text)
     val Label = TextStyle(fontFamily = Font, fontWeight = FontWeight.Bold, fontSize = 12.sp,
@@ -55,7 +66,7 @@ internal enum class PixelTone(val fill: Color, val label: Color) {
     CORAL(Color(0xFFF2735C), Color(0xFF3D0D05)),
 }
 
-/** A navy map panel inside the thick blue frame. */
+/** A frame-blue panel with a darker edge; the arena map inside stays navy. */
 @Composable
 internal fun SpiderMapPanel(
     modifier: Modifier = Modifier,
@@ -64,8 +75,8 @@ internal fun SpiderMapPanel(
     Card(
         modifier = modifier,
         shape = SpiderMap.PanelShape,
-        colors = CardDefaults.cardColors(containerColor = SpiderMap.Navy, contentColor = SpiderMap.Text),
-        border = BorderStroke(5.dp, SpiderMap.Frame),
+        colors = CardDefaults.cardColors(containerColor = SpiderMap.PanelBlue, contentColor = SpiderMap.Text),
+        border = BorderStroke(4.dp, SpiderMap.PanelEdge),
     ) {
         CompositionLocalProvider(LocalContentColor provides SpiderMap.Text) { content() }
     }
@@ -102,7 +113,10 @@ internal fun PixelButton(
             disabledContentColor = Color(0xFF7FA3BF),
         ),
     ) {
-        Text(text, fontFamily = SpiderMap.Font, fontWeight = FontWeight.Bold, fontSize = 13.sp)
+        // The pixel font has one weight and glyphs about twice normal width: no faux bold, smaller
+        // size, and centred lines so a long label wraps neatly instead of overflowing.
+        Text(text, fontFamily = SpiderMap.PixelFont, fontSize = 9.sp, lineHeight = 14.sp,
+            textAlign = TextAlign.Center)
     }
 }
 

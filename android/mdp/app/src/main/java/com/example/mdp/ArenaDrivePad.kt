@@ -4,6 +4,9 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.semantics.clearAndSetSemantics
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.text.style.TextOverflow
 import com.mdp.g15.arena.domain.ManualCommand
@@ -27,18 +30,24 @@ fun ArenaDrivePad(status: String, connected: Boolean, allowed: Set<ManualCommand
                         if (command == null) {
                             Button(onClick = onStop, enabled = connected, modifier = buttonModifier,
                                 colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)) { Text("■ Stop") }
-                        } else Button(onClick = { onMove(command) }, enabled = connected && command in allowed,
-                            modifier = buttonModifier, contentPadding = PaddingValues(4.dp)) {
-                            Text(when (command) {
-                                ManualCommand.FORWARD -> "▲ Forward"
-                                ManualCommand.REVERSE -> "▼ Reverse"
-                                ManualCommand.LEFT -> "◀ Left"
-                                ManualCommand.RIGHT -> "Right ▶"
-                                ManualCommand.FORWARD_LEFT -> "↖ Forward left"
-                                ManualCommand.FORWARD_RIGHT -> "Forward right ↗"
-                                ManualCommand.BACK_LEFT -> "↙ Back left"
-                                ManualCommand.BACK_RIGHT -> "Back right ↘"
-                            }, style = MaterialTheme.typography.labelMedium)
+                        } else {
+                            val (arrow, name) = when (command) {
+                                ManualCommand.FORWARD -> "▲" to "Forward"
+                                ManualCommand.REVERSE -> "▼" to "Reverse"
+                                ManualCommand.LEFT -> "◀" to "Left"
+                                ManualCommand.RIGHT -> "▶" to "Right"
+                                ManualCommand.FORWARD_LEFT -> "↖" to "Forward left"
+                                ManualCommand.FORWARD_RIGHT -> "↗" to "Forward right"
+                                ManualCommand.BACK_LEFT -> "↙" to "Back left"
+                                ManualCommand.BACK_RIGHT -> "↘" to "Back right"
+                            }
+                            // Arrow only on screen; the name is what screen readers (and tests) use.
+                            Button(onClick = { onMove(command) }, enabled = connected && command in allowed,
+                                modifier = buttonModifier.semantics { contentDescription = name },
+                                contentPadding = PaddingValues(4.dp)) {
+                                Text(arrow, style = MaterialTheme.typography.titleLarge,
+                                    modifier = Modifier.clearAndSetSemantics { })
+                            }
                         }
                     }
                 }

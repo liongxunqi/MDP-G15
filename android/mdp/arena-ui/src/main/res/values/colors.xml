@@ -7,7 +7,8 @@
     <color name="arena_grid_major">#2F74D0</color>
     <color name="arena_frame">#29A9F0</color>
     <color name="arena_web">#3381C9FF</color>
-    <color name="arena_axis_text">#9CC7EE</color>
+    <!-- Axis numbers sit on the frame-blue panel around the map. -->
+    <color name="arena_axis_text">#0A1630</color>
     <color name="arena_ink">#0A1630</color>
     <!-- Obstacle tokens: coral until the image is identified, then green. -->
     <color name="arena_obstacle">#F2735C</color>
@@ -21,7 +22,7 @@
     <!-- Path demo: translucent so grid lines stay visible through the swept cells. -->
     <color name="arena_path_cell">#6680D4FF</color>
     <color name="arena_path_arrow">#BFE6FF</color>
-    <color name="arena_panel_background">#0B2350</color>
-    <color name="arena_feedback_error">#FF8B78</color>
-    <color name="arena_feedback_normal">#E6F4FF</color>
+    <color name="arena_panel_background">#22A1E4</color>
+    <color name="arena_feedback_error">#8E1B0E</color>
+    <color name="arena_feedback_normal">#0A1630</color>
 </resources>

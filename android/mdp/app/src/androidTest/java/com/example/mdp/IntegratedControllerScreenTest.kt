@@ -84,7 +84,7 @@ class IntegratedControllerScreenTest {
         composeRule.onNodeWithText("Robot pose").assertDoesNotExist()
         composeRule.onNodeWithText("Obstacles").assertDoesNotExist()
         composeRule.onNodeWithText("Selected obstacle").assertDoesNotExist()
-        composeRule.onNodeWithText("▲ Forward").assertDoesNotExist()
+        composeRule.onNodeWithContentDescription("Forward").assertDoesNotExist()
         composeRule.onNodeWithText("■ Stop").assertDoesNotExist()
         composeRule.onNodeWithText("Amd tool").assertDoesNotExist()
         composeRule.onNodeWithText("Task 2: obstacles are discovered", substring = true).assertDoesNotExist()
@@ -331,14 +331,14 @@ class IntegratedControllerScreenTest {
         connected = true
         setScreen()
         composeRule.onNodeWithText("Arena").performClick()
-        composeRule.onNodeWithText("◀ Left").assertIsNotEnabled()
+        composeRule.onNodeWithContentDescription("Left").assertIsNotEnabled()
         composeRule.onNodeWithText("■ Stop").assertIsEnabled()
         composeRule.runOnIdle { assertTrue(incoming.tryEmit("ROBOT,NaN,99,N")) }
         composeRule.waitForIdle()
-        composeRule.onNodeWithText("▲ Forward").assertIsNotEnabled()
+        composeRule.onNodeWithContentDescription("Forward").assertIsNotEnabled()
         composeRule.runOnIdle { assertTrue(incoming.tryEmit("ROBOT,2,2,N")) }
         composeRule.waitForIdle()
-        composeRule.onNodeWithText("▲ Forward").performScrollTo().assertIsEnabled().performClick()
+        composeRule.onNodeWithContentDescription("Forward").performScrollTo().assertIsEnabled().performClick()
         composeRule.runOnIdle { assertEquals(listOf("f"), movement) }
     }
 
@@ -351,23 +351,23 @@ class IntegratedControllerScreenTest {
         composeRule.runOnIdle { assertEquals(false, appendNewline) }
         composeRule.runOnIdle { assertTrue(incoming.tryEmit("STATUS,DONE\nROBOT,8,8,N")) }
         composeRule.waitForIdle()
-        composeRule.onNodeWithText("◀ Left").performScrollTo().assertIsEnabled().performClick()
+        composeRule.onNodeWithContentDescription("Left").performScrollTo().assertIsEnabled().performClick()
         composeRule.onNodeWithText("(7.00, 8.00) • 270° · West • estimated").performScrollTo().assertIsDisplayed()
         composeRule.waitUntil(5_000) {
-            runCatching { composeRule.onNodeWithText("Right ▶").assertIsEnabled() }.isSuccess
+            runCatching { composeRule.onNodeWithContentDescription("Right").assertIsEnabled() }.isSuccess
         }
         composeRule.runOnIdle {
             assertTrue(incoming.tryEmit("ROBOT,NaN,19,N\nSTATUS,START,9999999999999999,8,N\nSTATUS,INVALID"))
         }
         composeRule.waitForIdle()
-        composeRule.onNodeWithText("Right ▶").performScrollTo().assertIsEnabled().performClick()
+        composeRule.onNodeWithContentDescription("Right").performScrollTo().assertIsEnabled().performClick()
         composeRule.onNodeWithText("(8.00, 8.00) • 90° · East • estimated").performScrollTo().assertIsDisplayed()
         composeRule.waitUntil(5_000) {
             runCatching { composeRule.onNodeWithText("normal").assertIsEnabled() }.isSuccess
         }
         composeRule.onNodeWithText("normal").performScrollTo().performClick()
         composeRule.runOnIdle { assertEquals(true, appendNewline) }
-        composeRule.onNodeWithText("Right ▶").performScrollTo().assertIsEnabled().performClick()
+        composeRule.onNodeWithContentDescription("Right").performScrollTo().assertIsEnabled().performClick()
         composeRule.onNodeWithText("(10.91, 5.09) • 180° · South • estimated").performScrollTo().assertIsDisplayed()
         composeRule.runOnIdle { assertEquals(listOf("tl", "tr", "tr"), movement) }
     }
@@ -391,7 +391,7 @@ class IntegratedControllerScreenTest {
         setScreen()
 
         composeRule.onNodeWithText("Bluetooth").assertIsDisplayed()
-        composeRule.onNodeWithText("▲ Forward").assertDoesNotExist()
+        composeRule.onNodeWithContentDescription("Forward").assertDoesNotExist()
         composeRule.onNodeWithText("■ Stop").assertDoesNotExist()
         composeRule.onNodeWithText("Stop robot").assertDoesNotExist()
         capture("controls")
@@ -532,17 +532,17 @@ class IntegratedControllerScreenTest {
         connected = true
         setScreen()
         composeRule.onNodeWithText("Arena").performClick()
-        composeRule.onNodeWithText("▲ Forward").assertIsNotEnabled()
-        for (label in listOf("▲ Forward", "◀ Left", "Right ▶", "▼ Reverse", "↖ Forward left", "Forward right ↗", "↙ Back left", "Back right ↘")) {
+        composeRule.onNodeWithContentDescription("Forward").assertIsNotEnabled()
+        for (label in listOf("Forward", "Left", "Right", "Reverse", "Forward left", "Forward right", "Back left", "Back right")) {
             assertTrue(incoming.tryEmit("ROBOT,8,8,N"))
             composeRule.waitForIdle()
             composeRule.waitUntil(5_000) {
-                runCatching { composeRule.onNodeWithText(label).assertIsEnabled() }.isSuccess
+                runCatching { composeRule.onNodeWithContentDescription(label).assertIsEnabled() }.isSuccess
             }
-            composeRule.onNodeWithText(label).performScrollTo().assertIsDisplayed().assertIsEnabled().performClick()
+            composeRule.onNodeWithContentDescription(label).performScrollTo().assertIsDisplayed().assertIsEnabled().performClick()
             // Preview completion is time-based; deterministic spam gating is covered by VM tests.
             composeRule.onNodeWithText("■ Stop").assertIsEnabled()
-            if (label == "▲ Forward") {
+            if (label == "Forward") {
                 composeRule.onNodeWithText("(8.00, 10.00) • 0° · North • estimated").performScrollTo().assertIsDisplayed()
                 composeRule.onNodeWithTag("arena_grid").assertIsDisplayed()
                 assertEquals(listOf("f"), movement)
@@ -554,10 +554,10 @@ class IntegratedControllerScreenTest {
         composeRule.onNodeWithText("■ Stop").performScrollTo().performClick()
         assertTrue(incoming.tryEmit("ROBOT,5,18,N"))
         composeRule.waitForIdle()
-        composeRule.onNodeWithText("▲ Forward").assertIsNotEnabled()
+        composeRule.onNodeWithContentDescription("Forward").assertIsNotEnabled()
         // The reported bottom-left y=18 puts a 2.1-cell robot outside the arena;
         // neither direction may be sent until a valid physical position is reported.
-        composeRule.onNodeWithText("▼ Reverse").assertIsNotEnabled()
+        composeRule.onNodeWithContentDescription("Reverse").assertIsNotEnabled()
         composeRule.onNodeWithTag("arena_grid").assertIsDisplayed()
         capture("checklist-connected-controls")
         for (tab in listOf("Arena", "Logs")) {

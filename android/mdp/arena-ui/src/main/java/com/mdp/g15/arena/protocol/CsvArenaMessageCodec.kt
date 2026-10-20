@@ -76,7 +76,7 @@ class CsvArenaMessageCodec : ArenaMessageCodec {
         }
         val text = message.substring(separator + 1).trim().removeSurrounding("[", "]")
         if (text.isBlank()) return ArenaDecodeResult.Malformed("Status message has no display text.")
-        return ArenaDecodeResult.Decoded(ArenaInboundEvent.Status(text))    
+        return ArenaDecodeResult.Decoded(ArenaInboundEvent.Status(text))
     }
 
     private fun decodeTarget(message: String): ArenaDecodeResult {
