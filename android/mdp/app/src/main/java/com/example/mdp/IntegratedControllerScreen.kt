@@ -39,6 +39,9 @@ import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.platform.testTag
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
@@ -52,6 +55,9 @@ import com.mdp.g15.arena.presentation.ArenaViewModel
 import com.mdp.g15.arena.presentation.AndroidTask2TimerClock
 import com.mdp.g15.arena.presentation.Task2Timer
 import com.mdp.g15.arena.presentation.DEFAULT_PLANNER_INFO
+import com.mdp.g15.arena.presentation.PixelButton
+import com.mdp.g15.arena.presentation.PixelTone
+import com.mdp.g15.arena.presentation.SpiderMap
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.delay
 import java.util.Locale
@@ -322,9 +328,16 @@ private fun TaskControls(
     }
     Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            // The active task is filled orange; the other is a hollow tab.
             TaskMode.entries.forEach { task ->
-                FilterChip(selected = mode == task, onClick = { onSelectTask(task) },
-                    enabled = canSelectTask, label = { Text(if (task == TaskMode.TASK1) "Task 1" else "Task 2") })
+                PixelButton(
+                    text = if (task == TaskMode.TASK1) "Task 1" else "Task 2",
+                    onClick = { onSelectTask(task) },
+                    tone = PixelTone.ORANGE,
+                    enabled = canSelectTask,
+                    selected = mode == task,
+                    contentPadding = PaddingValues(horizontal = 14.dp, vertical = 6.dp),
+                )
             }
         }
         Text("${if (mode == TaskMode.TASK1) "Task 1" else "Task 2"} • $phaseLabel",
@@ -346,9 +359,7 @@ private fun TaskControls(
                     Text("New attempt")
                 }
             } else if (!task2Active) {
-                Button(onClick = onStart, enabled = canRequest, modifier = Modifier.fillMaxWidth()) {
-                    Text("Start Task 2")
-                }
+                PixelButton("Start Task 2", onStart, Modifier.fillMaxWidth(), PixelTone.GREEN, enabled = canRequest)
             }
         } else if (phase in setOf(Task1Phase.COMPLETED, Task1Phase.FAILED, Task1Phase.STOPPED) ||
             (hasResults && phase in setOf(Task1Phase.SETUP, Task1Phase.PATH_REQUESTED))) {
@@ -357,9 +368,7 @@ private fun TaskControls(
             }
         } else {
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Button(onClick = onStart, enabled = canRequest, modifier = Modifier.weight(1f)) {
-                    Text("Start Task 1")
-                }
+                PixelButton("Start Task 1", onStart, Modifier.weight(1f), PixelTone.GREEN, enabled = canRequest)
             }
         }
         if (phase in setOf(Task1Phase.SETUP, Task1Phase.PATH_REQUESTED, Task1Phase.START_REQUESTED)) {
@@ -418,31 +427,29 @@ private fun Task2TimerPanel(timer: Task2Timer, phase: Task1Phase) {
         Task1Phase.START_REQUESTED -> "Start requested"
         else -> "Ready to start"
     }
+    // Same blue as the status card; the time-limit warnings still change it.
     val color = when {
-        elapsedMillis != null && elapsedMillis >= 180_000L -> MaterialTheme.colorScheme.error
-        elapsedMillis == null || elapsedMillis >= 150_000L -> MaterialTheme.colorScheme.errorContainer
-        else -> MaterialTheme.colorScheme.surfaceVariant
+        elapsedMillis != null && elapsedMillis >= 180_000L -> Color(0xFFD32F2F)
+        elapsedMillis == null || elapsedMillis >= 150_000L -> PixelTone.ORANGE.fill
+        else -> SpiderMap.PanelBlue
     }
-    val contentColor = when {
-        elapsedMillis != null && elapsedMillis >= 180_000L -> MaterialTheme.colorScheme.onError
-        elapsedMillis == null || elapsedMillis >= 150_000L -> MaterialTheme.colorScheme.onErrorContainer
-        else -> MaterialTheme.colorScheme.onSurfaceVariant
-    }
-    Surface(shape = RoundedCornerShape(12.dp), color = color, contentColor = contentColor,
+    val contentColor = if (elapsedMillis != null && elapsedMillis >= 180_000L) Color.White else SpiderMap.Ink
+    Surface(shape = SpiderMap.PanelShape, color = color, contentColor = contentColor,
         modifier = Modifier.fillMaxSize().semantics { contentDescription = label }
             .testTag("task2_timer_panel")) {
         BoxWithConstraints(Modifier.fillMaxSize().padding(16.dp), contentAlignment = Alignment.Center) {
             val fontScale = LocalDensity.current.fontScale
-            val size = minOf(112f,
-                maxWidth.value / (display.length * 0.65f * fontScale),
+            // Pixel glyphs are a full em wide (monospace is about 0.65), so size the digits to fit.
+            val size = minOf(96f,
+                maxWidth.value / (display.length * 1.0f * fontScale),
                 maxHeight.value / (2.4f * fontScale)).coerceAtLeast(1f)
             Column(horizontalAlignment = Alignment.CenterHorizontally,
-                verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                Text("Task 2 • $heading", style = MaterialTheme.typography.titleMedium)
-                Text(display, fontSize = size.sp, fontFamily = FontFamily.Monospace,
-                    fontWeight = FontWeight.Bold, maxLines = 1, softWrap = false)
-                Text("minutes : seconds : hundredths", style = MaterialTheme.typography.labelMedium)
-                Text("Tablet elapsed time", style = MaterialTheme.typography.labelSmall)
+                verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Text("Task 2 • $heading", style = SpiderMap.pixel(14.sp, contentColor), textAlign = TextAlign.Center)
+                Text(display, style = SpiderMap.pixel(size.sp, contentColor), maxLines = 1, softWrap = false)
+                Text("minutes : seconds : hundredths", style = SpiderMap.pixel(9.sp, contentColor),
+                    textAlign = TextAlign.Center)
+                Text("Tablet elapsed time", style = SpiderMap.pixel(8.sp, contentColor))
             }
         }
     }

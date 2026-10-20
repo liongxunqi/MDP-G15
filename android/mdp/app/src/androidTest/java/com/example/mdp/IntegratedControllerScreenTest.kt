@@ -85,7 +85,7 @@ class IntegratedControllerScreenTest {
         composeRule.onNodeWithText("Obstacles").assertDoesNotExist()
         composeRule.onNodeWithText("Selected obstacle").assertDoesNotExist()
         composeRule.onNodeWithContentDescription("Forward").assertDoesNotExist()
-        composeRule.onNodeWithText("■ Stop").assertDoesNotExist()
+        composeRule.onNodeWithContentDescription("Stop").assertDoesNotExist()
         composeRule.onNodeWithText("Amd tool").assertDoesNotExist()
         composeRule.onNodeWithText("Task 2: obstacles are discovered", substring = true).assertDoesNotExist()
         composeRule.onNodeWithText("Start Task 2").assertIsNotEnabled()
@@ -332,7 +332,7 @@ class IntegratedControllerScreenTest {
         setScreen()
         composeRule.onNodeWithText("Arena").performClick()
         composeRule.onNodeWithContentDescription("Left").assertIsNotEnabled()
-        composeRule.onNodeWithText("■ Stop").assertIsEnabled()
+        composeRule.onNodeWithContentDescription("Stop").assertIsEnabled()
         composeRule.runOnIdle { assertTrue(incoming.tryEmit("ROBOT,NaN,99,N")) }
         composeRule.waitForIdle()
         composeRule.onNodeWithContentDescription("Forward").assertIsNotEnabled()
@@ -392,7 +392,7 @@ class IntegratedControllerScreenTest {
 
         composeRule.onNodeWithText("Bluetooth").assertIsDisplayed()
         composeRule.onNodeWithContentDescription("Forward").assertDoesNotExist()
-        composeRule.onNodeWithText("■ Stop").assertDoesNotExist()
+        composeRule.onNodeWithContentDescription("Stop").assertDoesNotExist()
         composeRule.onNodeWithText("Stop robot").assertDoesNotExist()
         capture("controls")
         composeRule.onNodeWithText("Connect").performClick()
@@ -519,10 +519,10 @@ class IntegratedControllerScreenTest {
         composeRule.waitForIdle()
         composeRule.runOnIdle { assertTrue(incoming.tryEmit("MSG," + "A detailed status message from the robot. ".repeat(60))) }
         composeRule.onNodeWithText("Arena").performClick()
-        composeRule.onNodeWithText("■ Stop").performScrollTo().assertIsDisplayed().assertIsEnabled()
+        composeRule.onNodeWithContentDescription("Stop").performScrollTo().assertIsDisplayed().assertIsEnabled()
         composeRule.onNodeWithTag("arena_grid").assertIsDisplayed()
         composeRule.onNodeWithText("Add obstacle").performScrollTo().assertIsDisplayed()
-        composeRule.onNodeWithText("■ Stop").performScrollTo().assertIsDisplayed()
+        composeRule.onNodeWithContentDescription("Stop").performScrollTo().assertIsDisplayed()
         composeRule.onNodeWithTag("arena_grid").assertIsDisplayed()
         capture("checklist-long-status")
     }
@@ -541,7 +541,7 @@ class IntegratedControllerScreenTest {
             }
             composeRule.onNodeWithContentDescription(label).performScrollTo().assertIsDisplayed().assertIsEnabled().performClick()
             // Preview completion is time-based; deterministic spam gating is covered by VM tests.
-            composeRule.onNodeWithText("■ Stop").assertIsEnabled()
+            composeRule.onNodeWithContentDescription("Stop").assertIsEnabled()
             if (label == "Forward") {
                 composeRule.onNodeWithText("(8.00, 10.00) • 0° · North • estimated").performScrollTo().assertIsDisplayed()
                 composeRule.onNodeWithTag("arena_grid").assertIsDisplayed()
@@ -551,7 +551,7 @@ class IntegratedControllerScreenTest {
             composeRule.waitForIdle()
         }
         assertEquals(listOf("f", "tl", "tr", "r", "fl", "fr", "bl", "br"), movement)
-        composeRule.onNodeWithText("■ Stop").performScrollTo().performClick()
+        composeRule.onNodeWithContentDescription("Stop").performScrollTo().performClick()
         assertTrue(incoming.tryEmit("ROBOT,5,18,N"))
         composeRule.waitForIdle()
         composeRule.onNodeWithContentDescription("Forward").assertIsNotEnabled()

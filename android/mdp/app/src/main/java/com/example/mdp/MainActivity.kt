@@ -59,6 +59,13 @@ import com.example.mdp.BluetoothPermissions
 import com.example.mdp.ConnectionState
 import com.example.mdp.ControllerViewModel
 import com.example.mdp.ui.theme.MdpTheme
+import com.mdp.g15.arena.presentation.PixelButton
+import com.mdp.g15.arena.presentation.PixelTextScope
+import com.mdp.g15.arena.presentation.PixelTone
+import com.mdp.g15.arena.presentation.SpiderMap
+import com.mdp.g15.arena.presentation.SpiderMapPanel
+import androidx.compose.foundation.background
+import androidx.compose.material3.OutlinedTextFieldDefaults
 
 /**
  * NOTE ON IMPORTS: this assumes BluetoothPermissions / ConnectionState /
@@ -283,101 +290,105 @@ fun ControllerScreen(
     showManualPad: Boolean = true,
     showTaskButtons: Boolean = true,
 ) {
-    Box(modifier = modifier.fillMaxSize(), contentAlignment = Alignment.TopCenter) {
-        Column(
-            modifier = Modifier
-                .widthIn(max = 720.dp)
-                .fillMaxWidth()
-                .verticalScroll(rememberScrollState())
-                .padding(20.dp),
-            horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.spacedBy(16.dp),
-        ) {
-            Card(
-                modifier = Modifier.fillMaxWidth(),
-                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-                border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+    // Same look as the Arena tab: navy backdrop, frame-blue panels, pixel lettering.
+    Box(modifier = modifier.fillMaxSize().background(SpiderMap.Backdrop), contentAlignment = Alignment.TopCenter) {
+        PixelTextScope {
+            Column(
+                modifier = Modifier
+                    .widthIn(max = 720.dp)
+                    .fillMaxWidth()
+                    .verticalScroll(rememberScrollState())
+                    .padding(20.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(16.dp),
             ) {
-                Column(Modifier.padding(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                    Text("Bluetooth", style = MaterialTheme.typography.headlineSmall)
-                    Text(status, style = MaterialTheme.typography.bodyLarge, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    when {
-                        isConnected -> Button(onClick = onDisconnectClick) { Text("Disconnect") }
-                        isBusy -> OutlinedButton(onClick = onDisconnectClick) { Text("Cancel") }
-                        else -> Button(onClick = onConnectClick, enabled = permissionsGranted) {
-                            Text(if (permissionsGranted) "Connect" else "Permissions required")
+                SpiderMapPanel(modifier = Modifier.fillMaxWidth()) {
+                    Column(Modifier.padding(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                        Text("Bluetooth", style = MaterialTheme.typography.headlineSmall)
+                        Text(status, style = MaterialTheme.typography.bodyLarge, color = SpiderMap.TextDim)
+                        when {
+                            isConnected -> PixelButton("Disconnect", onDisconnectClick, tone = PixelTone.CORAL)
+                            isBusy -> PixelButton("Cancel", onDisconnectClick, tone = PixelTone.ORANGE)
+                            else -> PixelButton(if (permissionsGranted) "Connect" else "Permissions required",
+                                onConnectClick, tone = PixelTone.GREEN, enabled = permissionsGranted)
                         }
                     }
                 }
-            }
-            Card(
-                modifier = Modifier.fillMaxWidth(),
-                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer),
-            ) {
-                Column(Modifier.padding(20.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                    Text("Robot status", style = MaterialTheme.typography.labelLarge)
-                    Text(robotStatus, style = MaterialTheme.typography.titleLarge)
+                SpiderMapPanel(modifier = Modifier.fillMaxWidth()) {
+                    Column(Modifier.padding(20.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        Text("Robot status", style = MaterialTheme.typography.labelLarge, color = SpiderMap.TextDim)
+                        Text(robotStatus, style = MaterialTheme.typography.titleLarge)
+                    }
                 }
-            }
-            Card(
-                modifier = Modifier.fillMaxWidth(),
-                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-                border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
-            ) {
-                Column(
-                    Modifier.fillMaxWidth().padding(20.dp),
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                    verticalArrangement = Arrangement.spacedBy(16.dp),
-                ) {
-                    Text("Manual control", style = MaterialTheme.typography.titleMedium)
-                    var customMessage by rememberSaveable { mutableStateOf("") }
-                    OutlinedTextField(
-                        value = customMessage,
-                        onValueChange = { if (it.length <= 50) customMessage = it },
-                        modifier = Modifier.fillMaxWidth(),
-                        singleLine = true,
-                        label = { Text("Custom message (${customMessage.length}/50)") },
-                    )
-                    Button(
-                        onClick = {
-                            onSendCustomMessage(customMessage)
-                            customMessage = ""
-                        },
-                        enabled = isConnected && customMessage.isNotBlank(),
-                        modifier = Modifier.fillMaxWidth(),
-                    ) { Text("Send") }
-                    if (showTaskButtons) Button(onClick = onBegin, enabled = isConnected, modifier = Modifier.fillMaxWidth()) {
-                        Text("Begin")
-                    }
-                    if (showTaskButtons) Button(onClick = onPath, enabled = isConnected, modifier = Modifier.fillMaxWidth()) {
-                        Text("Send Path")
-                    }
-                    if (showManualPad) DPad(
-                        enabled = isConnected,
-                        forwardEnabled = forwardEnabled,
-                        reverseEnabled = reverseEnabled,
-                        onForward = onForward,
-                        onReverse = onReverse,
-                        onTurnLeft = onTurnLeft,
-                        onTurnRight = onTurnRight,
-                        onStop = onStop,
-                        onForwardLeft = onForwardLeft,
-                        onForwardRight = onForwardRight,
-                        onBackLeft = onBackLeft,
-                        onBackRight = onBackRight,
-                    )
-                    if (showManualPad && isConnected && (!forwardEnabled || !reverseEnabled)) {
-                        Text(
-                            "Blocked: obstacle or arena edge ahead",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.error,
+                SpiderMapPanel(modifier = Modifier.fillMaxWidth()) {
+                    Column(
+                        Modifier.fillMaxWidth().padding(20.dp),
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        verticalArrangement = Arrangement.spacedBy(16.dp),
+                    ) {
+                        Text("Manual control", style = MaterialTheme.typography.titleMedium)
+                        var customMessage by rememberSaveable { mutableStateOf("") }
+                        OutlinedTextField(
+                            value = customMessage,
+                            onValueChange = { if (it.length <= 50) customMessage = it },
+                            modifier = Modifier.fillMaxWidth(),
+                            singleLine = true,
+                            label = { Text("Custom message (${customMessage.length}/50)") },
+                            // A light field with ink text and outline stands out on the blue panel.
+                            colors = OutlinedTextFieldDefaults.colors(
+                                focusedContainerColor = SpiderMap.OnBackdrop,
+                                unfocusedContainerColor = SpiderMap.OnBackdrop,
+                                disabledContainerColor = SpiderMap.OnBackdrop,
+                                focusedTextColor = SpiderMap.Ink,
+                                unfocusedTextColor = SpiderMap.Ink,
+                                focusedBorderColor = SpiderMap.Ink,
+                                unfocusedBorderColor = SpiderMap.PanelEdge,
+                                focusedLabelColor = SpiderMap.Ink,
+                                unfocusedLabelColor = SpiderMap.TextDim,
+                                cursorColor = SpiderMap.Ink,
+                            ),
                         )
+                        PixelButton(
+                            text = "Send",
+                            onClick = {
+                                onSendCustomMessage(customMessage)
+                                customMessage = ""
+                            },
+                            modifier = Modifier.fillMaxWidth(),
+                            tone = PixelTone.GREEN,
+                            enabled = isConnected && customMessage.isNotBlank(),
+                        )
+                        if (showTaskButtons) PixelButton("Begin", onBegin, Modifier.fillMaxWidth(),
+                            PixelTone.ORANGE, enabled = isConnected)
+                        if (showTaskButtons) PixelButton("Send Path", onPath, Modifier.fillMaxWidth(),
+                            PixelTone.ORANGE, enabled = isConnected)
+                        if (showManualPad) DPad(
+                            enabled = isConnected,
+                            forwardEnabled = forwardEnabled,
+                            reverseEnabled = reverseEnabled,
+                            onForward = onForward,
+                            onReverse = onReverse,
+                            onTurnLeft = onTurnLeft,
+                            onTurnRight = onTurnRight,
+                            onStop = onStop,
+                            onForwardLeft = onForwardLeft,
+                            onForwardRight = onForwardRight,
+                            onBackLeft = onBackLeft,
+                            onBackRight = onBackRight,
+                        )
+                        if (showManualPad && isConnected && (!forwardEnabled || !reverseEnabled)) {
+                            Text(
+                                "Blocked: obstacle or arena edge ahead",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = SpiderMap.Warning,
+                            )
+                        }
                     }
                 }
-            }
-            if (latestMessage.isNotEmpty()) {
-                Card(Modifier.fillMaxWidth()) {
-                    Text("Last message: $latestMessage", Modifier.padding(16.dp), style = MaterialTheme.typography.bodySmall)
+                if (latestMessage.isNotEmpty()) {
+                    SpiderMapPanel(modifier = Modifier.fillMaxWidth()) {
+                        Text("Last message: $latestMessage", Modifier.padding(16.dp), style = MaterialTheme.typography.bodySmall)
+                    }
                 }
             }
         }

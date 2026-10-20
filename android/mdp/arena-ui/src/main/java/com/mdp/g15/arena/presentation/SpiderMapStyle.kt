@@ -11,11 +11,16 @@ import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.LocalContentColor
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.ProvideTextStyle
+import androidx.compose.material3.Typography
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.semantics.selected
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.font.Font
@@ -27,12 +32,13 @@ import com.mdp.g15.arena.R
 
 /**
  * Spider-Society map look for the arena: a navy blueprint map in frame-blue panels,
- * chunky outlined buttons in green / orange / coral with pixel-font labels, monospace elsewhere.
+ * chunky outlined buttons in green / orange / coral, and pixel-font lettering.
  * Colours here mirror res/values/colors.xml, which the grid view draws with.
  */
-internal object SpiderMap {
-    /** Screen backdrop behind the panels, like the reference's light blue surround. */
-    val Sky = Color(0xFFB8E4FF)
+object SpiderMap {
+    /** Screen backdrop behind the panels: the dark map navy, with light text on it. */
+    val Backdrop = Color(0xFF0B2350)
+    val OnBackdrop = Color(0xFFE6F4FF)
     val Ink = Color(0xFF0A1630)
     /** Panel fill and its darker inner edge, sampled from the reference's outer frame. */
     val PanelBlue = Color(0xFF22A1E4)
@@ -45,22 +51,52 @@ internal object SpiderMap {
     val Text = Ink
     val TextDim = Color(0xFF0B2E55)
     val Warning = Color(0xFF8E1B0E)
-    /** Readable type for titles, labels, status and explanations. */
-    val Font = FontFamily.Monospace
-    /** Press Start 2P (SIL OFL 1.1, see arena-ui/fonts/): button labels only, where text is short. */
+    /** Press Start 2P (SIL OFL 1.1, see arena-ui/fonts/). One weight only, glyphs a full em wide. */
     val PixelFont = FontFamily(Font(R.font.press_start_2p))
-    val Title = TextStyle(fontFamily = Font, fontWeight = FontWeight.Bold, fontSize = 18.sp,
-        letterSpacing = 1.sp, color = Text)
-    val Label = TextStyle(fontFamily = Font, fontWeight = FontWeight.Bold, fontSize = 12.sp,
-        letterSpacing = 0.5.sp, color = TextDim)
-    val Body = TextStyle(fontFamily = Font, fontSize = 13.sp, color = Text)
+    // Sized down from the old monospace styles because pixel glyphs are much wider.
+    val Title = TextStyle(fontFamily = PixelFont, fontSize = 13.sp, lineHeight = 20.sp, color = Text)
+    val Label = TextStyle(fontFamily = PixelFont, fontSize = 9.sp, lineHeight = 14.sp, color = TextDim)
+    val Body = TextStyle(fontFamily = PixelFont, fontSize = 10.sp, lineHeight = 16.sp, color = Text)
 
     val PanelShape = RoundedCornerShape(6.dp)
     val ButtonShape = RoundedCornerShape(10.dp)
+
+    /** Pixel lettering for short display text outside buttons (the Task 2 timer card). */
+    fun pixel(size: androidx.compose.ui.unit.TextUnit, color: Color = Ink) =
+        TextStyle(fontFamily = PixelFont, fontSize = size, lineHeight = size * 1.5f, color = color)
+}
+
+/**
+ * Puts every text inside [content] in the pixel font, including text from controls that use
+ * MaterialTheme typography (the app's task controls, drive pad and mode buttons). Material
+ * sizes are scaled down to suit the wider glyphs.
+ */
+@Composable
+fun PixelTextScope(content: @Composable () -> Unit) {
+    val base = MaterialTheme.typography
+    fun TextStyle.pixel(): TextStyle {
+        val size = fontSize * 0.7f
+        return copy(fontFamily = SpiderMap.PixelFont, fontWeight = FontWeight.Normal, fontSize = size,
+            lineHeight = size * 1.6f, letterSpacing = 0.sp)
+    }
+    val pixelTypography = Typography(
+        displayLarge = base.displayLarge.pixel(), displayMedium = base.displayMedium.pixel(),
+        displaySmall = base.displaySmall.pixel(), headlineLarge = base.headlineLarge.pixel(),
+        headlineMedium = base.headlineMedium.pixel(), headlineSmall = base.headlineSmall.pixel(),
+        titleLarge = base.titleLarge.pixel(), titleMedium = base.titleMedium.pixel(),
+        titleSmall = base.titleSmall.pixel(), bodyLarge = base.bodyLarge.pixel(),
+        bodyMedium = base.bodyMedium.pixel(), bodySmall = base.bodySmall.pixel(),
+        labelLarge = base.labelLarge.pixel(), labelMedium = base.labelMedium.pixel(),
+        labelSmall = base.labelSmall.pixel(),
+    )
+    MaterialTheme(colorScheme = MaterialTheme.colorScheme, shapes = MaterialTheme.shapes,
+        typography = pixelTypography) {
+        ProvideTextStyle(SpiderMap.Body.copy(color = Color.Unspecified), content)
+    }
 }
 
 /** Button fill and label colours, taken from the reference's three button families. */
-internal enum class PixelTone(val fill: Color, val label: Color) {
+enum class PixelTone(val fill: Color, val label: Color) {
     GREEN(Color(0xFF5FD27A), Color(0xFF0E4A26)),
     ORANGE(Color(0xFFFFB547), Color(0xFF5A2A00)),
     CORAL(Color(0xFFF2735C), Color(0xFF3D0D05)),
@@ -68,7 +104,7 @@ internal enum class PixelTone(val fill: Color, val label: Color) {
 
 /** A frame-blue panel with a darker edge; the arena map inside stays navy. */
 @Composable
-internal fun SpiderMapPanel(
+fun SpiderMapPanel(
     modifier: Modifier = Modifier,
     content: @Composable ColumnScope.() -> Unit,
 ) {
@@ -87,7 +123,7 @@ internal fun SpiderMapPanel(
  * so it is obvious at a glance which actions are available.
  */
 @Composable
-internal fun PixelButton(
+fun PixelButton(
     text: String,
     onClick: () -> Unit,
     modifier: Modifier = Modifier,
@@ -102,7 +138,7 @@ internal fun PixelButton(
     Button(
         onClick = onClick,
         enabled = enabled,
-        modifier = modifier.defaultMinSize(minHeight = 40.dp),
+        modifier = modifier.defaultMinSize(minHeight = 40.dp).semantics { this.selected = selected },
         shape = SpiderMap.ButtonShape,
         border = BorderStroke(3.dp, if (enabled) SpiderMap.Ink else SpiderMap.FrameDark),
         contentPadding = contentPadding,
@@ -122,7 +158,7 @@ internal fun PixelButton(
 
 /** Row-scoped convenience so button rows share width evenly. */
 @Composable
-internal fun RowScope.PixelButtonCell(
+fun RowScope.PixelButtonCell(
     text: String,
     onClick: () -> Unit,
     tone: PixelTone,

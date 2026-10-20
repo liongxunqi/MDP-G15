@@ -35,6 +35,7 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import com.mdp.g15.arena.domain.PoseSource
 import com.mdp.g15.arena.domain.readableHeading
 import com.mdp.g15.arena.domain.RobotFootprint
@@ -70,9 +71,9 @@ fun ArenaScreen(
         }
     }
 
-    // Panels set their own light text; anything placed straight on the sky backdrop is ink.
-    BoxWithConstraints(modifier = modifier.fillMaxSize().background(SpiderMap.Sky)) {
-        CompositionLocalProvider(LocalContentColor provides SpiderMap.Ink) {
+    // Panels set their own dark text; anything placed straight on the navy backdrop is light.
+    BoxWithConstraints(modifier = modifier.fillMaxSize().background(SpiderMap.Backdrop)) {
+        CompositionLocalProvider(LocalContentColor provides SpiderMap.OnBackdrop) {
             if (maxWidth >= maxHeight) {
                 Row(
                     modifier = Modifier
@@ -81,9 +82,7 @@ fun ArenaScreen(
                     horizontalArrangement = Arrangement.spacedBy(16.dp),
                 ) {
                     if (state.taskMode == TaskMode.TASK2) {
-                        Box(Modifier.weight(3f).fillMaxHeight()) {
-                            task2TimerDisplay?.invoke() ?: Text("Task 2 timer unavailable")
-                        }
+                        Task2TimerCard(task2TimerDisplay, Modifier.weight(3f).fillMaxHeight())
                     } else {
                         ArenaCanvas(
                             state = displayState,
@@ -111,9 +110,7 @@ fun ArenaScreen(
                     verticalArrangement = Arrangement.spacedBy(16.dp),
                 ) {
                     if (state.taskMode == TaskMode.TASK2) {
-                        Box(Modifier.fillMaxWidth().weight(3f)) {
-                            task2TimerDisplay?.invoke() ?: Text("Task 2 timer unavailable")
-                        }
+                        Task2TimerCard(task2TimerDisplay, Modifier.fillMaxWidth().weight(3f))
                     } else {
                         ArenaCanvas(
                             state = displayState,
@@ -154,6 +151,16 @@ fun ArenaScreen(
                 TextButton(onClick = { confirmReset = false }) { Text("Cancel") }
             },
         )
+    }
+}
+
+/** Task 2 replaces the map with the timer, framed like the status card below it. */
+@Composable
+private fun Task2TimerCard(content: (@Composable () -> Unit)?, modifier: Modifier) {
+    SpiderMapPanel(modifier = modifier) {
+        Box(Modifier.fillMaxSize().padding(4.dp), contentAlignment = Alignment.Center) {
+            content?.invoke() ?: Text("Task 2 timer unavailable", style = SpiderMap.pixel(12.sp))
+        }
     }
 }
 
@@ -222,7 +229,7 @@ private fun ArenaStatusPanel(
     modifier: Modifier = Modifier,
 ) {
     val selected = state.arena.selectedObstacle
-    SpiderMapPanel(modifier = modifier) {
+    SpiderMapPanel(modifier = modifier) { PixelTextScope {
         Column(
             // Inset by the 4 dp border before scrolling, so contents scroll beneath the
             // frame's inner edge instead of over it.
@@ -331,6 +338,20 @@ private fun ArenaStatusPanel(
                     PixelButtonCell("Redo", viewModel::redo, PixelTone.GREEN, enabled = state.canRedo)
                 }
                 PixelButton("Reset arena", onReset, Modifier.fillMaxWidth(), PixelTone.ORANGE)
+            }
+            if (state.taskMode == TaskMode.TASK1) {
+                ResyncOnReconnectControl(
+                    phase = state.task1Phase,
+                    armed = state.forceMapResyncOnReconnect,
+                    onArm = viewModel::armMapResyncOnReconnect,
+                    onCancel = viewModel::cancelMapResyncOnReconnect,
+                )
+            }
+            drivingControls?.invoke()
+            // Driving-related extras sit under the D-pad: the Amd tool / normal mode switch
+            // (passed in as belowResetControls), then the path demo.
+            if (state.taskMode == TaskMode.TASK1) {
+                belowResetControls?.invoke()
                 // Visual only: disabled while playing, so a press always starts from move 0.
                 PixelButton(
                     text = if (state.pathDemoRunning) "Playing path demo…" else "Play Path Demo",
@@ -341,19 +362,8 @@ private fun ArenaStatusPanel(
                     modifier = Modifier.fillMaxWidth().testTag("play_path_demo"),
                 )
             }
-            if (state.taskMode == TaskMode.TASK1) belowResetControls?.invoke()
-            if (state.taskMode == TaskMode.TASK1) {
-                ResyncOnReconnectControl(
-                    phase = state.task1Phase,
-                    armed = state.forceMapResyncOnReconnect,
-                    onArm = viewModel::armMapResyncOnReconnect,
-                    onCancel = viewModel::cancelMapResyncOnReconnect,
-                )
-            }
-            drivingControls?.invoke()
-
         }
-    }
+    } }
 }
 
 /**
