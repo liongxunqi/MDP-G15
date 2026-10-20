@@ -1,14 +1,27 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <color name="arena_background">#EAF4FA</color>
-    <color name="arena_grid_line">#4F6B7A</color>
-    <color name="arena_axis_text">#1F2933</color>
-    <color name="arena_obstacle">#174A6E</color>
-    <color name="arena_selected">#F5B700</color>
-    <color name="arena_target_face">#E63946</color>
-    <color name="arena_robot">#2A9D8F</color>
-    <color name="arena_robot_direction">#072E2A</color>
-    <color name="arena_panel_background">#F7F9FB</color>
-    <color name="arena_feedback_error">#B42318</color>
-    <color name="arena_feedback_normal">#364152</color>
+    <!-- Spider-Society map: navy blueprint, sky-blue frame, coral/green tokens, ink outlines.
+         SpiderMapStyle.kt holds the matching Compose colours. -->
+    <color name="arena_background">#0B2350</color>
+    <color name="arena_grid_line">#1A4689</color>
+    <color name="arena_grid_major">#2F74D0</color>
+    <color name="arena_frame">#29A9F0</color>
+    <color name="arena_web">#3381C9FF</color>
+    <color name="arena_axis_text">#9CC7EE</color>
+    <color name="arena_ink">#0A1630</color>
+    <!-- Obstacle tokens: coral until the image is identified, then green. -->
+    <color name="arena_obstacle">#F2735C</color>
+    <color name="arena_obstacle_found">#5FD27A</color>
+    <color name="arena_selected">#FFB547</color>
+    <color name="arena_target_face">#FFFFFF</color>
+    <!-- Robot: coral suit, white mask eyes, ink direction mark. -->
+    <color name="arena_robot">#F2735C</color>
+    <color name="arena_robot_eye">#FFFFFF</color>
+    <color name="arena_robot_direction">#0A1630</color>
+    <!-- Path demo: translucent so grid lines stay visible through the swept cells. -->
+    <color name="arena_path_cell">#6680D4FF</color>
+    <color name="arena_path_arrow">#BFE6FF</color>
+    <color name="arena_panel_background">#0B2350</color>
+    <color name="arena_feedback_error">#FF8B78</color>
+    <color name="arena_feedback_normal">#E6F4FF</color>
 </resources>

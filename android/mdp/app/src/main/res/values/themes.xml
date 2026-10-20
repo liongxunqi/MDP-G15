@@ -1,5 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-
-    <style name="Theme.Mdp" parent="android:Theme.Material.Light.NoActionBar" />
+    <!-- Dark window so launch and resize never flash white behind the dark Compose theme. -->
+    <style name="Theme.Mdp" parent="android:Theme.Material.NoActionBar">
+        <item name="android:windowBackground">@color/void_purple</item>
+        <item name="android:colorAccent">@color/portal_orange</item>
+    </style>
 </resources>

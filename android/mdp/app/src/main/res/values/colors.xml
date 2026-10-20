@@ -7,4 +7,6 @@
     <color name="teal_700">#FF018786</color>
     <color name="black">#FF000000</color>
     <color name="white">#FFFFFFFF</color>
+    <color name="void_purple">#FF12061F</color>
+    <color name="portal_orange">#FFFF8A2A</color>
 </resources>

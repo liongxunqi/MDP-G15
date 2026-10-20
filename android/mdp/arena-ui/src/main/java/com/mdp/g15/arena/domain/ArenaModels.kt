@@ -91,7 +91,8 @@ data class RobotPose(
     }
 }
 
-enum class PoseSource { REPORTED, OPERATOR, ESTIMATED }
+/** SIMULATED is the local path demo: visual only, never sent and never a basis for driving. */
+enum class PoseSource { REPORTED, OPERATOR, ESTIMATED, SIMULATED }
 
 fun RobotPose.compassLabel(): String {
     val labels = arrayOf("North", "Northeast", "East", "Southeast", "South", "Southwest", "West", "Northwest")

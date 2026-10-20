@@ -1,5 +1,6 @@
 package com.mdp.g15.arena.presentation
 
+import android.os.SystemClock
 import androidx.lifecycle.SavedStateHandle
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
@@ -15,6 +16,8 @@ import com.mdp.g15.arena.domain.ArenaState
 import com.mdp.g15.arena.domain.Direction
 import com.mdp.g15.arena.domain.GridCoordinate
 import com.mdp.g15.arena.domain.Obstacle
+import com.mdp.g15.arena.domain.PathDemo
+import com.mdp.g15.arena.domain.PathDemoPlayback
 import com.mdp.g15.arena.domain.RobotPose
 import com.mdp.g15.arena.domain.PoseSource
 import com.mdp.g15.arena.domain.readableHeading
@@ -45,6 +48,8 @@ class ArenaViewModel(
     private val codec: ArenaMessageCodec = CsvArenaMessageCodec(),
     private val useRpiMapSync: Boolean = false,
     private val task2TimerClock: Task2TimerClock = AndroidTask2TimerClock,
+    /** Monotonic milliseconds; the path demo derives every frame from this one clock. */
+    private val pathDemoClockMillis: () -> Long = SystemClock::uptimeMillis,
 ) : ViewModel(), ArenaInboundConsumer {
     private val undoHistory = ArrayDeque<ArenaEditSnapshot>()
     private val redoHistory = ArrayDeque<ArenaEditSnapshot>()
@@ -55,6 +60,7 @@ class ArenaViewModel(
     private var poseRevision = 0L
     private var connected = false
     private var previewJob: Job? = null
+    private var pathDemoJob: Job? = null
 
     private fun activeArena(): ArenaState = _uiState.value.arena.let { arena ->
         if (_uiState.value.taskMode == TaskMode.TASK2) arena.copy(obstacles = emptyMap(), selectedObstacleId = null)
@@ -62,7 +68,7 @@ class ArenaViewModel(
     }
 
     fun manualAllowed(command: ManualCommand): Boolean = connected && !_uiState.value.autonomousRunning &&
-        !_uiState.value.manualAnimating && !_uiState.value.manualPending &&
+        !_uiState.value.manualAnimating && !_uiState.value.manualPending && !_uiState.value.pathDemoRunning &&
         manualDrive.allowed(activeArena(), command, _uiState.value.amdToolMode)
 
     fun setAmdToolMode(enabled: Boolean): Boolean {
@@ -80,6 +86,7 @@ class ArenaViewModel(
             !connected -> "Connect to the robot before starting."
             state.autonomousRunning -> "A run is already active or awaiting confirmation."
             state.manualPending || state.manualAnimating -> "Wait for manual movement to finish."
+            state.pathDemoRunning -> "Wait for the path demo to finish."
             state.placementMode -> "Finish or cancel obstacle placement."
             state.task1Phase !in setOf(Task1Phase.SETUP, Task1Phase.PATH_REQUESTED) ||
                 state.arena.obstacles.values.any { it.targetId != null } -> "Prepare a new attempt to clear previous results."
@@ -212,6 +219,59 @@ class ArenaViewModel(
             else "Task 2 attempt prepared. Waiting for robot readiness.", false)
     }
 
+    /** Why the visual path demo cannot start now, or null when it can. */
+    fun pathDemoIssue(): String? {
+        val state = _uiState.value
+        return when {
+            state.taskMode != TaskMode.TASK1 -> "The path demo runs on the Task 1 arena."
+            state.pathDemoRunning -> "The path demo is already playing."
+            state.autonomousRunning -> "A run is active; the demo would hide the real robot."
+            state.manualPending || state.manualAnimating -> "Wait for manual movement to finish."
+            state.placementMode -> "Finish or cancel obstacle placement."
+            else -> null
+        }
+    }
+
+    /**
+     * Plays [PathDemo.SCRIPT] on the arena robot. Purely visual: nothing is sent, the drive guard
+     * is not seeded, and a real pose report ends the demo. The button is disabled while it plays.
+     */
+    fun playPathDemo() {
+        pathDemoIssue()?.let { setFeedback(it, true); return }
+        val playback = PathDemoPlayback(PathDemo.INITIAL_POSE, PathDemo.SCRIPT, _uiState.value.arena.config)
+        val startedAt = pathDemoClockMillis()
+        poseRevision++ // The demo pose replaces the old one; undo must not restore it over the demo.
+        showPathDemoFrame(playback.frameAt(0L))
+        setFeedback("Playing path demo — visual only, nothing is sent to the robot.", false)
+        pathDemoJob = viewModelScope.launch {
+            while (true) {
+                delay(PATH_DEMO_FRAME_MS)
+                val frame = playback.frameAt(pathDemoClockMillis() - startedAt)
+                showPathDemoFrame(frame)
+                if (frame.finished) break
+            }
+            pathDemoJob = null
+            setFeedback("Path demo finished. The robot shown is simulated, not reported.", false)
+        }
+    }
+
+    private fun showPathDemoFrame(frame: PathDemoPlayback.Frame) {
+        _uiState.value = _uiState.value.copy(
+            arena = _uiState.value.arena.copy(robot = frame.pose),
+            pathDemoRunning = !frame.finished,
+            pathOverlay = frame.overlay,
+        )
+    }
+
+    /** Ends playback where it is; the caller sets whatever robot pose should replace it. */
+    private fun stopPathDemo() {
+        pathDemoJob?.cancel()
+        pathDemoJob = null
+        if (_uiState.value.pathDemoRunning || _uiState.value.pathOverlay != null) {
+            _uiState.value = _uiState.value.copy(pathDemoRunning = false, pathOverlay = null)
+        }
+    }
+
     fun rejectUnsafeCustomMessage() = setFeedback("Send one command at a time; movement must pass the arena checks.", true)
 
     fun drive(command: ManualCommand, send: () -> Unit) {
@@ -298,6 +358,7 @@ class ArenaViewModel(
 
     fun connectionChanged(connected: Boolean) {
         if (this.connected != connected) {
+            stopPathDemo()
             _uiState.value = _uiState.value.copy(plannerInfo = DEFAULT_PLANNER_INFO)
             cancelPreviewGate()
             manualDrive.invalidate()
@@ -583,7 +644,8 @@ class ArenaViewModel(
     }
 
     private fun blockWhileDriving(): Boolean {
-        if (manualDrive.pending == null && !_uiState.value.autonomousRunning && !_uiState.value.manualAnimating) return false
+        if (manualDrive.pending == null && !_uiState.value.autonomousRunning && !_uiState.value.manualAnimating &&
+            !_uiState.value.pathDemoRunning) return false
         setFeedback("Wait for movement completion before editing the arena.", true)
         return true
     }
@@ -729,6 +791,7 @@ class ArenaViewModel(
                 applyReduction(
                     reduction,
                 ) { state ->
+                    stopPathDemo() // Real telemetry always replaces the simulated robot.
                     cancelPreviewGate()
                     manualDrive.report(event.pose)
                     poseRevision++
@@ -897,6 +960,7 @@ class ArenaViewModel(
 
     companion object {
         private const val MAX_STATUS_HISTORY = 20
+        private const val PATH_DEMO_FRAME_MS = 16L
         private const val MAX_UNDO_HISTORY = 50
         private const val KEY_OBSTACLES = "arena.obstacles"
         private const val KEY_ROBOT = "arena.robot"

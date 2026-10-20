@@ -1,6 +1,7 @@
 package com.mdp.g15.arena.presentation
 
 import com.mdp.g15.arena.domain.ArenaState
+import com.mdp.g15.arena.domain.PathOverlay
 
 enum class TaskMode { TASK1, TASK2 }
 
@@ -43,4 +44,8 @@ data class ArenaUiState(
      *  full obstacle list, overriding the normal post-BEGIN suppression. See
      *  [ArenaViewModel.armMapResyncOnReconnect]. */
     val forceMapResyncOnReconnect: Boolean = false,
+    /** Local "Play Path Demo" playback; it drives [ArenaState.robot] but sends nothing. */
+    val pathDemoRunning: Boolean = false,
+    /** Swept cells and travel arrow of the demo's active move only; null between runs. */
+    val pathOverlay: PathOverlay? = null,
 )

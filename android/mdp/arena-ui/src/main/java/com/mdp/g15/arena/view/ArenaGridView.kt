@@ -2,7 +2,6 @@ package com.mdp.g15.arena.view
 
 import android.content.Context
 import android.graphics.Canvas
-import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.Path
 import android.graphics.RectF
@@ -24,12 +23,16 @@ import com.mdp.g15.arena.domain.ArenaState
 import com.mdp.g15.arena.domain.Direction
 import com.mdp.g15.arena.domain.GridCoordinate
 import com.mdp.g15.arena.domain.Obstacle
+import com.mdp.g15.arena.domain.PathOverlay
 import com.mdp.g15.arena.domain.PoseSource
 import com.mdp.g15.arena.domain.RobotFootprint
 import com.mdp.g15.arena.domain.RobotPose
 import com.mdp.g15.arena.domain.readableHeading
+import kotlin.math.atan2
+import kotlin.math.cos
 import kotlin.math.hypot
 import kotlin.math.min
+import kotlin.math.sin
 
 class ArenaGridView @JvmOverloads constructor(
     context: Context,
@@ -40,6 +43,7 @@ class ArenaGridView @JvmOverloads constructor(
 
     private var state = ArenaState()
     private var placementMode = false
+    private var pathOverlay: PathOverlay? = null
     private val robotMotion = RobotMotion()
     private val geometry = ArenaGeometry()
     private val density = resources.displayMetrics.density
@@ -80,21 +84,36 @@ class ArenaGridView @JvmOverloads constructor(
 
     private val backgroundPaint = fillPaint(R.color.arena_background)
     private val gridPaint = strokePaint(R.color.arena_grid_line, 1f * density)
+    // Every fifth line is brighter, like a blueprint's major grid.
+    private val gridMajorPaint = strokePaint(R.color.arena_grid_major, 1.5f * density)
+    private val framePaint = strokePaint(R.color.arena_frame, 3f * density)
+    private val webPaint = strokePaint(R.color.arena_web, 1.5f * density)
+    private val inkPaint = strokePaint(R.color.arena_ink, 2.5f * density).apply {
+        strokeJoin = Paint.Join.ROUND
+    }
     private val axisTextPaint = textPaint(R.color.arena_axis_text, 10f, Paint.Align.CENTER)
     private val obstaclePaint = fillPaint(R.color.arena_obstacle)
+    private val obstacleFoundPaint = fillPaint(R.color.arena_obstacle_found)
     private val obstacleTextPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.WHITE
+        color = ContextCompat.getColor(context, R.color.arena_ink)
         textSize = sp(12f)
         textAlign = Paint.Align.CENTER
         typeface = android.graphics.Typeface.DEFAULT_BOLD
     }
-    private val selectedPaint = strokePaint(R.color.arena_selected, 3f * density)
+    private val selectedPaint = strokePaint(R.color.arena_selected, 4f * density)
     private val facePaint = strokePaint(R.color.arena_target_face, 4f * density)
     private val robotPaint = fillPaint(R.color.arena_robot)
     private val robotDirectionPaint = fillPaint(R.color.arena_robot_direction)
+    private val robotEyePaint = fillPaint(R.color.arena_robot_eye)
+    private val pathCellPaint = fillPaint(R.color.arena_path_cell)
+    private val pathArrowPaint = strokePaint(R.color.arena_path_arrow, 3f * density).apply {
+        strokeCap = Paint.Cap.ROUND
+        strokeJoin = Paint.Join.ROUND
+    }
+    private val pathArrowHeadPaint = fillPaint(R.color.arena_path_arrow)
     private val dragPaint = Paint(obstaclePaint).apply { alpha = 165 }
     private val dragInvalidPaint = Paint().apply {
-        color = ContextCompat.getColor(context, R.color.arena_target_face)
+        color = ContextCompat.getColor(context, R.color.arena_feedback_error)
         style = Paint.Style.STROKE
         strokeWidth = 3f * density
     }
@@ -137,7 +156,7 @@ class ArenaGridView @JvmOverloads constructor(
         contentDescription = context.getString(R.string.arena_content_description)
     }
 
-    fun render(state: ArenaState, placementMode: Boolean) {
+    fun render(state: ArenaState, placementMode: Boolean, pathOverlay: PathOverlay? = null) {
         if ((robotPressed || draggingRobot) && this.state.reportRevision != state.reportRevision) {
             handler.removeCallbacks(longPressRunnable)
             clearGesture()
@@ -145,13 +164,16 @@ class ArenaGridView @JvmOverloads constructor(
         }
         if (draggingRobot || this.state.config != state.config || this.state.obstacles != state.obstacles ||
             state.robot == null || (this.state.reportedRobot == null && state.reportedRobot != null) ||
-            this.state.robot?.source == PoseSource.OPERATOR) {
+            this.state.robot?.source == PoseSource.OPERATOR ||
+            // The path demo already supplies a pose every frame; smoothing would lag it.
+            state.robot?.source == PoseSource.SIMULATED) {
             robotMotion.snap(state.robot)
         } else if (this.state.robot != state.robot) {
             robotMotion.retarget(state, SystemClock.uptimeMillis())
         }
         this.state = state
         this.placementMode = placementMode
+        this.pathOverlay = pathOverlay
         contentDescription = buildContentDescription(state)
         invalidate()
     }
@@ -177,6 +199,7 @@ class ArenaGridView @JvmOverloads constructor(
         canvas.translate(panX, panY)
         canvas.scale(scale, scale)
         drawArena(canvas)
+        pathOverlay?.let { drawPathOverlay(canvas, it) }
         drawObstacles(canvas)
         if (!draggingRobot) {
             drawAnimatedRobot(canvas)
@@ -324,15 +347,19 @@ class ArenaGridView @JvmOverloads constructor(
         val arenaWidth = geometry.arenaWidth
         val arenaHeight = geometry.arenaHeight
         canvas.drawRect(left, top, left + arenaWidth, top + arenaHeight, backgroundPaint)
+        drawWebRadar(canvas)
 
         for (column in 0..state.config.columns) {
             val x = left + column * geometry.cellSize
-            canvas.drawLine(x, top, x, top + arenaHeight, gridPaint)
+            canvas.drawLine(x, top, x, top + arenaHeight, if (column % 5 == 0) gridMajorPaint else gridPaint)
         }
+        // Rows count from the bottom, so major lines follow arena y, not screen y.
         for (row in 0..state.config.rows) {
             val y = top + row * geometry.cellSize
-            canvas.drawLine(left, y, left + arenaWidth, y, gridPaint)
+            val arenaRow = state.config.rows - row
+            canvas.drawLine(left, y, left + arenaWidth, y, if (arenaRow % 5 == 0) gridMajorPaint else gridPaint)
         }
+        canvas.drawRect(left, top, left + arenaWidth, top + arenaHeight, framePaint)
 
         axisTextPaint.textSize = min(sp(10f), geometry.cellSize * 0.42f)
         for (column in 0 until state.config.columns) {
@@ -357,6 +384,74 @@ class ArenaGridView @JvmOverloads constructor(
         axisTextPaint.textAlign = Paint.Align.CENTER
     }
 
+    /** Decoration only: a faint spider-web radar under the grid, in the far corner from the start. */
+    private fun drawWebRadar(canvas: Canvas) {
+        val radius = geometry.cellSize * 4.5f
+        val cx = geometry.arenaLeft + geometry.arenaWidth - radius - geometry.cellSize * 0.5f
+        val cy = geometry.arenaTop + radius + geometry.cellSize * 0.5f
+        val spokes = 12
+        for (ring in 1..4) {
+            val r = radius * ring / 4f
+            val web = Path()
+            for (i in 0..spokes) {
+                val a = (2.0 * Math.PI * i / spokes).toFloat()
+                val x = cx + r * cos(a)
+                val y = cy + r * sin(a)
+                if (i == 0) web.moveTo(x, y) else web.lineTo(x, y)
+            }
+            canvas.drawPath(web, webPaint)
+        }
+        for (i in 0 until spokes) {
+            val a = (2.0 * Math.PI * i / spokes).toFloat()
+            canvas.drawLine(cx, cy, cx + radius * cos(a), cy + radius * sin(a), webPaint)
+        }
+    }
+
+    /** Active demo move: swept cells, then the centre-path arrow pointing the way of travel. */
+    private fun drawPathOverlay(canvas: Canvas, overlay: PathOverlay) {
+        overlay.cells.forEach { cell ->
+            if (!state.config.contains(cell)) return@forEach
+            val bounds = geometry.cellBounds(cell)
+            canvas.drawRect(bounds.left, bounds.top, bounds.right, bounds.bottom, pathCellPaint)
+        }
+        val points = overlay.centreline
+        if (points.size < 2) return
+        val checkpoint = canvas.save()
+        canvas.clipRect(geometry.arenaLeft, geometry.arenaTop,
+            geometry.arenaLeft + geometry.arenaWidth, geometry.arenaTop + geometry.arenaHeight)
+        val tipX = geometry.contentX(points.last().x)
+        val tipY = geometry.contentY(points.last().y)
+        // Aim along the last stretch that is long enough to have a stable direction.
+        val tail = points.asReversed().firstOrNull {
+            hypot(geometry.contentX(it.x) - tipX, geometry.contentY(it.y) - tipY) > geometry.cellSize * 0.2f
+        } ?: points.first()
+        val angle = atan2(tipY - geometry.contentY(tail.y), tipX - geometry.contentX(tail.x))
+        val headLength = geometry.cellSize * 0.45f
+        val headHalfWidth = geometry.cellSize * 0.28f
+        // Stop the shaft at the head's base so the round cap does not poke through the tip.
+        val baseX = tipX - headLength * cos(angle)
+        val baseY = tipY - headLength * sin(angle)
+        val shaft = Path().apply {
+            moveTo(geometry.contentX(points.first().x), geometry.contentY(points.first().y))
+            points.drop(1).forEach { point ->
+                val x = geometry.contentX(point.x)
+                val y = geometry.contentY(point.y)
+                if (hypot(x - tipX, y - tipY) < headLength) return@forEach
+                lineTo(x, y)
+            }
+            lineTo(baseX, baseY)
+        }
+        canvas.drawPath(shaft, pathArrowPaint)
+        val head = Path().apply {
+            moveTo(tipX, tipY)
+            lineTo(baseX - headHalfWidth * sin(angle), baseY + headHalfWidth * cos(angle))
+            lineTo(baseX + headHalfWidth * sin(angle), baseY - headHalfWidth * cos(angle))
+            close()
+        }
+        canvas.drawPath(head, pathArrowHeadPaint)
+        canvas.restoreToCount(checkpoint)
+    }
+
     private fun drawObstacles(canvas: Canvas) {
         val draggingId = draggingObstacleId
         state.obstacles.toSortedMap().values.forEach { obstacle ->
@@ -373,7 +468,9 @@ class ArenaGridView @JvmOverloads constructor(
             bounds.right - inset,
             bounds.bottom - inset,
         )
-        canvas.drawRect(rect, obstaclePaint)
+        val corner = geometry.cellSize * 0.22f
+        canvas.drawRoundRect(rect, corner, corner, if (obstacle.targetId == null) obstaclePaint else obstacleFoundPaint)
+        canvas.drawRoundRect(rect, corner, corner, inkPaint)
 
         obstacleTextPaint.textSize = if (obstacle.targetId == null) {
             geometry.cellSize * 0.38f
@@ -388,7 +485,11 @@ class ArenaGridView @JvmOverloads constructor(
             obstacleTextPaint,
         )
 
-        if (state.selectedObstacleId == obstacle.id) canvas.drawRect(rect, selectedPaint)
+        if (state.selectedObstacleId == obstacle.id) {
+            val ring = geometry.cellSize * 0.1f
+            canvas.drawRoundRect(RectF(rect.left - ring, rect.top - ring, rect.right + ring, rect.bottom + ring),
+                corner + ring, corner + ring, selectedPaint)
+        }
         obstacle.targetFace?.let { drawFace(canvas, rect, it) }
     }
 
@@ -405,16 +506,34 @@ class ArenaGridView @JvmOverloads constructor(
         val bounds = geometry.robotBounds(pose, state.config)
         val checkpoint = canvas.save()
         canvas.rotate(pose.heading.toFloat(), bounds.centerX, bounds.centerY)
-        val inset = geometry.cellSize * 0.08f
-        canvas.drawRoundRect(RectF(bounds.left + inset, bounds.top + inset,
-            bounds.right - inset, bounds.bottom - inset), inset, inset, robotPaint)
+        val cell = geometry.cellSize
+        val inset = cell * 0.08f
+        val body = RectF(bounds.left + inset, bounds.top + inset, bounds.right - inset, bounds.bottom - inset)
+        canvas.drawRoundRect(body, cell * 0.35f, cell * 0.35f, robotPaint)
+        canvas.drawRoundRect(body, cell * 0.35f, cell * 0.35f, inkPaint)
+        // The front is the top of the unrotated body; canvas.rotate turns it to the heading.
         val nose = Path().apply {
-            moveTo(bounds.centerX, bounds.top + inset * 1.2f)
-            lineTo(bounds.centerX - geometry.cellSize * 0.3f, bounds.top + geometry.cellSize * 0.55f)
-            lineTo(bounds.centerX + geometry.cellSize * 0.3f, bounds.top + geometry.cellSize * 0.55f)
+            moveTo(bounds.centerX, bounds.top + inset * 1.5f)
+            lineTo(bounds.centerX - cell * 0.28f, bounds.top + cell * 0.42f)
+            lineTo(bounds.centerX + cell * 0.28f, bounds.top + cell * 0.42f)
             close()
         }
         canvas.drawPath(nose, robotDirectionPaint)
+        val eyeTop = bounds.top + cell * 0.55f
+        val eyeWidth = (bounds.right - bounds.left) * 0.3f
+        listOf(-1f, 1f).forEach { side ->
+            val eyeCentre = bounds.centerX + side * eyeWidth * 0.62f
+            val eye = Path().apply {
+                // A slanted Spider-Man lens: pointed toward the middle, round at the outside.
+                moveTo(eyeCentre - side * eyeWidth * 0.5f, eyeTop + cell * 0.05f)
+                quadTo(eyeCentre + side * eyeWidth * 0.55f, eyeTop - cell * 0.05f,
+                    eyeCentre + side * eyeWidth * 0.45f, eyeTop + cell * 0.32f)
+                quadTo(eyeCentre, eyeTop + cell * 0.48f, eyeCentre - side * eyeWidth * 0.5f, eyeTop + cell * 0.05f)
+                close()
+            }
+            canvas.drawPath(eye, robotEyePaint)
+            canvas.drawPath(eye, inkPaint)
+        }
         canvas.restoreToCount(checkpoint)
     }
 
@@ -568,6 +687,7 @@ class ArenaGridView @JvmOverloads constructor(
                     PoseSource.REPORTED -> "RPi reported."
                     PoseSource.OPERATOR -> "Operator placed."
                     PoseSource.ESTIMATED -> "Estimated movement."
+                    PoseSource.SIMULATED -> "Path demo simulation."
                 }
         } ?: "Robot position unavailable."
         return "${state.config.columns} by ${state.config.rows} exploration arena. " +

@@ -1,7 +1,5 @@
 package com.mdp.g15.arena.presentation
 
-import androidx.compose.foundation.BorderStroke
-import androidx.compose.material3.CardDefaults
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.Box
@@ -17,12 +15,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
-import androidx.compose.material3.Button
-import androidx.compose.material3.Card
-import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
-import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.LaunchedEffect
@@ -37,6 +30,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.mdp.g15.arena.domain.PoseSource
 import com.mdp.g15.arena.domain.readableHeading
@@ -175,11 +169,7 @@ private fun ArenaCanvas(
         }
     }
 
-    Card(
-        modifier = modifier.testTag("arena_grid_card"),
-        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
-    ) {
+    SpiderMapPanel(modifier = modifier.testTag("arena_grid_card")) {
         Column(modifier = Modifier.fillMaxSize().clipToBounds()) {
             val viewportModifier = if (squareViewport) {
                 Modifier.fillMaxWidth().aspectRatio(1f)
@@ -195,7 +185,7 @@ private fun ArenaCanvas(
                 },
                 update = { view ->
                     view.interactionListener = interactions
-                    view.render(state.arena, state.placementMode)
+                    view.render(state.arena, state.placementMode, state.pathOverlay)
                 },
                 onRelease = { view ->
                     view.interactionListener = null
@@ -209,16 +199,10 @@ private fun ArenaCanvas(
                     .padding(horizontal = 8.dp, vertical = 4.dp),
                 horizontalArrangement = Arrangement.spacedBy(4.dp),
             ) {
-                OutlinedButton(
-                    onClick = { gridView?.zoomOut() },
-                    modifier = Modifier.height(40.dp),
-                    contentPadding = PaddingValues(horizontal = 12.dp),
-                ) { Text("− Zoom out") }
-                OutlinedButton(
-                    onClick = { gridView?.zoomIn() },
-                    modifier = Modifier.height(40.dp),
-                    contentPadding = PaddingValues(horizontal = 12.dp),
-                ) { Text("+ Zoom in") }
+                PixelButton("− Zoom out", { gridView?.zoomOut() }, Modifier.height(40.dp),
+                    contentPadding = PaddingValues(horizontal = 12.dp))
+                PixelButton("+ Zoom in", { gridView?.zoomIn() }, Modifier.height(40.dp),
+                    contentPadding = PaddingValues(horizontal = 12.dp))
             }
         }
     }
@@ -235,27 +219,19 @@ private fun ArenaStatusPanel(
     modifier: Modifier = Modifier,
 ) {
     val selected = state.arena.selectedObstacle
-    Card(
-        modifier = modifier,
-        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
-    ) {
+    SpiderMapPanel(modifier = modifier) {
         Column(
             modifier = Modifier.fillMaxWidth().padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
             taskControls?.invoke()
             Text(if (state.taskMode == TaskMode.TASK2) "Task 2 status" else "Arena status",
-                style = MaterialTheme.typography.titleLarge)
-            Text("Latest action", style = MaterialTheme.typography.labelLarge)
+                style = SpiderMap.Title)
+            Text("Latest action", style = SpiderMap.Label)
             Text(
                 text = state.feedback,
-                color = if (state.feedbackIsError) {
-                    MaterialTheme.colorScheme.error
-                } else {
-                    MaterialTheme.colorScheme.onSurfaceVariant
-                },
-                style = MaterialTheme.typography.bodyMedium,
+                color = if (state.feedbackIsError) SpiderMap.Warning else SpiderMap.Text,
+                style = SpiderMap.Body,
             )
             if (state.taskMode == TaskMode.TASK1 && state.latestReceived.isNotEmpty()) {
                 StatusValue("Last received", state.latestReceived)
@@ -276,6 +252,7 @@ private fun ArenaStatusPanel(
                                 PoseSource.REPORTED -> "RPi reported"
                                 PoseSource.OPERATOR -> "operator placed"
                                 PoseSource.ESTIMATED -> "estimated"
+                                PoseSource.SIMULATED -> "path demo"
                             }
                             val warning = when {
                                 !RobotFootprint.fitsArena(it, state.arena.config) -> " · outside arena"
@@ -308,54 +285,55 @@ private fun ArenaStatusPanel(
             }
 
             if (state.taskMode == TaskMode.TASK1) {
-                HorizontalDivider()
-                Text("Target face", style = MaterialTheme.typography.labelLarge)
+                HorizontalDivider(thickness = 2.dp, color = SpiderMap.FrameDark)
+                Text("Target face", style = SpiderMap.Label)
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.spacedBy(6.dp),
                 ) {
+                    // Coral tabs, like the reference's O / S / T; filled = the chosen face.
                     Direction.entries.forEach { direction ->
-                        FilterChip(
-                            selected = selected?.targetFace == direction,
+                        PixelButton(
+                            text = direction.wireValue,
                             onClick = { viewModel.setTargetFace(direction) },
+                            tone = PixelTone.CORAL,
                             enabled = selected != null,
-                            label = { Text(direction.wireValue) },
+                            selected = selected?.targetFace == direction,
+                            contentPadding = PaddingValues(horizontal = 14.dp, vertical = 6.dp),
                         )
                     }
                 }
 
                 val atObstacleLimit = state.arena.obstacles.size >= state.arena.config.maxObstacles
-                Button(
+                PixelButton(
+                    text = when {
+                        state.placementMode -> "Cancel placement"
+                        atObstacleLimit -> "Obstacle limit reached"
+                        else -> "Add obstacle"
+                    },
                     onClick = { viewModel.setPlacementMode(!state.placementMode) },
-                    enabled = state.placementMode || (!atObstacleLimit && !state.manualPending && !state.manualAnimating && !state.autonomousRunning),
+                    tone = if (state.placementMode) PixelTone.CORAL else PixelTone.GREEN,
+                    enabled = state.placementMode || (!atObstacleLimit && !state.manualPending && !state.manualAnimating &&
+                        !state.autonomousRunning && !state.pathDemoRunning),
                     modifier = Modifier.fillMaxWidth(),
-                ) {
-                    Text(
-                        when {
-                            state.placementMode -> "Cancel placement"
-                            atObstacleLimit -> "Obstacle limit reached"
-                            else -> "Add obstacle"
-                        },
-                    )
-                }
+                )
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
                 ) {
-                    OutlinedButton(
-                        onClick = viewModel::undo,
-                        enabled = state.canUndo,
-                        modifier = Modifier.weight(1f),
-                    ) { Text("Undo") }
-                    OutlinedButton(
-                        onClick = viewModel::redo,
-                        enabled = state.canRedo,
-                        modifier = Modifier.weight(1f),
-                    ) { Text("Redo") }
+                    PixelButtonCell("Undo", viewModel::undo, PixelTone.GREEN, enabled = state.canUndo)
+                    PixelButtonCell("Redo", viewModel::redo, PixelTone.GREEN, enabled = state.canRedo)
                 }
-                OutlinedButton(onClick = onReset, modifier = Modifier.fillMaxWidth()) {
-                    Text("Reset arena")
-                }
+                PixelButton("Reset arena", onReset, Modifier.fillMaxWidth(), PixelTone.ORANGE)
+                // Visual only: disabled while playing, so a press always starts from move 0.
+                PixelButton(
+                    text = if (state.pathDemoRunning) "Playing path demo…" else "Play Path Demo",
+                    onClick = viewModel::playPathDemo,
+                    tone = PixelTone.ORANGE,
+                    enabled = !state.pathDemoRunning && !state.autonomousRunning && !state.manualPending &&
+                        !state.manualAnimating && !state.placementMode,
+                    modifier = Modifier.fillMaxWidth().testTag("play_path_demo"),
+                )
             }
             if (state.taskMode == TaskMode.TASK1) belowResetControls?.invoke()
             if (state.taskMode == TaskMode.TASK1) {
@@ -383,18 +361,16 @@ private fun ResyncOnReconnectControl(phase: Task1Phase, armed: Boolean, onArm: (
     val eligible = phase !in setOf(Task1Phase.SETUP, Task1Phase.PATH_REQUESTED)
     Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
         if (armed) {
-            Button(onClick = onCancel, modifier = Modifier.fillMaxWidth()) {
-                Text("Map resync armed for next connect — tap to cancel")
-            }
+            PixelButton("Map resync armed for next connect — tap to cancel", onCancel,
+                Modifier.fillMaxWidth(), PixelTone.CORAL)
         } else {
-            OutlinedButton(onClick = onArm, enabled = eligible, modifier = Modifier.fillMaxWidth()) {
-                Text("Resend map on next reconnect")
-            }
+            PixelButton("Resend map on next reconnect", onArm, Modifier.fillMaxWidth(),
+                PixelTone.ORANGE, enabled = eligible)
         }
         Text(
             "Sends CLEAR + every obstacle to the RPi the next time it (re)connects — one time only. " +
                 "Use after BEGIN only if the RPi's map is known to be out of sync; it can disrupt an active mission.",
-            style = MaterialTheme.typography.bodySmall,
+            style = SpiderMap.Label.copy(fontWeight = FontWeight.Normal),
         )
     }
 }
@@ -402,7 +378,7 @@ private fun ResyncOnReconnectControl(phase: Task1Phase, armed: Boolean, onArm: (
 @Composable
 private fun StatusValue(label: String, value: String, modifier: Modifier = Modifier) {
     Column(modifier) {
-        Text(label, style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
-        Text(value, style = MaterialTheme.typography.bodyMedium)
+        Text(label, style = SpiderMap.Label)
+        Text(value, style = SpiderMap.Body)
     }
 }

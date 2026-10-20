@@ -69,6 +69,10 @@ class ArenaGeometry {
         return CellBounds(left, top, left + cellSize, top + cellSize)
     }
 
+    /** Arena point (cells, y up, may be fractional) to unscaled content space (y down). */
+    fun contentX(arenaX: Double): Float = arenaLeft + arenaX.toFloat() * cellSize
+    fun contentY(arenaY: Double): Float = arenaTop + (config.rows - arenaY).toFloat() * cellSize
+
     /** Unrotated reference rectangle; drawing rotates it about its centre. */
     fun robotBounds(pose: RobotPose, config: ArenaConfig): CellBounds {
         return CellBounds(
