@@ -2,33 +2,24 @@ package com.example.mdp.ui.theme
 
 import androidx.compose.material3.Typography
 import androidx.compose.ui.text.TextStyle
-import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.sp
+import com.mdp.g15.arena.presentation.SpiderMap
 
-// Set of Material typography styles to start with
 val Typography = Typography(
     bodyLarge = TextStyle(
-        fontFamily = FontFamily.Default,
+        fontFamily = SpiderMap.PixelFont,
         fontWeight = FontWeight.Normal,
-        fontSize = 16.sp,
-        lineHeight = 24.sp,
-        letterSpacing = 0.5.sp
-    )
-    /* Other default text styles to override
-    titleLarge = TextStyle(
-        fontFamily = FontFamily.Default,
-        fontWeight = FontWeight.Normal,
-        fontSize = 22.sp,
-        lineHeight = 28.sp,
-        letterSpacing = 0.sp
+        fontSize = 9.sp,
+        lineHeight = 14.sp,
     ),
-    labelSmall = TextStyle(
-        fontFamily = FontFamily.Default,
-        fontWeight = FontWeight.Medium,
-        fontSize = 11.sp,
-        lineHeight = 16.sp,
-        letterSpacing = 0.5.sp
-    )
-    */
+    bodyMedium = SpiderMap.Body,
+    bodySmall = SpiderMap.pixel(7.sp),
+    titleLarge = SpiderMap.pixel(12.sp),
+    titleMedium = SpiderMap.pixel(10.sp),
+    titleSmall = SpiderMap.pixel(9.sp),
+    headlineSmall = SpiderMap.pixel(12.sp),
+    labelLarge = SpiderMap.pixel(8.sp),
+    labelMedium = SpiderMap.pixel(7.sp),
+    labelSmall = SpiderMap.pixel(6.sp),
 )

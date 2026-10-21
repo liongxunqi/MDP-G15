@@ -23,11 +23,13 @@ import androidx.compose.ui.semantics.selected
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.font.Font
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.unit.TextUnit
 import com.mdp.g15.arena.R
 
 /**
@@ -54,9 +56,9 @@ object SpiderMap {
     /** Press Start 2P (SIL OFL 1.1, see arena-ui/fonts/). One weight only, glyphs a full em wide. */
     val PixelFont = FontFamily(Font(R.font.press_start_2p))
     // Sized down from the old monospace styles because pixel glyphs are much wider.
-    val Title = TextStyle(fontFamily = PixelFont, fontSize = 13.sp, lineHeight = 20.sp, color = Text)
-    val Label = TextStyle(fontFamily = PixelFont, fontSize = 9.sp, lineHeight = 14.sp, color = TextDim)
-    val Body = TextStyle(fontFamily = PixelFont, fontSize = 10.sp, lineHeight = 16.sp, color = Text)
+    val Title = TextStyle(fontFamily = PixelFont, fontSize = 12.sp, lineHeight = 18.sp, color = Text)
+    val Label = TextStyle(fontFamily = PixelFont, fontSize = 8.sp, lineHeight = 12.sp, color = TextDim)
+    val Body = TextStyle(fontFamily = PixelFont, fontSize = 9.sp, lineHeight = 14.sp, color = Text)
 
     val PanelShape = RoundedCornerShape(6.dp)
     val ButtonShape = RoundedCornerShape(10.dp)
@@ -66,33 +68,10 @@ object SpiderMap {
         TextStyle(fontFamily = PixelFont, fontSize = size, lineHeight = size * 1.5f, color = color)
 }
 
-/**
- * Puts every text inside [content] in the pixel font, including text from controls that use
- * MaterialTheme typography (the app's task controls, drive pad and mode buttons). Material
- * sizes are scaled down to suit the wider glyphs.
- */
+/** Applies the arena body style without scaling the app's shared pixel typography again. */
 @Composable
 fun PixelTextScope(content: @Composable () -> Unit) {
-    val base = MaterialTheme.typography
-    fun TextStyle.pixel(): TextStyle {
-        val size = fontSize * 0.7f
-        return copy(fontFamily = SpiderMap.PixelFont, fontWeight = FontWeight.Normal, fontSize = size,
-            lineHeight = size * 1.6f, letterSpacing = 0.sp)
-    }
-    val pixelTypography = Typography(
-        displayLarge = base.displayLarge.pixel(), displayMedium = base.displayMedium.pixel(),
-        displaySmall = base.displaySmall.pixel(), headlineLarge = base.headlineLarge.pixel(),
-        headlineMedium = base.headlineMedium.pixel(), headlineSmall = base.headlineSmall.pixel(),
-        titleLarge = base.titleLarge.pixel(), titleMedium = base.titleMedium.pixel(),
-        titleSmall = base.titleSmall.pixel(), bodyLarge = base.bodyLarge.pixel(),
-        bodyMedium = base.bodyMedium.pixel(), bodySmall = base.bodySmall.pixel(),
-        labelLarge = base.labelLarge.pixel(), labelMedium = base.labelMedium.pixel(),
-        labelSmall = base.labelSmall.pixel(),
-    )
-    MaterialTheme(colorScheme = MaterialTheme.colorScheme, shapes = MaterialTheme.shapes,
-        typography = pixelTypography) {
-        ProvideTextStyle(SpiderMap.Body.copy(color = Color.Unspecified), content)
-    }
+    ProvideTextStyle(SpiderMap.Body.copy(color = Color.Unspecified), content)
 }
 
 /** Button fill and label colours, taken from the reference's three button families. */
@@ -130,7 +109,8 @@ fun PixelButton(
     tone: PixelTone = PixelTone.ORANGE,
     enabled: Boolean = true,
     selected: Boolean = true,
-    contentPadding: PaddingValues = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
+    contentPadding: PaddingValues = PaddingValues(horizontal = 8.dp, vertical = 6.dp),
+    fontSize: TextUnit = 8.sp,
 ) {
     // An unselected chip is the same shape, hollow, so a set of them reads as one choice.
     val fill = if (selected) tone.fill else SpiderMap.NavyDeep
@@ -151,8 +131,11 @@ fun PixelButton(
     ) {
         // The pixel font has one weight and glyphs about twice normal width: no faux bold, smaller
         // size, and centred lines so a long label wraps neatly instead of overflowing.
-        Text(text, fontFamily = SpiderMap.PixelFont, fontSize = 9.sp, lineHeight = 14.sp,
-            textAlign = TextAlign.Center)
+        Text(text, fontFamily = SpiderMap.PixelFont, fontSize = fontSize,
+            lineHeight = fontSize * 1.55f,
+            color = if (enabled) label else Color(0xFF7FA3BF),
+            textAlign = TextAlign.Center, softWrap = true,
+            maxLines = 2, overflow = TextOverflow.Ellipsis)
     }
 }
 

@@ -66,6 +66,7 @@ import com.mdp.g15.arena.presentation.SpiderMap
 import com.mdp.g15.arena.presentation.SpiderMapPanel
 import androidx.compose.foundation.background
 import androidx.compose.material3.OutlinedTextFieldDefaults
+import androidx.compose.ui.graphics.Color
 
 /**
  * NOTE ON IMPORTS: this assumes BluetoothPermissions / ConnectionState /
@@ -317,7 +318,7 @@ fun ControllerScreen(
                 SpiderMapPanel(modifier = Modifier.fillMaxWidth()) {
                     Column(Modifier.padding(20.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                         Text("Robot status", style = MaterialTheme.typography.labelLarge, color = SpiderMap.TextDim)
-                        Text(robotStatus, style = MaterialTheme.typography.titleLarge)
+                        Text(robotStatus, style = MaterialTheme.typography.bodyMedium)
                     }
                 }
                 SpiderMapPanel(modifier = Modifier.fillMaxWidth()) {
@@ -457,24 +458,28 @@ fun DevicePickerDialog(
 ) {
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("Select a device") },
+        shape = SpiderMap.PanelShape,
+        containerColor = SpiderMap.PanelBlue,
+        titleContentColor = SpiderMap.Ink,
+        textContentColor = SpiderMap.Ink,
+        title = { Text("Select a device", style = SpiderMap.Title) },
         text = {
             Column(modifier = Modifier.verticalScroll(rememberScrollState())) {
-                Text("Paired", style = MaterialTheme.typography.labelMedium)
+                Text("PAIRED", style = SpiderMap.Label)
                 if (paired.isEmpty()) {
-                    Text("No paired devices", style = MaterialTheme.typography.bodySmall)
+                    Text("No paired devices", style = SpiderMap.Body)
                 }
                 paired.forEach { DeviceRow(it, onSelect) }
 
                 if (discovered.isNotEmpty()) {
                     Spacer(Modifier.height(16.dp))
-                    Text("Found", style = MaterialTheme.typography.labelMedium)
+                    Text("FOUND", style = SpiderMap.Label)
                     discovered.forEach { DeviceRow(it, onSelect) }
                 }
             }
         },
-        confirmButton = { TextButton(onClick = onScan) { Text("Scan") } },
-        dismissButton = { TextButton(onClick = onDismiss) { Text("Close") } },
+        confirmButton = { PixelButton("Scan", onScan, tone = PixelTone.GREEN) },
+        dismissButton = { PixelButton("Close", onDismiss, selected = false) },
     )
 }
 
@@ -486,8 +491,8 @@ private fun DeviceRow(item: DeviceItem, onSelect: (DeviceItem) -> Unit) {
             .clickable { onSelect(item) }
             .padding(vertical = 12.dp),
     ) {
-        Text(text = item.name, style = MaterialTheme.typography.bodyLarge)
-        Text(text = item.address, style = MaterialTheme.typography.bodySmall)
+        Text(text = item.name, style = SpiderMap.Body)
+        Text(text = item.address, style = SpiderMap.Label)
     }
 }
 
