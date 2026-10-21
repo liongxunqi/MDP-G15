@@ -1,6 +1,8 @@
 package com.mdp.g15.arena.presentation
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.Box
@@ -8,18 +10,25 @@ import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.VerticalDivider
 import androidx.compose.material3.LocalContentColor
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.Surface
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
@@ -36,6 +45,11 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.Color
 import com.mdp.g15.arena.domain.PoseSource
 import com.mdp.g15.arena.domain.readableHeading
 import com.mdp.g15.arena.domain.RobotFootprint
@@ -51,6 +65,7 @@ fun ArenaScreen(
     modifier: Modifier = Modifier,
     drivingControls: (@Composable () -> Unit)? = null,
     taskControls: (@Composable () -> Unit)? = null,
+    taskStatus: (@Composable () -> Unit)? = null,
     belowResetControls: (@Composable () -> Unit)? = null,
     task2TimerDisplay: (@Composable () -> Unit)? = null,
 ) {
@@ -71,65 +86,70 @@ fun ArenaScreen(
         }
     }
 
-    // Panels set their own dark text; anything placed straight on the navy backdrop is light.
+    // Task actions stay above the scrolling map and status content in both orientations.
     BoxWithConstraints(modifier = modifier.fillMaxSize().background(SpiderMap.Backdrop)) {
+        val landscape = maxWidth >= maxHeight
+        val portraitScroll = rememberScrollState()
+        LaunchedEffect(state.taskMode, maxWidth, maxHeight) { portraitScroll.scrollTo(0) }
         CompositionLocalProvider(LocalContentColor provides SpiderMap.OnBackdrop) {
-            if (maxWidth >= maxHeight) {
-                Row(
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .padding(12.dp),
-                    horizontalArrangement = Arrangement.spacedBy(16.dp),
-                ) {
+            Column(Modifier.fillMaxSize().padding(vertical = 4.dp)) {
+                SpiderMapPanel(Modifier.fillMaxWidth().padding(horizontal = 4.dp, vertical = 2.dp)
+                    .testTag("task_action_bar")) {
+                    Column(Modifier.fillMaxWidth().padding(8.dp)) { taskControls?.invoke() }
+                }
+            if (landscape) {
+                BoxWithConstraints(Modifier.fillMaxWidth().weight(1f)) {
+                    val paneHeight = maxHeight - 8.dp
+                    Row(Modifier.fillMaxSize().padding(4.dp),
+                        horizontalArrangement = Arrangement.spacedBy(4.dp)) {
                     if (state.taskMode == TaskMode.TASK2) {
-                        Task2TimerCard(task2TimerDisplay, Modifier.weight(3f).fillMaxHeight())
+                        Task2TimerCard(task2TimerDisplay,
+                            Modifier.width(paneHeight).fillMaxHeight())
                     } else {
                         ArenaCanvas(
                             state = displayState,
                             interactions = interactions,
-                            modifier = Modifier.weight(3f).fillMaxHeight(),
+                            modifier = Modifier.width(paneHeight).fillMaxHeight(),
                         )
                     }
-                    // The panel's frame stays put; only its contents scroll.
-                    ArenaStatusPanel(
-                        state = displayState,
-                        robotStatus = robotStatus,
-                        viewModel = viewModel,
-                        onReset = { confirmReset = true },
-                        taskControls = taskControls,
-                        belowResetControls = belowResetControls,
-                        drivingControls = drivingControls,
-                        modifier = Modifier.weight(2f).fillMaxHeight(),
-                    )
+                    Column(Modifier.weight(1f).fillMaxHeight().verticalScroll(rememberScrollState()),
+                        verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        ArenaStatusPanel(displayState, robotStatus, viewModel, taskStatus,
+                            drivingControls, Modifier.fillMaxWidth().height(paneHeight))
+                        ArenaSecondaryPanel(displayState, viewModel, { confirmReset = true },
+                            belowResetControls)
+                    }
+                    }
                 }
             } else {
-                Column(
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .padding(12.dp),
-                    verticalArrangement = Arrangement.spacedBy(16.dp),
-                ) {
+                BoxWithConstraints(Modifier.fillMaxWidth().weight(1f)) {
                     if (state.taskMode == TaskMode.TASK2) {
-                        Task2TimerCard(task2TimerDisplay, Modifier.fillMaxWidth().weight(3f))
+                        val statusHeight = minOf(190.dp, maxHeight * 0.24f)
+                        Column(Modifier.fillMaxSize().padding(horizontal = 4.dp),
+                            verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                            Task2TimerCard(task2TimerDisplay, Modifier.fillMaxWidth().weight(1f))
+                            ArenaStatusPanel(displayState, robotStatus, viewModel, taskStatus,
+                                drivingControls, Modifier.fillMaxWidth().height(statusHeight))
+                        }
                     } else {
-                        ArenaCanvas(
-                            state = displayState,
-                            interactions = interactions,
-                            modifier = Modifier.fillMaxWidth().weight(3f),
-                        )
+                        val availableHeight = maxHeight
+                        // Keep the essential controls compact on taller tablets; the map uses
+                        // the remaining height and is never smaller than 60% of this area.
+                        val mapHeight = availableHeight - minOf(availableHeight * 0.40f, 306.dp)
+                        val statusHeight = availableHeight - mapHeight - 4.dp
+                        Column(Modifier.fillMaxSize().verticalScroll(portraitScroll)
+                            .padding(horizontal = 4.dp),
+                            verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                            ArenaCanvas(displayState, interactions,
+                                Modifier.fillMaxWidth().height(mapHeight))
+                            ArenaStatusPanel(displayState, robotStatus, viewModel, taskStatus,
+                                drivingControls, Modifier.fillMaxWidth().height(statusHeight))
+                            ArenaSecondaryPanel(displayState, viewModel, { confirmReset = true },
+                                belowResetControls)
+                        }
                     }
-                    // The panel's frame stays put; only its contents scroll.
-                    ArenaStatusPanel(
-                        state = displayState,
-                        robotStatus = robotStatus,
-                        viewModel = viewModel,
-                        onReset = { confirmReset = true },
-                        taskControls = taskControls,
-                        belowResetControls = belowResetControls,
-                        drivingControls = drivingControls,
-                        modifier = Modifier.fillMaxWidth().weight(2f),
-                    )
                 }
+            }
             }
         }
     }
@@ -137,19 +157,19 @@ fun ArenaScreen(
     if (confirmReset) {
         AlertDialog(
             onDismissRequest = { confirmReset = false },
-            title = { Text("Reset arena?") },
+            shape = SpiderMap.PanelShape,
+            containerColor = SpiderMap.PanelBlue,
+            titleContentColor = SpiderMap.Ink,
+            textContentColor = SpiderMap.Ink,
+            title = { Text("Reset arena?", style = SpiderMap.Title) },
             text = { Text("All obstacles and the robot pose will be cleared.") },
             confirmButton = {
-                TextButton(
-                    onClick = {
+                PixelButton("Reset", {
                         confirmReset = false
                         viewModel.resetArena()
-                    },
-                ) { Text("Reset") }
+                    }, tone = PixelTone.CORAL)
             },
-            dismissButton = {
-                TextButton(onClick = { confirmReset = false }) { Text("Cancel") }
-            },
+            dismissButton = { PixelButton("Cancel", { confirmReset = false }, selected = false) },
         )
     }
 }
@@ -204,14 +224,21 @@ private fun ArenaCanvas(
             )
             Row(
                 modifier = Modifier
-                    .align(Alignment.End)
+                    .fillMaxWidth()
                     .padding(horizontal = 8.dp, vertical = 4.dp),
                 horizontalArrangement = Arrangement.spacedBy(4.dp),
+                verticalAlignment = Alignment.CenterVertically,
             ) {
-                PixelButton("− Zoom out", { gridView?.zoomOut() }, Modifier.height(40.dp),
-                    contentPadding = PaddingValues(horizontal = 12.dp))
-                PixelButton("+ Zoom in", { gridView?.zoomIn() }, Modifier.height(40.dp),
-                    contentPadding = PaddingValues(horizontal = 12.dp))
+                PixelSpiderIcon(Modifier.size(44.dp))
+                Spacer(Modifier.weight(1f))
+                PixelWebIcon(Modifier.size(40.dp))
+                Spacer(Modifier.weight(1f))
+                PixelButton("−", { gridView?.zoomOut() },
+                    Modifier.size(48.dp).semantics { contentDescription = "Zoom out" },
+                    contentPadding = PaddingValues(0.dp))
+                PixelButton("+", { gridView?.zoomIn() },
+                    Modifier.size(48.dp).semantics { contentDescription = "Zoom in" },
+                    contentPadding = PaddingValues(0.dp))
             }
         }
     }
@@ -222,148 +249,208 @@ private fun ArenaStatusPanel(
     state: ArenaUiState,
     robotStatus: String?,
     viewModel: ArenaViewModel,
-    onReset: () -> Unit,
-    taskControls: (@Composable () -> Unit)? = null,
-    belowResetControls: (@Composable () -> Unit)? = null,
+    taskStatus: (@Composable () -> Unit)? = null,
     drivingControls: (@Composable () -> Unit)? = null,
     modifier: Modifier = Modifier,
 ) {
-    val selected = state.arena.selectedObstacle
-    SpiderMapPanel(modifier = modifier) { PixelTextScope {
-        Column(
-            // Inset by the 4 dp border before scrolling, so contents scroll beneath the
-            // frame's inner edge instead of over it.
-            modifier = Modifier.fillMaxWidth().padding(4.dp)
-                .verticalScroll(rememberScrollState()).padding(12.dp),
-            verticalArrangement = Arrangement.spacedBy(12.dp),
-        ) {
-            taskControls?.invoke()
-            Text(if (state.taskMode == TaskMode.TASK2) "Task 2 status" else "Arena status",
-                style = SpiderMap.Title)
-            Text("Latest action", style = SpiderMap.Label)
-            Text(
-                text = state.feedback,
-                color = if (state.feedbackIsError) SpiderMap.Warning else SpiderMap.Text,
-                style = SpiderMap.Body,
-            )
-            if (state.taskMode == TaskMode.TASK1 && state.latestReceived.isNotEmpty()) {
-                StatusValue("Last received", state.latestReceived)
-            }
+    Column(modifier) {
+        BoxWithConstraints(Modifier.fillMaxSize()) {
             if (state.taskMode == TaskMode.TASK2) {
-                StatusValue("Robot status", robotStatus?.takeIf(String::isNotBlank) ?: state.status)
-            } else {
-                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                    StatusValue(
-                        "Robot status",
-                        robotStatus?.takeIf(String::isNotBlank) ?: state.status,
-                        Modifier.weight(1f),
-                    )
-                    StatusValue(
-                        "Robot pose",
-                        state.arena.robot?.let {
-                            val source = when (it.source) {
-                                PoseSource.REPORTED -> "RPi reported"
-                                PoseSource.OPERATOR -> "operator placed"
-                                PoseSource.ESTIMATED -> "estimated"
-                                PoseSource.SIMULATED -> "path demo"
-                            }
-                            val warning = when {
-                                !RobotFootprint.fitsArena(it, state.arena.config) -> " · outside arena"
-                                state.arena.obstacles.values.any { obstacle ->
-                                    RobotFootprint.overlapsCell(it, state.arena.config, obstacle.position)
-                                } -> " · overlaps obstacle"
-                                else -> ""
-                            }
-                            String.format(java.util.Locale.US, "(%.2f, %.2f) • %s • %s",
-                                it.x, it.y, it.readableHeading(), source) + warning
-                        } ?: "Not available",
-                        Modifier.weight(1f),
-                    )
-                    StatusValue(
-                        "Obstacles",
-                        "${state.arena.obstacles.size}/${state.arena.config.maxObstacles}",
-                        Modifier.weight(0.6f),
-                    )
+                SpiderMapPanel(Modifier.fillMaxSize().testTag("status_card")) {
+                    StatusDetails(state, robotStatus, taskStatus)
                 }
-                StatusValue(
-                    "Selected obstacle",
-                    selected?.let {
-                        buildString {
-                            append("#${it.id} • (${it.position.x}, ${it.position.y})")
-                            append(" • face ${it.targetFace?.wireValue ?: "unset"}")
-                            it.targetId?.let { target -> append(" • target $target") }
+            } else if (maxWidth >= 350.dp) {
+                val compactRight = maxHeight < 290.dp
+                SpiderMapPanel(Modifier.fillMaxSize().testTag("status_card")) {
+                    Row(Modifier.fillMaxSize().padding(8.dp),
+                        horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                        ControlInset(Modifier.weight(1f).fillMaxHeight()) {
+                            StatusDetails(state, robotStatus, taskStatus)
                         }
-                    } ?: "None",
-                )
-            }
-
-            if (state.taskMode == TaskMode.TASK1) {
-                HorizontalDivider(thickness = 2.dp, color = SpiderMap.FrameDark)
-                Text("Target face", style = SpiderMap.Label)
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(6.dp),
-                ) {
-                    // Coral tabs, like the reference's O / S / T; filled = the chosen face.
-                    Direction.entries.forEach { direction ->
-                        PixelButton(
-                            text = direction.wireValue,
-                            onClick = { viewModel.setTargetFace(direction) },
-                            tone = PixelTone.CORAL,
-                            enabled = selected != null,
-                            selected = selected?.targetFace == direction,
-                            contentPadding = PaddingValues(horizontal = 14.dp, vertical = 6.dp),
-                        )
+                        val rightModifier = Modifier.weight(1f).fillMaxHeight()
+                            .testTag("obstacle_card")
+                        Column(if (compactRight) rightModifier.verticalScroll(rememberScrollState())
+                               else rightModifier,
+                            verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                            Row(if (compactRight) Modifier.fillMaxWidth().height(152.dp)
+                                else Modifier.fillMaxWidth().weight(1f),
+                                horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                              ControlInset(Modifier.weight(1f).fillMaxHeight()) {
+                                ObstacleSelection(state)
+                              }
+                              ControlInset(Modifier.weight(1f).fillMaxHeight()) {
+                                drivingControls?.invoke()
+                              }
+                            }
+                            ControlInset(Modifier.fillMaxWidth()) {
+                                ObstacleButtons(state, viewModel)
+                            }
+                        }
                     }
                 }
-
-                val atObstacleLimit = state.arena.obstacles.size >= state.arena.config.maxObstacles
-                PixelButton(
-                    text = when {
-                        state.placementMode -> "Cancel placement"
-                        atObstacleLimit -> "Obstacle limit reached"
-                        else -> "Add obstacle"
-                    },
-                    onClick = { viewModel.setPlacementMode(!state.placementMode) },
-                    tone = if (state.placementMode) PixelTone.CORAL else PixelTone.GREEN,
-                    enabled = state.placementMode || (!atObstacleLimit && !state.manualPending && !state.manualAnimating &&
-                        !state.autonomousRunning && !state.pathDemoRunning),
-                    modifier = Modifier.fillMaxWidth(),
-                )
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                ) {
-                    PixelButtonCell("Undo", viewModel::undo, PixelTone.GREEN, enabled = state.canUndo)
-                    PixelButtonCell("Redo", viewModel::redo, PixelTone.GREEN, enabled = state.canRedo)
+            } else {
+                SpiderMapPanel(Modifier.fillMaxSize().testTag("status_card")) {
+                    ControlInset(Modifier.fillMaxWidth().padding(4.dp)) {
+                        StatusDetails(state, robotStatus, taskStatus)
+                    }
+                    Column(Modifier.fillMaxWidth().testTag("obstacle_card")) {
+                        ControlInset(Modifier.fillMaxWidth().padding(4.dp)) { drivingControls?.invoke() }
+                        ControlInset(Modifier.fillMaxWidth().padding(4.dp)) { ObstacleSelection(state) }
+                        ControlInset(Modifier.fillMaxWidth().padding(4.dp)) { ObstacleButtons(state, viewModel) }
+                    }
                 }
-                PixelButton("Reset arena", onReset, Modifier.fillMaxWidth(), PixelTone.ORANGE)
-            }
-            if (state.taskMode == TaskMode.TASK1) {
-                ResyncOnReconnectControl(
-                    phase = state.task1Phase,
-                    armed = state.forceMapResyncOnReconnect,
-                    onArm = viewModel::armMapResyncOnReconnect,
-                    onCancel = viewModel::cancelMapResyncOnReconnect,
-                )
-            }
-            drivingControls?.invoke()
-            // Driving-related extras sit under the D-pad: the Amd tool / normal mode switch
-            // (passed in as belowResetControls), then the path demo.
-            if (state.taskMode == TaskMode.TASK1) {
-                belowResetControls?.invoke()
-                // Visual only: disabled while playing, so a press always starts from move 0.
-                PixelButton(
-                    text = if (state.pathDemoRunning) "Playing path demo…" else "Play Path Demo",
-                    onClick = viewModel::playPathDemo,
-                    tone = PixelTone.ORANGE,
-                    enabled = !state.pathDemoRunning && !state.autonomousRunning && !state.manualPending &&
-                        !state.manualAnimating && !state.placementMode,
-                    modifier = Modifier.fillMaxWidth().testTag("play_path_demo"),
-                )
             }
         }
-    } }
+    }
+}
+
+@Composable
+private fun ControlInset(modifier: Modifier = Modifier, content: @Composable () -> Unit) {
+    Surface(modifier, shape = SpiderMap.PanelShape,
+        color = Color(0xFF54B8EB), contentColor = SpiderMap.Ink,
+        border = BorderStroke(2.dp, SpiderMap.FrameDark)) { content() }
+}
+
+@Composable
+private fun ArenaSecondaryPanel(state: ArenaUiState, viewModel: ArenaViewModel,
+                                onReset: () -> Unit, belowResetControls: (@Composable () -> Unit)?) {
+        if (state.taskMode == TaskMode.TASK1) {
+            SpiderMapPanel(Modifier.fillMaxWidth().testTag("secondary_card")) {
+                Column(Modifier.fillMaxWidth().padding(8.dp),
+                    verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    PixelButton("Reset arena", onReset, Modifier.fillMaxWidth(), PixelTone.CORAL)
+                    ResyncOnReconnectControl(
+                        phase = state.task1Phase,
+                        armed = state.forceMapResyncOnReconnect,
+                        onArm = viewModel::armMapResyncOnReconnect,
+                        onCancel = viewModel::cancelMapResyncOnReconnect,
+                    )
+                    belowResetControls?.invoke()
+                    PixelButton(
+                        text = if (state.pathDemoRunning) "Playing path demo…" else "Play Path Demo",
+                        onClick = viewModel::playPathDemo,
+                        tone = PixelTone.ORANGE,
+                        enabled = !state.pathDemoRunning && !state.autonomousRunning && !state.manualPending &&
+                            !state.manualAnimating && !state.placementMode,
+                        modifier = Modifier.fillMaxWidth().testTag("play_path_demo"),
+                    )
+                }
+            }
+        }
+}
+
+@Composable
+private fun StatusDetails(state: ArenaUiState, robotStatus: String?,
+                          taskStatus: (@Composable () -> Unit)?) {
+    Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(10.dp),
+        verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        Text(if (state.taskMode == TaskMode.TASK2) "Task 2 status" else "Arena status",
+            style = SpiderMap.pixel(10.sp))
+        taskStatus?.invoke()
+        StatusValue("Latest action", state.feedback, error = state.feedbackIsError)
+        if (state.taskMode == TaskMode.TASK1 && state.latestReceived.isNotEmpty()) {
+            StatusValue("Last received", state.latestReceived)
+        }
+        StatusValue("Robot status", robotStatus?.takeIf(String::isNotBlank) ?: state.status)
+        if (state.taskMode == TaskMode.TASK1) {
+            StatusValue("Robot pose", state.arena.robot?.let {
+                val source = when (it.source) {
+                    PoseSource.REPORTED -> "RPi reported"
+                    PoseSource.OPERATOR -> "operator placed"
+                    PoseSource.ESTIMATED -> "estimated"
+                    PoseSource.SIMULATED -> "preview"
+                }
+                val warning = when {
+                    !RobotFootprint.fitsArena(it, state.arena.config) -> " · outside arena"
+                    state.arena.obstacles.values.any { obstacle ->
+                        RobotFootprint.overlapsCell(it, state.arena.config, obstacle.position)
+                    } -> " · overlaps obstacle"
+                    else -> ""
+                }
+                String.format(java.util.Locale.US, "(%.2f, %.2f) • %s • %s",
+                    it.x, it.y, it.readableHeading(), source) + warning
+            } ?: "Not available")
+            StatusValue("Obstacles", "${state.arena.obstacles.size}/${state.arena.config.maxObstacles}")
+        }
+    }
+}
+
+@Composable
+private fun ObstacleSelection(state: ArenaUiState) {
+    val selected = state.arena.selectedObstacle
+    Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(8.dp),
+        verticalArrangement = Arrangement.spacedBy(5.dp)) {
+        Text("Obstacle", style = SpiderMap.pixel(9.sp))
+        if (selected == null) {
+            Text("None", style = SpiderMap.pixel(7.sp))
+        } else {
+            StatusValue("ID", "#${selected.id}")
+            StatusValue("Coordinates", "(${selected.position.x}, ${selected.position.y})")
+            StatusValue("Face", selected.targetFace?.wireValue ?: "unset",
+                Modifier.testTag("selected_obstacle_face").semantics(mergeDescendants = true) {})
+            selected.targetId?.let { StatusValue("Target", "$it",
+                Modifier.testTag("selected_obstacle_target").semantics(mergeDescendants = true) {}) }
+        }
+    }
+}
+
+@Composable
+private fun ObstacleButtons(state: ArenaUiState, viewModel: ArenaViewModel) {
+    val selected = state.arena.selectedObstacle
+    Column(Modifier.fillMaxWidth().padding(8.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        Text("Target face", style = SpiderMap.pixel(9.sp))
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+            Direction.entries.forEach { direction ->
+                PixelButton(direction.wireValue, { viewModel.setTargetFace(direction) },
+                    Modifier.weight(1f), PixelTone.CORAL, enabled = selected != null,
+                    selected = selected?.targetFace == direction,
+                    contentPadding = PaddingValues(0.dp))
+            }
+        }
+        val atObstacleLimit = state.arena.obstacles.size >= state.arena.config.maxObstacles
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(4.dp),
+            verticalAlignment = Alignment.CenterVertically) {
+            PixelButton(
+                text = when {
+                    state.placementMode -> "Cancel placement"
+                    atObstacleLimit -> "Obstacle limit reached"
+                    else -> "Add obstacle"
+                },
+                onClick = { viewModel.setPlacementMode(!state.placementMode) },
+                tone = if (state.placementMode) PixelTone.CORAL else PixelTone.GREEN,
+                enabled = state.placementMode || (!atObstacleLimit && !state.manualPending &&
+                    !state.manualAnimating && !state.autonomousRunning && !state.pathDemoRunning),
+                modifier = Modifier.weight(2f).height(44.dp),
+                contentPadding = PaddingValues(horizontal = 2.dp),
+                fontSize = 7.sp,
+            )
+            PixelHistoryButton("Undo", false, state.canUndo, viewModel::undo, Modifier.weight(1f))
+            PixelHistoryButton("Redo", true, state.canRedo, viewModel::redo, Modifier.weight(1f))
+        }
+    }
+}
+
+@Composable
+private fun PixelHistoryButton(label: String, redo: Boolean, enabled: Boolean,
+                               onClick: () -> Unit, modifier: Modifier = Modifier) {
+    Button(onClick = onClick, enabled = enabled,
+        modifier = modifier.height(44.dp).semantics { contentDescription = label },
+        shape = SpiderMap.ButtonShape, border = BorderStroke(3.dp, SpiderMap.Ink),
+        contentPadding = PaddingValues(0.dp),
+        colors = ButtonDefaults.buttonColors(containerColor = PixelTone.GREEN.fill,
+            contentColor = SpiderMap.Ink, disabledContainerColor = Color(0xFF3E5F7A),
+            disabledContentColor = Color(0xFF7FA3BF))) {
+        Canvas(Modifier.size(22.dp)) {
+            val cell = size.width / 11f
+            fun pixel(x: Int, y: Int) = drawRect(SpiderMap.Ink,
+                topLeft = Offset(x * cell, y * cell), size = Size(cell, cell))
+            // A bent return shaft distinguishes history from the D-pad's straight arrows.
+            val cells = listOf(2 to 7, 3 to 6, 3 to 7, 3 to 8, 4 to 5, 4 to 7, 4 to 9,
+                5 to 4, 5 to 7, 6 to 3, 6 to 7, 7 to 3, 7 to 7, 8 to 3,
+                8 to 7, 9 to 4, 9 to 5, 9 to 6)
+            cells.forEach { (x, y) -> pixel(if (redo) 10 - x else x, y) }
+        }
+    }
 }
 
 /**
@@ -378,24 +465,28 @@ private fun ResyncOnReconnectControl(phase: Task1Phase, armed: Boolean, onArm: (
     val eligible = phase !in setOf(Task1Phase.SETUP, Task1Phase.PATH_REQUESTED)
     Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
         if (armed) {
-            PixelButton("Map resync armed for next connect — tap to cancel", onCancel,
-                Modifier.fillMaxWidth(), PixelTone.CORAL)
+            PixelButton("Map resync armed — tap to cancel", onCancel,
+                Modifier.fillMaxWidth(), PixelTone.CORAL, fontSize = 7.sp)
         } else {
             PixelButton("Resend map on next reconnect", onArm, Modifier.fillMaxWidth(),
-                PixelTone.ORANGE, enabled = eligible)
+                PixelTone.ORANGE, enabled = eligible, fontSize = 7.sp)
         }
-        Text(
-            "Sends CLEAR + every obstacle to the RPi the next time it (re)connects — one time only. " +
-                "Use after BEGIN only if the RPi's map is known to be out of sync; it can disrupt an active mission.",
-            style = SpiderMap.Label.copy(fontWeight = FontWeight.Normal),
-        )
     }
 }
 
 @Composable
-private fun StatusValue(label: String, value: String, modifier: Modifier = Modifier) {
-    Column(modifier) {
-        Text(label, style = SpiderMap.Label)
-        Text(value, style = SpiderMap.Body)
+private fun StatusValue(label: String, value: String, modifier: Modifier = Modifier,
+                        error: Boolean = false) {
+    Column(modifier, verticalArrangement = Arrangement.spacedBy(5.dp)) {
+        StatusHeading(label)
+        Text(value, style = SpiderMap.pixel(7.sp),
+            color = if (error) SpiderMap.Warning else SpiderMap.Text)
     }
+}
+
+@Composable
+private fun StatusHeading(label: String) {
+    Text(label, modifier = Modifier.background(SpiderMap.NavyDeep, SpiderMap.PanelShape)
+        .padding(horizontal = 6.dp, vertical = 3.dp),
+        style = SpiderMap.pixel(6.sp, SpiderMap.PanelBlue))
 }

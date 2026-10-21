@@ -15,6 +15,7 @@ import android.graphics.Bitmap
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.assertIsEnabled
 import androidx.compose.ui.test.assertIsNotEnabled
+import androidx.compose.ui.test.assertTextContains
 import androidx.compose.ui.test.performScrollTo
 import androidx.compose.ui.test.junit4.StateRestorationTester
 import androidx.compose.ui.test.junit4.createComposeRule
@@ -73,9 +74,11 @@ class IntegratedControllerScreenTest {
         composeRule.onNodeWithText("Arena").performClick()
         composeRule.onNodeWithText("Start Task 1").assertIsNotEnabled()
         composeRule.onNodeWithTag("arena_grid").assertIsDisplayed()
+        composeRule.onNodeWithTag("task_action_bar").assertIsDisplayed()
         composeRule.onNodeWithText("Task 2").performClick()
         composeRule.onNodeWithTag("arena_grid").assertDoesNotExist()
         composeRule.onNodeWithTag("task2_timer_panel").assertIsDisplayed()
+        composeRule.onNodeWithText("Tablet elapsed time").assertDoesNotExist()
         composeRule.onNodeWithText("00:00:00").assertIsDisplayed()
         composeRule.onNodeWithText("Task 2 status").assertIsDisplayed()
         composeRule.onNodeWithText("Latest action").assertIsDisplayed()
@@ -116,6 +119,30 @@ class IntegratedControllerScreenTest {
         composeRule.waitForIdle()
         composeRule.onNodeWithText("Connect to the robot before starting.").assertDoesNotExist()
         composeRule.onNodeWithText("Task 1 needs 4–8 obstacles (0 placed).").assertIsDisplayed()
+    }
+
+    @Test
+    fun task1EssentialControlsFitWithoutScrolling() {
+        setScreen()
+        composeRule.onNodeWithText("Arena").performClick()
+        composeRule.onNodeWithTag("arena_grid_card").assertIsDisplayed()
+        composeRule.onNodeWithContentDescription("Forward").assertIsDisplayed()
+        composeRule.onNodeWithText("Add obstacle").assertIsDisplayed()
+        composeRule.onNodeWithContentDescription("Redo").assertIsDisplayed()
+        val redoBottom = composeRule.onNodeWithContentDescription("Redo")
+            .fetchSemanticsNode().boundsInRoot.bottom
+        val screenBottom = composeRule.onRoot().fetchSemanticsNode().boundsInRoot.bottom
+        assertTrue(redoBottom <= screenBottom)
+    }
+
+    @Test
+    fun returningFromTask2ShowsMapAtTop() {
+        setScreen()
+        composeRule.onNodeWithText("Arena").performClick()
+        composeRule.onNodeWithText("Task 2").performClick()
+        composeRule.onNodeWithText("Robot status").assertIsDisplayed()
+        composeRule.onNodeWithText("Task 1").performClick()
+        composeRule.onNodeWithTag("arena_grid_card").assertIsDisplayed()
     }
 
     @Test
@@ -181,7 +208,7 @@ class IntegratedControllerScreenTest {
             composeRule.onNodeWithText("N").performScrollTo().performClick()
         }
         composeRule.onNodeWithText("Planning confirmation unavailable — Start can proceed once setup is complete").assertDoesNotExist()
-        composeRule.onNodeWithText("Start Task 1").performScrollTo().assertIsDisplayed()
+        composeRule.onNodeWithText("Start Task 1").assertIsDisplayed()
             .assertIsEnabled().performClick()
         composeRule.runOnIdle { assertEquals(listOf("BEGIN"), movement) }
     }
@@ -194,9 +221,9 @@ class IntegratedControllerScreenTest {
         composeRule.onNodeWithText("Send Path").assertDoesNotExist()
         composeRule.onNodeWithText("Arena").performClick()
         setupTask1()
-        repeat(3) { composeRule.onNodeWithText("+ Zoom in").performClick() }
+        repeat(3) { composeRule.onNodeWithContentDescription("Zoom in").performClick() }
         composeRule.onNodeWithText("Prepare Path").assertDoesNotExist()
-        composeRule.onNodeWithText("Start Task 1").performScrollTo().assertIsDisplayed()
+        composeRule.onNodeWithText("Start Task 1").assertIsDisplayed()
             .assertIsEnabled().performClick()
         composeRule.onNodeWithText("Start Task 1").assertIsNotEnabled()
         composeRule.runOnIdle { assertEquals(listOf("BEGIN"), movement) }
@@ -212,11 +239,11 @@ class IntegratedControllerScreenTest {
             .performScrollTo().assertIsDisplayed()
         composeRule.onNodeWithText("New attempt").performClick()
         composeRule.onNodeWithText("Cancel").performClick()
-        composeRule.onNodeWithText(" • target 20", substring = true).performScrollTo().assertIsDisplayed()
+        composeRule.onNodeWithTag("selected_obstacle_target").assertTextContains("20", substring = true)
         composeRule.onNodeWithText("New attempt").performClick()
         composeRule.onNodeWithText("Clear results").performClick()
         composeRule.onNodeWithText("Task 1 • Setup").assertIsDisplayed()
-        composeRule.onNodeWithText(" • target 20", substring = true).assertDoesNotExist()
+        composeRule.onNodeWithTag("selected_obstacle_target").assertDoesNotExist()
         composeRule.onNodeWithText("Start Task 1").assertIsNotEnabled()
     }
 
@@ -263,7 +290,8 @@ class IntegratedControllerScreenTest {
         composeRule.runOnIdle { connected = false }
         composeRule.waitForIdle()
         restoration.emulateSavedInstanceStateRestore()
-        composeRule.onNodeWithText("Task 1 • Completed — results retained").assertIsDisplayed()
+        composeRule.onNodeWithText("Task 1 • Completed — results retained")
+            .performScrollTo().assertIsDisplayed()
         composeRule.runOnIdle {
             assertTrue(host!!.keepScreenOn)
             show = false
@@ -294,7 +322,8 @@ class IntegratedControllerScreenTest {
             android.os.SystemClock.sleep(18_000)
             val power = instrumentation.targetContext.getSystemService(android.os.PowerManager::class.java)
             assertTrue("Result presentation must survive the normal inactivity timeout", power.isInteractive)
-            composeRule.onNodeWithText("Task 1 • Completed — results retained").assertIsDisplayed()
+            composeRule.onNodeWithText("Task 1 • Completed — results retained")
+                .performScrollTo().assertIsDisplayed()
         } finally {
             if (timeout == "null") shell("settings delete system screen_off_timeout")
             else shell("settings put system screen_off_timeout $timeout")
@@ -380,9 +409,9 @@ class IntegratedControllerScreenTest {
         addAt(0, 0)
         // Captured synchronously inside the outgoing map callback, not after recomposition.
         assertEquals(RobotMessage.Target(1, "11"), targetChecksAtMapWrite.last())
-        composeRule.onNodeWithText("Undo").performScrollTo().performClick()
+        composeRule.onNodeWithContentDescription("Undo").performScrollTo().performClick()
         assertEquals(RobotMessage.TargetRejected("Target references unknown obstacle 1."), targetChecksAtMapWrite.last())
-        composeRule.onNodeWithText("Redo").performScrollTo().performClick()
+        composeRule.onNodeWithContentDescription("Redo").performScrollTo().performClick()
         assertEquals(RobotMessage.Target(1, "11"), targetChecksAtMapWrite.last())
     }
 
@@ -459,10 +488,10 @@ class IntegratedControllerScreenTest {
         composeRule.onNodeWithText("Obstacle limit reached").assertIsNotEnabled()
         assertEquals(51, outbound.size) // connection snapshot plus 50 additions
         assertEquals(51, outbound.last().lines().size) // CLEAR plus 50 obstacles
-        composeRule.onNodeWithText("Undo").performScrollTo().performClick()
+        composeRule.onNodeWithContentDescription("Undo").performScrollTo().performClick()
         composeRule.onNodeWithText("Add obstacle").assertIsEnabled()
         assertEquals(50, outbound.last().lines().size)
-        composeRule.onNodeWithText("Redo").performScrollTo().performClick()
+        composeRule.onNodeWithContentDescription("Redo").performScrollTo().performClick()
         composeRule.onNodeWithText("Obstacle limit reached").assertIsNotEnabled()
         assertEquals(51, outbound.last().lines().size)
     }
@@ -578,9 +607,10 @@ class IntegratedControllerScreenTest {
         assertEquals(outbound[1].replace("SKIP", "NORTH"), outbound[2])
         assertTrue(incoming.tryEmit("TARGET,B1,11,E"))
         composeRule.waitForIdle()
-        composeRule.onNodeWithText(" • face E • target 11", substring = true).performScrollTo().assertIsDisplayed()
-        composeRule.onNodeWithText("+ Zoom in").assertIsDisplayed()
-        composeRule.onNodeWithText("− Zoom out").assertIsDisplayed()
+        composeRule.onNodeWithTag("selected_obstacle_face").assertTextContains("E", substring = true)
+        composeRule.onNodeWithTag("selected_obstacle_target").assertTextContains("11", substring = true)
+        composeRule.onNodeWithContentDescription("Zoom in").performScrollTo().assertIsDisplayed()
+        composeRule.onNodeWithContentDescription("Zoom out").assertIsDisplayed()
         capture("checklist-arena")
         assertEquals(3, outbound.size) // Received messages must never echo to the robot.
     }
@@ -647,7 +677,8 @@ class IntegratedControllerScreenTest {
         val density = InstrumentationRegistry.getInstrumentation().targetContext.resources.displayMetrics.density
         composeRule.onNodeWithTag("arena_grid").performTouchInput {
             val geometry = ArenaGeometry()
-            geometry.update(width, height, ArenaConfig(), 30f * density, 8f * density)
+            geometry.update(width, height, ArenaConfig(), 30f * density, 8f * density,
+                stretchToFill = true)
             val cell = geometry.cellBounds(GridCoordinate(x, y))
             click(Offset(cell.centerX, cell.centerY))
         }

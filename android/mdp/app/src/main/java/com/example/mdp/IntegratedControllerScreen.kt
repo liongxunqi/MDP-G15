@@ -39,6 +39,10 @@ import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.platform.testTag
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.ui.unit.dp
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.material3.TabRowDefaults
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.foundation.layout.PaddingValues
@@ -49,6 +53,7 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import com.mdp.g15.arena.domain.ManualCommand
 import com.mdp.g15.arena.integration.ArenaOutboundSink
 import com.mdp.g15.arena.presentation.ArenaScreen
+import com.mdp.g15.arena.presentation.PixelMaskIcon
 import com.mdp.g15.arena.presentation.Task1Phase
 import com.mdp.g15.arena.presentation.TaskMode
 import com.mdp.g15.arena.presentation.ArenaViewModel
@@ -149,24 +154,20 @@ fun IntegratedControllerScreen(
     )
 
     Column(modifier = modifier.fillMaxSize()) {
-        PrimaryTabRow(selectedTabIndex = selectedTab) {
+        PrimaryTabRow(selectedTabIndex = selectedTab,
+            containerColor = SpiderMap.NavyDeep,
+            contentColor = SpiderMap.OnBackdrop,
+            indicator = { TabRowDefaults.PrimaryIndicator(
+                Modifier.tabIndicatorOffset(selectedTab), color = SpiderMap.Frame,
+                width = 72.dp) },
+            modifier = Modifier.height(48.dp)) {
             ControllerTab.entries.forEach { tab ->
                 Tab(
                     selected = selectedTab == tab.ordinal,
                     onClick = { selectedTab = tab.ordinal },
-                    text = {
-                        Column(horizontalAlignment = androidx.compose.ui.Alignment.CenterHorizontally) {
-                            Text(tab.title)
-                            Text(
-                                when (tab) {
-                                    ControllerTab.CONTROLS -> "Bluetooth & commands"
-                                    ControllerTab.ARENA -> "Map & driving"
-                                    ControllerTab.LOGS -> "TX / RX history"
-                                },
-                                style = MaterialTheme.typography.labelSmall,
-                            )
-                        }
-                    },
+                    text = { Text(tab.title, style = SpiderMap.pixel(10.sp,
+                        if (selectedTab == tab.ordinal) SpiderMap.OnBackdrop else SpiderMap.PanelBlue)) },
+                    modifier = Modifier.height(48.dp),
                 )
             }
         }
@@ -263,6 +264,14 @@ fun IntegratedControllerScreen(
                             onNewAttempt = arenaViewModel::newAttempt,
                         )
                     },
+                    taskStatus = {
+                        TaskStatusDetails(
+                            mode = arenaState.taskMode, phase = arenaState.task1Phase,
+                            plannerInfo = arenaState.plannerInfo,
+                            startIssue = if (arenaState.taskMode == TaskMode.TASK1)
+                                arenaViewModel.task1StartIssue() else arenaViewModel.task2StartIssue(),
+                        )
+                    },
                     drivingControls = {
                         if (arenaState.taskMode == TaskMode.TASK1) {
                             ArenaDrivePad(
@@ -293,13 +302,10 @@ fun IntegratedControllerScreen(
 @Composable
 private fun NewlineModeButtons(appendNewline: Boolean, enabled: Boolean, onChange: (Boolean) -> Unit) {
     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-        if (!appendNewline) {
-            Button(enabled = enabled, onClick = { onChange(false) }, modifier = Modifier.weight(1f)) { Text("Amd tool") }
-            OutlinedButton(enabled = enabled, onClick = { onChange(true) }, modifier = Modifier.weight(1f)) { Text("normal") }
-        } else {
-            OutlinedButton(enabled = enabled, onClick = { onChange(false) }, modifier = Modifier.weight(1f)) { Text("Amd tool") }
-            Button(enabled = enabled, onClick = { onChange(true) }, modifier = Modifier.weight(1f)) { Text("normal") }
-        }
+        PixelButton("Amd tool", { onChange(false) }, Modifier.weight(1f), PixelTone.ORANGE,
+            enabled = enabled, selected = !appendNewline)
+        PixelButton("normal", { onChange(true) }, Modifier.weight(1f), PixelTone.ORANGE,
+            enabled = enabled, selected = appendNewline)
     }
 }
 
@@ -320,14 +326,8 @@ private fun TaskControls(
     onNewAttempt: () -> Unit,
 ) {
     var confirmNewAttempt by rememberSaveable { mutableStateOf(false) }
-    val phaseLabel = if (mode == TaskMode.TASK1) phase.label else when (phase) {
-        Task1Phase.COMPLETED -> "Completed — check image evidence"
-        Task1Phase.FAILED -> "Run ended with a failure"
-        Task1Phase.STOPPED -> "Stop requested"
-        else -> phase.label
-    }
-    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp),
+        verticalAlignment = Alignment.CenterVertically) {
             // The active task is filled orange; the other is a hollow tab.
             TaskMode.entries.forEach { task ->
                 PixelButton(
@@ -339,62 +339,69 @@ private fun TaskControls(
                     contentPadding = PaddingValues(horizontal = 14.dp, vertical = 6.dp),
                 )
             }
+        BoxWithConstraints(Modifier.weight(1f).height(40.dp), contentAlignment = Alignment.Center) {
+            if (maxWidth >= 48.dp) PixelMaskIcon(Modifier.size(38.dp))
         }
-        Text("${if (mode == TaskMode.TASK1) "Task 1" else "Task 2"} • $phaseLabel",
-            style = MaterialTheme.typography.titleSmall)
         val task2Active = mode == TaskMode.TASK2 && phase in setOf(
             Task1Phase.START_REQUESTED, Task1Phase.RUNNING, Task1Phase.UNKNOWN)
         if (mode == TaskMode.TASK2) {
             if (task2Active) {
-                Button(onClick = onStop, enabled = connected,
-                    colors = androidx.compose.material3.ButtonDefaults.buttonColors(
-                        containerColor = MaterialTheme.colorScheme.error),
-                    modifier = Modifier.fillMaxWidth()) {
-                    Text("Stop Task 2")
-                }
+                PixelButton("Stop Task 2", onStop, tone = PixelTone.CORAL,
+                    enabled = connected)
             }
             if (phase in setOf(Task1Phase.COMPLETED, Task1Phase.FAILED, Task1Phase.STOPPED,
                     Task1Phase.UNKNOWN)) {
-                OutlinedButton(onClick = { confirmNewAttempt = true }, enabled = canNewAttempt) {
-                    Text("New attempt")
-                }
+                PixelButton("New attempt", { confirmNewAttempt = true },
+                    enabled = canNewAttempt, selected = false)
             } else if (!task2Active) {
-                PixelButton("Start Task 2", onStart, Modifier.fillMaxWidth(), PixelTone.GREEN, enabled = canRequest)
+                PixelButton("Start Task 2", onStart, tone = PixelTone.GREEN, enabled = canRequest)
             }
         } else if (phase in setOf(Task1Phase.COMPLETED, Task1Phase.FAILED, Task1Phase.STOPPED) ||
             (hasResults && phase in setOf(Task1Phase.SETUP, Task1Phase.PATH_REQUESTED))) {
-            OutlinedButton(onClick = { confirmNewAttempt = true }, enabled = canNewAttempt) {
-                Text("New attempt")
-            }
+            PixelButton("New attempt", { confirmNewAttempt = true },
+                enabled = canNewAttempt, selected = false)
         } else {
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                PixelButton("Start Task 1", onStart, Modifier.weight(1f), PixelTone.GREEN, enabled = canRequest)
-            }
-        }
-        if (phase in setOf(Task1Phase.SETUP, Task1Phase.PATH_REQUESTED, Task1Phase.START_REQUESTED)) {
-            if (mode == TaskMode.TASK1 && plannerInfo != DEFAULT_PLANNER_INFO) {
-                Text(plannerInfo, style = MaterialTheme.typography.bodySmall)
-            }
-            if (startIssue != null && phase != Task1Phase.START_REQUESTED) {
-                Text(startIssue, style = MaterialTheme.typography.bodySmall)
-            }
+            PixelButton("Start Task 1", onStart, tone = PixelTone.GREEN, enabled = canRequest)
         }
     }
     if (confirmNewAttempt) {
         AlertDialog(
             onDismissRequest = { confirmNewAttempt = false },
-            title = { Text("Prepare a new attempt?") },
+            shape = SpiderMap.PanelShape,
+            containerColor = SpiderMap.PanelBlue,
+            titleContentColor = SpiderMap.Ink,
+            textContentColor = SpiderMap.Ink,
+            title = { Text("Prepare a new attempt?", style = SpiderMap.Title) },
             text = { Text(if (mode == TaskMode.TASK1)
                 "Save the result-map screenshot first. Previous image results will be cleared; obstacle positions and faces will be kept. No command will be sent to the robot."
                 else "Before another Task 2 attempt, verify the robot is stationary and the previous run has ended. Saved Task 1 markers and results will be kept. Preparing does not send BEGIN or STOP. For local tests, restart the Task 2 Pi; leave the PC service running and wait for READY before Start. Competition retries are shared across tasks; confirm eligibility with the supervisor.") },
             confirmButton = {
-                TextButton(enabled = canNewAttempt, onClick = {
+                PixelButton(if (mode == TaskMode.TASK1) "Clear results" else "Prepare attempt", {
                     confirmNewAttempt = false
                     onNewAttempt()
-                }) { Text(if (mode == TaskMode.TASK1) "Clear results" else "Prepare attempt") }
+                }, enabled = canNewAttempt, tone = PixelTone.CORAL)
             },
-            dismissButton = { TextButton(onClick = { confirmNewAttempt = false }) { Text("Cancel") } },
+            dismissButton = { PixelButton("Cancel", { confirmNewAttempt = false }, selected = false) },
         )
+    }
+}
+
+@Composable
+private fun TaskStatusDetails(mode: TaskMode, phase: Task1Phase, plannerInfo: String,
+                              startIssue: String?) {
+    val phaseLabel = if (mode == TaskMode.TASK1) phase.label else when (phase) {
+        Task1Phase.COMPLETED -> "Completed — check image evidence"
+        Task1Phase.FAILED -> "Run ended with a failure"
+        Task1Phase.STOPPED -> "Stop requested"
+        else -> phase.label
+    }
+    Text("${if (mode == TaskMode.TASK1) "Task 1" else "Task 2"} • $phaseLabel",
+        style = SpiderMap.pixel(7.sp))
+    if (phase in setOf(Task1Phase.SETUP, Task1Phase.PATH_REQUESTED, Task1Phase.START_REQUESTED)) {
+        if (mode == TaskMode.TASK1 && plannerInfo != DEFAULT_PLANNER_INFO)
+            Text(plannerInfo, style = SpiderMap.pixel(7.sp))
+        if (startIssue != null && phase != Task1Phase.START_REQUESTED)
+            Text(startIssue, style = SpiderMap.pixel(7.sp), color = SpiderMap.Warning)
     }
 }
 
@@ -439,17 +446,16 @@ private fun Task2TimerPanel(timer: Task2Timer, phase: Task1Phase) {
             .testTag("task2_timer_panel")) {
         BoxWithConstraints(Modifier.fillMaxSize().padding(16.dp), contentAlignment = Alignment.Center) {
             val fontScale = LocalDensity.current.fontScale
-            // Pixel glyphs are a full em wide (monospace is about 0.65), so size the digits to fit.
-            val size = minOf(96f,
-                maxWidth.value / (display.length * 1.0f * fontScale),
+            // Measure against the actual glyph width so the timer fills its panel.
+            val size = minOf(128f,
+                maxWidth.value / (display.length * 0.75f * fontScale),
                 maxHeight.value / (2.4f * fontScale)).coerceAtLeast(1f)
             Column(horizontalAlignment = Alignment.CenterHorizontally,
                 verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                Text("Task 2 • $heading", style = SpiderMap.pixel(14.sp, contentColor), textAlign = TextAlign.Center)
+                Text("Task 2 • $heading", style = SpiderMap.pixel(11.sp, contentColor), textAlign = TextAlign.Center)
                 Text(display, style = SpiderMap.pixel(size.sp, contentColor), maxLines = 1, softWrap = false)
-                Text("minutes : seconds : hundredths", style = SpiderMap.pixel(9.sp, contentColor),
+                Text("minutes : seconds : hundredths", style = SpiderMap.pixel(7.sp, contentColor),
                     textAlign = TextAlign.Center)
-                Text("Tablet elapsed time", style = SpiderMap.pixel(8.sp, contentColor))
             }
         }
     }
