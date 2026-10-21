@@ -28,6 +28,10 @@ class ArenaGeometry {
         private set
     var cellSize: Float = 0f
         private set
+    var cellWidth: Float = 0f
+        private set
+    var cellHeight: Float = 0f
+        private set
 
     private var config: ArenaConfig = ArenaConfig()
 
@@ -37,6 +41,7 @@ class ArenaGeometry {
         config: ArenaConfig,
         axisPadding: Float,
         outerPadding: Float,
+        stretchToFill: Boolean = false,
     ) {
         this.config = config
         // Reserve the same label-safe inset on every side. This keeps the square
@@ -45,8 +50,10 @@ class ArenaGeometry {
         val availableWidth = (viewWidth - contentPadding * 2f).coerceAtLeast(0f)
         val availableHeight = (viewHeight - contentPadding * 2f).coerceAtLeast(0f)
         cellSize = min(availableWidth / config.columns, availableHeight / config.rows)
-        arenaWidth = cellSize * config.columns
-        arenaHeight = cellSize * config.rows
+        cellWidth = if (stretchToFill) availableWidth / config.columns else cellSize
+        cellHeight = if (stretchToFill) availableHeight / config.rows else cellSize
+        arenaWidth = cellWidth * config.columns
+        arenaHeight = cellHeight * config.rows
         arenaLeft = contentPadding + ((availableWidth - arenaWidth) / 2f)
         arenaTop = contentPadding + ((availableHeight - arenaHeight) / 2f)
     }
@@ -56,30 +63,30 @@ class ArenaGeometry {
         if (x < arenaLeft || x >= arenaLeft + arenaWidth) return null
         if (y < arenaTop || y >= arenaTop + arenaHeight) return null
 
-        val column = floor((x - arenaLeft) / cellSize).toInt()
-        val displayRow = floor((y - arenaTop) / cellSize).toInt()
+        val column = floor((x - arenaLeft) / cellWidth).toInt()
+        val displayRow = floor((y - arenaTop) / cellHeight).toInt()
         val coordinate = GridCoordinate(column, config.rows - 1 - displayRow)
         return coordinate.takeIf(config::contains)
     }
 
     fun cellBounds(coordinate: GridCoordinate): CellBounds {
         require(config.contains(coordinate)) { "Coordinate must be inside the configured arena." }
-        val left = arenaLeft + coordinate.x * cellSize
-        val top = arenaTop + (config.rows - 1 - coordinate.y) * cellSize
-        return CellBounds(left, top, left + cellSize, top + cellSize)
+        val left = arenaLeft + coordinate.x * cellWidth
+        val top = arenaTop + (config.rows - 1 - coordinate.y) * cellHeight
+        return CellBounds(left, top, left + cellWidth, top + cellHeight)
     }
 
     /** Arena point (cells, y up, may be fractional) to unscaled content space (y down). */
-    fun contentX(arenaX: Double): Float = arenaLeft + arenaX.toFloat() * cellSize
-    fun contentY(arenaY: Double): Float = arenaTop + (config.rows - arenaY).toFloat() * cellSize
+    fun contentX(arenaX: Double): Float = arenaLeft + arenaX.toFloat() * cellWidth
+    fun contentY(arenaY: Double): Float = arenaTop + (config.rows - arenaY).toFloat() * cellHeight
 
     /** Unrotated reference rectangle; drawing rotates it about its centre. */
     fun robotBounds(pose: RobotPose, config: ArenaConfig): CellBounds {
         return CellBounds(
-            left = arenaLeft + pose.x.toFloat() * cellSize,
-            top = arenaTop + (config.rows - pose.y - config.robotLengthCells).toFloat() * cellSize,
-            right = arenaLeft + (pose.x + config.robotWidthCells).toFloat() * cellSize,
-            bottom = arenaTop + (config.rows - pose.y).toFloat() * cellSize,
+            left = arenaLeft + pose.x.toFloat() * cellWidth,
+            top = arenaTop + (config.rows - pose.y - config.robotLengthCells).toFloat() * cellHeight,
+            right = arenaLeft + (pose.x + config.robotWidthCells).toFloat() * cellWidth,
+            bottom = arenaTop + (config.rows - pose.y).toFloat() * cellHeight,
         )
     }
 }

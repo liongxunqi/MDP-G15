@@ -15,6 +15,7 @@ import android.view.ScaleGestureDetector
 import android.view.View
 import android.view.ViewConfiguration
 import androidx.core.content.ContextCompat
+import androidx.core.content.res.ResourcesCompat
 import com.mdp.g15.arena.R
 import com.mdp.g15.arena.domain.ArenaReducer
 import com.mdp.g15.arena.domain.ArenaAction
@@ -47,7 +48,7 @@ class ArenaGridView @JvmOverloads constructor(
     private val robotMotion = RobotMotion()
     private val geometry = ArenaGeometry()
     private val density = resources.displayMetrics.density
-    private val axisPadding = 30f * density
+    private val axisPadding = 36f * density
     private val outerPadding = 8f * density
     private val handler = Handler(Looper.getMainLooper())
     private val touchSlop = ViewConfiguration.get(context).scaledTouchSlop.toFloat()
@@ -91,7 +92,10 @@ class ArenaGridView @JvmOverloads constructor(
     private val inkPaint = strokePaint(R.color.arena_ink, 2.5f * density).apply {
         strokeJoin = Paint.Join.ROUND
     }
-    private val axisTextPaint = textPaint(R.color.arena_axis_text, 10f, Paint.Align.CENTER)
+    private val axisTextPaint = textPaint(R.color.arena_axis_text, 14f, Paint.Align.CENTER).apply {
+        typeface = ResourcesCompat.getFont(context, R.font.press_start_2p)
+        isAntiAlias = false
+    }
     private val obstaclePaint = fillPaint(R.color.arena_obstacle)
     private val obstacleFoundPaint = fillPaint(R.color.arena_obstacle_found)
     private val obstacleTextPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
@@ -350,18 +354,27 @@ class ArenaGridView @JvmOverloads constructor(
         drawWebRadar(canvas)
 
         for (column in 0..state.config.columns) {
-            val x = left + column * geometry.cellSize
+            val x = left + column * geometry.cellWidth
             canvas.drawLine(x, top, x, top + arenaHeight, if (column % 5 == 0) gridMajorPaint else gridPaint)
         }
         // Rows count from the bottom, so major lines follow arena y, not screen y.
         for (row in 0..state.config.rows) {
-            val y = top + row * geometry.cellSize
+            val y = top + row * geometry.cellHeight
             val arenaRow = state.config.rows - row
             canvas.drawLine(left, y, left + arenaWidth, y, if (arenaRow % 5 == 0) gridMajorPaint else gridPaint)
         }
         canvas.drawRect(left, top, left + arenaWidth, top + arenaHeight, framePaint)
 
-        axisTextPaint.textSize = min(sp(10f), geometry.cellSize * 0.42f)
+        axisTextPaint.textSize = min(sp(13f), geometry.cellSize * 0.65f)
+        axisTextPaint.textScaleX = 1f
+        // Press Start 2P uses full-width glyphs. Size for a two-digit label so adjacent
+        // coordinates and the left axis remain distinct at the tablet's native resolution.
+        val twoDigitWidth = axisTextPaint.measureText("19")
+        val axisLabelWidth = min(geometry.cellWidth * 0.86f,
+            geometry.arenaLeft - 4f * density)
+        if (twoDigitWidth > axisLabelWidth && axisLabelWidth > 0f) {
+            axisTextPaint.textScaleX = axisLabelWidth / twoDigitWidth
+        }
         for (column in 0 until state.config.columns) {
             val bounds = geometry.cellBounds(GridCoordinate(column, 0))
             canvas.drawText(
@@ -372,15 +385,18 @@ class ArenaGridView @JvmOverloads constructor(
             )
         }
         axisTextPaint.textAlign = Paint.Align.RIGHT
+        val bottomAxisScale = axisTextPaint.textScaleX
+        axisTextPaint.textScaleX = bottomAxisScale * 0.85f
         for (row in 0 until state.config.rows) {
             val bounds = geometry.cellBounds(GridCoordinate(0, row))
             canvas.drawText(
                 row.toString(),
-                geometry.arenaLeft - 4f * density,
+                geometry.arenaLeft - 1.5f * density,
                 bounds.centerY - (axisTextPaint.ascent() + axisTextPaint.descent()) / 2f,
                 axisTextPaint,
             )
         }
+        axisTextPaint.textScaleX = bottomAxisScale
         axisTextPaint.textAlign = Paint.Align.CENTER
     }
 
@@ -614,7 +630,7 @@ class ArenaGridView @JvmOverloads constructor(
     }
 
     private fun updateGeometry(width: Int, height: Int) {
-        geometry.update(width, height, state.config, axisPadding, outerPadding)
+        geometry.update(width, height, state.config, axisPadding, outerPadding, stretchToFill = true)
     }
 
     /** Converts a raw touch/screen coordinate into the unscaled grid space [ArenaGeometry] expects. */
@@ -630,8 +646,8 @@ class ArenaGridView @JvmOverloads constructor(
     private fun pointAtTouch(x: Float, y: Float): RobotFootprint.Point? {
         if (coordinateAtTouch(x, y) == null) return null
         return RobotFootprint.Point(
-            ((toContentX(x) - geometry.arenaLeft) / geometry.cellSize).toDouble(),
-            (state.config.rows - (toContentY(y) - geometry.arenaTop) / geometry.cellSize).toDouble(),
+            ((toContentX(x) - geometry.arenaLeft) / geometry.cellWidth).toDouble(),
+            (state.config.rows - (toContentY(y) - geometry.arenaTop) / geometry.cellHeight).toDouble(),
         )
     }
 

@@ -58,4 +58,16 @@ class ArenaGeometryTest {
         assertEquals((800f - geometry.arenaWidth) / 2f, geometry.arenaLeft, 0.001f)
         assertEquals((500f - geometry.arenaHeight) / 2f, geometry.arenaTop, 0.001f)
     }
+
+    @Test
+    fun `stretched viewport fills width and preserves touch coordinates`() {
+        geometry.update(600, 400, ArenaConfig(), axisPadding = 30f, outerPadding = 8f,
+            stretchToFill = true)
+        assertEquals(540f, geometry.arenaWidth, 0.001f)
+        assertEquals(340f, geometry.arenaHeight, 0.001f)
+        val coordinate = GridCoordinate(19, 0)
+        val bounds = geometry.cellBounds(coordinate)
+        assertEquals(coordinate, geometry.coordinateAt(bounds.centerX, bounds.centerY))
+        assertEquals(geometry.arenaLeft + geometry.arenaWidth, bounds.right, 0.001f)
+    }
 }
