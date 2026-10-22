@@ -1,5 +1,5 @@
 package com.mdp.g15.arena.presentation
-
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.background
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
@@ -57,7 +57,7 @@ import com.mdp.g15.arena.domain.Direction
 import com.mdp.g15.arena.domain.GridCoordinate
 import com.mdp.g15.arena.view.ArenaGridView
 import com.mdp.g15.arena.view.ArenaInteractionListener
-
+import androidx.compose.foundation.interaction.MutableInteractionSource
 @Composable
 fun ArenaScreen(
     viewModel: ArenaViewModel,
@@ -115,6 +115,7 @@ fun ArenaScreen(
                             state = displayState,
                             interactions = interactions,
                             modifier = Modifier.weight(1f).fillMaxHeight(),
+                            onPlayPathDemo = viewModel::playPathDemo,
                         )
                         Column(Modifier.width((availableWidth * 0.31f).coerceIn(270.dp, 430.dp))
                             .fillMaxHeight().verticalScroll(rememberScrollState()),
@@ -146,7 +147,8 @@ fun ArenaScreen(
                             .padding(horizontal = 4.dp),
                             verticalArrangement = Arrangement.spacedBy(4.dp)) {
                             ArenaCanvas(displayState, interactions,
-                                Modifier.fillMaxWidth().height(mapHeight))
+                                Modifier.fillMaxWidth().height(mapHeight),
+                                onPlayPathDemo = viewModel::playPathDemo)
                             ArenaStatusPanel(displayState, robotStatus, viewModel, taskStatus,
                                 drivingControls, Modifier.fillMaxWidth().height(statusHeight))
                             ArenaSecondaryPanel(displayState, viewModel, { confirmReset = true },
@@ -238,6 +240,7 @@ private fun ArenaCanvas(
     interactions: ArenaInteractionListener,
     modifier: Modifier,
     squareViewport: Boolean = false,
+    onPlayPathDemo: () -> Unit = {},
 ) {
     var gridView by remember { mutableStateOf<ArenaGridView?>(null) }
     LaunchedEffect(gridView, state.task1Phase) {
@@ -277,7 +280,11 @@ private fun ArenaCanvas(
                 horizontalArrangement = Arrangement.spacedBy(4.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                PixelSpiderIcon(Modifier.size(44.dp))
+                // The spider doubles as the path demo trigger; no ripple, so it looks unchanged.
+                PixelSpiderIcon(Modifier.size(44.dp)
+                    .clickable(remember { MutableInteractionSource() }, indication = null,
+                        onClickLabel = "Play path demo", onClick = onPlayPathDemo)
+                    .testTag("play_path_demo"))
                 Spacer(Modifier.weight(1f))
                 PixelWebIcon(Modifier.size(40.dp))
                 Spacer(Modifier.weight(1f))
@@ -374,14 +381,14 @@ private fun ArenaSecondaryPanel(state: ArenaUiState, viewModel: ArenaViewModel,
                         onCancel = viewModel::cancelMapResyncOnReconnect,
                     )
                     belowResetControls?.invoke()
-                    PixelButton(
-                        text = if (state.pathDemoRunning) "Playing path demo…" else "Play Path Demo",
-                        onClick = viewModel::playPathDemo,
-                        tone = PixelTone.ORANGE,
-                        enabled = !state.pathDemoRunning && !state.autonomousRunning && !state.manualPending &&
-                            !state.manualAnimating && !state.placementMode,
-                        modifier = Modifier.fillMaxWidth().testTag("play_path_demo"),
-                    )
+                    // PixelButton(
+                    //     text = if (state.pathDemoRunning) "Playing path demo…" else "Play Path Demo",
+                    //     onClick = viewModel::playPathDemo,
+                    //     tone = PixelTone.ORANGE,
+                    //     enabled = !state.pathDemoRunning && !state.autonomousRunning && !state.manualPending &&
+                    //         !state.manualAnimating && !state.placementMode,
+                    //     modifier = Modifier.fillMaxWidth().testTag("play_path_demo"),
+                    // )
                 }
             }
         }
@@ -472,8 +479,10 @@ private fun ObstacleButtons(state: ArenaUiState, viewModel: ArenaViewModel) {
                 contentPadding = PaddingValues(horizontal = 2.dp),
                 fontSize = 7.sp,
             )
-            PixelHistoryButton("Undo", false, state.canUndo, viewModel::undo, Modifier.weight(1f))
-            PixelHistoryButton("Redo", true, state.canRedo, viewModel::redo, Modifier.weight(1f))
+            PixelButton("Undo", viewModel::undo, Modifier.weight(1f).height(44.dp), PixelTone.GREEN,
+                enabled = state.canUndo, contentPadding = PaddingValues(horizontal = 2.dp), fontSize = 7.sp)
+            PixelButton("Redo", viewModel::redo, Modifier.weight(1f).height(44.dp), PixelTone.GREEN,
+                enabled = state.canRedo, contentPadding = PaddingValues(horizontal = 2.dp), fontSize = 7.sp)
         }
     }
 }
