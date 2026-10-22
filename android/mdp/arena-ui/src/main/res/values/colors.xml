@@ -15,10 +15,11 @@
     <color name="arena_obstacle_found">#5FD27A</color>
     <color name="arena_selected">#FFB547</color>
     <color name="arena_target_face">#FFFFFF</color>
-    <!-- Robot: coral suit, white mask eyes, ink direction mark. -->
-    <color name="arena_robot">#F2735C</color>
-    <color name="arena_robot_eye">#FFFFFF</color>
-    <color name="arena_robot_direction">#0A1630</color>
+    <!-- Robot: purple chassis, yellow lightning, and ice-blue front sensors. -->
+    <color name="arena_robot">#492875</color>
+    <color name="arena_robot_trim">#A77CE0</color>
+    <color name="arena_robot_eye">#A9E9FF</color>
+    <color name="arena_robot_direction">#FFD84A</color>
     <!-- Path demo: translucent so grid lines stay visible through the swept cells. -->
     <color name="arena_path_cell">#6680D4FF</color>
     <color name="arena_path_arrow">#BFE6FF</color>

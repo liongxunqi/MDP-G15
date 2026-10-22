@@ -9,10 +9,13 @@ import android.view.ViewConfiguration
 import androidx.test.core.app.ApplicationProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
+import androidx.core.content.ContextCompat
+import com.mdp.g15.arena.R
 import com.mdp.g15.arena.domain.ArenaState
 import com.mdp.g15.arena.domain.Direction
 import com.mdp.g15.arena.domain.GridCoordinate
 import com.mdp.g15.arena.domain.Obstacle
+import com.mdp.g15.arena.domain.PoseSource
 import com.mdp.g15.arena.domain.RobotPose
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotEquals
@@ -101,6 +104,54 @@ class ArenaGridViewInstrumentedTest {
         view.draw(Canvas(bitmap))
 
         assertTrue(bitmap.getPixel(400, 400) != 0)
+    }
+
+    @Test
+    fun robotArtworkUsesRequestedColorsAndEyesFollowHeading() {
+        val context = ApplicationProvider.getApplicationContext<android.content.Context>()
+        val bodyColor = ContextCompat.getColor(context, R.color.arena_robot)
+        val boltColor = ContextCompat.getColor(context, R.color.arena_robot_direction)
+        val eyeColor = ContextCompat.getColor(context, R.color.arena_robot_eye)
+
+        fun capture(heading: Double): Bitmap {
+            val view = createView(context)
+            val bitmap = Bitmap.createBitmap(VIEW_SIZE, VIEW_SIZE, Bitmap.Config.ARGB_8888)
+            onMain {
+                prepare(view, ArenaState(robot = RobotPose(8.0, 8.0, heading,
+                    source = PoseSource.SIMULATED)), false)
+                view.draw(Canvas(bitmap))
+            }
+            return bitmap
+        }
+
+        fun centroid(bitmap: Bitmap, color: Int): Pair<Double, Double> {
+            var count = 0
+            var sumX = 0L
+            var sumY = 0L
+            for (y in 0 until bitmap.height) for (x in 0 until bitmap.width) {
+                if (bitmap.getPixel(x, y) == color) {
+                    count++
+                    sumX += x
+                    sumY += y
+                }
+            }
+            assertTrue("Expected rendered robot color #${color.toUInt().toString(16)}", count > 0)
+            return sumX.toDouble() / count to sumY.toDouble() / count
+        }
+
+        val north = capture(0.0)
+        val east = capture(90.0)
+        val northBody = centroid(north, bodyColor)
+        val northEyes = centroid(north, eyeColor)
+        centroid(north, boltColor)
+        val eastBody = centroid(east, bodyColor)
+        val eastEyes = centroid(east, eyeColor)
+        centroid(east, boltColor)
+
+        assertTrue("Front sensors should be above a north-facing chassis", northEyes.second < northBody.second)
+        assertTrue("Front sensors should be right of an east-facing chassis", eastEyes.first > eastBody.first)
+        north.recycle()
+        east.recycle()
     }
 
     @Test

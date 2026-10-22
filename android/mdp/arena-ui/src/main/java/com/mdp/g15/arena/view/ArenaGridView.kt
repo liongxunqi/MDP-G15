@@ -109,6 +109,15 @@ class ArenaGridView @JvmOverloads constructor(
     private val robotPaint = fillPaint(R.color.arena_robot)
     private val robotDirectionPaint = fillPaint(R.color.arena_robot_direction)
     private val robotEyePaint = fillPaint(R.color.arena_robot_eye)
+    private val robotTrimPaint = strokePaint(R.color.arena_robot_trim, 1f).apply {
+        strokeCap = Paint.Cap.ROUND
+        strokeJoin = Paint.Join.ROUND
+    }
+    private val robotLegPaint = Paint(robotPaint).apply {
+        style = Paint.Style.STROKE
+        strokeCap = Paint.Cap.SQUARE
+        strokeJoin = Paint.Join.ROUND
+    }
     private val pathCellPaint = fillPaint(R.color.arena_path_cell)
     private val pathArrowPaint = strokePaint(R.color.arena_path_arrow, 3f * density).apply {
         strokeCap = Paint.Cap.ROUND
@@ -522,34 +531,59 @@ class ArenaGridView @JvmOverloads constructor(
         val bounds = geometry.robotBounds(pose, state.config)
         val checkpoint = canvas.save()
         canvas.rotate(pose.heading.toFloat(), bounds.centerX, bounds.centerY)
-        val cell = geometry.cellSize
-        val inset = cell * 0.08f
-        val body = RectF(bounds.left + inset, bounds.top + inset, bounds.right - inset, bounds.bottom - inset)
-        canvas.drawRoundRect(body, cell * 0.35f, cell * 0.35f, robotPaint)
-        canvas.drawRoundRect(body, cell * 0.35f, cell * 0.35f, inkPaint)
-        // The front is the top of the unrotated body; canvas.rotate turns it to the heading.
-        val nose = Path().apply {
-            moveTo(bounds.centerX, bounds.top + inset * 1.5f)
-            lineTo(bounds.centerX - cell * 0.28f, bounds.top + cell * 0.42f)
-            lineTo(bounds.centerX + cell * 0.28f, bounds.top + cell * 0.42f)
+        val width = bounds.right - bounds.left
+        val height = bounds.bottom - bounds.top
+        fun x(fraction: Float) = bounds.left + width * fraction
+        fun y(fraction: Float) = bounds.top + height * fraction
+
+        // Four articulated wheel-like legs stay inside the robot's actual footprint.
+        robotTrimPaint.strokeWidth = width * 0.105f
+        robotLegPaint.strokeWidth = width * 0.068f
+        for (side in listOf(-1, 1)) {
+            val inner = if (side < 0) 0.26f else 0.74f
+            val outer = if (side < 0) 0.10f else 0.90f
+            val tip = if (side < 0) 0.07f else 0.93f
+            for (front in listOf(true, false)) {
+                val shoulder = if (front) 0.39f else 0.70f
+                val knee = if (front) 0.34f else 0.75f
+                val end = if (front) 0.09f else 0.93f
+                val leg = Path().apply {
+                    moveTo(x(inner), y(shoulder))
+                    lineTo(x(outer), y(knee))
+                    lineTo(x(tip), y(end))
+                }
+                canvas.drawPath(leg, robotTrimPaint)
+                canvas.drawPath(leg, robotLegPaint)
+                val foot = RectF(x(tip) - width * 0.045f, y(end) - height * 0.035f,
+                    x(tip) + width * 0.045f, y(end) + height * 0.035f)
+                canvas.drawRoundRect(foot, width * 0.025f, width * 0.025f, robotPaint)
+                canvas.drawRoundRect(foot, width * 0.025f, width * 0.025f, robotTrimPaint)
+            }
+        }
+
+        // The two front sensor lenses also make the heading clear when the map rotates.
+        robotTrimPaint.strokeWidth = width * 0.025f
+        for (centre in listOf(0.38f, 0.62f)) {
+            val eye = RectF(x(centre - 0.075f), y(0.10f), x(centre + 0.075f), y(0.22f))
+            canvas.drawOval(eye, robotEyePaint)
+            canvas.drawOval(eye, robotTrimPaint)
+        }
+
+        val body = RectF(x(0.25f), y(0.22f), x(0.75f), y(0.88f))
+        canvas.drawRoundRect(body, width * 0.07f, width * 0.07f, robotPaint)
+        robotTrimPaint.strokeWidth = width * 0.035f
+        canvas.drawRoundRect(body, width * 0.07f, width * 0.07f, robotTrimPaint)
+
+        val bolt = Path().apply {
+            moveTo(x(0.57f), y(0.30f))
+            lineTo(x(0.38f), y(0.58f))
+            lineTo(x(0.52f), y(0.55f))
+            lineTo(x(0.43f), y(0.79f))
+            lineTo(x(0.66f), y(0.48f))
+            lineTo(x(0.53f), y(0.50f))
             close()
         }
-        canvas.drawPath(nose, robotDirectionPaint)
-        val eyeTop = bounds.top + cell * 0.55f
-        val eyeWidth = (bounds.right - bounds.left) * 0.3f
-        listOf(-1f, 1f).forEach { side ->
-            val eyeCentre = bounds.centerX + side * eyeWidth * 0.62f
-            val eye = Path().apply {
-                // A slanted Spider-Man lens: pointed toward the middle, round at the outside.
-                moveTo(eyeCentre - side * eyeWidth * 0.5f, eyeTop + cell * 0.05f)
-                quadTo(eyeCentre + side * eyeWidth * 0.55f, eyeTop - cell * 0.05f,
-                    eyeCentre + side * eyeWidth * 0.45f, eyeTop + cell * 0.32f)
-                quadTo(eyeCentre, eyeTop + cell * 0.48f, eyeCentre - side * eyeWidth * 0.5f, eyeTop + cell * 0.05f)
-                close()
-            }
-            canvas.drawPath(eye, robotEyePaint)
-            canvas.drawPath(eye, inkPaint)
-        }
+        canvas.drawPath(bolt, robotDirectionPaint)
         canvas.restoreToCount(checkpoint)
     }
 
