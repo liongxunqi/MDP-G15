@@ -99,25 +99,30 @@ fun ArenaScreen(
                 }
             if (landscape) {
                 BoxWithConstraints(Modifier.fillMaxWidth().weight(1f)) {
-                    val paneHeight = maxHeight - 8.dp
+                    val availableWidth = maxWidth
                     Row(Modifier.fillMaxSize().padding(4.dp),
                         horizontalArrangement = Arrangement.spacedBy(4.dp)) {
                     if (state.taskMode == TaskMode.TASK2) {
-                        Task2TimerCard(task2TimerDisplay,
-                            Modifier.width(paneHeight).fillMaxHeight())
+                        ArenaStatusPanel(displayState, robotStatus, viewModel, taskStatus,
+                            modifier = Modifier.width((availableWidth * 0.24f).coerceIn(210.dp, 320.dp))
+                                .fillMaxHeight())
+                        Task2TimerCard(task2TimerDisplay, Modifier.weight(1f).fillMaxHeight())
                     } else {
+                        LandscapeStatusCard(displayState, robotStatus, taskStatus,
+                            Modifier.width((availableWidth * 0.22f).coerceIn(190.dp, 300.dp))
+                                .fillMaxHeight())
                         ArenaCanvas(
                             state = displayState,
                             interactions = interactions,
-                            modifier = Modifier.width(paneHeight).fillMaxHeight(),
+                            modifier = Modifier.weight(1f).fillMaxHeight(),
                         )
-                    }
-                    Column(Modifier.weight(1f).fillMaxHeight().verticalScroll(rememberScrollState()),
-                        verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                        ArenaStatusPanel(displayState, robotStatus, viewModel, taskStatus,
-                            drivingControls, Modifier.fillMaxWidth().height(paneHeight))
-                        ArenaSecondaryPanel(displayState, viewModel, { confirmReset = true },
-                            belowResetControls)
+                        Column(Modifier.width((availableWidth * 0.31f).coerceIn(270.dp, 430.dp))
+                            .fillMaxHeight().verticalScroll(rememberScrollState()),
+                            verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                            LandscapeControlCard(displayState, viewModel, drivingControls)
+                            ArenaSecondaryPanel(displayState, viewModel, { confirmReset = true },
+                                belowResetControls)
+                        }
                     }
                     }
                 }
@@ -171,6 +176,49 @@ fun ArenaScreen(
             },
             dismissButton = { PixelButton("Cancel", { confirmReset = false }, selected = false) },
         )
+    }
+}
+
+@Composable
+private fun LandscapeStatusCard(state: ArenaUiState, robotStatus: String?,
+                                taskStatus: (@Composable () -> Unit)?, modifier: Modifier) {
+    SpiderMapPanel(modifier.testTag("status_card")) {
+        ControlInset(Modifier.fillMaxSize().padding(8.dp)) {
+            StatusDetails(state, robotStatus, taskStatus)
+        }
+    }
+}
+
+@Composable
+private fun LandscapeControlCard(state: ArenaUiState, viewModel: ArenaViewModel,
+                                 drivingControls: (@Composable () -> Unit)?) {
+    SpiderMapPanel(Modifier.fillMaxWidth().testTag("landscape_controls_card")) {
+        BoxWithConstraints(Modifier.fillMaxWidth().padding(8.dp)) {
+            val controlsMaxWidth = maxWidth
+            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                if (controlsMaxWidth >= 330.dp) {
+                    Row(Modifier.fillMaxWidth().height(190.dp),
+                        horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                        ControlInset(Modifier.weight(1f).fillMaxHeight().testTag("obstacle_card")) {
+                            ObstacleSelection(state)
+                        }
+                        ControlInset(Modifier.weight(1.1f).fillMaxHeight()) {
+                            drivingControls?.invoke()
+                        }
+                    }
+                } else {
+                    ControlInset(Modifier.fillMaxWidth().height(116.dp).testTag("obstacle_card")) {
+                        ObstacleSelection(state)
+                    }
+                    ControlInset(Modifier.fillMaxWidth().height(190.dp)) {
+                        drivingControls?.invoke()
+                    }
+                }
+                ControlInset(Modifier.fillMaxWidth()) {
+                    ObstacleButtons(state, viewModel)
+                }
+            }
+        }
     }
 }
 

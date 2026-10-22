@@ -3,7 +3,7 @@ package com.example.mdp
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
@@ -13,6 +13,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -21,7 +22,9 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import com.mdp.g15.arena.domain.ManualCommand
 import com.mdp.g15.arena.presentation.SpiderMap
 
@@ -31,8 +34,15 @@ private val StopCoral = Color(0xFFF2735C)
 @Composable
 fun ArenaDrivePad(status: String, connected: Boolean, allowed: Set<ManualCommand>,
                   onMove: (ManualCommand) -> Unit, onStop: () -> Unit) {
-        Box(Modifier.fillMaxWidth().padding(8.dp), contentAlignment = Alignment.Center) {
-            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        BoxWithConstraints(Modifier.fillMaxWidth().padding(8.dp)) {
+            val buttonSize = minOf(44.dp, (maxWidth - 8.dp) / 3f)
+            Column(Modifier.fillMaxWidth(),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                    Text("Manual drive", style = SpiderMap.pixel(7.sp))
+                    Text(if (connected) "LIVE" else "OFF", style = SpiderMap.pixel(6.sp))
+                }
                 val commands = listOf(
                     listOf(ManualCommand.FORWARD_LEFT, ManualCommand.FORWARD, ManualCommand.FORWARD_RIGHT),
                     listOf(ManualCommand.LEFT, null, ManualCommand.RIGHT),
@@ -55,7 +65,7 @@ fun ArenaDrivePad(status: String, connected: Boolean, allowed: Set<ManualCommand
                             Button(
                                 onClick = { if (command == null) onStop() else onMove(command) },
                                 enabled = connected && (command == null || command in allowed),
-                                modifier = Modifier.size(42.dp).semantics { contentDescription = name },
+                                modifier = Modifier.size(buttonSize).semantics { contentDescription = name },
                                 shape = SpiderMap.ButtonShape,
                                 border = BorderStroke(3.dp, SpiderMap.Ink),
                                 contentPadding = PaddingValues(0.dp),
@@ -69,6 +79,8 @@ fun ArenaDrivePad(status: String, connected: Boolean, allowed: Set<ManualCommand
                         }
                     }
                 }
+                Text(status, style = SpiderMap.pixel(6.sp), maxLines = 1,
+                    overflow = TextOverflow.Ellipsis, modifier = Modifier.fillMaxWidth())
             }
         }
 }

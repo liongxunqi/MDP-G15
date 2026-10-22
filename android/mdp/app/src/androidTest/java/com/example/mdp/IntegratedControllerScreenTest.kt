@@ -20,6 +20,7 @@ import androidx.compose.ui.test.performScrollTo
 import androidx.compose.ui.test.junit4.StateRestorationTester
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onNodeWithTag
+import androidx.compose.ui.test.getUnclippedBoundsInRoot
 import androidx.compose.ui.test.onNodeWithContentDescription
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.onAllNodesWithText
@@ -36,6 +37,7 @@ import androidx.compose.ui.test.performClick
 import kotlinx.coroutines.flow.MutableSharedFlow
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
+import org.junit.Assume.assumeTrue
 import org.junit.Before
 import org.junit.Rule
 import org.junit.Test
@@ -65,6 +67,27 @@ class IntegratedControllerScreenTest {
         movement.clear()
         targetLookup = { false }
         targetChecksAtMapWrite.clear()
+    }
+
+    @Test
+    fun landscapeArenaKeepsStatusGridAndDriveControlsInOrder() {
+        setScreen()
+        composeRule.onNodeWithText("Arena").performClick()
+        val root = composeRule.onRoot().getUnclippedBoundsInRoot()
+        assumeTrue("Landscape-only layout check",
+            root.right - root.left > root.bottom - root.top)
+        val status = composeRule.onNodeWithTag("status_card").getUnclippedBoundsInRoot()
+        val grid = composeRule.onNodeWithTag("arena_grid_card").getUnclippedBoundsInRoot()
+        val controls = composeRule.onNodeWithTag("landscape_controls_card").getUnclippedBoundsInRoot()
+        val stop = composeRule.onNodeWithContentDescription("Stop").getUnclippedBoundsInRoot()
+        assertTrue(status.right <= grid.left)
+        assertTrue(grid.right <= controls.left)
+        assertTrue(controls.right <= root.right)
+        assertTrue(status.bottom <= root.bottom)
+        assertTrue(grid.bottom <= root.bottom)
+        assertTrue(controls.bottom <= root.bottom)
+        assertTrue(stop.left >= controls.left && stop.right <= controls.right)
+        assertTrue(stop.top >= controls.top && stop.bottom <= controls.bottom)
     }
 
     @Test
