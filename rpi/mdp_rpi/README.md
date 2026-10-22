@@ -388,9 +388,12 @@ authoritative wherever it disagrees with this table.
 | `SEGMENT_DELAY_S` | 0.5 | Pause between segments (give STM time to settle) |
 | `DETECT_RETRY_COUNT` | 1 | Extra attempts if PC doesn't reply in time |
 | `DETECT_RETRY_DELAY_S` | 0.2 | Wait between retries |
-| `DETECT_TIMEOUT_S` | 0.5 | How long to wait for OBJECT reply per attempt |
+| `DETECT_TIMEOUT_S` | 30.0 | How long to wait for the PC's YOLO OBJECT reply per attempt |
+| `TASK1_CAPTURE_SETTLE_S` | 2.0 | Chassis settling time before each Task 1 photograph |
 | `DEBOUNCE_DELAY_S` | 1.0 | How long after last obstacle before auto-sending to PC |
 | `PATH_TIMEOUT_S` | 30.0 | Give up waiting for the PC's `PATH` and report `STATUS,FAILED` |
+| `TASK1_FEEDBACK_WAIT` | 0 | Set to 1 to require a PC decision after every instruction |
+| `TASK1_FEEDBACK_TIMEOUT_S` | 30.0 | Positive finite seconds to wait for a matching decision |
 
 A.5 only (`task_a5.py`):
 
@@ -403,3 +406,106 @@ A.5 only (`task_a5.py`):
 | `A5_SETTLE_S` | 0.3 | Let the chassis stop rocking before `FU` measures |
 | `A5_ARC_PROFILE` | 0 | Profile `A5_ORBIT` was traced for. Checked against `?STAT`, never set |
 | `A5_ORBIT` | `R20,FR90,FL90,R37,FL90` | One face to the next — **the thing you tune** |
+
+## Task 1 PC Feedback Contract
+
+The RPi and `pc/task1_pc.py` implement this handshake. With
+`TASK1_FEEDBACK_WAIT=1`, the PC answers `CONTINUE` while measured pose remains
+within its configured limits. Outside them it plans a collision-checked recovery
+to the current segment's original endpoint, sends that correction plus the
+unchanged later segments as `REPLACE`, and resets its expected-pose monitor to
+the replacement. If recovery is unsafe, or no valid reply arrives within
+`TASK1_FEEDBACK_TIMEOUT_S`, the RPi continues the existing path. The IP, port,
+Android messages and image framing are unchanged.
+
+After each STM `OK`, RPi queries `?WPOSE`, sends Android `ROBOT,x,y,heading`,
+then sends PC one newline-terminated `PROGRESS,<json>` message. With wait mode
+enabled, no next movement, photo capture or DONE is issued before the decision.
+The PC receive thread remains available while the STM execution thread waits.
+
+Example JSON (transmit on ONE line after `PROGRESS,`):
+
+```json
+{
+  "event": "instruction_completed",
+  "segment_index": 0,
+  "instruction_index": 0,
+  "token": "FR90",
+  "segment": ["FR90", "F15", "S"],
+  "segment_completed": false,
+  "motion_plan_completed": false,
+  "next_segment_index": 0,
+  "next_instruction_index": 1,
+  "x_grid": 2.75,
+  "y_grid": 3.25,
+  "heading_deg": 92.6,
+  "remaining_photo_ids": ["7"],
+  "awaiting_decision": true,
+  "decision_timeout_s": 30.0,
+  "feedback_id": "opaque-unique-value"
+}
+```
+
+- Indexes are zero-based within the currently installed path. `token` has
+  already completed. `segment` includes both executed and unexecuted tokens.
+- Coordinates are fractional grid units: one unit = 100 mm; arena `[0,20)` on
+  each axis. Heading is degrees, north=0, clockwise positive, `[0,360)`.
+- `PATH.start` is only the bottom-left cell of Android's 2 x 2 robot drawing.
+  The starting x/y/bearing for `ROBOT` and `PROGRESS` comes from the separate
+  `PATH.odometry_start` object. The planner sends that origin explicitly; the
+  RPi has no fixed `(2,2)` fallback. STM odometry measures the rear-axle
+  midpoint, so the planner owns any required reference-point conversion.
+- In telemetry-only mode `awaiting_decision` is false and no feedback ID is
+  issued. Do not send decisions in that mode.
+- Echo the feedback ID and completed indexes exactly. A fresh feedback ID is
+  issued for EVERY wait, even after replacements and new runs. It is a request
+  correlation ID, not an execution ID. Do not infer or reuse it.
+
+The PC may send exactly ONE of these UTF-8 newline-terminated responses:
+
+```text
+CONTINUE,{"feedback_id":"opaque-unique-value","segment_index":0,"instruction_index":0}
+REPLACE,{"feedback_id":"opaque-unique-value","segment_index":0,"instruction_index":0,"segments":[["F5","S"]],"segment_obstacles":["7"]}
+```
+
+### Decision Semantics
+
+- `CONTINUE`: preserve the current path; perform any due photo, then send the
+  next instruction. A final CONTINUE allows the final photo, STITCH and DONE.
+- `REPLACE`: supply the ENTIRE remaining route from the reported measured pose,
+  not a delta, not the old completed prefix. `segments` must be nonempty lists
+  of valid STM movement tokens or `S`. Queries, resets and config commands are
+  rejected. Existing STM line/token caps apply. `segment_obstacles` is required,
+  parallel to `segments`, with null for travel or a string/integer obstacle ID.
+  Non-null IDs must match `remaining_photo_ids` as a multiset (same counts;
+  reordering is allowed). Omitted targets, duplicates and unknown IDs halt.
+  RPi validates before swapping any path state, retains the original odometry
+  origin and completed-photo count, resets path indexes to zero and immediately
+  executes the first replacement instruction. Do not send a separate CONTINUE.
+  `dirs` and `obstacle_ids` are not required or used for replacement.
+- At a completed photo boundary, PROGRESS is sent BEFORE the photo. REPLACE
+  defers that photo to its assignment in the replacement route. To photograph
+  at the current position, a replacement segment `["S"]` with that obstacle ID
+  is valid. Its completion will require a new decision. Completed photo
+  assignments from earlier boundaries must not be reintroduced.
+Missing replies, including a disconnected PC, cause the RPi to continue the
+existing route after `TASK1_FEEDBACK_TIMEOUT_S`. `STOP` is not part of this
+protocol and is ignored. Unknown IDs, duplicate/expired replies and malformed
+JSON are ignored without extending the deadline. A matching ID with wrong
+indexes or an invalid replacement still halts because executing an ambiguous or
+malformed replacement is unsafe. Late decisions are stale and cannot alter the
+route after fallback continuation. A feedback-mode validation halt invalidates
+the old path: request a fresh PATH before restarting. A new BEGIN is an operator
+restart from the configured physical start, not a resume from the last pose;
+reposition/reset deliberately.
+
+The RPi validates protocol and pending photo assignments, NOT collision safety
+or physical reachability. The algorithm owns path geometry, non-cardinal
+heading support and deciding whether a measured correction is appropriate.
+Raw `PATH` messages remain rejected during active execution; use REPLACE.
+
+Offline verification:
+
+```bash
+python3 -B -m unittest rpi/mdp_rpi/test_instruction_mission.py rpi/mdp_rpi/test_feedback_control.py rpi/mdp_rpi/test_task_a5.py -q
+```

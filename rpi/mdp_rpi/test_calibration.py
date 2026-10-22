@@ -292,6 +292,44 @@ class GyroStepTests(unittest.TestCase):
             self.assertAlmostEqual(calibrate.ask_angle("x"), 1.5)
 
 
+class OneStepTests(ProfileStoreMixin, unittest.TestCase):
+    def gyro_robot(self):
+        fw = FakeFirmware()
+        fw.after_move = lambda tok: setattr(fw, "hdg", [3600, 3600, 900, 900, 0])
+        return fw
+
+    def test_rerun_keeps_the_other_steps(self):
+        self.saved_arena(checks={"radius": {"target_cm": 29.1, "rounds": []},
+                                 "brakes": {"worst_deg": 0.3}},
+                         steer_left_us=425, steer_right_us=586)
+        fw = self.gyro_robot()
+        with mock.patch("builtins.input", side_effect=["", "3.6", "", "3.6"]):
+            self.assertTrue(calibrate.run_one_step(fw, "arena", "gyro"))
+        p = cal_profile.load("arena")
+        self.assertEqual(set(p["checks"]), {"radius", "brakes", "gyro"})
+        self.assertEqual(p["gyro_x10000"], round(10087 * 1.01))
+        self.assertEqual((p["steer_left_us"], p["steer_right_us"]), (425, 586))
+        self.assertEqual(p["note"], "test")
+        self.assertFalse(p["verified"])
+
+    def test_missing_profile_starts_from_the_robot(self):
+        fw = self.gyro_robot()
+        with mock.patch("builtins.input", side_effect=["", "3.6", "", "3.6"]):
+            self.assertTrue(calibrate.run_one_step(fw, "fresh", "gyro", note="hpl"))
+        p = cal_profile.load("fresh")
+        self.assertEqual(set(p["checks"]), {"gyro"})
+        self.assertEqual(p["note"], "hpl")
+        self.assertIn("decel_x10", p)
+
+    def test_failed_step_saves_nothing(self):
+        self.saved_arena()
+        before = cal_profile.load("arena")
+        fw = FakeFirmware(proto=4)
+        with mock.patch("builtins.input", return_value=""):
+            self.assertFalse(calibrate.run_one_step(fw, "arena", "radius"))
+        self.assertEqual(cal_profile.load("arena"), before)
+
+
 class RadiusStepTests(unittest.TestCase):
     """
     A robot whose radius is K / deflection per side - wider the less it
@@ -299,19 +337,23 @@ class RadiusStepTests(unittest.TestCase):
     chord prompt with what a tape would read for the side just driven.
     """
 
-    def make(self, k_left_cm, k_right_cm):
+    def make(self, k_left_cm, k_right_cm, rev_scale=1.0):
+        # rev_scale: reverse radius / forward radius on the same steering.
         fw = FakeFirmware()
         fw.last = None
 
         def moved(tok):
             fw.last = tok
-            fw.hdg = [0, 0, 900, -900 if tok == "FR90" else 900, 0]
+            # Body rotation: FR and RL clockwise, FL and RR anticlockwise.
+            fw.hdg = [0, 0, 900, -900 if tok in ("FR90", "RL90") else 900, 0]
         fw.after_move = moved
 
         def person(prompt):
             if "distance" in prompt.lower():
-                side = "SR" if fw.last == "FR90" else "SL"
+                side = "S" + fw.last[1]
                 k = k_right_cm if side == "SR" else k_left_cm
+                if fw.last[0] == "R":
+                    k *= rev_scale
                 return f"{k / fw.cal[side] * 2 ** 0.5:.2f}"
             if "[y/n]" in prompt.lower():
                 return "y"
@@ -342,10 +384,86 @@ class RadiusStepTests(unittest.TestCase):
         self.assertEqual(result["checks"]["radius"]["target_cm"], 31.0)
         self.assertTrue(any("TURN_RADIUS_MM" in m for m in logs.output))
 
+    def test_reverse_arcs_are_measured_on_the_same_steering(self):
+        fw, person = self.make(k_left_cm=29.1 * 574, k_right_cm=29.1 * 574)
+        result = {"checks": {}}
+        with mock.patch("builtins.input", side_effect=person):
+            self.assertTrue(calibrate.step_radius(fw, result))
+        for tok in ("FR90", "RR90", "FL90", "RL90"):
+            self.assertEqual(fw.sent.count(tok), calibrate.RADIUS_RUNS)
+        last = result["checks"]["radius"]["rounds"][-1]
+        self.assertAlmostEqual(last["radius_rr_cm"], 29.1, delta=0.1)
+        self.assertAlmostEqual(last["radius_lr_cm"], 29.1, delta=0.1)
+
+    def test_reverse_wider_than_forward_is_warned_and_split_down_the_middle(self):
+        # Reverse 6% wider: steering moves both together, so the side is
+        # tuned on the mean and the mismatch is reported, not chased.
+        fw, person = self.make(k_left_cm=29.1 * 574, k_right_cm=29.1 * 574,
+                               rev_scale=1.06)
+        result = {"checks": {}}
+        with mock.patch("builtins.input", side_effect=person),                 self.assertLogs(level="WARNING") as logs:
+            self.assertTrue(calibrate.step_radius(fw, result))
+        rad = result["checks"]["radius"]
+        last = rad["rounds"][-1]
+        self.assertAlmostEqual(last["radius_r_cm"], rad["target_cm"], delta=0.5)
+        self.assertAlmostEqual(last["radius_l_cm"], rad["target_cm"], delta=0.5)
+        self.assertGreater(last["radius_rr_cm"], last["radius_rf_cm"] + 1.0)
+        self.assertTrue(any("reverse" in m for m in logs.output))
+
+    def test_auto_finds_the_tightest_radius_both_sides_can_turn(self):
+        # Full lock: left 574 -> 31.0 cm, right 626 -> 28.0 cm. Left cannot
+        # go tighter, so 31.0 is the target and the right is widened to it.
+        fw, person = self.make(k_left_cm=31.0 * 574, k_right_cm=28.0 * 626)
+        fw.cal["SL"], fw.cal["SR"] = 425, 586
+        result = {"checks": {}}
+        with mock.patch("builtins.input", side_effect=person), \
+                self.assertLogs(level="INFO") as logs:
+            self.assertTrue(calibrate.step_radius(fw, result, target_cm=None))
+        rad = result["checks"]["radius"]
+        self.assertEqual((rad["rounds"][0]["steer_l"], rad["rounds"][0]["steer_r"]),
+                         (574, 626))
+        self.assertEqual(rad["target_cm"], 31.0)
+        self.assertEqual(fw.cal["SL"], 574)
+        self.assertLess(fw.cal["SR"], 626)
+        self.assertAlmostEqual(rad["rounds"][-1]["radius_r_cm"], 31.0, delta=0.5)
+        self.assertTrue(any("TURN_RADIUS_MM" in m and "310" in m for m in logs.output))
+
     def test_needs_protocol_5(self):
         fw = FakeFirmware(proto=4)
         with mock.patch("builtins.input", return_value=""):
             self.assertFalse(calibrate.step_radius(fw, {"checks": {}}))
+
+
+class DriftTests(unittest.TestCase):
+    def test_drift_after_handling_is_flagged(self):
+        # Left alone: 0.1° in 10 s. Just handled: 2° in 10 s.
+        fw = FakeFirmware()
+        rates = iter([1, 20])                  # x10 degrees per reading
+        clock = [0.0]
+
+        def zero_then_rate(*_):
+            fw.step, fw.t0 = next(rates), clock[0]
+            fw.hdg = [0, 0, 0, 0, 0]
+            return True
+
+        real_query = fw.query
+
+        def query(cmd, timeout=2.0):
+            if cmd == "?HDG":
+                clock[0] += 1.0
+                fw.hdg[1] = int((clock[0] - fw.t0) * fw.step / 10)
+            return real_query(cmd, timeout)
+        fw.query = query
+
+        with mock.patch.object(calibrate.cal_profile, "zero_heading",
+                               side_effect=zero_then_rate), \
+                mock.patch.object(calibrate.time, "sleep"), \
+                mock.patch.object(calibrate.time, "monotonic",
+                                  side_effect=lambda: clock[0]), \
+                mock.patch("builtins.input", return_value=""), \
+                self.assertLogs(level="WARNING") as logs:
+            self.assertTrue(calibrate.gyro_drift(fw, seconds=10))
+        self.assertTrue(any("bias" in m for m in logs.output))
 
 
 class StopSummaryTests(unittest.TestCase):

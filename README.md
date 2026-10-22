@@ -33,6 +33,10 @@ from the left line. The planner assumes exactly this (`START_*` in
 `START_GAP_MM`, or `START_X_MM` / `START_Y_MM` (robot centre, mm), in the
 PC's environment before starting `task1_pc.py`.
 
+Task 1 odometry and arc motion are rear-axle referenced. Photo poses use the
+measured 23 cm rear-axle-to-front-ultrasonic offset; override it with
+`REAR_AXLE_TO_SENSOR_CM` on the PC only after measuring that distance.
+
 Each run writes a log with an end-of-run summary of warnings and errors: `rpi/mdp_rpi/logs/` on the RPi, `pc/logs/` on the PC.
 
 ## Tests (no robot needed)

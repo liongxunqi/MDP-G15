@@ -8,7 +8,7 @@ What it does
 1. Connects to the RPi's TCP socket server.
 2. Waits for OBSTACLES,<json>  →  runs pathfinding  →  sends back PATH,<json>.
 3. Enters detection loop:
-    RPi sends:  DETECT,<obstacle_id>\n
+    RPi sends:  DETECT,<obstacle_id>[,<standoff_cm>]\n
     4-byte big-endian image size (struct.pack(">I", size))
     raw JPEG bytes (exactly <size> bytes)
     PC saves the JPEG, runs YOLO, sends back:
@@ -45,6 +45,9 @@ RPI_PORT = 5000              # must match RPI_PORT in .env
 RECEIVED_DIR    = "received_images"   # incoming JPEGs saved here
 ANNOTATED_DIR   = "runs/predict"      # YOLO-annotated outputs saved here
 STITCHED_OUTPUT = "stitched_result.jpg"
+STITCH_COLUMNS = max(1, int(os.getenv("STITCH_COLUMNS", "3")))
+STITCH_TILE_WIDTH = max(160, int(os.getenv("STITCH_TILE_WIDTH", "960")))
+STITCH_TILE_HEIGHT = max(90, int(os.getenv("STITCH_TILE_HEIGHT", "540")))
 
 # ── Logging ────────────────────────────────────────────────────────────────────
 # Shared with the RPi side, so it lives in rpi/mdp_rpi/. Logs go to pc/logs/.
@@ -61,6 +64,7 @@ run_log.setup("task1_pc", "%(asctime)s [PC] %(levelname)s — %(message)s",
 # It exposes:  detect(image_path) -> (class_name, confidence)
 sys.path.insert(0, PC_DIR)
 from image_recognition.detect import detect as _detect
+from progress_monitor import PlanMonitor
 
 
 def run_detection(image_path: str):
@@ -78,10 +82,22 @@ def run_detection(image_path: str):
 #   "segment_obstacles" — parallel to "segments": obstacle to photograph after
 #                         that line, or None for pure travel
 #   "dirs"              — robot pose per line, for the Android map
+#   "start"             — bottom-left cell of Android's 2x2 robot drawing
+#   "odometry_start"    — planner-owned origin for RPi ROBOT/PROGRESS feedback
 
 sys.path.insert(0, os.path.join(REPO_ROOT, "algo"))
+os.environ.setdefault("RPI_ANCHOR_X_MM", "0") # the RPi reports ROBOT as displacement from the start
+os.environ.setdefault("RPI_ANCHOR_Y_MM", "0")
+os.environ.setdefault("RPI_ARENA_GUARD", "0") # see the caveat below
 from stm_tokens import PROFILE_NAMES, TURN_RADIUS_MM  # noqa: E402
-from path_planner import plan_mission  # noqa: E402
+from path_planner import (  # noqa: E402
+    REAR_AXLE_TO_SENSOR_MM,
+    RPI_ANCHOR_X_MM,
+    RPI_ANCHOR_Y_MM,
+    assess_primitive_safety,
+    plan_mission,
+    plan_segment_recovery,
+)
 
 # Must match whatever profile is actually running on the STM (?STAT).
 ARC_PROFILE = int(os.getenv("STM_ARC_PROFILE", "0"))
@@ -93,27 +109,86 @@ def compute_path(obstacles: list) -> dict:
         f"({PROFILE_NAMES.get(ARC_PROFILE, '?')}, radius "
         f"{TURN_RADIUS_MM.get(ARC_PROFILE, '?')}mm)."
     )
+    logging.info(
+        f"Planner geometry: rear axle to front sensor "
+        f"{REAR_AXLE_TO_SENSOR_MM:.0f}mm; odometry start "
+        f"({RPI_ANCHOR_X_MM:.0f},{RPI_ANCHOR_Y_MM:.0f})mm."
+    )
     return plan_mission(obstacles, arc_profile=ARC_PROFILE)
 
 
 # ── Image stitching ────────────────────────────────────────────────────────────
 
 def stitch_images(image_paths: list, output_path: str) -> None:
-    """Concatenate a list of images horizontally and save."""
+    """Save a readable, multi-row contact sheet of this run's images."""
+    if not hasattr(cv2, "imread"):
+        logging.warning("Stitch: OpenCV image support is unavailable — skipping.")
+        return
     imgs = [cv2.imread(p) for p in image_paths if os.path.exists(p)]
+    imgs = [img for img in imgs if img is not None]
     if not imgs:
         logging.warning("Stitch: no valid images found — skipping.")
         return
-    min_h = min(img.shape[0] for img in imgs)
-    resized = [
-        cv2.resize(img, (int(img.shape[1] * min_h / img.shape[0]), min_h))
-        for img in imgs
-    ]
-    cv2.imwrite(output_path, cv2.hconcat(resized))
-    logging.info(f"Stitch: saved → {output_path}.")
+
+    tiles = []
+    for img in imgs:
+        height, width = img.shape[:2]
+        scale = min(STITCH_TILE_WIDTH / width, STITCH_TILE_HEIGHT / height)
+        resized = cv2.resize(
+            img,
+            (max(1, round(width * scale)), max(1, round(height * scale))),
+            interpolation=cv2.INTER_AREA,
+        )
+        vertical = STITCH_TILE_HEIGHT - resized.shape[0]
+        horizontal = STITCH_TILE_WIDTH - resized.shape[1]
+        tile = cv2.copyMakeBorder(
+            resized,
+            vertical // 2,
+            vertical - vertical // 2,
+            horizontal // 2,
+            horizontal - horizontal // 2,
+            cv2.BORDER_CONSTANT,
+            value=(0, 0, 0),
+        )
+        tiles.append(tile)
+
+    blank = tiles[0].copy()
+    blank[:] = 0
+    rows = []
+    for offset in range(0, len(tiles), STITCH_COLUMNS):
+        row = tiles[offset:offset + STITCH_COLUMNS]
+        row += [blank.copy() for _ in range(STITCH_COLUMNS - len(row))]
+        rows.append(cv2.hconcat(row))
+
+    sheet = cv2.vconcat(rows)
+    root, extension = os.path.splitext(output_path)
+    temporary_path = root + ".tmp" + (extension or ".jpg")
+    if not cv2.imwrite(temporary_path, sheet):
+        logging.error(f"Stitch: could not save {output_path}.")
+        return
+    os.replace(temporary_path, output_path)
+    logging.info(
+        "Stitch: updated %s with %d image(s) in a %d-column grid.",
+        output_path, len(imgs), STITCH_COLUMNS,
+    )
 
 
 # ── Socket helpers ─────────────────────────────────────────────────────────────
+
+# The RPi gives up on a PATH reply after PATH_TIMEOUT_S (30 s, rpi/mdp_rpi/task1.py).
+# A plan slower than this may arrive after the RPi has stopped listening for it.
+RPI_PATH_TIMEOUT_S = float(os.getenv("PATH_TIMEOUT_S", "30.0"))
+
+
+def _connection_lost_msg(doing: str, message, exc: BaseException) -> str:
+    what = f" ({message.split(',', 1)[0]})" if message else ""
+    return (
+        f"Connection to the RPi was lost while {doing}{what}: {exc!r}. "
+        "The RPi side closed or dropped the link - usually task1.py on the RPi "
+        "exited or was restarted, or the hotspot blipped. Restart task1.py on "
+        "the RPi first, then this script."
+    )
+
 
 class RPiConnection:
     """TCP client that connects to the RPi's socket server."""
@@ -129,11 +204,23 @@ class RPiConnection:
         self.sock.connect((self.ip, self.port))
         logging.info(f"Connected to RPi at {self.ip}:{self.port}.")
 
-    def send(self, message: str) -> None:
-        """Send a newline-terminated UTF-8 text message to the RPi."""
+    def send(self, message: str) -> bool:
+        """Send a newline-terminated UTF-8 text message to the RPi.
+
+        Returns False (and logs why) if the connection is gone, instead of
+        raising: on Windows a peer that closed while the PC was busy shows up
+        here or in receive_line() as ConnectionAbortedError [WinError 10053] /
+        ConnectionResetError [WinError 10054], and a raw traceback hides what
+        actually happened.
+        """
         payload = (message.rstrip("\n") + "\n").encode("utf-8")
-        self.sock.sendall(payload)
+        try:
+            self.sock.sendall(payload)
+        except OSError as exc:
+            logging.error(_connection_lost_msg("sending", message, exc))
+            return False
         logging.info(f"→ RPi: {message.strip()}")
+        return True
 
     def receive_line(self) -> Optional[str]:
         """
@@ -141,7 +228,11 @@ class RPiConnection:
         one complete line. Returns None if the connection is closed.
         """
         while b"\n" not in self._rx_buf:
-            chunk = self.sock.recv(4096)
+            try:
+                chunk = self.sock.recv(4096)
+            except OSError as exc:
+                logging.error(_connection_lost_msg("waiting for a message", None, exc))
+                return None
             if not chunk:
                 return None
             self._rx_buf += chunk
@@ -210,11 +301,13 @@ def main() -> None:
     # Run relative to this file so all relative paths work correctly
     os.chdir(Path(__file__).parent)
     os.makedirs(RECEIVED_DIR, exist_ok=True)
+    logging.info("Live stitch viewer: %s", Path("stitched_live.html").resolve())
 
     rpi = RPiConnection(RPI_IP, RPI_PORT)
     rpi.connect()
 
     annotated_images = []
+    monitor = PlanMonitor(None)     # replaced by one built from each PATH we send
 
     logging.info("Waiting for messages from RPi…")
 
@@ -222,7 +315,35 @@ def main() -> None:
         msg = rpi.receive_line()
         if msg is None:
             logging.info("RPi disconnected — exiting.")
+            logging.info(monitor.summary())
             break
+
+        # ── PROGRESS → compare with the plan; answer a feedback wait ──────────
+        # One of these arrives after EVERY instruction (the RPi now sends each
+        # token as its own STM line). With feedback on, the RPi stalls until we
+        # answer, so this must stay quick and never raise.
+        if msg.startswith("PROGRESS,"):
+            reply = monitor.handle(msg.split(",", 1)[1])
+            if reply is not None and not rpi.send(reply):
+                break
+            continue
+
+        if msg.startswith("PHOTO_PROGRESS,"):
+            try:
+                report = json.loads(msg.split(",", 1)[1])
+                logging.info(
+                    "Photo adjustment: obstacle %s attempt %s used %s from US=%s cm "
+                    "-> (%.2f, %.2f) @ %.1f deg.",
+                    report.get("obstacle_id", "?"),
+                    report.get("correction_attempt", "?"),
+                    report.get("token", "?"),
+                    report.get("measured_us_cm_before", "?"),
+                    float(report.get("x_grid")), float(report.get("y_grid")),
+                    float(report.get("heading_deg")),
+                )
+            except (ValueError, TypeError, json.JSONDecodeError):
+                logging.warning("Malformed PHOTO_PROGRESS from RPi: %s", msg[:300])
+            continue
 
         # ── OBSTACLES → pathfinding → PATH ────────────────────────────────────
         if msg.startswith("OBSTACLES"):
@@ -232,48 +353,117 @@ def main() -> None:
                 logging.error(f"Bad OBSTACLES message: {exc}")
                 continue
 
+            # A new obstacle list starts a new contact sheet. This also drops
+            # images left in memory when a previous mission ended early.
+            annotated_images.clear()
+            try:
+                os.remove(STITCHED_OUTPUT)
+            except FileNotFoundError:
+                pass
+
             logging.info(f"{len(obstacles)} obstacle(s) received — computing path…")
-            path = compute_path(obstacles)
-            rpi.send("PATH," + json.dumps(path))
+            t_plan = time.monotonic()
+            try:
+                path = compute_path(obstacles)
+            except Exception:
+                # One bad layout must not take the whole PC server down. Nothing
+                # is sent, so the RPi's PATH watchdog reports STATUS,FAILED to
+                # Android; fix the layout / planner and press Send Data again.
+                logging.exception(
+                    f"Path planning crashed on obstacles {obstacles} — no PATH sent."
+                )
+                continue
+            took = time.monotonic() - t_plan
+            if took > 0.8 * RPI_PATH_TIMEOUT_S:
+                logging.warning(
+                    f"Planning took {took:.0f}s; the RPi stops waiting for PATH after "
+                    f"{RPI_PATH_TIMEOUT_S:.0f}s, so this plan may arrive too late."
+                )
+            obstacle_snapshot = [dict(obstacle) for obstacle in obstacles]
+            monitor = PlanMonitor(
+                path,
+                recovery_planner=lambda current_plan, progress, obs=obstacle_snapshot: (
+                    plan_segment_recovery(
+                        current_plan, obs, progress, arc_profile=ARC_PROFILE,
+                    )
+                ),
+                safety_checker=lambda current_plan, progress, token,
+                                      obs=obstacle_snapshot: assess_primitive_safety(
+                    current_plan, obs, progress, token, arc_profile=ARC_PROFILE,
+                ),
+            )
+            if not rpi.send("PATH," + json.dumps(path)):
+                break
 
         # ── DETECT → receive image → YOLO → OBJECT ────────────────────────────
         elif msg.startswith("DETECT"):
             parts = msg.split(",")
             obstacle_id = parts[1].strip() if len(parts) > 1 else "0"
+            standoff = parts[2].strip() if len(parts) > 2 else "unknown"
+            distance_tag = f"_{standoff}cm" if standoff.isdigit() else ""
 
             # Save path — named by obstacle ID + timestamp so files don't collide
-            filename = f"obstacle_{obstacle_id}_{int(time.time())}.jpg"
+            # A distance retry can produce several frames in one second.
+            filename = f"obstacle_{obstacle_id}{distance_tag}_{time.time_ns()}.jpg"
             save_path = os.path.join(RECEIVED_DIR, filename)
 
             # Receive the JPEG (4-byte length header + raw bytes)
             ok = rpi.receive_image(save_path)
             if not ok:
-                logging.error(f"Image receive failed for obstacle {obstacle_id}.")
-                rpi.send(f"OBJECT,{obstacle_id},0.0,NONE")
+                logging.error(
+                    "Image receive failed for obstacle %s at %s cm.",
+                    obstacle_id, standoff,
+                )
+                if not rpi.send(f"OBJECT,{obstacle_id},0.0,NONE"):
+                    break
                 continue
 
-            # Run YOLO via your detect.py
-            class_id, confidence = run_detection(save_path)
+            # Run YOLO via your detect.py. A detector exception must not lose
+            # the photograph or terminate the PC server; the raw frame still
+            # belongs in the live stitch and NONE lets the RPi try a new range.
+            try:
+                class_id, confidence = run_detection(save_path)
+            except Exception:
+                logging.exception(
+                    "Detector crashed for obstacle %s at %s cm; keeping the raw frame.",
+                    obstacle_id, standoff,
+                )
+                class_id, confidence = None, None
+
+            # detect.py saves an annotated frame even when no trustworthy box
+            # is found. Include every attempt in the live contact sheet so it
+            # can be inspected while the mission is still running.
+            annotated_path = os.path.join(
+                ANNOTATED_DIR, os.path.basename(save_path)
+            )
+            stitch_source = annotated_path if os.path.exists(annotated_path) else save_path
+            if not os.path.exists(annotated_path):
+                logging.info(
+                    "Detector did not create %s; adding the received frame to the stitch instead.",
+                    annotated_path,
+                )
+            annotated_images.append(stitch_source)
+            stitch_images(annotated_images, STITCHED_OUTPUT)
 
             if class_id is None:
-                logging.warning(f"Nothing detected for obstacle {obstacle_id}.")
-                rpi.send(f"OBJECT,{obstacle_id},0.0,NONE")
+                logging.warning(
+                    "Nothing detected for obstacle %s at %s cm.",
+                    obstacle_id, standoff,
+                )
+                if not rpi.send(f"OBJECT,{obstacle_id},0.0,NONE"):
+                    break
             else:
                 logging.info(
                     f"Detected '{class_id}' (conf={confidence:.2f}) "
-                    f"for obstacle {obstacle_id}."
+                    f"for obstacle {obstacle_id} at {standoff} cm."
                 )
-                rpi.send(f"OBJECT,{obstacle_id},{confidence:.4f},{class_id}")
-
-                # Track for stitching
-                annotated_path = os.path.join(
-                    ANNOTATED_DIR, os.path.basename(save_path)
-                )
-                annotated_images.append(annotated_path)
+                if not rpi.send(f"OBJECT,{obstacle_id},{confidence:.4f},{class_id}"):
+                    break
 
         # ── STITCH → combine all result images ────────────────────────────────
         elif msg.startswith("STITCH"):
             logging.info("STITCH received — creating result image…")
+            logging.info(monitor.summary())
             stitch_images(annotated_images, STITCHED_OUTPUT)
             annotated_images.clear()
             logging.info("Stitching done. Ready for next run (Ctrl-C to quit).")

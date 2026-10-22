@@ -419,8 +419,15 @@ static void Calib_StartStep(void)
     }
 }
 
+/* Learning is off at power-on (Motion_SetLearning). The CALIB cycle exists to
+   learn, so it switches learning on for its own duration and puts back
+   whatever was there before when it ends, however it ends. */
+static uint8_t g_calLearnPrev = 0U;
+
 static void Calib_Start(void)
 {
+    g_calLearnPrev = Motion_LearningEnabled();
+    Motion_SetLearning(1U);
     g_calPrevDecel10 = CalDecel10();
     g_calPrevLag10   = CalLag10();
     g_calPrevTrim    = (int32_t)Odom_GetHeadingTrim();
@@ -438,6 +445,7 @@ static void Calib_Cancel(void)
     if (g_calState == CALIB_RUNNING)
     {
         g_calState = CALIB_IDLE;
+        Motion_SetLearning(g_calLearnPrev);
         RpiLink_Log("calib cycle cancelled\r\n");
     }
 }
@@ -490,6 +498,7 @@ static void Calib_Tick(void)
         /* A stalled wheel or a dead encoder. Launching the next arc from a
            pose the odometry has lost is how a bench test becomes a repair. */
         g_calState = CALIB_IDLE;
+        Motion_SetLearning(g_calLearnPrev);
         RpiLink_Log("calib cycle ABORTED: a move timed out\r\n");
         return;
     }
@@ -508,6 +517,7 @@ static void Calib_Tick(void)
     g_calDeltaTrim  = (int32_t)Odom_GetHeadingTrim() - g_calPrevTrim;
     g_calRuns++;
     g_calState = CALIB_DONE;
+    Motion_SetLearning(g_calLearnPrev);
 
     {
         char msg[112];

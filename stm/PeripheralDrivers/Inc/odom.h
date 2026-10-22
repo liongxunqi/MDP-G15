@@ -340,6 +340,13 @@ void Odom_Update(void);
 /* Current pose. Safe to call from the main loop. */
 void Odom_GetPose(Odom_Pose_t *out);
 
+/* Continuous pose since boot, from the same per-tick increments as
+ * Odom_GetPose() but never reset - not by a move starting, not by an FU
+ * pass, not by !ZERO. Frame: where the robot was at power-on, +x forward,
+ * +y left, heading counter-clockwise positive. Dead reckoning: it drifts,
+ * and it counts the robot being carried or turned by hand. ?WPOSE. */
+void Odom_GetWorldPose(Odom_Pose_t *out);
+
 float Odom_GetHeading(void);
 
 /* Heading since the last Odom_Reset(), degrees, NOT wrapped. Positive follows

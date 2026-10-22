@@ -8,7 +8,17 @@ Queries, config and the `FAIL,*` replies are implemented in firmware but have
 and the `FAIL,*` rows of §3 as a proposal until that happens — the firmware can
 change if the RPi side wants different names or fields.
 
-**Protocol version: 3** — ask for it with `?VER`.
+**Protocol version: 5** — ask for it with `?VER`.
+
+Version 5 adds `!CALSL` / `!CALSR`, a separate arc steering deflection for
+each side (§7.1), and appends the two values in force to `?CAL`. Additive.
+
+Version 4 freezes calibration during tasks (§7.1): learning is **off at
+power-on** and runs only after `!LEARN1`; `!CALG` sets a gyro scale; heading
+error now carries from one move into the next and `?HDG` reports it; `!PROF`
+accepts only `0` (the robot is locked to TIGHT). `?CAL` gains two appended
+fields. Movement tokens are unchanged, but a sender that relied on the robot
+learning during a run must now ask for it.
 
 Version 3 adds `FU<n>` (§4.1) and the `FAIL,NOECHO` reply. Movement is purely
 additive; a sender that treats an unrecognised reply as fatal must learn
@@ -187,6 +197,7 @@ line; there is no separate `OK`.
 | `?IR` | `IR,<left_cm>,<right_cm>` | `65535` = out of range |
 | `?IRR` | `IRR,<left>,<right>` | Raw filtered counts, 0–4095 |
 | `?POSE` | `POSE,<x_mm>,<y_mm>,<hdg_x10>` | Since the last `!ZERO` or move start |
+| `?WPOSE` | `WPOSE,<x_mm>,<y_mm>,<hdg_x10>` | Continuous since boot; unaffected by move starts, FU passes or `!ZERO`. See §12 |
 | `?DIST` | `DIST,<mm>` | Travelled in the current or last move |
 | `?TURN` | `TURN,<deg_x10>` | Turned in the current or last arc, signed |
 | `?STAT` | `STAT,<state>,<busy>,<imu_ok>,<profile>` | `busy` is the **line**, not the motor — see below |
@@ -230,14 +241,18 @@ arc. Reads all zeros when the check did not run.
 | Send | Effect | Reply |
 |---|---|---|
 | `!PROF0` | Arc profile **TIGHT** — radius 291 mm, fastest | `OK` |
-| `!PROF1` | Arc profile **CLEAN** — radius 318 mm, no tyre scrub, cross-check valid | `OK` |
-| `!PROF2` | Arc profile **SLOW** — radius 306 mm, gentlest | `OK` |
-| `!ZERO` | Zero the odometry and heading | `OK` |
+| `!PROF1` | Arc profile CLEAN — radius 318 mm. **Locked out (v4)** | `RESEND` |
+| `!PROF2` | Arc profile SLOW — radius 306 mm. **Locked out (v4)** | `RESEND` |
+| `!ZERO` | Zero the odometry and heading, **and the heading carry-over** (§7.1) | `OK` |
+| `!LEARN1` / `!LEARN0` | Switch the calibration learners on / off (§7.1) | `OK` |
 
-Profile persists until changed or reset. Default is **TIGHT**.
+**Protocol 4 is locked to TIGHT** (`MOTION_PROFILE_LOCK_TIGHT` in `motion.h`).
+The planner radius, the A5 orbit and the saved calibration all assume it, and
+the braking model is one set of numbers that only fits the profile it was
+measured on. Turning the lock off restores CLEAN and SLOW.
 
-Pick **CLEAN** when the planner needs the robot to finish where it predicted —
-it traces a truer circle. Pick **TIGHT** when floor space is the constraint.
+**Send `!ZERO` after anything moves the robot by hand.** The gyro sees the
+rotation, and without a zero the next move would steer it straight back.
 
 ---
 
@@ -336,6 +351,59 @@ the gyro. Run one `!PROF1` arc at the end of the sequence and check it.
 > **Calibration must never be able to hide a fault.** Both checks exist so a
 > converged-looking `CAL` reply cannot cover for a linkage that has come
 > loose. If either fails, the answer is a spanner, not a number.
+
+> **v4 note on `?XCHK`:** the cross-check only runs on a profile with no
+> differential boost, and TIGHT has 2.0, so on a TIGHT-locked robot it reports
+> 0. The gyro is checked against the floor instead — §7.1, step 2.
+
+### 7.1 Frozen calibration and heading carry-over (protocol 4)
+
+**Learning is off at power-on.** The arc decel/lag learner and the trim
+learner run only between `!LEARN1` and `!LEARN0` (and during the OLED CALIB
+cycle, which switches it on for itself). During a task the robot drives on
+exactly what was restored — nothing a task does can change it.
+
+| Send | Effect | Reply |
+|---|---|---|
+| `!CALG<n>` | Gyro scale, **×10000**, 9000..11000 (0.90..1.10). Same busy/range rules as §7 | `OK` / `RESEND` |
+| `!CALSL<n>` / `!CALSR<n>` | Left / right arc deflection from centre, **µs**. Left 300..574, right 300..626 (servo limits). **v5** | `OK` / `RESEND` |
+| `?CAL` | now `CAL,<decel_x10>,<lag_ms_x10>,<trim_us>,<gyro_x10000>,<learn>,<steer_left_us>,<steer_right_us>` (last two v5) | |
+| `?HDG` | `HDG,<commanded_x10>,<actual_x10>,<last_aim_x10>,<last_turned_x10>,<capped>` | |
+
+**`?WPOSE`, the continuous pose** - the same increments as `?POSE`, never
+reset. Frame, Task 1 usage and host test: §12.
+
+**The gyro scale** corrects the datasheet sensitivity (32.8 LSB/dps is
+nominal). A scale error is invisible to the robot — the arc termination, the
+braking model and `?TURN` all read the same gyro — so it can only be measured
+against the floor. `calibrate.py guided` does that with two full circles.
+
+**Per-side steering (v5).** The same pulse either side of centre does not
+give the same wheel angle, so left and right turns trace different circles
+even though the gyro stops both at the right angle. Each side's deflection is
+its own calibration value; `calibrate.py radius` measures each side's radius
+with a floor chord and adjusts them until both match the planner's 29.1 cm.
+Until something is restored, both sides use the symmetric 574 µs.
+
+**Heading carry-over.** The firmware keeps two totals that survive between
+moves: *commanded* (every arc angle asked for since `!ZERO`) and *actual*
+(everything the gyro measured). Each move aims at the commanded total:
+
+    arc       turns  asked + (commanded - actual)
+    straight  holds  (commanded - actual)
+
+So an `FR90` that stopped at 89.5° is followed by one that turns 90.5°, and a
+straight after it steers the half degree out. Error never builds up past one
+move's worth. The correction is capped at **5°**; beyond that it is a bump or
+a slip, not braking error, and `?HDG`'s last field counts every capped move.
+`RST` and a `FAIL,*` move reset commanded to actual.
+
+From `?HDG`: `commanded - actual` is the error the next move will correct;
+`last_turned - last_aim` is how precisely the last arc stopped.
+
+**Task startup** (`communications/cal_profile.py: prepare_for_task`):
+`!LEARN0`, `!PROF0`, restore the four values from the named profile and read
+them back, then `!ZERO` at the start pose.
 
 ---
 
@@ -438,3 +506,57 @@ Size the read timeout off the **line**, not a single move: 20 s.
 Senders should use a read timeout **comfortably above** that — 20 s — and treat
 expiry as a lost link rather than a slow move. A sender that blocks forever
 waiting for a reply cannot recover from a dropped connection.
+
+## 12. Task 1 instruction feedback
+
+Task 1 keeps the PC's segment/photo boundaries but sends each instruction as
+its own line. For a segment `FR90,F20,S`, the wire exchange is:
+
+```text
+RPi -> STM: FR90
+STM -> RPi: OK
+RPi -> STM: ?WPOSE
+STM -> RPi: WPOSE,<x_mm>,<y_mm>,<heading_degrees_times_10>
+RPi -> Android: ROBOT,<grid_x>,<grid_y>,<heading_deg>
+RPi -> STM: F20
+... repeat for F20, then S ...
+```
+
+Only after the last instruction's OK and pose update does the RPi photograph
+the segment's obstacle. RESEND retries only the outstanding instruction.
+FAIL, missing OK, or missing pose halts execution before another instruction.
+`OK` and `WPOSE` are separate replies, preserving the existing serial parser.
+
+`?WPOSE` is an additive capability and requires updated STM firmware. It uses
+encoder/gyro increments continuously across primitive and FU-pass resets;
+`?POSE`, `?TURN`, and motion control keep their existing local semantics.
+The boot frame has +x forward, +y left, and positive counterclockwise heading
+with the gyro source. The RPi snapshots this frame before the first instruction
+and anchors it to the `PATH.odometry_start` supplied by the PC planner. By
+default this is the planner's calculated rear-axle start; it is not a fixed
+`(0,0)` or `(2,2)`. The arena is 20 x 20 cells,
+each 100 mm (10 cm), for a total of 2000 x 2000 mm. Android receives fractional
+grid coordinates via position_mm / 100 (0 <= coordinate < 20), and the nearest
+heading in degrees, where North is 0 and clockwise is positive. For example,
+(275 mm, 325 mm) is `ROBOT,2.75,3.25,0` when facing North. Raw WPOSE values
+stay in logs. Positions outside
+the arena stop execution rather than being clamped to a misleading valid cell.
+These coordinates are dead reckoning and can drift. They are not planner poses
+or external localization. Keep the same physical pose reference when placing
+the robot at the start; firmware integrates displacement at the rear axle.
+
+The checked-in STM source is protocol 5 and includes `?WPOSE` alongside the
+frozen calibration, per-side steering and gyro bias fix (§7.1). A protocol 5
+board flashed before `?WPOSE` was added answers `RESEND`, and Task 1 stops
+before its first movement - reflash from this tree. Task 1 probes WPOSE
+before sending its first movement.
+
+Host regression checks (no hardware):
+
+```sh
+cc -Istm/tests -Istm/PeripheralDrivers/Inc stm/tests/test_world_pose.c \
+  stm/PeripheralDrivers/Src/odom.c stm/PeripheralDrivers/Src/commands.c \
+  -lm -o /tmp/mdp-test-world-pose
+/tmp/mdp-test-world-pose
+python3 -B -m unittest rpi/mdp_rpi/test_instruction_mission.py -v
+```

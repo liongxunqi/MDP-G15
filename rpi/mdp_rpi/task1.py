@@ -40,13 +40,15 @@ import logging
 import os
 from collections import Counter
 from threading import Event, Lock, Thread, Timer
-from time import sleep
+from time import monotonic, sleep
+from typing import Optional
 
 from dotenv import load_dotenv
 
 load_dotenv()
 
 from communications.android import Android
+from communications import cal_profile
 from communications.pc import PC
 from communications.stm import (
     CAL_MIN_PROTOCOL,
@@ -55,7 +57,7 @@ from communications.stm import (
     STM,
 )
 from image_capture.camera import Camera
-from instruction_mission import InstructionMission
+from instruction_mission import InstructionMission, parse_start_pose
 from feedback_control import FeedbackControl
 
 import run_log
@@ -81,10 +83,12 @@ A5_FACE_D = (0, 2, 4, 6)
 A5_FACE_NAME = {0: "N", 2: "E", 4: "S", 6: "W"}
 
 # What does NOT count as "a valid image from the image list". The bullseye is
-# the MARKER — finding it means the right obstacle and the wrong face, which is
-# the situation A.5 asks you to get out of. 'dot' is the filler class, and NONE
-# is what task1_pc.py sends when YOLO found nothing.
+# the MARKER, 'dot' is the filler class, and NONE is what task1_pc.py sends when
+# YOLO found nothing. A5 uses this to keep checking faces. Normal Task 1 uses
+# the PC detector's final selection directly, including a bullseye when no
+# preferred image class was present.
 A5_NOT_A_TARGET = {"bullseye", "dot", "none"}
+TASK1_NOT_A_TARGET = {"dot", "none"}
 
 
 class Task1:
@@ -100,9 +104,9 @@ class Task1:
         self.camera = Camera()
 
         # Thread handles
-        self.android_thread: Thread | None = None
-        self.pc_thread: Thread | None = None
-        self.stm_thread: Thread | None = None
+        self.android_thread: Optional[Thread] = None
+        self.pc_thread: Optional[Thread] = None
+        self.stm_thread: Optional[Thread] = None
 
         # ── Obstacle / path state ─────────────────────────────────────────────
         self.obstacles: list = []           # list of obstacle dicts from Android
@@ -112,7 +116,8 @@ class Task1:
         self._completed_photo_count = 0
         self.obstacle_order: list = []      # obstacle IDs in visit order
         self.directions: list = []          # direction info per segment (for Android map)
-        self.start_pose: dict | None = None # planner's start pose, same shape as a dirs entry
+        self.start_pose: Optional[dict] = None # Android's 2x2 drawing anchor from PATH.start
+        self.odometry_start: Optional[dict] = None # planner-provided ROBOT/PROGRESS origin
         self.direction_index: int = 0
 
         # Per-segment obstacle mapping. A segment is NOT 1:1 with an obstacle any
@@ -121,6 +126,12 @@ class Task1:
         # segments are pure travel with no photo at the end. Entry is an
         # obstacle id, or None for "no detection after this segment".
         self.segment_obstacles: list = []
+        # Planner-approved camera positions, keyed by obstacle id. Distance
+        # retries never invent a pose that was not checked for arena bounds,
+        # obstacle clearance and ultrasonic line of sight.
+        self.photo_standoffs: dict = {}
+        self.selected_standoffs: dict = {}
+        self.ultrasonic_adjustments: dict = {}
 
         self.started: bool = False          # True after Android sends BEGIN
         self.path_requested: bool = False   # True while OBSTACLES request is in-flight
@@ -130,9 +141,9 @@ class Task1:
         # Off unless this was constructed by task_a5.py. Everything it touches
         # is guarded, so Task 1 behaves exactly as it did.
         self.a5_mode: bool = a5_mode
-        self._a5_base_id: int | None = None    # the id Android actually knows
+        self._a5_base_id: Optional[int] = None    # the id Android actually knows
         self._a5_face_of: dict = {}            # fanned-out id (str) -> "N"/"E"/"S"/"W"
-        self._a5_found: tuple | None = None    # (face, class_id, confidence)
+        self._a5_found: Optional[tuple] = None    # (face, class_id, confidence)
 
         # PROTOCOL.md §3: cap RESEND retries. A permanently malformed segment
         # retried forever is an infinite loop in which the robot never moves.
@@ -143,19 +154,23 @@ class Task1:
         self._idx_lock = Lock()
         self.feedback_control = FeedbackControl(
             enabled=os.getenv("TASK1_FEEDBACK_WAIT", "0").strip().lower() in ("1", "true", "yes"),
-            timeout=float(os.getenv("TASK1_FEEDBACK_TIMEOUT_S", "30.0")),
+            timeout=float(os.getenv("TASK1_FEEDBACK_TIMEOUT_S", "7.0")),
         )
         logging.info("PC feedback wait mode: %s (timeout %.1fs)",
                      self.feedback_control.enabled, self.feedback_control.timeout)
         # Set by pc_thread when OBJECT arrives; waited on by stm_thread DETECT logic
         self.image_done = Event()
+        self._detection_lock = Lock()
+        self._expected_detection_id = None
+        self._last_detection = None
+        self._last_capture_attempts = 0
         # Set by pc_thread when PATH arrives; waited on by android_thread BEGIN logic
         self.path_ready = Event()
         # Debounce timer — send OBSTACLES to PC 1 s after last obstacle arrives
         self._debounce_lock = Lock()
-        self._calc_timer: Timer | None = None
+        self._calc_timer: Optional[Timer] = None
         # Watchdog on an outstanding OBSTACLES request. See _arm_path_watchdog().
-        self._path_timer: Timer | None = None
+        self._path_timer: Optional[Timer] = None
 
         # ── Tunable config from .env ──────────────────────────────────────────
         self._debounce_delay = float(os.getenv("DEBOUNCE_DELAY_S", "1.0"))
@@ -166,7 +181,50 @@ class Task1:
         self.segment_delay = float(os.getenv("SEGMENT_DELAY_S", "0.5"))
         self.detect_retries = int(os.getenv("DETECT_RETRY_COUNT", "1"))
         self.detect_retry_delay = float(os.getenv("DETECT_RETRY_DELAY_S", "0.2"))
-        self.detect_timeout = float(os.getenv("DETECT_TIMEOUT_S", "0.5"))
+        self.detect_timeout = float(os.getenv("DETECT_TIMEOUT_S", "30.0"))
+        self.capture_settle = float(os.getenv("TASK1_CAPTURE_SETTLE_S", "2.0"))
+        self.us_adjust_retries = max(
+            0, int(os.getenv("TASK1_US_ADJUST_RETRIES", "3"))
+        )
+        self.us_adjust_tolerance_cm = max(
+            0.0, float(os.getenv("TASK1_US_ADJUST_TOLERANCE_CM", "3.0"))
+        )
+        self.us_adjust_max_step_cm = max(
+            1, int(os.getenv("TASK1_US_ADJUST_MAX_STEP_CM", "30"))
+        )
+        self.us_settle_s = max(
+            0.0, float(os.getenv("TASK1_US_SETTLE_S", "0.2"))
+        )
+        self.ir_feedback_enabled = os.getenv(
+            "TASK1_IR_FEEDBACK", "1"
+        ).strip().lower() in ("1", "true", "yes")
+        self.preflight_enabled = self.ir_feedback_enabled and self.feedback_control.enabled
+        self.gyro_settle_enabled = os.getenv(
+            "TASK1_GYRO_SETTLE", "1"
+        ).strip().lower() in ("1", "true", "yes")
+        self.gyro_settle_rate_dps = float(os.getenv(
+            "TASK1_GYRO_SETTLE_RATE_DPS", "1.0"
+        ))
+        self.gyro_settle_samples = max(1, int(os.getenv(
+            "TASK1_GYRO_SETTLE_SAMPLES", "3"
+        )))
+        self.gyro_settle_timeout = max(0.0, float(os.getenv(
+            "TASK1_GYRO_SETTLE_TIMEOUT_S", "1.0"
+        )))
+        retry_text = os.getenv("TASK1_PHOTO_RETRY_STANDOFFS", "40,45,35,33,20")
+        try:
+            self.photo_retry_standoffs = [
+                int(value.strip()) for value in retry_text.split(",") if value.strip()
+            ]
+        except ValueError:
+            logging.warning(
+                "Invalid TASK1_PHOTO_RETRY_STANDOFFS=%r; using 40,45,35,33,20.",
+                retry_text,
+            )
+            self.photo_retry_standoffs = [40, 45, 35, 33, 20]
+        self.photo_retry_limit = max(
+            0, int(os.getenv("TASK1_PHOTO_RETRY_LIMIT", "5"))
+        )
         # PROTOCOL.md §3 recommends at most three retransmissions.
         self.max_resends = int(os.getenv("STM_MAX_RESENDS", "3"))
         # PROTOCOL.md §6: 0 TIGHT (r=291mm), 1 CLEAN (r=318mm), 2 SLOW (r=306mm).
@@ -182,6 +240,12 @@ class Task1:
             f"detect_retries={self.detect_retries}  "
             f"detect_retry_delay={self.detect_retry_delay}s  "
             f"detect_timeout={self.detect_timeout}s  "
+            f"capture_settle={self.capture_settle}s  "
+            f"us_adjust={self.us_adjust_retries}x/"
+            f"{self.us_adjust_tolerance_cm:.1f}cm/"
+            f"max{self.us_adjust_max_step_cm}cm  "
+            f"photo_retry_standoffs={self.photo_retry_standoffs}  "
+            f"photo_retry_limit={self.photo_retry_limit}  "
             f"debounce_delay={self._debounce_delay}s  "
             f"max_resends={self.max_resends}  "
             f"arc_profile={self.arc_profile}"
@@ -376,16 +440,115 @@ class Task1:
             return str(self.obstacle_order[seg_index])
         return None
 
+    def _read_ir_snapshot(self):
+        """Read both calibrated IR ranges and their filtered ADC counts."""
+        if not getattr(self, "ir_feedback_enabled", False):
+            return {}
+        ranges = self.stm.query_fields("?IR")
+        raw = self.stm.query_fields("?IRR")
+        snapshot = {
+            "ir_left_cm": None,
+            "ir_right_cm": None,
+            "ir_left_raw": None,
+            "ir_right_raw": None,
+        }
+        try:
+            if ranges is not None and len(ranges) == 2:
+                snapshot["ir_left_cm"], snapshot["ir_right_cm"] = (
+                    int(value) for value in ranges
+                )
+            if raw is not None and len(raw) == 2:
+                snapshot["ir_left_raw"], snapshot["ir_right_raw"] = (
+                    int(value) for value in raw
+                )
+        except (TypeError, ValueError):
+            logging.warning("Ignoring malformed STM IR/IRR response.")
+        logging.info(
+            "IR snapshot: L=%s cm/%s raw, R=%s cm/%s raw.",
+            snapshot["ir_left_cm"], snapshot["ir_left_raw"],
+            snapshot["ir_right_cm"], snapshot["ir_right_raw"],
+        )
+        return snapshot
+
+    def _read_ultrasonic_cm(self):
+        """Return one usable front-ultrasonic range, or None for no echo."""
+        fields = self.stm.query_fields("?US")
+        if fields is None or len(fields) != 1:
+            logging.warning("STM returned no usable ?US response.")
+            return None
+        try:
+            distance = int(fields[0])
+        except (TypeError, ValueError):
+            logging.warning("Ignoring malformed STM ?US response: %r", fields)
+            return None
+        if distance <= 0 or distance == 65535:
+            logging.warning("Ultrasonic has no target echo (US,%s).", distance)
+            return None
+        return distance
+
+    def _wait_for_gyro_settle(self, token):
+        """After an arc OK, wait briefly until measured yaw rate is stationary."""
+        if (not getattr(self, "gyro_settle_enabled", False) or
+                not str(token).upper().startswith(("FR", "FL", "RR", "RL")) or
+                self.gyro_settle_timeout <= 0):
+            return
+        deadline = monotonic() + self.gyro_settle_timeout
+        stable = 0
+        last_rate = None
+        while monotonic() < deadline:
+            fields = self.stm.query_fields("?IMU")
+            try:
+                ready = fields is not None and len(fields) >= 3 and int(fields[0]) == 1
+                last_rate = abs(int(fields[2]) / 10.0) if ready else None
+            except (TypeError, ValueError):
+                ready, last_rate = False, None
+            if ready and last_rate <= self.gyro_settle_rate_dps:
+                stable += 1
+                if stable >= self.gyro_settle_samples:
+                    logging.info(
+                        "Gyro settled after %s: %.1f dps (%d samples).",
+                        token, last_rate, stable,
+                    )
+                    return
+            else:
+                stable = 0
+            sleep(0.05)
+        logging.warning(
+            "Gyro did not provide %d stable sample(s) <= %.1f dps after %s "
+            "within %.1fs (last=%s); continuing.",
+            self.gyro_settle_samples, self.gyro_settle_rate_dps, token,
+            self.gyro_settle_timeout, last_rate,
+        )
+
     def _send_next_segment(self) -> bool:
         """Send the next primitive, retaining the planner's photo boundaries."""
         if self.halted:
             return False
         try:
+            while True:
+                with self._idx_lock:
+                    if self.halted or self.feedback_control.waiting:
+                        return False
+                    if self.instruction_mission is None:
+                        self.instruction_mission = InstructionMission(
+                            self.segments, self.odometry_start
+                        )
+                    mission = self.instruction_mission
+                    needs_preflight = (
+                        getattr(self, "preflight_enabled", False) and
+                        mission.segment_index not in mission.preflighted_segments
+                    )
+                if not needs_preflight:
+                    break
+                outcome = self._preflight_mission(mission)
+                if outcome is None:
+                    return False
+                if outcome == "replace":
+                    continue
+
             with self._idx_lock:
                 if self.halted or self.feedback_control.waiting:
                     return False
-                if self.instruction_mission is None:
-                    self.instruction_mission = InstructionMission(self.segments)
                 mission = self.instruction_mission
                 if not mission.send_next(self.stm):
                     return False
@@ -402,37 +565,78 @@ class Task1:
             self._halt_mission(str(exc))
             return False
 
-        logging.info(
-            f"STM segment {self.segments_index}/{len(self.segments)} sent: {seg}"
-        ) 
-        # for individual segments when they start running
-        try:
-            self.android.send(f"STATUS,RUNNING,{self.segments_index},{len(self.segments)}")
-        except OSError as exc:
-            logging.warning(f"Could not notify Android of running status: {exc}")
-        return True
+    def _preflight_mission(self, mission):
+        """Give PC live pose/IR before the first instruction of a new route."""
+        with self._idx_lock:
+            if self.instruction_mission is not mission or mission.done:
+                return None
+            if mission.origin is None:
+                mission.origin = mission.read_pose(self.stm)
+            robot_message, pose = mission.report_pose(self.stm)
+            remaining = [
+                obstacle_id
+                for i in range(mission.segment_index, len(mission.segments))
+                for obstacle_id in [self._obstacle_for_segment(i)]
+                if obstacle_id is not None
+            ]
+            progress = {
+                "event": "instruction_preflight",
+                "segment_index": mission.segment_index,
+                "instruction_index": -1,
+                "token": mission.token,
+                "segment": list(mission.segments[mission.segment_index]),
+                "segment_completed": False,
+                "motion_plan_completed": False,
+                "next_segment_index": mission.segment_index,
+                "next_instruction_index": mission.instruction_index,
+                "x_grid": pose["x_grid"],
+                "y_grid": pose["y_grid"],
+                "heading_deg": pose["heading_deg"],
+                "remaining_photo_ids": remaining,
+            }
+            progress.update(self._read_ir_snapshot())
+            pending = self.feedback_control.arm(progress)
+            self.android.send(robot_message)
+            self.pc.send("PROGRESS," + json.dumps(progress, separators=(",", ":")))
+
+        decision = self._wait_for_feedback(pending, mission, None)
+        if decision == "continue":
+            with self._idx_lock:
+                if self.instruction_mission is mission:
+                    mission.preflighted_segments.add(mission.segment_index)
+        return decision
 
     def _send_start_status(self) -> None:
-        """Tell Android where the planner assumes the robot starts. Older PCs
-        send no "start" in PATH; fall back to the old fixed position then."""
+        """Pass the planner's Android drawing anchor directly to Android."""
         with self._idx_lock:
-            if not self.directions:
-                return
             start = self.start_pose
-        if start:
-            status = f"STATUS,START,{start['x']},{start['y']},{start['dir']}"
-        else:
-            status = "STATUS,START,2,2,N"
+        if start is None:
+            self._halt_mission("Cannot start without planner PATH.start")
+            return
+        status = f"STATUS,START,{start['x']},{start['y']},{start['dir']}"
         try:
             self.android.send(status)
         except OSError as exc:
             logging.warning(f"Could not notify Android of start position: {exc}")
 
+    def _validate_task1_mission(self, mission):
+        """Reject legacy FU tokens at every Task 1 path boundary."""
+        if (not getattr(self, "a5_mode", False) and
+                any(token.startswith("FU")
+                    for segment in mission.segments for token in segment)):
+            raise ValueError(
+                "Task 1 PATH may not contain FU; plan ordinary F/R motion and "
+                "let the RPi verify the camera range with ?US"
+            )
+        return mission
+
     # ── Failure handling ───────────────────────────────────────────────────────
 
     def _apply_replacement(self, payload, mission, just_finished):
         """Called under _idx_lock; validate everything before swapping state."""
-        candidate = InstructionMission(payload.get("segments"))
+        candidate = self._validate_task1_mission(
+            InstructionMission(payload.get("segments"), mission.start_pose)
+        )
         mapping = payload.get("segment_obstacles")
         if not isinstance(mapping, list) or len(mapping) != len(candidate.segments):
             raise ValueError("REPLACE requires segment_obstacles parallel to segments")
@@ -513,18 +717,29 @@ class Task1:
 
     # ── Image detection with retry ────────────────────────────────────────────
 
-    def _detect_and_send_image(self, obstacle_id: str) -> bool:
+    @staticmethod
+    def _valid_detection(result) -> bool:
+        if not isinstance(result, dict):
+            return False
+        class_id = str(result.get("class_id", "")).strip().lower()
+        confidence = result.get("confidence")
+        return (class_id not in TASK1_NOT_A_TARGET and
+                isinstance(confidence, (int, float)) and confidence > 0.0)
+
+    def _detect_and_send_image(self, obstacle_id: str, standoff_cm=None):
         """
         Full image capture + transfer + wait-for-result cycle with retry.
 
         Steps per attempt:
           1. Capture JPEG bytes from camera.
-          2. Tell PC a DETECT is coming: DETECT,<id>
+          2. Tell PC a DETECT is coming: DETECT,<id>[,<standoff_cm>]
           3. Send a 4-byte size header then raw bytes.
           4. Wait up to detect_timeout seconds for pc_thread to set image_done.
           5. Retry up to detect_retries times if no response.
 
-        Returns True if OBJECT was received, False after all attempts exhausted.
+        Returns the OBJECT fields as a dict, or None after all attempts fail.
+        An OBJECT with class NONE is returned normally so the caller can move
+        to another safe camera distance and take a fresh frame.
         """
         total_attempts = self.detect_retries + 1
 
@@ -536,8 +751,15 @@ class Task1:
                 continue
 
             # ── Signal + send ─────────────────────────────────────────────────
-            self.image_done.clear()
-            self.pc.send_image(image_bytes, header=f"DETECT,{obstacle_id}")
+            with self._detection_lock:
+                self._expected_detection_id = str(obstacle_id)
+                self._last_detection = None
+                self.image_done.clear()
+            header = f"DETECT,{obstacle_id}"
+            if standoff_cm is not None:
+                header += f",{int(standoff_cm)}"
+            self.pc.send_image(image_bytes, header=header)
+            self._last_capture_attempts += 1
             logging.info(
                 f"DETECT sent for obstacle {obstacle_id} "
                 f"(attempt {attempt}/{total_attempts})."
@@ -545,11 +767,15 @@ class Task1:
 
             # ── Wait for result ───────────────────────────────────────────────
             if self.image_done.wait(timeout=self.detect_timeout):
+                with self._detection_lock:
+                    result = self._last_detection
                 logging.info(
-                    f"OBJECT received for obstacle {obstacle_id} "
-                    f"on attempt {attempt}."
+                    "OBJECT received for obstacle %s on attempt %d: %s (conf=%s).",
+                    obstacle_id, attempt,
+                    result.get("class_id") if result else "invalid",
+                    result.get("confidence") if result else "?",
                 )
-                return True
+                return result
 
             logging.warning(
                 f"No OBJECT for obstacle {obstacle_id} within "
@@ -562,7 +788,177 @@ class Task1:
             f"Gave up waiting for OBJECT for obstacle {obstacle_id} "
             f"after {total_attempts} attempt(s)."
         )
+        with self._detection_lock:
+            self._expected_detection_id = None
+        return None
+
+    def _move_for_photo(self, mission, obstacle_id: str, standoff_cm: int) -> bool:
+        """Reach a camera range with ?US plus bounded ordinary F/R commands.
+
+        FU is deliberately not used by Task 1. A large disagreement is treated
+        as a wrong/missing target echo rather than permission for a long blind
+        drive. Every actual correction publishes WPOSE and the resulting range.
+        """
+        measured_us = None
+        for correction in range(self.us_adjust_retries + 1):
+            if self.us_settle_s > 0:
+                sleep(self.us_settle_s)
+            measured_us = self._read_ultrasonic_cm()
+            if measured_us is None:
+                logging.warning(
+                    "Cannot range-correct obstacle %s to %d cm; keeping the "
+                    "odometry-planned camera pose.", obstacle_id, standoff_cm,
+                )
+                return False
+
+            error_cm = measured_us - standoff_cm
+            if abs(error_cm) <= self.us_adjust_tolerance_cm:
+                logging.info(
+                    "Obstacle %s camera range is %d cm (target %d cm, tolerance %.1f cm).",
+                    obstacle_id, measured_us, standoff_cm,
+                    self.us_adjust_tolerance_cm,
+                )
+                return True
+            if correction >= self.us_adjust_retries:
+                logging.warning(
+                    "Obstacle %s remains at %d cm after %d range correction(s); "
+                    "target is %d cm. Continuing with the photograph.",
+                    obstacle_id, measured_us, self.us_adjust_retries, standoff_cm,
+                )
+                return False
+
+            distance_cm = int(round(abs(error_cm)))
+            if distance_cm > self.us_adjust_max_step_cm:
+                logging.warning(
+                    "Ultrasonic range %d cm is %d cm from obstacle %s's %d cm "
+                    "target, beyond the %d cm correction cap. This is probably "
+                    "the wrong echo; refusing blind motion.",
+                    measured_us, distance_cm, obstacle_id, standoff_cm,
+                    self.us_adjust_max_step_cm,
+                )
+                return False
+            token = f"F{distance_cm}" if error_cm > 0 else f"R{distance_cm}"
+
+            reply_upper = None
+            for resend in range(self.max_resends + 1):
+                if not self.stm.send_line([token]):
+                    self._halt_mission(f"Could not send camera adjustment {token}")
+                    return False
+                reply = self.stm.wait_reply()
+                if reply is None:
+                    self._halt_mission(f"No STM reply for camera adjustment {token}")
+                    return False
+                reply_upper = reply.strip().upper()
+                logging.info(
+                    "Camera correction %s received STM reply %s.", token, reply_upper,
+                )
+                if reply_upper != "RESEND":
+                    break
+                if resend >= self.max_resends:
+                    self._halt_mission(f"Camera adjustment {token} exceeded RESEND limit")
+                    return False
+                logging.warning(
+                    "Camera adjustment %s was RESENDed; retry %d/%d.",
+                    token, resend + 1, self.max_resends,
+                )
+            if reply_upper != "OK":
+                self._halt_mission(f"Camera adjustment {token} failed: {reply_upper}")
+                return False
+
+            try:
+                robot_message, pose = mission.report_pose(self.stm)
+                self.android.send(robot_message)
+                report = {
+                    "event": "photo_distance_adjustment",
+                    "obstacle_id": str(obstacle_id),
+                    "token": token,
+                    "target_standoff_cm": standoff_cm,
+                    "measured_us_cm_before": measured_us,
+                    "correction_attempt": correction + 1,
+                    "x_grid": pose["x_grid"],
+                    "y_grid": pose["y_grid"],
+                    "heading_deg": pose["heading_deg"],
+                }
+                self.pc.send("PHOTO_PROGRESS," + json.dumps(report, separators=(",", ":")))
+            except (ValueError, OSError) as exc:
+                self._halt_mission(str(exc))
+                return False
         return False
+
+    def _detect_with_distance_retry(self, obstacle_id: str, mission):
+        """Retry an unclear photograph only at planner-approved standoffs."""
+        self._last_capture_attempts = 0
+        obstacle_key = str(obstacle_id)
+        original = getattr(self, "selected_standoffs", {}).get(obstacle_key)
+        us_adjustable = getattr(self, "ultrasonic_adjustments", {}).get(
+            obstacle_key, False
+        )
+        if original is not None and us_adjustable:
+            self._move_for_photo(mission, obstacle_id, original)
+        if self.capture_settle > 0:
+            logging.info(
+                "Waiting %.1fs for chassis vibration to settle before capture.",
+                self.capture_settle,
+            )
+            sleep(self.capture_settle)
+        if original is None:
+            result = self._detect_and_send_image(obstacle_id)
+        else:
+            result = self._detect_and_send_image(obstacle_id, original)
+        if self.a5_mode or self._valid_detection(result):
+            return result
+
+        safe = getattr(self, "photo_standoffs", {}).get(obstacle_key, [])
+        if original is None or not safe or not us_adjustable:
+            logging.warning(
+                "No planner-approved alternate camera distances for obstacle %s; "
+                "keeping the original frame.", obstacle_id,
+            )
+            return result
+
+        candidates = []
+        for distance in self.photo_retry_standoffs:
+            if distance in safe and distance != original and distance not in candidates:
+                candidates.append(distance)
+        candidates = candidates[:self.photo_retry_limit]
+        if not candidates:
+            logging.warning(
+                "Obstacle %s has no safe configured retry standoff (selected=%s, safe=%s).",
+                obstacle_id, original, safe,
+            )
+            return result
+
+        logging.warning(
+            "Detection for obstacle %s was missing/low-confidence at %d cm; "
+            "trying safe camera distances %s.",
+            obstacle_id, original, candidates,
+        )
+        moved = False
+        for distance in candidates:
+            if not self._move_for_photo(mission, obstacle_id, distance):
+                break
+            moved = True
+            if self.capture_settle > 0:
+                logging.info(
+                    "Waiting %.1fs for camera to settle at %d cm.",
+                    self.capture_settle, distance,
+                )
+                sleep(self.capture_settle)
+            result = self._detect_and_send_image(obstacle_id, distance)
+            if self._valid_detection(result):
+                logging.info(
+                    "Obstacle %s detected at retry standoff %d cm.",
+                    obstacle_id, distance,
+                )
+                break
+
+        if moved and not self.halted:
+            logging.info(
+                "Returning obstacle %s to its planned %d cm standoff before continuing.",
+                obstacle_id, original,
+            )
+            self._move_for_photo(mission, obstacle_id, original)
+        return result
 
     # ══ Thread: Android receive ═══════════════════════════════════════════════
 
@@ -677,6 +1073,18 @@ class Task1:
                     if not self._send_next_segment():
                         logging.warning("Android: BEGIN received but no segments to send.")
 
+                elif tag in ("S", "STOP"):
+                    # Android's stop button sends lowercase `s` on current builds.
+                    # RST is the STM protocol's immediate brake-and-drop-queue
+                    # command; a normal S token cannot be queued safely while a
+                    # movement instruction is outstanding.
+                    if self.started and not self.halted:
+                        logging.warning("Android: emergency stop requested.")
+                        self.stm.abort()
+                        self._halt_mission("operator requested emergency stop")
+                    else:
+                        logging.info("Android: stop received while no mission is active.")
+
                 else:
                     logging.warning(f"Android: unrecognised message '{msg}' — ignoring.")
 
@@ -721,15 +1129,55 @@ class Task1:
                         if self.started and self.instruction_mission is not None and not self.halted:
                             logging.warning("Ignoring replacement PATH during execution.")
                             continue
-                        self.segments = payload.get("segments", [])
-                        self.instruction_mission = None
+                        try:
+                            parse_start_pose(payload.get("start"))
+                            odometry_start = parse_start_pose(payload.get("odometry_start"))
+                            candidate = self._validate_task1_mission(
+                                InstructionMission(
+                                    payload.get("segments", []), odometry_start
+                                )
+                            )
+                        except ValueError as exc:
+                            logging.error("PC: invalid PATH — %s", exc)
+                            continue
+                        self.segments = candidate.segments
+                        self.instruction_mission = candidate
                         self.obstacle_order = payload.get("obstacle_ids", [])
                         # Optional per-segment map; see _obstacle_for_segment().
                         # Present when the planner had to split an approach
                         # across several lines to respect the §2 caps.
                         self.segment_obstacles = payload.get("segment_obstacles", [])
+                        raw_safe = payload.get("photo_standoffs", {})
+                        raw_selected = payload.get("selected_standoffs", {})
+                        raw_us_adjustments = payload.get("ultrasonic_adjustments", {})
+                        if (not isinstance(raw_safe, dict) or
+                                not isinstance(raw_selected, dict) or
+                                not isinstance(raw_us_adjustments, dict)):
+                            raise ValueError("PATH camera standoff metadata must be objects")
+                        self.photo_standoffs = {
+                            str(key): [int(value) for value in values]
+                            for key, values in raw_safe.items()
+                            if isinstance(values, list)
+                        }
+                        self.selected_standoffs = {
+                            str(key): int(value) for key, value in raw_selected.items()
+                        }
+                        self.ultrasonic_adjustments = {
+                            str(key): bool(value)
+                            for key, value in raw_us_adjustments.items()
+                        }
                         self.directions = payload.get("dirs", [])
-                        self.start_pose = payload.get("start")
+                        # Keep the planner's wire values for STATUS,START.
+                        self.start_pose = {
+                            "x": payload["start"]["x"],
+                            "y": payload["start"]["y"],
+                            "dir": payload["start"]["dir"],
+                        }
+                        self.odometry_start = {
+                            "x": payload["odometry_start"]["x"],
+                            "y": payload["odometry_start"]["y"],
+                            "dir": payload["odometry_start"]["dir"],
+                        }
                         self.direction_index = 0
 
                     self.path_requested = False
@@ -737,7 +1185,9 @@ class Task1:
                     self.path_ready.set()
                     logging.info(
                         f"PC: PATH received — {len(self.segments)} segment(s), "
-                        f"obstacle order: {self.obstacle_order}."
+                        f"obstacle order: {self.obstacle_order}; "
+                        f"Android start: {self.start_pose}; "
+                        f"odometry start: {self.odometry_start}."
                     )
 
                     # If Android already sent BEGIN but PATH hadn't arrived yet,
@@ -769,17 +1219,30 @@ class Task1:
                         f"class={class_id}  conf={confidence}."
                     )
 
-                    # Unblock stm_thread which is waiting for this. Must happen
-                    # for EVERY reply, valid image or not, or the segment pump
-                    # waits out its timeout on every wrong face.
-                    self.image_done.set()
+                    accepted_result = False
+                    with self._detection_lock:
+                        expected = self._expected_detection_id
+                        if expected is not None and str(obstacle_id) == expected:
+                            self._last_detection = {
+                                "obstacle_id": str(obstacle_id),
+                                "confidence": confidence,
+                                "class_id": class_id,
+                            }
+                            self._expected_detection_id = None
+                            accepted_result = True
+                            self.image_done.set()
+                        else:
+                            logging.warning(
+                                "Ignoring stale OBJECT for obstacle %s; waiting for %s.",
+                                obstacle_id, expected,
+                            )
 
                     # Forward result to Android
-                    if confidence is None:
+                    if not accepted_result or confidence is None:
                         pass
                     elif self.a5_mode:
                         self._a5_report(obstacle_id, class_id, confidence)
-                    else:
+                    elif class_id.lower() not in TASK1_NOT_A_TARGET:
                         self.android.send(f"TARGET,{obstacle_id},{class_id}")
 
                 else:
@@ -890,6 +1353,13 @@ class Task1:
                 elif reply == "OK":
                     try:
                         with self._idx_lock:
+                            active = self.instruction_mission
+                            if active is None or not active.pending:
+                                raise ValueError("Unexpected STM OK outside a mission")
+                            completed_token = active.token
+                        self._wait_for_gyro_settle(completed_token)
+
+                        with self._idx_lock:
                             mission = self.instruction_mission
                             if mission is None:
                                 raise ValueError("Unexpected STM OK outside a mission")
@@ -902,10 +1372,22 @@ class Task1:
                             # PROGRESS includes pose and execution context for PC.
                             pending = None
                             first_photo_segment = mission.segment_index if just_finished is None else just_finished
-                            mission.progress["remaining_photo_ids"] = [
-                                oid for i in range(first_photo_segment, len(mission.segments))
-                                if (oid := self._obstacle_for_segment(i)) is not None
-                            ]
+                            remaining_photo_ids = []
+                            for i in range(first_photo_segment, len(mission.segments)):
+                                obstacle_id = self._obstacle_for_segment(i)
+                                if obstacle_id is not None:
+                                    remaining_photo_ids.append(obstacle_id)
+                            mission.progress["remaining_photo_ids"] = remaining_photo_ids
+                            mission.progress.update(self._read_ir_snapshot())
+                            finished_obstacle = (
+                                self._obstacle_for_segment(just_finished)
+                                if just_finished is not None else None
+                            )
+                            if (finished_obstacle is not None and
+                                    getattr(self, "ultrasonic_adjustments", {}).get(
+                                        str(finished_obstacle), False
+                                    )):
+                                mission.progress["ultrasonic_cm"] = self._read_ultrasonic_cm()
                             mission.progress["awaiting_decision"] = self.feedback_control.enabled
                             if self.feedback_control.enabled:
                                 pending = self.feedback_control.arm(mission.progress)
@@ -931,8 +1413,12 @@ class Task1:
                     # ── Capture + detect for the obstacle we just reached ──────
                     obstacle_id = self._obstacle_for_segment(just_finished)
                     if obstacle_id is not None:
-                        self._detect_and_send_image(obstacle_id)
-                        self._completed_photo_count += 1
+                        self._detect_with_distance_retry(obstacle_id, mission)
+                        if self.halted:
+                            continue
+                        self._completed_photo_count += max(
+                            1, getattr(self, "_last_capture_attempts", 0)
+                        )
 
                     # ── Send next movement segment (or finish) ─────────────────
                     if more_to_send:
@@ -948,7 +1434,7 @@ class Task1:
                         # obstacle can span several segments, so len(segments)
                         # would over-count.
                         shots = self._completed_photo_count
-                        self.pc.send(f"STITCH,{max(shots - 1, 0)}\n")
+                        self.pc.send(f"STITCH,{shots}\n")
                         self.android.send("STATUS,DONE")
                         self.started = False
 
@@ -990,8 +1476,8 @@ class Task1:
         ?VER costs one round trip and distinguishes "the firmware is alive and
         talking a protocol version we know" from "the port opened but nothing
         is listening", which otherwise only shows up as a mysteriously silent
-        first move. It is also the only way to find out whether FU<n> exists
-        before a segment containing one earns a RESEND.
+        first move. Task 1 itself uses ?US plus F/R correction; A.5 still uses
+        FU and therefore retains its protocol-version warning.
 
         Runs BEFORE the segment pump starts, so sending !PROF here cannot
         collide with a movement OK (see STM.set_profile).
@@ -1014,10 +1500,8 @@ class Task1:
             # version-mismatch warning that would cry wolf on a board that runs
             # Task 1 perfectly well.
             #
-            # The gap that can actually bite is FU<n>: on v1 or v2 it is still a
-            # reserved token, so a segment containing one is a parse failure and
-            # the WHOLE line RESENDs. That is a silent planning bug if nobody is
-            # told, hence the explicit warning rather than an info line.
+            # FU is no longer emitted by Task 1. A.5 still uses it, so only A.5
+            # needs the protocol-v3 capability warning.
             try:
                 proto_num = int(proto)
             except ValueError:
@@ -1034,7 +1518,7 @@ class Task1:
                     "unaffected, but ?CAL and the !CAL* setters will RESEND "
                     "(PROTOCOL.md §7)."
                 )
-            elif proto_num < FU_MIN_PROTOCOL:
+            elif self.a5_mode and proto_num < FU_MIN_PROTOCOL:
                 logging.warning(
                     f"STM: firmware is protocol {proto_num}. Movement and "
                     "calibration are fine, but FU<n> is still RESERVED there — "
@@ -1049,26 +1533,6 @@ class Task1:
                     "it added is unused here — re-read PROTOCOL.md."
                 )
 
-        if self.arc_profile is None:
-            # No !PROF sent: the firmware's selected profile stands. Ask what it
-            # is rather than assume, so the planner's radius can be checked
-            # against reality instead of against a guess.
-            stat = self.stm.query("?STAT")
-            if stat:
-                logging.info(f"STM: {stat} (arc profile is the last field — §5).")
-            logging.info(
-                "STM: no !PROF sent — running the firmware's own profile "
-                "(default TIGHT, radius 291mm)."
-            )
-        elif self.stm.set_profile(self.arc_profile):
-            logging.info(f"STM: arc profile set to {self.arc_profile}.")
-        else:
-            logging.warning(
-                f"STM: could not set arc profile {self.arc_profile} — the firmware "
-                "keeps whatever it had. If the planner assumed a different radius, "
-                "its turns will land short or long."
-            )
-
     def start(self) -> None:
         """
         Connect all peripherals, start threads, and block until they exit.
@@ -1081,6 +1545,22 @@ class Task1:
         logging.info("Connecting to STM32…")
         self.stm.connect()
         self._stm_startup_check()
+        if self.arc_profile not in (None, cal_profile.ARC_PROFILE):
+            logging.error(
+                "STM_ARC_PROFILE=%s conflicts with calibrated Task 1 profile %s.",
+                self.arc_profile, cal_profile.ARC_PROFILE,
+            )
+            self.camera.stop_camera()
+            self.stm.disconnect()
+            return
+        if not cal_profile.prepare_for_task(self.stm):
+            logging.error("Task 1 calibration startup failed — refusing to move.")
+            self.camera.stop_camera()
+            self.stm.disconnect()
+            return
+        stat = self.stm.query("?STAT")
+        if stat:
+            logging.info("STM after calibration: %s", stat)
 
         logging.info("Starting Bluetooth server (waiting for Android)…")
         self.android.start()          # non-blocking; background accept loop starts

@@ -2,6 +2,11 @@ package com.mdp.g15.arena.protocol
 
 import com.mdp.g15.arena.domain.ArenaOutboundEvent
 import com.mdp.g15.arena.domain.Direction
+import com.mdp.g15.arena.domain.DrivePose
+import com.mdp.g15.arena.domain.ArenaState
+import com.mdp.g15.arena.domain.ArenaReducer
+import com.mdp.g15.arena.domain.ArenaAction
+import com.mdp.g15.arena.domain.ArenaReduction
 import com.mdp.g15.arena.domain.GridCoordinate
 import com.mdp.g15.arena.domain.Obstacle
 import org.junit.Assert.assertEquals
@@ -63,6 +68,30 @@ class CsvArenaMessageCodecTest {
         val short = codec.decode("ROBOT,7,2,W") as ArenaDecodeResult.Decoded
         val long = codec.decode("ROBOT,7,2,WEST") as ArenaDecodeResult.Decoded
         assertEquals(short, long)
+    }
+
+    @Test
+    fun `robot preserves fractional grid telemetry without marking it estimated`() {
+        val decoded = codec.decode("ROBOT,2.75,3.25,N") as ArenaDecodeResult.Decoded
+        val pose = (decoded.event as ArenaInboundEvent.Robot).pose
+        assertEquals(GridCoordinate(2, 3), pose.position)
+        assertEquals(DrivePose(2.75, 3.25, 0.0), DrivePose.from(pose))
+        assertEquals(null, pose.estimate)
+        assertTrue(ArenaReducer().reduce(ArenaState(), ArenaAction.ApplyRobotPose(pose)) is ArenaReduction.Success)
+        assertEquals(codec.decode("ROBOT,2,3,N"), codec.decode("ROBOT,2.0,3.0,N"))
+    }
+
+    @Test
+    fun `robot rejects nonfinite coordinates and keeps fractional bounds checks`() {
+        for (x in listOf("NaN", "Infinity", "-Infinity", "1e100", "oops")) {
+            assertTrue(codec.decode("ROBOT,$x,2,N") is ArenaDecodeResult.Malformed)
+            assertTrue(codec.decode("ROBOT,2,$x,N") is ArenaDecodeResult.Malformed)
+        }
+        for ((x, valid) in listOf("-0.01" to false, "19.99" to true, "20" to false)) {
+            val decoded = codec.decode("ROBOT,$x,2,N") as ArenaDecodeResult.Decoded
+            val pose = (decoded.event as ArenaInboundEvent.Robot).pose
+            assertEquals(valid, ArenaReducer().reduce(ArenaState(), ArenaAction.ApplyRobotPose(pose)) is ArenaReduction.Success)
+        }
     }
 
     @Test

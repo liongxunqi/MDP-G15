@@ -48,15 +48,18 @@ US_BIAS_CM = 1.3
 # it on CLEAN puts every turn 27mm wide, and the error compounds across turns.
 PROFILE_TIGHT, PROFILE_CLEAN, PROFILE_SLOW = 0, 1, 2
 TURN_RADIUS_MM = {
-    PROFILE_TIGHT: 291,
-    PROFILE_CLEAN: 318,
-    PROFILE_SLOW: 306,
+    PROFILE_TIGHT: 294.5,
+    PROFILE_CLEAN: 318.0,
+    PROFILE_SLOW: 306.0,
 }
 PROFILE_NAMES = {PROFILE_TIGHT: "TIGHT", PROFILE_CLEAN: "CLEAN", PROFILE_SLOW: "SLOW"}
 
 # ── PROTOCOL.md §8 — chassis ──────────────────────────────────────────────────
 ROBOT_WIDTH_CM = 18.8
 ROBOT_LENGTH_CM = 23.0
+# ?WPOSE integrates the driven rear axle, while FU measures from the front
+# ultrasonic sensor. Photo-pose geometry must bridge those two references.
+REAR_AXLE_TO_SENSOR_CM = 23.0
 ARENA_CM = 200.0
 
 # FU before F, exactly as the firmware's own parser orders its prefixes — "fu"
