@@ -15,11 +15,17 @@
     <color name="arena_obstacle_found">#5FD27A</color>
     <color name="arena_selected">#FFB547</color>
     <color name="arena_target_face">#FFFFFF</color>
-    <!-- Robot: purple chassis, yellow lightning, and ice-blue front sensors. -->
-    <color name="arena_robot">#492875</color>
-    <color name="arena_robot_trim">#A77CE0</color>
+    <!-- Pixel robot: layered purple chassis, mechanical wheel pods, and bright front sensors. -->
+    <color name="arena_robot_outline">#0B1029</color>
+    <color name="arena_robot_dark">#2A174A</color>
+    <color name="arena_robot">#57318A</color>
+    <color name="arena_robot_trim">#9A70D4</color>
+    <color name="arena_robot_tire">#161B31</color>
+    <color name="arena_robot_wheel_hub">#6E9FC4</color>
     <color name="arena_robot_eye">#A9E9FF</color>
+    <color name="arena_robot_eye_glint">#F4FCFF</color>
     <color name="arena_robot_direction">#FFD84A</color>
+    <color name="arena_robot_direction_shadow">#C98B1E</color>
     <!-- Path demo: translucent so grid lines stay visible through the swept cells. -->
     <color name="arena_path_cell">#6680D4FF</color>
     <color name="arena_path_arrow">#BFE6FF</color>

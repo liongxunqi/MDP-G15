@@ -106,18 +106,18 @@ class ArenaGridView @JvmOverloads constructor(
     }
     private val selectedPaint = strokePaint(R.color.arena_selected, 4f * density)
     private val facePaint = strokePaint(R.color.arena_target_face, 4f * density)
-    private val robotPaint = fillPaint(R.color.arena_robot)
-    private val robotDirectionPaint = fillPaint(R.color.arena_robot_direction)
-    private val robotEyePaint = fillPaint(R.color.arena_robot_eye)
-    private val robotTrimPaint = strokePaint(R.color.arena_robot_trim, 1f).apply {
-        strokeCap = Paint.Cap.ROUND
-        strokeJoin = Paint.Join.ROUND
-    }
-    private val robotLegPaint = Paint(robotPaint).apply {
-        style = Paint.Style.STROKE
-        strokeCap = Paint.Cap.SQUARE
-        strokeJoin = Paint.Join.ROUND
-    }
+    private val robotPixelPaints = mapOf(
+        'O' to pixelPaint(R.color.arena_robot_outline),
+        'D' to pixelPaint(R.color.arena_robot_dark),
+        'P' to pixelPaint(R.color.arena_robot),
+        'L' to pixelPaint(R.color.arena_robot_trim),
+        'T' to pixelPaint(R.color.arena_robot_tire),
+        'G' to pixelPaint(R.color.arena_robot_wheel_hub),
+        'E' to pixelPaint(R.color.arena_robot_eye),
+        'H' to pixelPaint(R.color.arena_robot_eye_glint),
+        'Y' to pixelPaint(R.color.arena_robot_direction),
+        'Q' to pixelPaint(R.color.arena_robot_direction_shadow),
+    )
     private val pathCellPaint = fillPaint(R.color.arena_path_cell)
     private val pathArrowPaint = strokePaint(R.color.arena_path_arrow, 3f * density).apply {
         strokeCap = Paint.Cap.ROUND
@@ -531,59 +531,23 @@ class ArenaGridView @JvmOverloads constructor(
         val bounds = geometry.robotBounds(pose, state.config)
         val checkpoint = canvas.save()
         canvas.rotate(pose.heading.toFloat(), bounds.centerX, bounds.centerY)
-        val width = bounds.right - bounds.left
-        val height = bounds.bottom - bounds.top
-        fun x(fraction: Float) = bounds.left + width * fraction
-        fun y(fraction: Float) = bounds.top + height * fraction
-
-        // Four articulated wheel-like legs stay inside the robot's actual footprint.
-        robotTrimPaint.strokeWidth = width * 0.105f
-        robotLegPaint.strokeWidth = width * 0.068f
-        for (side in listOf(-1, 1)) {
-            val inner = if (side < 0) 0.26f else 0.74f
-            val outer = if (side < 0) 0.10f else 0.90f
-            val tip = if (side < 0) 0.07f else 0.93f
-            for (front in listOf(true, false)) {
-                val shoulder = if (front) 0.39f else 0.70f
-                val knee = if (front) 0.34f else 0.75f
-                val end = if (front) 0.09f else 0.93f
-                val leg = Path().apply {
-                    moveTo(x(inner), y(shoulder))
-                    lineTo(x(outer), y(knee))
-                    lineTo(x(tip), y(end))
+        canvas.translate(bounds.left, bounds.top)
+        canvas.scale((bounds.right - bounds.left) / ROBOT_SPRITE_SIZE,
+            (bounds.bottom - bounds.top) / ROBOT_SPRITE_SIZE)
+        canvas.clipRect(0f, 0f, ROBOT_SPRITE_SIZE, ROBOT_SPRITE_SIZE)
+        ROBOT_SPRITE.forEachIndexed { rowIndex, row ->
+            var start = 0
+            while (start < row.length) {
+                val pixel = row[start]
+                var end = start + 1
+                while (end < row.length && row[end] == pixel) end++
+                robotPixelPaints[pixel]?.let { paint ->
+                    canvas.drawRect(start.toFloat(), rowIndex.toFloat(), end.toFloat(),
+                        rowIndex + 1f, paint)
                 }
-                canvas.drawPath(leg, robotTrimPaint)
-                canvas.drawPath(leg, robotLegPaint)
-                val foot = RectF(x(tip) - width * 0.045f, y(end) - height * 0.035f,
-                    x(tip) + width * 0.045f, y(end) + height * 0.035f)
-                canvas.drawRoundRect(foot, width * 0.025f, width * 0.025f, robotPaint)
-                canvas.drawRoundRect(foot, width * 0.025f, width * 0.025f, robotTrimPaint)
+                start = end
             }
         }
-
-        // The two front sensor lenses also make the heading clear when the map rotates.
-        robotTrimPaint.strokeWidth = width * 0.025f
-        for (centre in listOf(0.38f, 0.62f)) {
-            val eye = RectF(x(centre - 0.075f), y(0.10f), x(centre + 0.075f), y(0.22f))
-            canvas.drawOval(eye, robotEyePaint)
-            canvas.drawOval(eye, robotTrimPaint)
-        }
-
-        val body = RectF(x(0.25f), y(0.22f), x(0.75f), y(0.88f))
-        canvas.drawRoundRect(body, width * 0.07f, width * 0.07f, robotPaint)
-        robotTrimPaint.strokeWidth = width * 0.035f
-        canvas.drawRoundRect(body, width * 0.07f, width * 0.07f, robotTrimPaint)
-
-        val bolt = Path().apply {
-            moveTo(x(0.57f), y(0.30f))
-            lineTo(x(0.38f), y(0.58f))
-            lineTo(x(0.52f), y(0.55f))
-            lineTo(x(0.43f), y(0.79f))
-            lineTo(x(0.66f), y(0.48f))
-            lineTo(x(0.53f), y(0.50f))
-            close()
-        }
-        canvas.drawPath(bolt, robotDirectionPaint)
         canvas.restoreToCount(checkpoint)
     }
 
@@ -749,6 +713,10 @@ class ArenaGridView @JvmOverloads constructor(
         style = Paint.Style.FILL
     }
 
+    private fun pixelPaint(colorRes: Int): Paint = fillPaint(colorRes).apply {
+        isAntiAlias = false
+    }
+
     private fun strokePaint(colorRes: Int, width: Float): Paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color = ContextCompat.getColor(context, colorRes)
         style = Paint.Style.STROKE
@@ -777,5 +745,41 @@ class ArenaGridView @JvmOverloads constructor(
         private const val MIN_SCALE = 1f
         private const val MAX_SCALE = 4f
         private const val ZOOM_STEP = 0.5f
+        private const val ROBOT_SPRITE_SIZE = 32f
+        // 32×32 top-down chassis. The stepped limbs terminate in dark tires with steel-blue hubs.
+        private val ROBOT_SPRITE = arrayOf(
+            "................................",
+            "................................",
+            "..OOO......OOOO...OOOO.....OOO..",
+            ".OLTTO.....OHEO...OHEO....OLTTO.",
+            ".OLGGO.....OEEO...OEEO....OLGGO.",
+            ".OTGGO.....OOOO...OOOO....OTGGO.",
+            ".OTTTO....OOOOOOOOOOOO....OTTTO.",
+            "..OOOLO..OODDDDDDDDDDOO..OLOOO..",
+            "...OOOO..ODDLLLLLLLLDDO..OOOO...",
+            ".....LO..ODLLLLLLLLLPDO..OL.....",
+            "....OLOGLODLPDDDDDYYQDOLGOLO....",
+            "....OOOLLODLPDDDDYYQDDOLLOOO....",
+            "....OOOOOODLPDDDYYYQDDOOOOOO....",
+            ".........OGLPDDDYYQPDGO.........",
+            ".........OGLPDDYYYQPDGO.........",
+            ".........OGLPDYYYYYYQGO.........",
+            ".........ODLPYYYYYYQDDO.........",
+            ".........ODLPDDDYYQPDDO.........",
+            ".........OGLPDDYYQDPDGO.........",
+            ".........OGLPDDYYDDPDGO.........",
+            "....OLLGLOGLPDYYQDDPDGOLGLLO....",
+            "....OOOLLODLPDYQDDDPDDOLLOOO....",
+            "....OLOOOODPPYQDDDDPDDOOOOLO....",
+            ".....LO..ODDDQDDDDDDDDO..OL.....",
+            "...OLLO..ODDLDDDDDDLDDO..OLLO...",
+            "...OLOO..ODDDDDDDDDDDDO..OOLO...",
+            "..OOO....OODPPPPPPPPDOO....OOO..",
+            ".OLTTO....OOOOOOOOOOOO....OLTTO.",
+            ".OLGGO....................OLGGO.",
+            ".OTGGO....................OTGGO.",
+            ".OTTTO....................OTTTO.",
+            "..OOO......................OOO..",
+        )
     }
 }

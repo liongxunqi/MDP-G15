@@ -110,6 +110,9 @@ class ArenaGridViewInstrumentedTest {
     fun robotArtworkUsesRequestedColorsAndEyesFollowHeading() {
         val context = ApplicationProvider.getApplicationContext<android.content.Context>()
         val bodyColor = ContextCompat.getColor(context, R.color.arena_robot)
+        val darkPanelColor = ContextCompat.getColor(context, R.color.arena_robot_dark)
+        val trimColor = ContextCompat.getColor(context, R.color.arena_robot_trim)
+        val wheelHubColor = ContextCompat.getColor(context, R.color.arena_robot_wheel_hub)
         val boltColor = ContextCompat.getColor(context, R.color.arena_robot_direction)
         val eyeColor = ContextCompat.getColor(context, R.color.arena_robot_eye)
 
@@ -142,6 +145,9 @@ class ArenaGridViewInstrumentedTest {
         val north = capture(0.0)
         val east = capture(90.0)
         val northBody = centroid(north, bodyColor)
+        centroid(north, darkPanelColor)
+        centroid(north, trimColor)
+        centroid(north, wheelHubColor)
         val northEyes = centroid(north, eyeColor)
         centroid(north, boltColor)
         val eastBody = centroid(east, bodyColor)
@@ -152,6 +158,40 @@ class ArenaGridViewInstrumentedTest {
         assertTrue("Front sensors should be right of an east-facing chassis", eastEyes.first > eastBody.first)
         north.recycle()
         east.recycle()
+    }
+
+    @Test
+    fun pixelRobotDoesNotDrawOutsideItsFootprint() {
+        val context = ApplicationProvider.getApplicationContext<android.content.Context>()
+        val view = createView(context)
+        val pose = RobotPose(8.0, 8.0, 0.0, source = PoseSource.SIMULATED)
+        val state = ArenaState(robot = pose)
+        onMain {
+            prepare(view, ArenaState(), false)
+            fun capture() = Bitmap.createBitmap(VIEW_SIZE, VIEW_SIZE, Bitmap.Config.ARGB_8888).also {
+                view.draw(Canvas(it))
+            }
+            val empty = capture()
+            view.render(state, false)
+            val withRobot = capture()
+            val density = context.resources.displayMetrics.density
+            val bounds = ArenaGeometry().apply {
+                update(VIEW_SIZE, VIEW_SIZE, state.config, 36f * density, 8f * density,
+                    stretchToFill = true)
+            }.robotBounds(pose, state.config)
+            var changed = 0
+            for (y in 0 until VIEW_SIZE) for (x in 0 until VIEW_SIZE) {
+                if (empty.getPixel(x, y) != withRobot.getPixel(x, y)) {
+                    changed++
+                    assertTrue("Robot pixel ($x, $y) spilled outside its footprint",
+                        x >= bounds.left - 1f && x <= bounds.right + 1f &&
+                            y >= bounds.top - 1f && y <= bounds.bottom + 1f)
+                }
+            }
+            assertTrue("Robot must change pixels within its footprint", changed > 0)
+            empty.recycle()
+            withRobot.recycle()
+        }
     }
 
     @Test
