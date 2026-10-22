@@ -3,9 +3,12 @@
 #include "motors.h"
 #include "pid.h"
 #include "odom.h"
+#include "encoders.h"
 #include "imu.h"
 #include "ir.h"
 #include "ultrasonic.h"
+#include "caltab.h"
+#include "task2fw.h"
 #include <string.h>
 #include <stdio.h>
 
@@ -59,6 +62,33 @@ static uint32_t s_calRange;
  * answered. */
 static uint8_t s_lineFailed;
 
+/* IR SNAPSHOT AND EDGE LATCH, rpilink.h. One tick's worth of side IR and
+ * world pose. Written only by RpiLink_Tick() in the TIM6 ISR; read in the
+ * main loop with interrupts masked so a reply never mixes two ticks. */
+typedef struct
+{
+    uint16_t l_cm;
+    uint16_t r_cm;
+    uint16_t l_raw;
+    uint16_t r_raw;
+    int32_t  x_mm;
+    int32_t  y_mm;
+    int32_t  hdg_x10;
+    uint32_t ms;
+} IrSnap_t;
+
+static volatile IrSnap_t s_irSnap;
+
+/* Latch: 0 off, 1 armed, 2 latched. Side 1 left, 2 right. s_ireRun counts
+ * consecutive in-window ticks; s_ireFirst holds the first of them. */
+static volatile uint8_t  s_ireState;
+static volatile uint8_t  s_ireSide;
+static volatile uint16_t s_ireLo;
+static volatile uint16_t s_ireHi;
+static volatile uint8_t  s_ireRun;
+static volatile IrSnap_t s_ireFirst;
+static volatile IrSnap_t s_ireHit;
+
 /* ===================================================================
  * Weak sensor stubs.
  *
@@ -103,6 +133,8 @@ static void link_reply(const char *s)
 
     (void)HAL_UART_Transmit(s_uart, (uint8_t *)s, (uint16_t)strlen(s), 100U);
 }
+
+void RpiLink_Send(const char *s) { link_reply(s); }
 
 /* Human-readable telemetry. Silent once the RPi has spoken. */
 void RpiLink_Log(const char *s)
@@ -219,9 +251,95 @@ static int32_t scaled10(float v)
     return (int32_t)((v * 10.0f) + ((v < 0.0f) ? -0.5f : 0.5f));
 }
 
+/* ------------------------------------------------------------------ */
+/* IR snapshot and edge latch - see rpilink.h                          */
+/* ------------------------------------------------------------------ */
+
+void RpiLink_Tick(void)
+{
+    IrSnap_t    s;
+    Odom_Pose_t p;
+
+    Odom_GetWorldPose(&p);
+    s.l_cm    = IR_LeftCm();
+    s.r_cm    = IR_RightCm();
+    s.l_raw   = IR_LeftFiltered();
+    s.r_raw   = IR_RightFiltered();
+    s.x_mm    = (int32_t)p.x_mm;
+    s.y_mm    = (int32_t)p.y_mm;
+    s.hdg_x10 = scaled10(p.heading_deg);
+    s.ms      = HAL_GetTick();
+    s_irSnap  = s;
+
+    if (s_ireState != 1U) { return; }
+
+    /* Only while driving: a robot parked beside something would otherwise
+     * latch the moment it is armed, before the move it was armed for. */
+    if (!Motion_IsBusy())
+    {
+        s_ireRun = 0U;
+        return;
+    }
+
+    {
+        uint16_t cm = (s_ireSide == 1U) ? s.l_cm : s.r_cm;
+
+        if ((cm != SENSOR_NO_READING) && (cm >= s_ireLo) && (cm <= s_ireHi))
+        {
+            if (s_ireRun == 0U) { s_ireFirst = s; }
+            s_ireRun++;
+            if (s_ireRun >= RPILINK_IRE_CONFIRM_TICKS)
+            {
+                s_ireHit   = s_ireFirst;
+                s_ireState = 2U;
+            }
+        }
+        else
+        {
+            s_ireRun = 0U;
+        }
+    }
+}
+
+/* Copy a tick-written snapshot without tearing it. */
+static IrSnap_t ir_snap_read(const volatile IrSnap_t *src)
+{
+    IrSnap_t out;
+    uint32_t pm = __get_PRIMASK();
+
+    __disable_irq();
+    out = *src;
+    __set_PRIMASK(pm);
+    return out;
+}
+
+/* Push the table's hardware globals into the layers that use them. After
+ * every !KG set and !KCLR - cheap, and it means no layer can hold a stale
+ * copy. 0 = compiled constant throughout. */
+static void apply_globals(void)
+{
+    int16_t w = CalTab_Global(CTG_WHEEL);
+
+    (void)Odom_SetWheelRatio((w != 0) ? ((float)w / 10000.0f) : 1.0f);
+    PID_SetMotorModel(0U, CalTab_Global(CTG_FFAF), CalTab_Global(CTG_FFAR),
+                      CalTab_Global(CTG_DBA));
+    PID_SetMotorModel(1U, CalTab_Global(CTG_FFBF), CalTab_Global(CTG_FFBR),
+                      CalTab_Global(CTG_DBB));
+}
+
+/* One table value for ?K: the number, or "-" when unset. */
+static int fmt_k(char *out, int room, uint8_t move, uint8_t anchor, uint8_t field)
+{
+    int16_t v;
+
+    if (!CalTab_FieldAllowed(move, field)) { return snprintf(out, (size_t)room, ",."); }
+    if (!CalTab_Get(move, anchor, field, &v)) { return snprintf(out, (size_t)room, ",-"); }
+    return snprintf(out, (size_t)room, ",%d", (int)v);
+}
+
 static void answer_immediate(const Command_t *c)
 {
-    char b[96];
+    char b[256];
 
     switch (c->op)
     {
@@ -259,6 +377,75 @@ static void answer_immediate(const Command_t *c)
             snprintf(b, sizeof(b), "WPOSE,%ld,%ld,%ld\n",
                      (long)p.x_mm, (long)p.y_mm, (long)scaled10(p.heading_deg));
         }
+        break;
+
+    case CMD_Q_IRW:
+        {
+            IrSnap_t s = ir_snap_read(&s_irSnap);
+            snprintf(b, sizeof(b), "IRW,%u,%u,%u,%u,%ld,%ld,%ld,%lu\n",
+                     (unsigned)s.l_cm, (unsigned)s.r_cm,
+                     (unsigned)s.l_raw, (unsigned)s.r_raw,
+                     (long)s.x_mm, (long)s.y_mm, (long)s.hdg_x10,
+                     (unsigned long)s.ms);
+        }
+        break;
+
+    case CMD_Q_IRE:
+        {
+            IrSnap_t s;
+            uint8_t  state, side;
+            uint32_t pm = __get_PRIMASK();
+
+            __disable_irq();
+            state = s_ireState;
+            side  = s_ireSide;
+            s     = s_ireHit;
+            __set_PRIMASK(pm);
+
+            if (state != 2U)
+            {
+                (void)memset(&s, 0, sizeof(s));
+            }
+            snprintf(b, sizeof(b), "IRE,%u,%u,%u,%u,%ld,%ld,%ld,%lu\n",
+                     (unsigned)state, (unsigned)side,
+                     (unsigned)((side == 2U) ? s.r_cm : s.l_cm),
+                     (unsigned)((side == 2U) ? s.r_raw : s.l_raw),
+                     (long)s.x_mm, (long)s.y_mm, (long)s.hdg_x10,
+                     (unsigned long)s.ms);
+        }
+        break;
+
+    case CMD_SET_IR_EDGE:
+        {
+            /* Arm or disarm in one go, so the tick never sees a half-set
+               window. Already validated by the parser. */
+            uint32_t pm  = __get_PRIMASK();
+            int16_t  arg = c->arg;
+
+            __disable_irq();
+            s_ireRun = 0U;
+            if (arg == 0)
+            {
+                s_ireState = 0U;
+                s_ireSide  = 0U;
+            }
+            else
+            {
+                s_ireSide  = (uint8_t)(arg / 10000);
+                s_ireLo    = (uint16_t)((arg / 100) % 100);
+                s_ireHi    = (uint16_t)(arg % 100);
+                s_ireState = 1U;
+            }
+            __set_PRIMASK(pm);
+        }
+        snprintf(b, sizeof(b), "%s", CMD_REPLY_OK);
+        break;
+
+    case CMD_Q_ENC:
+        /* Raw cumulative counts, signed, as Odom_Update() reads them. Only
+           differences mean anything - see CMD_Q_ENC in commands.h. */
+        snprintf(b, sizeof(b), "ENC,%ld,%ld\n",
+                 (long)Encoder_A_GetCount(), (long)Encoder_B_GetCount());
         break;
 
     case CMD_Q_TURN:
@@ -309,12 +496,11 @@ static void answer_immediate(const Command_t *c)
         break;
 
     case CMD_SET_PROFILE:
-        /* Locked to TIGHT (MOTION_PROFILE_LOCK_TIGHT). Refused rather than
+        /* Locked to TIGHT/SAFE (MOTION_PROFILE_LOCK). Refused rather than
            OK'd and ignored: a sender asking for CLEAN believes the robot
            will turn at 318 mm, and an OK would let it go on believing it. */
-        Motion_SetArcProfile((uint8_t)c->arg);
         snprintf(b, sizeof(b), "%s",
-                 (Motion_GetArcProfile() == (uint8_t)c->arg)
+                 Motion_SetArcProfile((uint8_t)c->arg)
                  ? CMD_REPLY_OK : CMD_REPLY_RESEND);
         break;
 
@@ -338,6 +524,13 @@ static void answer_immediate(const Command_t *c)
                  (unsigned)Motion_GetCarryClampCount());
         break;
 
+    case CMD_SET_FAST:
+        /* Read when each move launches and while it runs - a change lands on
+           the next move, or on the speed of the one in flight, harmlessly. */
+        Motion_SetFast((uint8_t)c->arg);
+        snprintf(b, sizeof(b), "%s", CMD_REPLY_OK);
+        break;
+
     case CMD_SET_LEARN:
         /* Takes effect at the END of the move in flight, which is where the
            learners run - so unlike the setters there is nothing to guard. */
@@ -352,15 +545,104 @@ static void answer_immediate(const Command_t *c)
            quantise the whole usable range into three steps. */
         /* Protocol 4 appends gyro scale x10000 and the learning switch;
            protocol 5 the left and right arc deflections in force. Appended,
-           not inserted, so older readers still read the right fields. */
-        snprintf(b, sizeof(b), "CAL,%d,%d,%d,%d,%u,%u,%u\n",
+           not inserted, so older readers still read the right fields.
+           Protocol 6 appends the last arc's raw decel measurement, x10, 0
+           when it gave none - see Motion_GetLastDecelMeas(). */
+        snprintf(b, sizeof(b), "CAL,%d,%d,%d,%d,%u,%u,%u,%d\n",
                  (int)scaled10(Motion_GetArcDecel()),
                  (int)scaled10(Motion_GetArcLag() * 1000.0f),
-                 (int)Odom_GetHeadingTrim(),
+                 /* Rounded, not truncated: (int) cut 1.9 to 1 and -1.9
+                    to -1, so a saved trim lost up to 1 us and every value
+                    in -1..1 read as 0. */
+                 (int)((Odom_GetHeadingTrim() >= 0.0f)
+                       ? (Odom_GetHeadingTrim() + 0.5f)
+                       : (Odom_GetHeadingTrim() - 0.5f)),
                  (int)((IMU_GetGyroScale() * 10000.0f) + 0.5f),
                  (unsigned)Motion_LearningEnabled(),
                  (unsigned)Motion_GetArcSteerSideUs(0U),
-                 (unsigned)Motion_GetArcSteerSideUs(1U));
+                 (unsigned)Motion_GetArcSteerSideUs(1U),
+                 (int)scaled10(Motion_GetLastDecelMeas()));
+        break;
+
+    case CMD_Q_MV:
+    {
+        /* MOVE REPORT in motion.h. Floats x10 where a tenth matters. */
+        const MotionReport_t *r = Motion_GetReport();
+
+        snprintf(b, sizeof(b),
+                 "MV,%u,%u,%u,%d,%u,%ld,%ld,%u,%d,%d,%d,%d,%d,%d,%ld,%ld,"
+                 "%d,%d,%d,%d,%d,%ld,%ld,%u,%d,%ld\n",
+                 (unsigned)r->seq, (unsigned)r->move, (unsigned)r->result,
+                 (int)r->rpm, (unsigned)r->ticks,
+                 (long)r->enc_a, (long)r->enc_b, (unsigned)r->n,
+                 (int)scaled10(r->rpm_a), (int)scaled10(r->rpm_b),
+                 (int)(r->duty_a + 0.5f), (int)(r->duty_b + 0.5f),
+                 (int)scaled10(r->corr), (int)scaled10(r->max_err),
+                 (long)scaled10(r->dist_brake), (long)scaled10(r->dist),
+                 (int)scaled10(r->aim), (int)scaled10(r->turned),
+                 (int)scaled10(r->brake_rate), (int)scaled10(r->brake_ang),
+                 (int)scaled10(r->decel_meas),
+                 (long)scaled10(r->x), (long)scaled10(r->y),
+                 (unsigned)r->servo, (int)scaled10(r->trim),
+                 (long)scaled10(r->target));
+        break;
+    }
+
+    case CMD_Q_K:
+    {
+        /* K,<move>,<anchor>,<rpm>,<trim>,<coast>,<dist>,<steer>,<decel>,
+               <lag>,<radius>,<boost>   - "-" unset, "." not this move's
+           KG,<wheel>,<ffaf>,<ffar>,<ffbf>,<ffbr>,<dba>,<dbb>,<vs>,<va> */
+        int     n;
+        uint8_t f;
+
+        if (c->kmove == (uint8_t)CT_GLOBAL)
+        {
+            n = snprintf(b, sizeof(b), "KG");
+            for (f = 0U; f < (uint8_t)CTG_COUNT; f++)
+            {
+                n += snprintf(&b[n], sizeof(b) - (size_t)n, ",%d",
+                              (int)CalTab_Global((CtGlobal_t)f));
+            }
+        }
+        else
+        {
+            n = snprintf(b, sizeof(b), "K,%s,%u", CalTab_MoveName(c->kmove),
+                         (unsigned)c->kanchor);
+            for (f = 0U; f < (uint8_t)CTF_COUNT; f++)
+            {
+                n += fmt_k(&b[n], (int)sizeof(b) - n, c->kmove, c->kanchor, f);
+            }
+        }
+        snprintf(&b[n], sizeof(b) - (size_t)n, "\n");
+        break;
+    }
+
+    case CMD_SET_K:
+    case CMD_SET_K_CLR:
+        /* Same guard as the !CAL* setters below: a move in flight latched
+           its values when it was queued, but the next one on the line has
+           not, and a table changing between two moves of one line is a
+           calibration nobody asked for. */
+        if (Motion_IsBusy() || s_lineActive)
+        {
+            s_calBusy++;
+            snprintf(b, sizeof(b), "%s", CMD_REPLY_RESEND);
+        }
+        else
+        {
+            uint8_t ok = 1U;
+
+            if (c->op == CMD_SET_K_CLR) { CalTab_Clear(); }
+            else { ok = CalTab_Set(c->kmove, c->kanchor, c->kfield, c->arg); }
+
+            if (ok && (c->op == CMD_SET_K_CLR || c->kmove == (uint8_t)CT_GLOBAL))
+            {
+                apply_globals();
+            }
+            if (ok) { s_calOk++; } else { s_calRange++; }
+            snprintf(b, sizeof(b), "%s", ok ? CMD_REPLY_OK : CMD_REPLY_RESEND);
+        }
         break;
 
     case CMD_SET_CAL_DECEL:
@@ -438,9 +720,16 @@ static void answer_immediate(const Command_t *c)
 static void abort_everything(void)
 {
     Cmd_QueueFlush();
-    Motion_Stop();
+    Motion_Stop();            /* PID off, both bridges shorted: braking */
     Motion_ClearState();
-    Motors_Coast();
+
+    /* NO Motors_Coast() here. It used to follow straight after the brake
+     * and undo it within microseconds, so RST released the wheels: on the
+     * floor a robot at ~50 cm/s rolled on 18.5 cm after RST and drifted a
+     * degree, eating the clearance the RPi had just checked. The shorted
+     * bridges stay on - they only resist while the wheels turn, so a parked
+     * robot draws nothing - until the next move's PID takes the motors
+     * back. Matches how a normal stop holds the brake until it settles. */
     Motion_ResyncHeading();   /* whatever was planned no longer applies */
     s_lineActive = 0U;
     s_f0Active   = 0U;
@@ -540,7 +829,8 @@ static uint8_t fu_poll(void)
          * as the line executor below does. */
         if (Motion_GetState() == MOTION_TIMEOUT)
         {
-            s_lineFailed = Motion_WrongWayAborted() ? 2U : 1U;
+            s_lineFailed = Motion_WrongWayAborted() ? 2U
+                         : Motion_ArcMissed()      ? 4U : 1U;
             Motion_ClearState();
             s_fuState = FU_OFF;
             return 0U;
@@ -582,7 +872,8 @@ static uint8_t dispatch(Command_t c)
         }
         else
         {
-            Motion_DriveDistance((int32_t)c.arg * 10);   /* cm -> mm */
+            /* cm -> mm; speed 0 is the protocol 9 move, exactly. */
+            Motion_DriveDistanceV((int32_t)c.arg * 10, (int16_t)(c.speed * 10U));
         }
         return 1U;
 
@@ -604,13 +895,13 @@ static uint8_t dispatch(Command_t c)
         return 0U;
 
     case CMD_REVERSE:
-        Motion_DriveDistance(-((int32_t)c.arg * 10));
+        Motion_DriveDistanceV(-((int32_t)c.arg * 10), (int16_t)(c.speed * 10U));
         return 1U;
 
-    case CMD_ARC_FWD_RIGHT: Motion_DriveArc(c.arg, 1U, 1U); return 1U;
-    case CMD_ARC_FWD_LEFT:  Motion_DriveArc(c.arg, 1U, 0U); return 1U;
-    case CMD_ARC_REV_RIGHT: Motion_DriveArc(c.arg, 0U, 1U); return 1U;
-    case CMD_ARC_REV_LEFT:  Motion_DriveArc(c.arg, 0U, 0U); return 1U;
+    case CMD_ARC_FWD_RIGHT: Motion_DriveArcV(c.arg, 1U, 1U, (int16_t)(c.speed * 10U)); return 1U;
+    case CMD_ARC_FWD_LEFT:  Motion_DriveArcV(c.arg, 1U, 0U, (int16_t)(c.speed * 10U)); return 1U;
+    case CMD_ARC_REV_RIGHT: Motion_DriveArcV(c.arg, 0U, 1U, (int16_t)(c.speed * 10U)); return 1U;
+    case CMD_ARC_REV_LEFT:  Motion_DriveArcV(c.arg, 0U, 0U, (int16_t)(c.speed * 10U)); return 1U;
 
     case CMD_STOP:
         Motion_Stop();
@@ -629,12 +920,106 @@ static uint8_t dispatch(Command_t c)
     }
 }
 
+/* Take the received line: lowercased, surrounding whitespace trimmed. Returns
+ * the start of the text inside line[]. */
+static char *take_line(char *line)
+{
+    char     *p = line;
+    uint16_t  i;
+
+    (void)memcpy(line, s_pending, CMD_LINE_MAX);
+    s_lineReady = 0U;
+
+    /* Lowercase on receive, so sender casing is irrelevant everywhere
+     * downstream. */
+    for (i = 0U; i < CMD_LINE_MAX; i++)
+    {
+        if (line[i] == '\0') { break; }
+        if ((line[i] >= 'A') && (line[i] <= 'Z'))
+        {
+            line[i] = (char)(line[i] - 'A' + 'a');
+        }
+    }
+
+    /* Trim surrounding whitespace before the single-token tests. Cmd_ParseLine()
+     * treats spaces as delimiters and skips empty runs, so movement lines never
+     * cared - but RST and the immediate opcodes are matched against the WHOLE
+     * line, and "?US " with a trailing space would otherwise fall through to
+     * RESEND. Confusing, and trivial to prevent. */
+    {
+        uint16_t end;
+
+        while ((*p == ' ') || (*p == '\t')) { p++; }
+
+        end = (uint16_t)strlen(p);
+        while ((end > 0U) && ((p[end - 1U] == ' ') || (p[end - 1U] == '\t')))
+        {
+            p[end - 1U] = '\0';
+            end--;
+        }
+    }
+    return p;
+}
+
+/* Reception torn down by a line error: re-arm it. See RpiLink_Poll(). */
+static void rearm_rx(void)
+{
+    if ((s_uart != 0) && (s_uart->RxState == HAL_UART_STATE_READY))
+    {
+        s_rearms++;
+        (void)HAL_UART_Receive_IT(s_uart, &s_rxByte, 1U);
+    }
+}
+
+void RpiLink_Service(void)
+{
+    char      line[CMD_LINE_MAX];
+    char     *p;
+    Command_t c;
+
+    rearm_rx();
+
+    if (s_overrun)
+    {
+        s_overrun = 0U;
+        link_reply(CMD_REPLY_RESEND);
+    }
+
+    if (!s_lineReady) { return; }
+
+    p = take_line(line);
+    c = Cmd_ParseToken(p);
+
+    if (strcmp(p, "rst") == 0)
+    {
+        /* The !t2go line answers it, FAIL,STOP - RST's own silence stands. */
+        Task2Fw_Abort();
+    }
+    else if (c.op == CMD_T2_ARROW)
+    {
+        Task2Fw_Answer((uint8_t)(c.arg / 10), ((c.arg % 10) == 1) ? 'R' : 'L');
+    }
+    else if (c.op == CMD_T2_LATERAL)
+    {
+        Task2Fw_Lateral((uint8_t)(c.arg / 1000), (int16_t)((c.arg % 1000) - 500));
+    }
+    else if ((p[0] == '?') && Cmd_IsImmediate(c.op))
+    {
+        /* Queries only. A setter mid-course would change the calibration
+         * between two of its moves. */
+        answer_immediate(&c);
+    }
+    else
+    {
+        link_reply(CMD_REPLY_RESEND);
+    }
+}
+
 void RpiLink_Poll(void)
 {
     char      line[CMD_LINE_MAX];
     char     *p = line;
     Command_t next;
-    uint16_t  i;
 
     /* ---- 0. re-arm reception if it has been torn down ----
      *
@@ -652,11 +1037,7 @@ void RpiLink_Poll(void)
      *
      * The counter is the point: silent recovery hides the underlying fault, so
      * anything other than zero here means go and look at the wiring. */
-    if ((s_uart != 0) && (s_uart->RxState == HAL_UART_STATE_READY))
-    {
-        s_rearms++;
-        (void)HAL_UART_Receive_IT(s_uart, &s_rxByte, 1U);
-    }
+    rearm_rx();
 
     /* ---- 1. a dropped line still owes the sender an answer ---- */
     if (s_overrun)
@@ -668,38 +1049,7 @@ void RpiLink_Poll(void)
     /* ---- 2. new line in ---- */
     if (s_lineReady)
     {
-        (void)memcpy(line, s_pending, sizeof(line));
-        s_lineReady = 0U;
-
-        /* Lowercase on receive, so sender casing is irrelevant everywhere
-         * downstream. */
-        for (i = 0U; i < CMD_LINE_MAX; i++)
-        {
-            if (line[i] == '\0') { break; }
-            if ((line[i] >= 'A') && (line[i] <= 'Z'))
-            {
-                line[i] = (char)(line[i] - 'A' + 'a');
-            }
-        }
-
-        /* Trim surrounding whitespace before the single-token tests below.
-         * Cmd_ParseLine() treats spaces as delimiters and skips empty runs, so
-         * movement lines never cared - but RST and the immediate opcodes are
-         * matched against the WHOLE line, and "?US " with a trailing space
-         * would otherwise fall through to RESEND. Confusing, and trivial to
-         * prevent. */
-        {
-            uint16_t end;
-
-            while ((*p == ' ') || (*p == '\t')) { p++; }
-
-            end = (uint16_t)strlen(p);
-            while ((end > 0U) && ((p[end - 1U] == ' ') || (p[end - 1U] == '\t')))
-            {
-                p[end - 1U] = '\0';
-                end--;
-            }
-        }
+        p = take_line(line);
 
         if (strcmp(p, "rst") == 0)
         {
@@ -707,6 +1057,23 @@ void RpiLink_Poll(void)
              * replies NOTHING. The silence is part of the frozen protocol -
              * do not "helpfully" add an OK here. */
             abort_everything();
+        }
+        else if (Cmd_ParseToken(p).op == CMD_T2_GO)
+        {
+            /* The Task 2 course (task2fw.h). Blocks here until it ends -
+             * RpiLink_Service() keeps the link alive meanwhile - and answers
+             * the line once. Refused while anything else owns the robot. */
+            Command_t go = Cmd_ParseToken(p);
+
+            s_quiet = 1U;
+            if (s_lineActive || Motion_IsBusy() || (s_fuState != FU_OFF))
+            {
+                link_reply(CMD_REPLY_RESEND);
+            }
+            else
+            {
+                link_reply(Task2Fw_Run((uint16_t)go.arg));
+            }
         }
         else if (Cmd_IsImmediate(Cmd_ParseToken(p).op))
         {
@@ -769,7 +1136,8 @@ void RpiLink_Poll(void)
      * because the reply is owed to the line and not to the primitive. */
     if (Motion_GetState() == MOTION_TIMEOUT)
     {
-        s_lineFailed = Motion_WrongWayAborted() ? 2U : 1U;
+        s_lineFailed = Motion_WrongWayAborted() ? 2U
+                     : Motion_ArcMissed()      ? 4U : 1U;
     }
 
     Motion_ClearState();
@@ -793,6 +1161,7 @@ void RpiLink_Poll(void)
 
         if      (failed == 3U) { link_reply(CMD_REPLY_FAIL_NOECHO);   }
         else if (failed == 2U) { link_reply(CMD_REPLY_FAIL_WRONGWAY); }
+        else if (failed == 4U) { link_reply(CMD_REPLY_FAIL_SHORT);    }
         else if (failed == 1U) { link_reply(CMD_REPLY_FAIL_TIMEOUT);  }
         else                   { link_reply(CMD_REPLY_OK);            }
         return;

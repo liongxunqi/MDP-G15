@@ -1,0 +1,112 @@
+{
+  "note": "",
+  "verified": false,
+  "arc_profile": 3,
+  "checks": {
+    "gyro": {
+      "ratios": [
+        0.99861,
+        1.00499
+      ],
+      "asymmetry_pct": 0.637,
+      "from": 1.003,
+      "to": 1.0048
+    },
+    "radius": {
+      "target_cm": 31.5,
+      "rounds": [
+        {
+          "steer_l": 394,
+          "steer_r": 626,
+          "radius_r_cm": 31.5,
+          "radius_rf_cm": 31.5,
+          "radius_rr_cm": 31.5,
+          "radius_l_cm": 33.75,
+          "radius_lf_cm": 34.0,
+          "radius_lr_cm": 33.5
+        },
+        {
+          "steer_l": 422,
+          "steer_r": 626,
+          "radius_r_cm": 31.39,
+          "radius_rf_cm": 31.49,
+          "radius_rr_cm": 31.3,
+          "radius_l_cm": 31.89,
+          "radius_lf_cm": 31.93,
+          "radius_lr_cm": 31.85
+        }
+      ],
+      "odometry_factor": {
+        "FR": 1.0072,
+        "RR": 0.9794,
+        "FL": 1.0028,
+        "RL": 0.9844
+      }
+    },
+    "brakes": {
+      "worst_deg": 1.4,
+      "by_direction": {
+        "FR": 1.4,
+        "RR": -0.7,
+        "FL": 0.6,
+        "RL": 0.1
+      },
+      "all": [
+        [
+          "FR90",
+          1.4
+        ],
+        [
+          "RR90",
+          -0.7
+        ],
+        [
+          "FL90",
+          0.6
+        ],
+        [
+          "RL90",
+          0.1
+        ]
+      ]
+    },
+    "square": {
+      "side_cm": 50,
+      "worst_corner_deg": 1.0,
+      "gyro_heading_err_deg": -0.9,
+      "floor_angle_deg": 0.0,
+      "gap_cm": 0.0,
+      "passed": false,
+      "when": "2026-09-13T12:48:22"
+    },
+    "straight": {
+      "converged": false,
+      "drift_cm": [
+        -2.0,
+        2.6
+      ],
+      "distance_err_pct": -0.5,
+      "trim_us": 48
+    }
+  },
+  "decel_x10": 3653,
+  "lag_ms_x10": 0,
+  "trim_us": 48,
+  "gyro_x10000": 10048,
+  "steer_left_us": 422,
+  "steer_right_us": 626,
+  "taken": "2026-09-13T13:19:37",
+  "name": "tr18s",
+  "spread": {
+    "decel_x10": {
+      "sd": 282.1,
+      "min": 3435,
+      "max": 4045
+    },
+    "lag_ms_x10": {
+      "sd": 0.0,
+      "min": 0,
+      "max": 0
+    }
+  }
+}

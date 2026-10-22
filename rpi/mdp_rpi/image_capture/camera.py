@@ -260,6 +260,71 @@ class Camera:
 
         return None
 
+    def continuous_images(self, stop_event, resolution=(960, 540), exposure_us=5000,
+                          port=None):
+        """JPEG frames until stop_event; use only from the camera-owning
+        worker. task2mn.py and task2fw.py stream arrow frames through it.
+
+        port "still" (the default, T2_CAMERA_PORT): one still-port capture
+        after another, the path capture_image() and raspistill use - on this
+        Buster/MMAL stack a video-port capture can hang for a minute
+        (_settle_camera). Slower, ~2-4 frames a second at this size, which
+        Vision's two-vote confirmation is fine with.
+        port "video": origin/task2-working's capture_continuous on the video
+        port - many frames a second where the stack allows it.
+
+        exposure_us: fixed shutter, to keep a moving robot's frames sharp;
+        0 = automatic."""
+        import os
+        port = (port or os.getenv("T2_CAMERA_PORT", "still")).strip().lower()
+        self.camera.resolution = resolution
+        self.camera.shutter_speed = int(exposure_us)
+        logging.info("Camera: streaming %dx%d on the %s port, shutter %s.",
+                     resolution[0], resolution[1], port,
+                     "%d us" % exposure_us if exposure_us else "auto")
+        count = 0
+        if port == "video":
+            stream = io.BytesIO()
+            try:
+                for _ in self.camera.capture_continuous(
+                        stream, format="jpeg", use_video_port=True):
+                    if stop_event.is_set():
+                        break
+                    count += 1
+                    if count == 1:
+                        logging.info("Camera: first frame, %d bytes.", stream.tell())
+                    yield stream.getvalue()
+                    stream.seek(0)
+                    stream.truncate()
+            finally:
+                stream.close()
+            return
+
+        failures = 0
+        while not stop_event.is_set():
+            stream = io.BytesIO()
+            try:
+                self.camera.capture(stream, format="jpeg", use_video_port=False)
+                data = stream.getvalue()
+            except Exception as exc:
+                failures += 1
+                logging.error("Camera: still capture failed (%d) - %s", failures, exc)
+                if failures >= 5:
+                    raise
+                self._reopen_camera()
+                self.camera.resolution = resolution
+                self.camera.shutter_speed = int(exposure_us)
+                continue
+            finally:
+                stream.close()
+            failures = 0
+            if not data:
+                continue
+            count += 1
+            if count == 1:
+                logging.info("Camera: first frame, %d bytes.", len(data))
+            yield data
+
     # ── Teardown ─────────────────────────────────────────────────────
 
     def stop_camera(self) -> None:

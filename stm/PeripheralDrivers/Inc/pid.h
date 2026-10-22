@@ -31,10 +31,52 @@
  * huge accumulated value that takes seconds to unwind after a disturbance. */
 #define PID_I_LIMIT     300.0f
 
+/* Fast unwind. When a wheel runs more than PID_UNWIND_FRAC faster than asked
+ * while the integral is still pushing it ON, the integral is multiplied by
+ * PID_UNWIND_KEEP every tick instead of bleeding off at Ki.
+ *
+ * Why: in a turn the inner wheel is dragged against the rear scrub. If it
+ * bogs down, the integral climbs to the limit; when the wheel breaks free
+ * that 300 counts of extra duty is still there, and at Ki 2 it took ~0.75 s
+ * of overspeed to bleed away - the robot visibly lurched mid-turn. At 0.5 per
+ * tick it is gone in about 50 ms. The threshold keeps it out of normal
+ * regulation, where measured speed sits within a few rpm of the target. */
+#define PID_UNWIND_FRAC  0.10f
+#define PID_UNWIND_KEEP  0.5f
+
 /* Below this setpoint the wheel is commanded to a hard stop rather than
  * creeping. MOTOR_DEADBAND duty produces roughly 32 RPM, so anything under
  * that is not reachable and asking for it only winds up the integrator. */
 #define PID_MIN_RPM     25
+
+/* ---------------------------------------------------------------------------
+ * PID_LOW_DUTY  (A/B switch, 2026-10 calibration fixes)
+ *
+ * 1  MOTOR_DEADBAND is what it takes to START a wheel from rest (static
+ *    friction, measured wheels-free). A wheel that is already turning keeps
+ *    turning on less. So:
+ *      - from rest (|measured| < PID_MOVING_RPM) a small output is still
+ *        pushed up to the deadband, to break it away, as before;
+ *      - once turning, the output is passed through as it is, and only one
+ *        under PID_ZERO_DUTY is dropped to zero - a duty that small is the
+ *        loop passing through zero, not a speed;
+ *      - the feedforward line starts PID_RUN_DB_DROP below the deadband
+ *        instead of at it. The bench figure "deadband duty gives ~32 rpm"
+ *        puts the running line's zero about 37 counts under it;
+ *      - the hard-stop setpoint is PID_MIN_RPM_LOW instead of PID_MIN_RPM.
+ *    This is what lets an arc's inner wheel be regulated at ~20 rpm, which
+ *    MOTION_ARC_TAPER depends on.
+ * 0  every non-zero output snaps up to the deadband, PID_MIN_RPM 25, as
+ *    before.
+ *
+ * Re-check PID_RUN_DB_DROP from the move report (?MV duty against rpm at
+ * a low cruise) once on the floor: too large and slow wheels lag their
+ * setpoint at launch, too small and they overspeed. */
+#define PID_LOW_DUTY        1
+#define PID_MOVING_RPM      8
+#define PID_ZERO_DUTY       150
+#define PID_RUN_DB_DROP     40
+#define PID_MIN_RPM_LOW     10
 
 typedef struct
 {
@@ -45,6 +87,9 @@ typedef struct
     float   target_rpm;     /* what we are asking for        */
     float   integral;       /* accumulated error, duty counts */
     float   last_error;     /* for the derivative term        */
+    int16_t ff_fwd;         /* protocol 10: rpm at full duty, forward, 0 = max_rpm */
+    int16_t ff_rev;         /*              ... and reverse                         */
+    int16_t deadband;       /*              duty to start turning, 0 = MOTOR_DEADBAND */
 
     int16_t output;         /* last duty written to the motor */
     int16_t max_rpm;        /* free-running speed, this wheel */
@@ -86,5 +131,12 @@ int16_t PID_GetErrorB(void);
 /* Change gains at runtime. Applies to both wheels. Clears the integrators,
  * since an accumulated value scaled by the old Ki is meaningless. */
 void PID_SetGains(float kp, float ki, float kd);
+
+/* Protocol 10: one wheel's measured motor line (calibration table globals
+ * ff*, db* - caltab.h). ff_fwd / ff_rev are the rpm the wheel would reach at
+ * full duty driving forward / reverse; deadband the duty it needs to start.
+ * 0 for any of them = the compiled constant. Takes effect on the next tick. */
+void PID_SetMotorModel(uint8_t wheel_b, int16_t ff_fwd, int16_t ff_rev,
+                       int16_t deadband);
 
 #endif /* __PID_H */

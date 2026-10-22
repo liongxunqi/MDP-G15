@@ -1,0 +1,125 @@
+{
+  "note": "",
+  "verified": false,
+  "arc_profile": 0,
+  "checks": {
+    "straight": {
+      "converged": true,
+      "drift_cm": [
+        -1.1,
+        0.0
+      ],
+      "distance_err_pct": 4.5,
+      "trim_us": 44
+    },
+    "gyro": {
+      "ratios": [
+        0.99917,
+        0.99365
+      ],
+      "asymmetry_pct": 0.554,
+      "from": 1.0095,
+      "to": 1.00587
+    },
+    "radius": {
+      "target_cm": 29.1,
+      "rounds": [
+        {
+          "steer_l": 389,
+          "steer_r": 554,
+          "radius_r_cm": 31.5,
+          "radius_rf_cm": 32.0,
+          "radius_rr_cm": 31.0,
+          "home_r_cm": 5.3,
+          "radius_l_cm": 31.78,
+          "radius_lf_cm": 32.51,
+          "radius_lr_cm": 31.05,
+          "home_l_cm": 4.4
+        },
+        {
+          "steer_l": 425,
+          "steer_r": 600,
+          "radius_r_cm": 30.25,
+          "radius_rf_cm": 31.0,
+          "radius_rr_cm": 29.51,
+          "home_r_cm": 4.3,
+          "radius_l_cm": 29.51,
+          "radius_lf_cm": 30.01,
+          "radius_lr_cm": 29.01,
+          "home_l_cm": 6.0
+        },
+        {
+          "steer_l": 425,
+          "steer_r": 626,
+          "radius_r_cm": 28.5,
+          "radius_rf_cm": 28.0,
+          "radius_rr_cm": 29.0,
+          "home_r_cm": 6.2,
+          "radius_l_cm": 28.75,
+          "radius_lf_cm": 28.5,
+          "radius_lr_cm": 29.0,
+          "home_l_cm": 6.9
+        },
+        {
+          "steer_l": 425,
+          "steer_r": 617,
+          "radius_r_cm": 29.0,
+          "radius_rf_cm": 28.5,
+          "radius_rr_cm": 29.5,
+          "home_r_cm": 5.9,
+          "radius_l_cm": 29.0,
+          "radius_lf_cm": 30.0,
+          "radius_lr_cm": 28.0,
+          "home_l_cm": 6.5
+        }
+      ]
+    },
+    "brakes": {
+      "worst_deg": 0.7,
+      "by_direction": {
+        "FR": 0.7,
+        "RR": -0.6,
+        "FL": -0.4,
+        "RL": -0.2
+      },
+      "all": [
+        [
+          "FR90",
+          0.7
+        ],
+        [
+          "RR90",
+          -0.6
+        ],
+        [
+          "FL90",
+          -0.4
+        ],
+        [
+          "RL90",
+          -0.2
+        ]
+      ]
+    }
+  },
+  "decel_x10": 5170,
+  "lag_ms_x10": 0,
+  "trim_us": 44,
+  "gyro_x10000": 10059,
+  "steer_left_us": 425,
+  "steer_right_us": 617,
+  "taken": "2026-09-13T14:54:17",
+  "name": "tr18",
+  "spread": {
+    "decel_x10": {
+      "sd": 290.4,
+      "min": 4865,
+      "max": 5551
+    },
+    "lag_ms_x10": {
+      "sd": 0.0,
+      "min": 0,
+      "max": 0
+    }
+  }
+}

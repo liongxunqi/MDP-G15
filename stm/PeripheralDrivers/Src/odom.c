@@ -65,6 +65,18 @@ static uint32_t s_ticksHeld;
 static uint8_t  s_trimUpdated;
 static uint16_t s_servoUs;
 
+/* Protocol 10. The trim a straight drives on when the calibration table has
+ * one for its direction and speed - see Odom_SetTrimOverride(). */
+static uint8_t  s_trimOverOn;
+static float    s_trimOver;
+
+/* Worst |heading error| held this straight, past the warm-up. Reported by
+ * the move report; says how hard the line was to hold. */
+static float    s_maxErr;
+
+/* Right/left ground travel per count - see Odom_SetWheelRatio(). */
+static float    s_wheelRatio = 1.0f;
+
 /* Spin calibration state */
 static int32_t s_spinStartA;
 static int32_t s_spinStartB;
@@ -109,6 +121,15 @@ static float clampf(float v, float lo, float hi)
     if (v < lo) { return lo; }
     if (v > hi) { return hi; }
     return v;
+}
+
+/* Wheel B's speed target for a ground speed wheel A is asked to match: a
+ * wheel that covers more ground per count turns that much slower. See
+ * Odom_SetWheelRatio(). */
+static int16_t wheel_b(int16_t rpm)
+{
+    float v = (float)rpm / s_wheelRatio;
+    return (int16_t)((v >= 0.0f) ? (v + 0.5f) : (v - 0.5f));
 }
 
 /* ------------------------------------------------------------------ */
@@ -184,7 +205,7 @@ void Odom_Update(void)
 
     /* Distance each wheel rolled since the last tick. */
     dA_mm = (float)(countA - s_lastCountA) * MM_PER_COUNT_A;
-    dB_mm = (float)(countB - s_lastCountB) * MM_PER_COUNT_B;
+    dB_mm = (float)(countB - s_lastCountB) * MM_PER_COUNT_B * s_wheelRatio;
 
     s_lastCountA = countA;
     s_lastCountB = countB;
@@ -261,10 +282,16 @@ void Odom_Update(void)
     {
         /* Servo is already parked at the arc angle. Just keep the two wheel
          * setpoints applied; there is no heading correction during a turn. */
-        PID_SetTargets(s_arcRpmA, s_arcRpmB);
+        PID_SetTargets(s_arcRpmA, wheel_b(s_arcRpmB));
     }
     else if (s_holdActive)
     {
+        /* See HEADING_GAIN_REF_RPM: 1 up to the tuned speed, then falling
+         * with speed so the loop gain stays where it was tuned. */
+        float rpm_mag    = (s_holdRpm < 0) ? -(float)s_holdRpm : (float)s_holdRpm;
+        float gain_scale = (rpm_mag > HEADING_GAIN_REF_RPM)
+                         ? (HEADING_GAIN_REF_RPM / rpm_mag) : 1.0f;
+
         /* Aim slightly off the held heading, leaning back toward the line.
          *
          * y_mm is left-positive and heading is counter-clockwise positive, so
@@ -283,7 +310,7 @@ void Odom_Update(void)
              * robot back onto the crooked line the carry-over is correcting. */
             float hr    = s_holdHeading * (3.14159265f / 180.0f);
             float off   = (s_pose.y_mm * cosf(hr)) - (s_pose.x_mm * sinf(hr));
-            float cross = -CROSS_KP_DEG_PER_MM * off;
+            float cross = -CROSS_KP_DEG_PER_MM * gain_scale * off;
 
             cross = clampf(cross, -CROSS_MAX_DEG, CROSS_MAX_DEG);
             if (s_holdRpm < 0) { cross = -cross; }
@@ -300,7 +327,7 @@ void Odom_Update(void)
         }
         else
         {
-            correction = HEADING_KP_US * s_error * (float)HEADING_SIGN;
+            correction = HEADING_KP_US * gain_scale * s_error * (float)HEADING_SIGN;
 
             /* Reversing: the same steering angle bends the path the other
              * way relative to travel, so flip the correction. */
@@ -341,16 +368,18 @@ void Odom_Update(void)
                reverse flip; servo space does not. */
             s_errSum += s_error * ((s_holdRpm < 0) ? -1.0f : 1.0f);
             s_errCount++;
+
+            if (fabsf(s_error) > s_maxErr) { s_maxErr = fabsf(s_error); }
         }
 
         /* Trim added AFTER the direction flip - it is a servo-space constant,
          * not a heading-space correction. */
-        s_servoUs = (uint16_t)((float)SERVO_CENTER_US + correction + s_headingTrim);
+        s_servoUs = (uint16_t)((float)SERVO_CENTER_US + correction + Odom_GetEffectiveTrim());
         Servo_SetMicroseconds(s_servoUs);   /* clamps to MIN/MAX internally */
 
         /* Both rear wheels at the same speed. The PID's only job now is to
          * make A and B match each other - steering is the servo's. */
-        PID_SetTargets(s_holdRpm, s_holdRpm);
+        PID_SetTargets(s_holdRpm, wheel_b(s_holdRpm));
     }
 }
 
@@ -380,6 +409,33 @@ uint16_t Odom_GetServoUs(void)      { return s_servoUs; }
 float    Odom_GetHeadingError(void) { return s_error; }
 float    Odom_GetHeadingTrim(void)  { return s_headingTrim; }
 uint8_t  Odom_TrimWasUpdated(void)   { return s_trimUpdated; }
+
+void Odom_SetTrimOverride(uint8_t on, float us)
+{
+    s_trimOver   = clampf(us, -HEADING_TRIM_MAX_US, HEADING_TRIM_MAX_US);
+    s_trimOverOn = on ? 1U : 0U;
+}
+
+float Odom_GetEffectiveTrim(void)
+{
+    return s_trimOverOn ? s_trimOver : s_headingTrim;
+}
+
+float Odom_GetMeanCorrection(void)
+{
+    return (s_corrCount > 0U) ? (s_corrSum / (float)s_corrCount) : 0.0f;
+}
+
+float Odom_GetMaxHeadingError(void) { return s_maxErr; }
+
+uint8_t Odom_SetWheelRatio(float r)
+{
+    if ((r < 0.9f) || (r > 1.1f)) { return 0U; }
+    s_wheelRatio = r;
+    return 1U;
+}
+
+float Odom_GetWheelRatio(void) { return s_wheelRatio; }
 float    Odom_GetCrossTrack(void)   { return s_pose.y_mm; }
 
 /* ------------------------------------------------------------------ */
@@ -484,13 +540,27 @@ void Odom_DriveHeading(int16_t rpm, float heading_deg)
     s_corrSum     = 0.0f;
     s_corrCount   = 0U;
     s_ticksHeld   = 0U;          /* restart the warm-up window */
+    s_maxErr      = 0.0f;
     s_trimUpdated = 0U;          /* until this straight earns it */
     s_holdHeading = wrap180(heading_deg);
     s_holdRpm     = rpm;
     s_error       = 0.0f;
-    s_servoUs     = SERVO_CENTER_US;
 
-    Servo_SetMicroseconds(SERVO_CENTER_US);
+#if ODOM_LAUNCH_KEEP_TRIM
+    /* Where the align phase just settled the wheels: centre plus trim. Bare
+     * centre here swung the linkage centre -> trim on every launch, from
+     * above whenever the trim is negative. See ODOM_LAUNCH_KEEP_TRIM. */
+    {
+        float t = Odom_GetEffectiveTrim();
+
+        s_servoUs = (uint16_t)((int32_t)SERVO_CENTER_US
+                  + (int32_t)((t >= 0.0f) ? (t + 0.5f) : (t - 0.5f)));
+    }
+#else
+    s_servoUs     = SERVO_CENTER_US;
+#endif
+
+    Servo_SetMicroseconds(s_servoUs);
     s_holdActive  = 1U;
     s_mode        = ODOM_STRAIGHT;
 }
@@ -548,7 +618,7 @@ void Odom_DriveArc(int16_t rpm, uint16_t servo_us, float radius_mm,
     s_servoUs    = servo_us;
 
     Servo_SetMicroseconds(servo_us);
-    PID_SetTargets(s_arcRpmA, s_arcRpmB);
+    PID_SetTargets(s_arcRpmA, wheel_b(s_arcRpmB));
 
     s_mode = ODOM_ARC;
 }
@@ -559,7 +629,7 @@ void Odom_SetSpeed(int16_t rpm)
     {
         s_arcRpmA = (int16_t)((float)rpm * s_arcScaleA);
         s_arcRpmB = (int16_t)((float)rpm * s_arcScaleB);
-        PID_SetTargets(s_arcRpmA, s_arcRpmB);
+        PID_SetTargets(s_arcRpmA, wheel_b(s_arcRpmB));
     }
     else if (s_mode == ODOM_STRAIGHT)
     {
@@ -567,7 +637,7 @@ void Odom_SetSpeed(int16_t rpm)
          * by when reversing, so it must be updated even though the servo is
          * deliberately left alone. */
         s_holdRpm = rpm;
-        PID_SetTargets(rpm, rpm);
+        PID_SetTargets(rpm, wheel_b(rpm));
     }
     else
     {
@@ -575,7 +645,7 @@ void Odom_SetSpeed(int16_t rpm)
     }
 }
 
-void Odom_Stop(void)
+void Odom_StopHoldSteer(void)
 {
     s_mode       = ODOM_OFF;
     s_holdActive = 0U;
@@ -584,10 +654,16 @@ void Odom_Stop(void)
     s_arcScaleA  = 1.0f;
     s_arcScaleB  = 1.0f;
     s_error      = 0.0f;
-    s_servoUs    = SERVO_CENTER_US;
 
-    Servo_SetMicroseconds(SERVO_CENTER_US);
     PID_Stop();
+}
+
+void Odom_Stop(void)
+{
+    Odom_StopHoldSteer();
+
+    s_servoUs = SERVO_CENTER_US;
+    Servo_SetMicroseconds(SERVO_CENTER_US);
 }
 
 /* ------------------------------------------------------------------ */

@@ -150,6 +150,20 @@
  * weaves. */
 #define HEADING_KP_US       8.0f
 
+/* Speed the heading and cross-track gains were tuned at, rpm.
+ *
+ * The same steering angle swings the nose round faster the faster the robot
+ * is going - yaw rate is speed x tan(steer) / wheelbase - so a fixed gain
+ * is a loop gain that rises with speed. Tuned at 100 rpm, it was 1.5x as
+ * strong at fast mode's 150, and with the linkage slack that is a weave.
+ * Cross-track is the same again: sideways drift is speed x sin(heading).
+ *
+ * Above this speed both gains are scaled by HEADING_GAIN_REF_RPM / |rpm|,
+ * which holds the loop where it was tuned. At or below it they are left
+ * alone, so normal mode - which never exceeds 100 - behaves exactly as
+ * before. The backlash push is not scaled: slack is slack at any speed. */
+#define HEADING_GAIN_REF_RPM  100.0f
+
 /* Ceiling on the correction, in microseconds either side of centre. Keeps a
  * large error from slamming the steering to full lock mid-run. 150 us is
  * about 8 degrees of steer. */
@@ -318,6 +332,13 @@
  * original line. If they turn the same way you nudged, flip this. */
 #define HEADING_SIGN        (-1)
 
+/* ODOM_LAUNCH_KEEP_TRIM  (A/B switch, 2026-10 calibration fixes)
+ *   1  Odom_DriveHeading() starts the straight with the servo at centre +
+ *      trim - where motion.c's align phase has just settled it.
+ *   0  it sends bare SERVO_CENTER_US, and the first Odom_Update() puts the
+ *      trim back 10 ms later, as before. */
+#define ODOM_LAUNCH_KEEP_TRIM   1
+
 typedef struct
 {
     float x_mm;         /* forward from the start pose   */
@@ -444,6 +465,12 @@ void Odom_DriveArc(int16_t rpm, uint16_t servo_us, float radius_mm,
 /* Stops the robot, recentres the steering, disables heading hold. */
 void Odom_Stop(void);
 
+/* Odom_Stop() without the recentre: the servo stays where the move left it.
+ * For braking out of an arc - the robot is still coasting, and swinging the
+ * front wheels to centre under it steers the coast. The motion layer
+ * recentres once the wheels have stopped. */
+void Odom_StopHoldSteer(void);
+
 /* The servo pulse width the heading loop is currently commanding, in
  * microseconds. Equals SERVO_CENTER_US when the robot is on course.
  * Exposed for tuning - put it on the OLED. */
@@ -482,6 +509,34 @@ void Odom_LearnTrim(void);
  * that silently taught nothing can otherwise be saved into a calibration
  * profile as though it had been measured. */
 uint8_t Odom_TrimWasUpdated(void);
+
+/* ---------------------------------------------------------------------------
+ * Protocol 10 - the calibration table (caltab.h) and the move report.
+ *
+ * Odom_SetTrimOverride: the trim a straight drives on, when the table has one
+ * for its direction and speed (on = 1); on = 0 goes back to the learned /
+ * restored trim above. Set by the motion layer when each straight is queued.
+ * Odom_LearnTrim() still only ever moves the learned trim.
+ *
+ * Odom_GetMeanCorrection / Odom_GetMaxHeadingError: what this straight's
+ * steering loop had to do, past the warm-up - read before Odom_LearnTrim()
+ * clears it.
+ *
+ * Odom_SetWheelRatio: right (B) / left (A) ground travel per encoder count.
+ * Two tyres a fraction of a millimetre apart in diameter cover different
+ * ground at the same count rate, so the speed loop - which holds the COUNT
+ * rates equal - drives the robot in a gentle curve and the steering has to
+ * hold it straight against its own rear axle. With the ratio known, B's
+ * counts are scaled into ground in the odometry and B's speed target is
+ * divided by it, so both wheels cover the same ground. 0.9..1.1, else
+ * refused. 1.0 at power-on.
+ * ------------------------------------------------------------------------- */
+void    Odom_SetTrimOverride(uint8_t on, float us);
+float   Odom_GetEffectiveTrim(void);
+float   Odom_GetMeanCorrection(void);
+float   Odom_GetMaxHeadingError(void);
+uint8_t Odom_SetWheelRatio(float r);
+float   Odom_GetWheelRatio(void);
 
 /* ------------------------------------------------------------------ */
 /* Calibration helper                                                  */

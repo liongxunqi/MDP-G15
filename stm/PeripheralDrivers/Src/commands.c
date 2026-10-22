@@ -13,6 +13,8 @@
   */
 
 #include "commands.h"
+#include "ir.h"          /* IR_MIN_VALID_CM / IR_MAX_VALID_CM for !IRE */
+#include "caltab.h"      /* !K / ?K keys */
 #include <string.h>
 
 /* Circular queue. Head is the next slot to pop, count is what is in it. */
@@ -68,6 +70,12 @@ static uint8_t parse_uint(const char *s, int16_t *out)
     uint32_t v = 0U;
     uint8_t  n = 0U;
 
+    /* No leading zeros: "0" is a number, "00" and "050" are not. No sender
+     * writes them, and one byte lost off "F100" leaves "F00" - which would
+     * otherwise parse as F0, drive-until-obstacle, and run the robot on to
+     * the next wall. Refused, it costs a RESEND and the sender retries. */
+    if ((s[0] == '0') && (s[1] != '\0')) { return 0U; }
+
     while (s[n] != '\0')
     {
         if ((s[n] < '0') || (s[n] > '9')) { return 0U; }
@@ -115,7 +123,7 @@ uint8_t Cmd_IsImmediate(CmdOpcode_t op)
      * silently handed to the movement parser instead. Append new ones before
      * this endpoint and move the endpoint with them. */
     return (((op >= CMD_Q_US)  && (op <= CMD_SET_CAL_TRIM)) ||
-            ((op >= CMD_Q_HDG) && (op <= CMD_Q_WPOSE))) ? 1U : 0U;
+            ((op >= CMD_Q_HDG) && (op <= CMD_T2_LATERAL))) ? 1U : 0U;
 }
 
 Command_t Cmd_ParseToken(const char *token)
@@ -125,8 +133,12 @@ Command_t Cmd_ParseToken(const char *token)
     int16_t     arg = 0;
     CmdOpcode_t op  = CMD_INVALID;
 
-    cmd.op  = CMD_INVALID;
-    cmd.arg = 0;
+    cmd.op      = CMD_INVALID;
+    cmd.arg     = 0;
+    cmd.speed   = 0U;
+    cmd.kmove   = 0U;
+    cmd.kanchor = 0U;
+    cmd.kfield  = 0U;
 
     if ((token == 0) || (token[0] == '\0')) { return cmd; }
 
@@ -140,8 +152,11 @@ Command_t Cmd_ParseToken(const char *token)
         if (token_is(token, "?us"))   { cmd.op = CMD_Q_US;   }
         else if (token_is(token, "?ir"))   { cmd.op = CMD_Q_IR;   }
         else if (token_is(token, "?irr"))  { cmd.op = CMD_Q_IRR;  }
+        else if (token_is(token, "?irw"))  { cmd.op = CMD_Q_IRW;  }
+        else if (token_is(token, "?ire"))  { cmd.op = CMD_Q_IRE;  }
         else if (token_is(token, "?pose")) { cmd.op = CMD_Q_POSE; }
         else if (token_is(token, "?wpose")) { cmd.op = CMD_Q_WPOSE; }
+        else if (token_is(token, "?enc"))  { cmd.op = CMD_Q_ENC;  }
         else if (token_is(token, "?dist")) { cmd.op = CMD_Q_DIST; }
         else if (token_is(token, "?turn")) { cmd.op = CMD_Q_TURN; }
         else if (token_is(token, "?stat")) { cmd.op = CMD_Q_STAT; }
@@ -150,6 +165,39 @@ Command_t Cmd_ParseToken(const char *token)
         else if (token_is(token, "?ver"))  { cmd.op = CMD_Q_VER;  }
         else if (token_is(token, "?cal"))  { cmd.op = CMD_Q_CAL;  }
         else if (token_is(token, "?hdg"))  { cmd.op = CMD_Q_HDG;  }
+        else if (token_is(token, "?mv"))   { cmd.op = CMD_Q_MV;   }
+        else if (token_is(token, "?kg"))
+        {
+            cmd.op    = CMD_Q_K;
+            cmd.kmove = (uint8_t)CT_GLOBAL;
+        }
+        else if ((n = token_starts(token, "?k")) != 0U)
+        {
+            /* ?K<move><anchor>: reuse the key parser on "<move><anchor>.rpm"
+             * so the move names are spelled in one place only. */
+            char    key[8];
+            uint8_t len = 0U;
+            uint8_t f;
+
+            while ((token[n + len] != '\0') && (len < 3U))
+            {
+                key[len] = token[n + len];
+                len++;
+            }
+            if (token[n + len] != '\0') { return cmd; }
+            key[len++] = '.';
+            key[len++] = 'r';
+            key[len++] = 'p';
+            key[len++] = 'm';
+            key[len]   = '\0';
+            if ((len < 6U) ||
+                (CalTab_ParseKey(key, &cmd.kmove, &cmd.kanchor, &f) != len) ||
+                (cmd.kmove == (uint8_t)CT_GLOBAL))
+            {
+                return cmd;
+            }
+            cmd.op = CMD_Q_K;
+        }
         return cmd;
     }
 
@@ -157,10 +205,29 @@ Command_t Cmd_ParseToken(const char *token)
     {
         if (token_is(token, "!zero")) { cmd.op = CMD_SET_ZERO; return cmd; }
 
+        /* Protocol 10, the calibration table: !K<move><anchor>.<field>=<n>,
+         * !KG.<field>=<n>, !KCLR. Tested before every other "!k..." could
+         * exist, and "!kclr" before the key parser, which would refuse it
+         * anyway ("clr" is not a move). */
+        if (token_is(token, "!kclr")) { cmd.op = CMD_SET_K_CLR; return cmd; }
+        if ((n = token_starts(token, "!k")) != 0U)
+        {
+            uint8_t used = CalTab_ParseKey(&token[n], &cmd.kmove,
+                                           &cmd.kanchor, &cmd.kfield);
+
+            if (used == 0U)                       { return cmd; }
+            n = (uint8_t)(n + used);
+            if (token[n] != '=')                  { return cmd; }
+            if (!parse_int(&token[n + 1U], &arg)) { return cmd; }
+            cmd.op  = CMD_SET_K;
+            cmd.arg = arg;
+            return cmd;
+        }
+
         if ((n = token_starts(token, "!prof")) != 0U)
         {
             if (!parse_uint(&token[n], &arg)) { return cmd; }
-            if (arg > 2)                      { return cmd; }
+            if (arg > 3)                      { return cmd; }
             cmd.op  = CMD_SET_PROFILE;
             cmd.arg = arg;
             return cmd;
@@ -221,6 +288,79 @@ Command_t Cmd_ParseToken(const char *token)
             return cmd;
         }
 
+        /* !IRE<n>: 0 disarms; otherwise n = side * 10000 + lo * 100 + hi,
+         * side 1 left / 2 right, lo..hi in cm inside the IR's valid span.
+         * One packed number because Command_t carries one argument, and one
+         * setter means one round trip before the move. Anything that does
+         * not decode is a parse failure, like every other setter. */
+        if ((n = token_starts(token, "!ire")) != 0U)
+        {
+            int16_t side, lo, hi;
+
+            if (!parse_uint(&token[n], &arg)) { return cmd; }
+            if (arg != 0)
+            {
+                side = (int16_t)(arg / 10000);
+                lo   = (int16_t)((arg / 100) % 100);
+                hi   = (int16_t)(arg % 100);
+                if ((side < 1) || (side > 2))               { return cmd; }
+                if ((lo < (int16_t)IR_MIN_VALID_CM) || (hi > (int16_t)IR_MAX_VALID_CM)
+                    || (lo > hi))                           { return cmd; }
+            }
+            cmd.op  = CMD_SET_IR_EDGE;
+            cmd.arg = arg;
+            return cmd;
+        }
+
+        /* Task 2 on the STM, protocol 11 (task2fw.h). "!t2go" before
+         * "!t2a"/"!t2y" only for readability - they differ at the fourth
+         * character. */
+        if ((n = token_starts(token, "!t2go")) != 0U)
+        {
+            if (!parse_uint(&token[n], &arg))     { return cmd; }
+            if ((arg < 1) || (arg > 180))         { return cmd; }
+            cmd.op  = CMD_T2_GO;
+            cmd.arg = arg;
+            return cmd;
+        }
+
+        if ((n = token_starts(token, "!t2a")) != 0U)
+        {
+            /* exactly two digits: obstacle 1|2, arrow 0|1 */
+            if ((token[n] != '1') && (token[n] != '2'))         { return cmd; }
+            if ((token[n + 1U] != '0') && (token[n + 1U] != '1')) { return cmd; }
+            if (token[n + 2U] != '\0')                          { return cmd; }
+            cmd.op  = CMD_T2_ARROW;
+            cmd.arg = (int16_t)((token[n] - '0') * 10 + (token[n + 1U] - '0'));
+            return cmd;
+        }
+
+        if ((n = token_starts(token, "!t2y")) != 0U)
+        {
+            /* obstacle 1|2 then exactly three digits, mm + 500 */
+            uint8_t k;
+
+            if ((token[n] != '1') && (token[n] != '2')) { return cmd; }
+            for (k = 1U; k <= 3U; k++)
+            {
+                if ((token[n + k] < '0') || (token[n + k] > '9')) { return cmd; }
+            }
+            if (token[n + 4U] != '\0') { return cmd; }
+            cmd.op  = CMD_T2_LATERAL;
+            cmd.arg = (int16_t)((token[n] - '0') * 1000 + (token[n + 1U] - '0') * 100 +
+                                (token[n + 2U] - '0') * 10 + (token[n + 3U] - '0'));
+            return cmd;
+        }
+
+        if ((n = token_starts(token, "!fast")) != 0U)
+        {
+            if (!parse_uint(&token[n], &arg)) { return cmd; }
+            if (arg > 1)                      { return cmd; }
+            cmd.op  = CMD_SET_FAST;
+            cmd.arg = arg;
+            return cmd;
+        }
+
         if ((n = token_starts(token, "!calt")) != 0U)
         {
             if (!parse_int(&token[n], &arg)) { return cmd; }
@@ -248,7 +388,48 @@ Command_t Cmd_ParseToken(const char *token)
     else if ((n = token_starts(token, "r"))  != 0U) { op = CMD_REVERSE;       }
     else                                            { return cmd; }
 
-    if (!parse_uint(&token[n], &arg)) { return cmd; }
+    /* Protocol 10: an optional V<n> suffix (PER-MOVE SPEED in commands.h).
+     * Cut off the end before the argument is parsed, so the argument keeps
+     * exactly its protocol 9 rules - "f120v20" parses 120 the way "f120"
+     * always has. */
+    {
+        char    num[8];
+        uint8_t len = 0U;
+        int16_t v   = 0;
+
+        while ((token[n + len] >= '0') && (token[n + len] <= '9'))
+        {
+            if (len >= (sizeof(num) - 1U)) { return cmd; }
+            num[len] = token[n + len];
+            len++;
+        }
+        num[len] = '\0';
+
+        if (token[n + len] == 'v')
+        {
+            uint8_t arc = ((op == CMD_ARC_FWD_RIGHT) || (op == CMD_ARC_FWD_LEFT) ||
+                           (op == CMD_ARC_REV_RIGHT) || (op == CMD_ARC_REV_LEFT))
+                        ? 1U : 0U;
+
+            if (!parse_uint(&token[n + len + 1U], &v)) { return cmd; }
+            if (arc ? ((v < CMD_V_MIN_ARC) || (v > CMD_V_MAX_ARC))
+                    : ((v < CMD_V_MIN_STRAIGHT) || (v > CMD_V_MAX_STRAIGHT)))
+            {
+                return cmd;
+            }
+            /* FU ends on the ultrasound and F0 on an obstacle: neither has
+             * a cruise worth choosing. */
+            if (op == CMD_FWD_UNTIL_US) { return cmd; }
+        }
+        else if (token[n + len] != '\0')
+        {
+            return cmd;
+        }
+
+        if (!parse_uint(num, &arg)) { return cmd; }
+        if ((v != 0) && (op == CMD_FORWARD) && (arg == 0)) { return cmd; }
+        cmd.speed = (uint8_t)v;
+    }
 
     /* A zero-degree arc is not a manoeuvre. F0 IS meaningful - it is
      * "forward until an obstacle stops you" - and R0 is not, so only F is
@@ -316,6 +497,10 @@ uint8_t Cmd_ParseLine(const char *line)
                  * ever reaches here. */
                 if (Cmd_IsImmediate(staged[nstaged].op)) { return 0U; }
 
+                /* The Task 2 course owns the robot and the line until it
+                 * ends: alone on its line or not at all. */
+                if (staged[nstaged].op == CMD_T2_GO) { return 0U; }
+
                 nstaged++;
                 tlen = 0U;
             }
@@ -371,8 +556,12 @@ Command_t Cmd_QueuePop(void)
 
     if (s_count == 0U)
     {
-        out.op  = CMD_NONE;
-        out.arg = 0;
+        out.op      = CMD_NONE;
+        out.arg     = 0;
+        out.speed   = 0U;
+        out.kmove   = 0U;
+        out.kanchor = 0U;
+        out.kfield  = 0U;
         return out;
     }
 

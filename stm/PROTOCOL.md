@@ -80,6 +80,7 @@ answered `RESEND`.
 | `RESEND` | Parse failure. **Nothing executed** — safe to retransmit verbatim |
 | `FAIL,TIMEOUT` | Watchdog fired mid-move. Wheel stalled or encoder dead |
 | `FAIL,WRONGWAY` | Arc rotated away from its target and was aborted |
+| `FAIL,SHORT` | Arc finished more than 10° from its aim (braked early off a wheel surge, or stopped) - **v7** |
 | `FAIL,NOECHO` | `FU<n>` had no usable ultrasound reading. **The robot did not move** |
 | `<TAG>,<fields>` | Answer to a query — see §5 |
 
@@ -110,7 +111,7 @@ Queued and executed in order. The reply comes when the **last** one finishes.
 | `RR<n>` | degrees | Arc reverse-right |
 | `RL<n>` | degrees | Arc reverse-left |
 | `S` | — | Stop: brake, recentre steering. Replies `OK` |
-| `RST` | — | Emergency abort: drop queue, brake now. **No reply** |
+| `RST` | — | Emergency abort: drop queue, brake now and hold the brake until the next move (it used to release the wheels at once, so the robot rolled on). **No reply** |
 
 Example: `FR90,F20,S\n` → arc right 90°, forward 20 cm, stop → one `OK`.
 
@@ -196,6 +197,8 @@ line; there is no separate `OK`.
 | `?US` | `US,<cm>` | Front distance. `65535` = no reading |
 | `?IR` | `IR,<left_cm>,<right_cm>` | `65535` = out of range |
 | `?IRR` | `IRR,<left>,<right>` | Raw filtered counts, 0–4095 |
+| `?IRW` | `IRW,<l_cm>,<r_cm>,<l_raw>,<r_raw>,<x_mm>,<y_mm>,<hdg_x10>,<ms>` | Both IRs, their raw counts and the `?WPOSE` pose from **one** control tick, plus its `HAL_GetTick()`. A `65535` with **high** raw counts is closer than 10 cm, not clear. **v9** |
+| `?IRE` | `IRE,<state>,<side>,<cm>,<raw>,<x_mm>,<y_mm>,<hdg_x10>,<ms>` | IR edge latch: state 0 off, 1 armed, 2 latched; side 1 left, 2 right. Latched fields are the first tick of the confirming run, else 0. **v9** |
 | `?POSE` | `POSE,<x_mm>,<y_mm>,<hdg_x10>` | Since the last `!ZERO` or move start |
 | `?WPOSE` | `WPOSE,<x_mm>,<y_mm>,<hdg_x10>` | Continuous since boot; unaffected by move starts, FU passes or `!ZERO`. See §12 |
 | `?DIST` | `DIST,<mm>` | Travelled in the current or last move |
@@ -212,7 +215,8 @@ All values are **integers**. Anything needing a decimal is scaled ×10 — so
 **`?STAT` fields:** `state` is `0` IDLE, `1` ALIGN, `2` RUN, `3` BRAKE,
 `4` DONE, `5` TIMEOUT. `busy` is 1 **while the line you sent is unfinished** —
 not merely while the motors are turning. `imu_ok` is 1 while the gyro is
-healthy. `profile` is the active arc profile, 0–2.
+healthy. `profile` is the active arc profile: 0 TIGHT, 3 SAFE (a SAFE build
+reports 3 after `!PROF0` too).
 
 > `busy` changed meaning in version 3. It used to track the motion layer
 > alone, which was indistinguishable from the line for ordinary movement. It
@@ -224,7 +228,10 @@ healthy. `profile` is the active arc profile, 0–2.
 
 **`?IMU` is the health check.** `ok` 0 means the gyro has gone stale and
 heading has fallen back to the encoder difference, which is much less
-accurate. `stalls` counts how many times that has happened. `peak` is the
+accurate. `stalls` counts how many times that has happened. The firmware
+recovers the I2C bus and re-arms the gyro by itself once the robot has stood
+still for ~0.5 s (~3 s if its bias was never measured), so `ok` 0 at rest is
+usually temporary; one that stays 0 is a wiring or sensor fault. `peak` is the
 largest raw sample seen — anything approaching **32767** means the gyro is
 clipping and every angle is being under-reported. Normal is 4000–5000.
 
@@ -243,13 +250,15 @@ arc. Reads all zeros when the check did not run.
 | `!PROF0` | Arc profile **TIGHT** — radius 291 mm, fastest | `OK` |
 | `!PROF1` | Arc profile CLEAN — radius 318 mm. **Locked out (v4)** | `RESEND` |
 | `!PROF2` | Arc profile SLOW — radius 306 mm. **Locked out (v4)** | `RESEND` |
+| `!PROF3` | Arc profile **SAFE** — TIGHT's steering at 120 rpm instead of 150. Radius not yet measured | `OK` (`RESEND` on firmware before SAFE) |
 | `!ZERO` | Zero the odometry and heading, **and the heading carry-over** (§7.1) | `OK` |
 | `!LEARN1` / `!LEARN0` | Switch the calibration learners on / off (§7.1) | `OK` |
 
-**Protocol 4 is locked to TIGHT** (`MOTION_PROFILE_LOCK_TIGHT` in `motion.h`).
-The planner radius, the A5 orbit and the saved calibration all assume it, and
-the braking model is one set of numbers that only fits the profile it was
-measured on. Turning the lock off restores CLEAN and SLOW.
+**Locked to TIGHT and SAFE** (`MOTION_PROFILE_LOCK` in `motion.h`). The
+braking model, steering and radius are one set of numbers that only fits the
+profile it was measured on, so each of the two has its own saved calibration;
+the RPi records which profile a calibration was taken on and selects it before
+restoring. Turning the lock off restores CLEAN and SLOW.
 
 **Send `!ZERO` after anything moves the robot by hand.** The gyro sees the
 rotation, and without a zero the next move would steer it straight back.
@@ -367,8 +376,11 @@ exactly what was restored — nothing a task does can change it.
 |---|---|---|
 | `!CALG<n>` | Gyro scale, **×10000**, 9000..11000 (0.90..1.10). Same busy/range rules as §7 | `OK` / `RESEND` |
 | `!CALSL<n>` / `!CALSR<n>` | Left / right arc deflection from centre, **µs**. Left 300..574, right 300..626 (servo limits). **v5** | `OK` / `RESEND` |
-| `?CAL` | now `CAL,<decel_x10>,<lag_ms_x10>,<trim_us>,<gyro_x10000>,<learn>,<steer_left_us>,<steer_right_us>` (last two v5) | |
+| `?CAL` | now `CAL,<decel_x10>,<lag_ms_x10>,<trim_us>,<gyro_x10000>,<learn>,<steer_left_us>,<steer_right_us>,<last_decel_x10>` (steering v5; `last_decel_x10` v6: the last arc's raw decel measurement, 0 if it gave none) | |
 | `?HDG` | `HDG,<commanded_x10>,<actual_x10>,<last_aim_x10>,<last_turned_x10>,<capped>` | |
+| `?ENC` | `ENC,<counts_a>,<counts_b>` cumulative per-wheel encoder counts since boot; only differences mean anything. **v7** | |
+| `!IRE<n>` | Arm the IR edge latch: `n = side*10000 + lo*100 + hi` (side 1 left / 2 right, 10 ≤ lo ≤ hi ≤ 80 cm), e.g. `!IRE11227` = left, 12..27 cm. `!IRE0` disarms. While a primitive runs, the first 3 consecutive ticks in the window latch that side's reading and the pose of the first of them; the move carries on. Arming clears the old latch. Plain `OK` on the movement path - send it before the line it watches. **v9** | `OK` / `RESEND` |
+| `!FAST1` / `!FAST0` | Fast mode on/off: straights ramp up to 200 rpm (not 100), ramp down to the usual 40 rpm approach, and every move settles 200 ms after braking (not 400); heading-hold gains scale down with speed above 100 rpm. Off at power-on; arcs unchanged. Plain `OK` on the movement path, like `!LEARN`. **v8** | `OK` |
 
 **`?WPOSE`, the continuous pose** - the same increments as `?POSE`, never
 reset. Frame, Task 1 usage and host test: §12.
@@ -402,7 +414,8 @@ From `?HDG`: `commanded - actual` is the error the next move will correct;
 `last_turned - last_aim` is how precisely the last arc stopped.
 
 **Task startup** (`communications/cal_profile.py: prepare_for_task`):
-`!LEARN0`, `!PROF0`, restore the four values from the named profile and read
+`!LEARN0`, `!PROF<n>` for the profile the calibration was taken on (0 TIGHT,
+3 SAFE; older saves are TIGHT), restore the values from it and read
 them back, then `!ZERO` at the start pose.
 
 ---
@@ -545,7 +558,7 @@ These coordinates are dead reckoning and can drift. They are not planner poses
 or external localization. Keep the same physical pose reference when placing
 the robot at the start; firmware integrates displacement at the rear axle.
 
-The checked-in STM source is protocol 5 and includes `?WPOSE` alongside the
+The checked-in STM source is protocol 7 (v5, plus the raw decel field in `?CAL` in v6 and `?ENC` in v7) and includes `?WPOSE` alongside the
 frozen calibration, per-side steering and gyro bias fix (§7.1). A protocol 5
 board flashed before `?WPOSE` was added answers `RESEND`, and Task 1 stops
 before its first movement - reflash from this tree. Task 1 probes WPOSE
@@ -559,4 +572,181 @@ cc -Istm/tests -Istm/PeripheralDrivers/Inc stm/tests/test_world_pose.c \
   -lm -o /tmp/mdp-test-world-pose
 /tmp/mdp-test-world-pose
 python3 -B -m unittest rpi/mdp_rpi/test_instruction_mission.py -v
+```
+
+## 14. Task 2 on the STM (protocol 11)
+
+The whole Task 2 course runs on the STM: approach obstacle 1, the S past it,
+the turn round obstacle 2 on the side IR, home and into the carpark on the
+ultrasonic. The Pi only starts it and answers the arrows. Ported from the
+MDP_WORKING_2 firmware, whose car ran this course end to end
+(`task2_mission.c`); the robot side is `task2fw.c`, the constants
+`task2_params.h`, the Pi side `rpi/mdp_rpi/task2fw.py`.
+
+**Every move the course makes is an ordinary `Motion_DriveDistanceV` /
+`Motion_DriveArcV`**, so it runs on the calibration table (protocol 10)
+exactly like `F` / `FR` / `FL` sent over the wire. Restore it first
+(`cal_profile.prepare_for_task`). The course plans every turn on the table's
+`radius` for FL / FR at the arc speed, or 30.0 cm if the table has none, and
+does not re-measure it during the run.
+
+| Direction | Line | Meaning |
+|---|---|---|
+| RPi → STM | `!T2GO<s>` | Run the course, s = mission seconds 1..180. **Alone on its line**, refused with `RESEND` while anything else is running. One reply when it ends |
+| STM → RPi | `P,<n>` | Photograph obstacle n (1 or 2). Sent before the robot drives up to it, repeated every 1.5 s until answered |
+| RPi → STM | `!T2A<n><d>` | Obstacle n's arrow, d `0` left / `1` right. **No reply.** Send it again if the prompt repeats |
+| RPi → STM | `!T2Y<n><ddd>` | Optional: where that arrow sat sideways in the photo, ddd − 500 mm from the camera's centre line, left positive (`!T2Y1580` = 8 cm left). Before its `!T2A`. No reply |
+| STM → RPi | `D,<step>,...` | The run log, one line per decision, ending `x,y,heading` in cm / degrees from the start pose |
+| RPi → STM | `RST` | Abort: brake now. The `!T2GO` line then replies `FAIL,STOP` |
+
+Replies to `!T2GO`:
+
+| Reply | Meaning |
+|---|---|
+| `OK` | Parked |
+| `FAIL,STOP` | `RST`, or a long press on the board |
+| `FAIL,DEADLINE` | The `<s>` seconds ran out - the STM stops on its own, whatever the Pi is doing |
+| `FAIL,NOARROW` | No `!T2A` for a prompted obstacle within 20 s. **The STM never guesses** |
+| `FAIL,NOECHO` | No usable ultrasonic reading for an approach |
+| `FAIL,NOEDGE` | Drove 200 cm along obstacle 2 without the side IR finding its end |
+| `FAIL,GYRO` | The gyro was not ready, or went stale mid-run |
+| `FAIL,TIMEOUT` / `WRONGWAY` / `SHORT` | A move failed, as for a movement line (§3) |
+
+While the course runs, **queries are still answered** (`?US`, `?WPOSE`, ...);
+`!` setters and movement lines get `RESEND` - nothing else moves the robot,
+and nothing changes its calibration between two of the course's moves.
+
+`!T2A` / `!T2Y` outside a run answer `RESEND`. Without `!T2GO` nothing else in
+the protocol changes.
+
+The arrow names its obstacle so a late repeat for obstacle 1 can never be
+read as obstacle 2's.
+
+### Side IRs: obstacle 2 and the carpark
+
+The side IRs are used the way the RPi's Task 2 uses them (`task2mn_park.py`,
+`task2mn_gordon.py`), with their constants in `task2_params.h`:
+
+- **Per-side ranges.** A reading counts only inside 10..65 cm on the left and
+  10..50 cm on the right (the right unit is the weaker one). A no-reading
+  with a high raw count is "closer than 10 cm", never "clear".
+- **Obstacle 2's end and width (Gordon's face scan).** The leg along
+  obstacle 2's face ends where the side IR loses it; that point, moved back
+  `T2_IR_LAG_CM` for the sensor's lag and forward to the lens, is obstacle
+  2's near end (`D,end2_y`). Mirrored about obstacle 1's line it gives the
+  far end and the width (`D,width2`; `D,walls` is where the arena walls must
+  be at least). With the ends known, the leg behind obstacle 2 stops past
+  the far end even if the IR never sees the back face (`D,back_capped`, no
+  `FAIL,NOEDGE`), and the way home keeps clear of obstacle 2 as well as
+  obstacle 1, driving on along the leg first if the turn home would clip
+  its end (`D,home_clear2`).
+- **Lining up on the carpark (`D,line_up`).** The way home must reach the
+  carpark's line (`bay_y`) facing in, within 5 cm on the odometry, before it
+  drives in. If no S fits from where the car is, the entry goes deeper (to
+  35 cm) and the car moves along the lane first, up to 40 cm either way, on
+  past obstacle 1 or back for room (`D,line_shift`; `D,line_ms` is how long
+  the search took). A plan with a straight over 60 cm stops 30 cm short and
+  plans the rest again (`D,line_leg`), because the straights home drift 2-3°.
+  Still off after every try (`D,line_off`, ×10 mm) by more than the car fits
+  between the fences with 3 cm to spare, it stays outside and the reply is
+  `FAIL,STOP`. On the floor (2026-09-14 14:39) the S no longer fitted after
+  that drift (`D,plan_loop,357`) and the car drove in from 51 cm off the line,
+  past the carpark.
+- **Parking: in on the ultrasonic to 10 cm.** One straight in until the
+  ultrasonic reads `T2_PARK_US_CM` (10), then a look and a nudge more while it
+  is over 3 cm short. No centring: lined up within 5 cm, the car has ~15 cm
+  each side. A reading past the deepest the back wall can be (the mouth, or
+  the start nose, + 50 cm + 10) is not the back wall, and the car goes only
+  that far (`D,park_far`). `D,bay` is the mouth's x from the first reading,
+  and `D,parked_off` is the offset from the fences when it stopped.
+- **Side-safety stop.** The drive in stops if either side IR reads under
+  10 cm (`D,side_stop`). Then, and only then, one lane change off that fence
+  (`D,centre_back` if it backs out for room, `D,centre`), and on in.
+- **No IR shortcut at obstacle 2.** The 90 away from obstacle 2 is always
+  finished; the face scan, with the IR square on to the face, decides where
+  the end is. The original cut the 90 short when the IR read clear part-way
+  round (`T2_WATCH_CUT 1` brings it back): on the floor (2026-09-14 13:22)
+  the right IR read the black face as clear 21° off square from ~14 cm, the
+  course took obstacle 2 for short, and its turn back (`D,cut_blind`, a 161°
+  right) drove through it. A face scan that starts already past the end
+  drives `T2_PAST_RUN_CM` on before the 180 (the end may be right at the
+  lens), and one whose lens is further from the face than the IR reaches
+  (`D,past_unsure`) goes on past the widest obstacle 2 there can be (90 cm).
+
+- **Obstacle 2's ends, both ways.** A face scan that starts already past the
+  end backs up along the face until the IR sees it (`D,seek_back`,
+  `ir_seen_back`), so the end is read rather than assumed; the leg behind
+  obstacle 2 reads the far end the same way. Each end read updates the span
+  (`D,width2`) and where the walls can be (`D,wall_lo` / `D,wall_hi`).
+- **Not everything the IR sees is obstacle 2.** An end read further than
+  80 cm (+8) out from obstacle 1's line is something else - a wall, a box -
+  and is rejected (`D,end_reject`); the robot then backs up along the face,
+  past it, to the real end. Squared up off the line with the ultrasound
+  straight ahead hearing nothing at obstacle 2's face (`peek_wins`), the end
+  on that side is bounded inward of the car (`D,end_bound`): an IR end beyond
+  it is rejected too, and a face scan that would start already past it is
+  skipped (`D,past_bound`). On the floor (2026-09-14 14:28) a box 50 cm past
+  obstacle 2 was taken for its end and rounded instead.
+- **The arena walls**, which can stand as near as 50 cm past either end of
+  obstacle 2. Until an end is read the wall is taken where the narrowest
+  obstacle 2 would put it. The 180 round the end starts with the axle
+  `T2_TURN_AXLE_SHORT_CM` short of the read end and moves up to 20 cm sooner
+  if the wall needs it (`D,wall_180`); the turn home moves along the leg, up
+  to 30 cm either way, to clear both obstacle 2's end and the wall
+  (`D,home_shift`); every route home is checked against the walls.
+  `D,wall_tight` means nothing fitted and the turn went ahead as planned.
+- **The carpark from its fences.** Before moving, the side IRs place the
+  carpark's centreline (`D,bay_y`, ×10 mm); on the way out the first side IR
+  to lose its fence marks the mouth (`D,mouth`). The way home aims at that
+  centreline, straightens up with the nose 6 cm outside the mouth, and keeps
+  off the fences' ends.
+
+### Before a floor run
+
+The course logic was proven in the original car's simulator and, re-derived
+for this robot, in `stm/tests/test_task2_mission.c`: 1677 of 1728 arena
+layouts with the planned 30 cm radius off by up to ±2 cm (6 collisions, the
+rest swinging further than 90 cm past obstacle 2's end - see below), all 16
+starts 5-8 cm off the bay's centreline parked clear of both fences, and with the
+robot at the back of the carpark, obstacle 1 34 cm past the mouth and gaps of
+56-105 cm (`-DSTART_TAIL_CM=2`), 132 of 144 with no collision - the same with
+an IR blind to black more than 15° off square (`-DIR_OBLIQUE_DEG=15`), which
+the old shortcut drops to 54. With the walls 50 cm past obstacle 2 it now
+completes 1650 of 1728, every finished course parked clear of the fences with
+the ultrasonic within 0.5 cm of 10. `-DDRIFT_DEG_PER_M=5` (or `-5`) makes every
+straight facing home wander off its heading the way the floor runs did; with
+it, every finished course still parks inside the carpark (1583 of 1728 from the
+back; the misses are walls or obstacles hit on the long lane straight, not the
+carpark). Measure on this robot, then update
+`task2_params.h` and re-run that test:
+
+0. **The arena walls.** In the simulator the robot swings up to ~96 cm past
+   obstacle 2's end (shortest obstacle 2, the same arrow twice, squared up
+   off the line). If the walls are closer than that, it needs a tighter round
+   for that case.
+
+1. **The turn radius** on the arc profile and speed Task 2 uses (SAFE),
+   per side - `calibrate.py radius`, stored as the table's FL / FR radius.
+2. **How far the side IR sees obstacle 2** (it is black), square on: the
+   course wants a reading of `T2_IR_SEEN_CM` (32) or less from ~32 cm. If it
+   only sees to 28 cm the simulator completes 1497 of 1728 (`-DIR_SEE_CM=28`),
+   at 20 cm under half - the most sensitive number on the robot.
+3. **The carpark** (`T2_BAY_DEPTH_CM` 50, `T2_BAY_HALF_CM` 30) and the left -
+   right IR bias with the robot centred in it by hand (`T2_IR_LR_BIAS_CM`).
+   And where the ultrasonic reads 10 cm: the nose that close to the back wall
+   must leave the tail inside the mouth (`T2_PARK_US_CM`).
+4. **How far a deliberate stop rolls** after `Motion_Stop()` at
+   `T2_EDGE_RPM` and at arc speed - the simulator's `EDGE_OVERRUN_CM` /
+   `WATCH_OVERRUN_DEG` / `GUARD_OVERRUN_CM` / `SIDE_OVERRUN_CM`, and the IR
+   lag (`T2_IR_LAG_CM`, 2 cm, not measured).
+5. The car's real outline (`T2_NOSE_*`, `T2_HALF_WIDTH_CM`).
+
+Host test (no hardware; any C compiler, the RPi included):
+
+```sh
+cc -std=c11 -O2 -Wall -Wextra -Istm/tests -Istm/PeripheralDrivers/Inc \
+  stm/tests/test_task2_mission.c stm/PeripheralDrivers/Src/task2_mission.c \
+  stm/PeripheralDrivers/Src/commands.c stm/PeripheralDrivers/Src/caltab.c \
+  -lm -o /tmp/test_task2_mission && /tmp/test_task2_mission
+python3 -B -m unittest rpi/mdp_rpi/test_task2fw.py -v
 ```

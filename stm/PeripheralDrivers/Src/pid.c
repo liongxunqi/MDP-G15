@@ -29,19 +29,38 @@ static float clampf(float v, float lo, float hi)
  * correct the error in the fit rather than discover the whole operating
  * point from zero, which is the difference between settling in a tenth of a
  * second and taking two seconds with a big overshoot on the way. */
-static float feedforward(float rpm, int16_t max_rpm)
+/* Protocol 10: each wheel's own line, per direction, when the calibration
+ * table has measured it (PID_SetMotorModel). A weak motor needs more duty for
+ * the same speed; seeding it with the strong one's line leaves its integrator
+ * to make up the difference on every launch, and the robot yaws off the line
+ * while it does. */
+static int16_t deadband_of(const PID_t *p)
 {
-    float span;
-    float mag = (rpm < 0.0f) ? -rpm : rpm;
+    return (p->deadband > 0) ? p->deadband : (int16_t)MOTOR_DEADBAND;
+}
+
+static float feedforward(const PID_t *p, float rpm)
+{
+    float   span;
+    float   mag = (rpm < 0.0f) ? -rpm : rpm;
+    int16_t max_rpm = (rpm < 0.0f) ? p->ff_rev : p->ff_fwd;
+    int16_t db = deadband_of(p);
+
+    if (max_rpm <= 0) { max_rpm = p->max_rpm; }
 
     if (mag < 1.0f || max_rpm <= 0)
     {
         return 0.0f;
     }
 
-    span = (float)(MOTOR_SPEED_MAX - MOTOR_DEADBAND);
+#if PID_LOW_DUTY
+    /* The running line, not the breakaway one - see PID_LOW_DUTY. */
+    db = (int16_t)(db - PID_RUN_DB_DROP);
+#endif
 
-    return (float)MOTOR_DEADBAND + (mag / (float)max_rpm) * span;
+    span = (float)(MOTOR_SPEED_MAX - db);
+
+    return (float)db + (mag / (float)max_rpm) * span;
 }
 
 /* Maps a signed controller output onto duty the motor can actually act on.
@@ -51,7 +70,7 @@ static float feedforward(float rpm, int16_t max_rpm)
  * climbing until the output finally clears the threshold and the wheel
  * lurches. So small outputs get pushed up to the deadband instead. Genuine
  * zero still means stop. */
-static int16_t apply_deadband(float out)
+static int16_t apply_deadband(float out, int16_t db, float measured_rpm)
 {
     float mag = (out < 0.0f) ? -out : out;
 
@@ -60,9 +79,29 @@ static int16_t apply_deadband(float out)
         return 0;
     }
 
-    if (mag < (float)MOTOR_DEADBAND)
+#if PID_LOW_DUTY
+    /* Already turning: kinetic friction, no breakaway needed. See
+     * PID_LOW_DUTY in pid.h. */
+    if ((measured_rpm >= (float)PID_MOVING_RPM) ||
+        (measured_rpm <= -(float)PID_MOVING_RPM))
     {
-        mag = (float)MOTOR_DEADBAND;
+        if (mag < (float)PID_ZERO_DUTY)
+        {
+            return 0;
+        }
+        if (mag > (float)MOTOR_SPEED_MAX)
+        {
+            mag = (float)MOTOR_SPEED_MAX;
+        }
+        return (out < 0.0f) ? (int16_t)(-mag) : (int16_t)mag;
+    }
+#else
+    (void)measured_rpm;
+#endif
+
+    if (mag < (float)db)
+    {
+        mag = (float)db;
     }
     else if (mag > (float)MOTOR_SPEED_MAX)
     {
@@ -94,13 +133,28 @@ static int16_t pid_step(PID_t *p, float measured_rpm)
 
     /* A target the wheel physically cannot hold. Stop cleanly rather than
      * chattering around a speed that is below the deadband. */
+#if PID_LOW_DUTY
+    if (mag_target < (float)PID_MIN_RPM_LOW)
+#else
     if (mag_target < (float)PID_MIN_RPM)
+#endif
     {
         pid_reset(p);
         return 0;
     }
 
     error = p->target_rpm - measured_rpm;
+
+    /* Overspeeding with the integral still pushing the same way it is
+     * already going too fast: drop the integral fast. See PID_UNWIND_FRAC.
+     * Works for reverse too - there the integral is negative and an
+     * overspeed makes the error positive. */
+    if ((((error < 0.0f) && (p->integral > 0.0f)) ||
+         ((error > 0.0f) && (p->integral < 0.0f))) &&
+        (((error < 0.0f) ? -error : error) > (PID_UNWIND_FRAC * mag_target)))
+    {
+        p->integral *= PID_UNWIND_KEEP;
+    }
 
     p_term = p->kp * error;
 
@@ -113,7 +167,7 @@ static int16_t pid_step(PID_t *p, float measured_rpm)
     d_term = p->kd * (error - p->last_error) / PID_DT_S;
     p->last_error = error;
 
-    ff = feedforward(p->target_rpm, p->max_rpm);
+    ff = feedforward(p, p->target_rpm);
     if (p->target_rpm < 0.0f)
     {
         ff = -ff;
@@ -137,7 +191,7 @@ static int16_t pid_step(PID_t *p, float measured_rpm)
         raw = -(float)MOTOR_SPEED_MAX;
     }
 
-    p->output = apply_deadband(raw);
+    p->output = apply_deadband(raw, deadband_of(p), measured_rpm);
 
     return p->output;
 }
@@ -152,6 +206,9 @@ void PID_Init(void)
     s_pidA.ki = PID_KI_DEFAULT;
     s_pidA.kd = PID_KD_DEFAULT;
     s_pidA.max_rpm = MOTOR_A_MAX_RPM;
+    s_pidA.ff_fwd  = 0;
+    s_pidA.ff_rev  = 0;
+    s_pidA.deadband = 0;
     s_pidA.enabled = 0U;
     pid_reset(&s_pidA);
 
@@ -159,6 +216,9 @@ void PID_Init(void)
     s_pidB.ki = PID_KI_DEFAULT;
     s_pidB.kd = PID_KD_DEFAULT;
     s_pidB.max_rpm = MOTOR_B_MAX_RPM;
+    s_pidB.ff_fwd  = 0;
+    s_pidB.ff_rev  = 0;
+    s_pidB.deadband = 0;
     s_pidB.enabled = 0U;
     pid_reset(&s_pidB);
 
@@ -261,4 +321,14 @@ void PID_SetGains(float kp, float ki, float kd)
      * I changed a gain". */
     s_pidA.integral = 0.0f;
     s_pidB.integral = 0.0f;
+}
+
+void PID_SetMotorModel(uint8_t wheel_b, int16_t ff_fwd, int16_t ff_rev,
+                       int16_t deadband)
+{
+    PID_t *p = wheel_b ? &s_pidB : &s_pidA;
+
+    p->ff_fwd   = ff_fwd;
+    p->ff_rev   = ff_rev;
+    p->deadband = deadband;
 }

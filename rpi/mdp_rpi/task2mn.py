@@ -1,0 +1,543 @@
+"""
+task2mn.py - Mahan's Task 2: Android BEGIN, TIGHT route, PC arrows, parking.
+
+Built on the task2-working integrated run (task2.py / task2t.py /
+task2t_park.py / task2_vision.py), copied to the task2mn* files so the team's
+version stays untouched:
+
+    task2mn.py          this entry point
+    task2mn_route.py    the route            (from task2t.py)
+    task2mn_park.py     return and parking   (from task2t_park.py)
+    task2mn_vision.py   arrow recognition    (from task2_vision.py)
+    task2mn_link.py     protocol 9 side-IR commands (new)
+    task2mn_sim.py      laptop simulator     (from task2t_sim.py)
+
+What changed, from the review and the 2026-09-14 floor log:
+  - Narrow obstacle 2 is found with the firmware IR edge latch (protocol 9)
+    at normal speed, not by polling at fast speed and RST.
+  - A PC timeout or dropped socket no longer aborts the run; arrows fall
+    back to the last vote, then T2MN_DEFAULT_ARROW. The camera watchdog only
+    runs while recognition is waiting on frames.
+  - Startup waits for the gyro to re-arm instead of failing at once.
+  - A finished route whose parking check fails is not RST.
+  - Parking only skips the centring line when it is genuinely centred.
+  - Per-query polling lines are kept out of the log.
+
+    python3 task2mn.py
+"""
+import logging
+import math
+import os
+import socket
+import time
+import uuid
+from pathlib import Path
+from threading import Event, Lock, Thread
+
+from dotenv import load_dotenv
+
+load_dotenv(Path(__file__).with_name(".env"))
+
+import task2mn_link as link
+import task2mn_route as route
+import task2mn_park as geometry
+from task2mn_vision import Vision
+
+# How long one recognition reply may take before the PC link is given up on.
+# 5 s dropped the socket on a slow first inference.
+PC_TIMEOUT_S = float(os.getenv("T2MN_PC_TIMEOUT_S", "15"))
+# A gyro that dropped out re-arms once the robot stands still (firmware with
+# the I2C recovery); give it this long at startup before refusing to run.
+GYRO_WAIT_S = float(os.getenv("T2MN_GYRO_WAIT_S", "4"))
+
+
+class QuietPolling(logging.Filter):
+    """Drop the per-query STM lines. Scans poll ?IR / ?WPOSE / ?IRW / ?IRE
+    dozens of times a second; logging each one to the console and the SD card
+    buried the log and added jitter to the very loop doing the polling."""
+    TAGS = ("?IR", "?WPOSE", "?IRW", "?IRE", "?IRR",
+            "STM ← stm: IR,", "STM ← stm: WPOSE,", "STM ← stm: IRW,",
+            "STM ← stm: IRE,", "STM ← stm: IRR,")
+
+    def filter(self, record):
+        msg = record.getMessage()
+        if not msg.startswith("STM "):
+            return True
+        return not any(tag in msg for tag in self.TAGS)
+
+
+def android_status(phase):
+    """Keep the existing Android STATUS grammar; details go to the text log."""
+    stages = {"START": 0, "APPROACH_1": 1, "BYPASS_1": 2,
+              "APPROACH_2": 3, "ROUND_2": 4, "RETURN_AND_PARK": 5}
+    if phase in ("DONE", "FAILED"):
+        return "STATUS," + phase
+    if phase in stages:
+        return "STATUS,RUNNING,%d,5" % stages[phase]
+    if phase == "READY":
+        return "STATUS,OK"
+    return "TASK2," + phase
+
+
+def task2_control_status(ready, running):
+    """Answer a tablet readiness query without relying on the one-time READY log."""
+    return "TASK2,RUNNING" if running else "TASK2,READY" if ready else "TASK2,NOT_READY"
+
+
+class Motion:
+    """One mission thread owns movement; abort is the only cross-thread command."""
+    def __init__(self, stm, stop, report):
+        self.raw, self.stop, self.report = stm, stop, report
+        self.lock = Lock()
+        self.supports_fast = True
+
+    def check(self):
+        if self.stop.is_set():
+            raise RuntimeError("Task 2 cancelled")
+
+    def send_line(self, line):
+        with self.lock:
+            self.check()
+            return self.raw.send_line(line)
+
+    def abort(self):
+        with self.lock:
+            self.raw.abort()
+
+    def receive(self):
+        self.check()
+        return self.raw.receive()
+
+    def wait_reply(self, timeout=25.0):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            reply = self.receive()
+            if reply is not None:
+                # Route reads measured WPOSE at its next decision point.
+                # A telemetry-only read here duplicated that serial query.
+                return reply
+            self.stop.wait(0.02)
+        self.abort()
+        raise RuntimeError("STM movement reply timed out")
+
+    def query_fields(self, command, timeout=0.5):
+        self.check()
+        return self.raw.query_fields(command, timeout)
+
+    def read_wpose(self, timeout=0.5):
+        self.check()
+        return self.raw.read_wpose(timeout)
+
+    def set_fast(self, on, timeout=None):
+        with self.lock:
+            self.check()
+            if not self.supports_fast:
+                return not on  # normal mode already; no unsupported FAST0
+            return self.raw.set_fast(on, timeout)
+
+    def prepare_start(self):
+        from communications import cal_profile
+        with self.lock:
+            self.check()
+            logging.info("Android BEGIN: zeroing heading at the placed start pose.")
+            return cal_profile.zero_heading(self.raw)
+
+
+class Task2(route.Task2):
+    """Task-specific route decisions; communication helpers remain shared."""
+    def __init__(self, stm, vision, stop, status, ir_latch=False):
+        super().__init__(stm, input_fn=self._arrow, sleep_fn=stop.wait,
+                         startup=False, wait_for_go=False,
+                         early_arrow_fn=getattr(vision, "peek_arrow", None),
+                         lane_reached_fn=self._lane_reached,
+                         arrow_pending_fn=getattr(vision, "arrow_pending", None))
+        self.vision, self.stop, self.status = vision, stop, status
+        self.obstacle = 0
+        self.stage2_started = False
+        # main() enabled this before BEGIN. The route must know so that its
+        # first precision phase actually sends FAST0.
+        self.fast = route.FAST
+        self.ir_latch = ir_latch
+        # Set once every route line has run; main() then never RSTs the robot.
+        self.route_finished = False
+
+    def _stable_us(self, attempts=4, tolerance=2.0):
+        return geometry.stable_us(self._us, attempts, tolerance)
+
+    def _pose(self):
+        pose = self.frame.pose()
+        if pose is None:
+            raise RuntimeError("No valid measured world pose")
+        return pose
+
+    def _arrow(self, prompt):
+        direction = self.vision.wait_arrow(float(os.getenv("T2_ARROW_TIMEOUT_S", "8")))
+        logging.info("Confirmed obstacle %s arrow: %s", self.obstacle, direction)
+        self.status("ARROW,%s,%s" % (self.obstacle, direction.upper()))
+        self.vision.idle()
+        return direction
+
+    def obstacle1(self):
+        self.obstacle = 1
+        self.status("APPROACH_1")
+        self.vision.begin(1)
+        return super().obstacle1()
+
+    def pass_obstacle1(self, x1, side1):
+        self.status("BYPASS_1")
+        result = super().pass_obstacle1(x1, side1)
+        return result
+
+    def _lane_reached(self):
+        """Called only after the route excludes obstacle 1 from the camera view."""
+        if self.stage2_started:
+            return
+        self.obstacle = 2
+        self.status("APPROACH_2")
+        self.vision.begin(2)
+        self.stage2_started = True
+        logging.info("Obstacle 1 is behind the forward camera plane; fresh "
+                     "stage-2 recognition is live.")
+
+    def photo_obstacle2(self, course, side1):
+        self.obstacle = 2
+        self.status("APPROACH_2")
+        return super().photo_obstacle2(course, side1)
+
+    def around_obstacle2(self, course, side1, side2):
+        self.status("ROUND_2")
+        result = super().around_obstacle2(course, side1, side2)
+        if result is not None:
+            self.status("RETURN_AND_PARK")
+        return result
+
+    def _first_clear(self, pose, candidates, course, what):
+        # Prefer the shortest estimated execution time at the normal margin.
+        # A fallback never relaxes clearance below the configured positive floor.
+        choices = [(self._check(pose, segs, course), geometry.motion_cost(segs, self.r), segs)
+                   for segs in candidates]
+        for margin in (geometry.CLEARANCE_CM, geometry.CLEARANCE_FLOOR_CM):
+            safe = [item for item in choices if item[0] >= margin]
+            if safe:
+                clearance, cost, segs = min(safe, key=lambda item: item[1])
+                logging.info("%s: estimated cost %.2f, clearance %.1f cm", what, cost, clearance)
+                return segs
+        logging.error("No collision-checked %s from %s", what, pose)
+        return None
+
+    def run(self):
+        result = super().run()
+        if result:
+            return result
+        self.route_finished = True
+        pose = self.frame.pose()
+        us = self._stable_us()
+        left, right = self._ir("left"), self._ir("right")
+        imu = self.stm.query_fields("?IMU")
+        try:
+            stationary = int(imu[0]) == 1 and abs(float(imu[2]) / 10) <= 1.0
+        except (TypeError, ValueError, IndexError):
+            stationary = False
+        corners = geometry.footprint(pose) if pose is not None else []
+        inside = bool(corners) and all(
+            -geometry.BAY_DEPTH_CM < x < 0 and abs(y) < geometry.BAY_HALF_WIDTH_CM
+            for x, y in corners)
+        # Completion means fully parked, not exactly at the aiming point.
+        # Use independent sensor clearance as well as the odometry footprint.
+        aligned = (pose is not None and geometry.parking_heading_error(pose.th)
+                   <= geometry.PARK_HEADING_TOL_DEG)
+        us_at_target = (us is not None and math.isfinite(us)
+                        and geometry.PARK_GAP_CM - geometry.PARK_GAP_TOL_CM
+                        <= us
+                        <= geometry.PARK_GAP_CM + geometry.PARK_GAP_TOL_CM)
+        # Side IRs are useful when both fences are visible, but the final
+        # parking decision must still work when one sensor looks through the
+        # open mouth. Any side reading that is present remains a hard guard.
+        side_safe = all(v is None or (math.isfinite(v)
+                                      and v >= geometry.PARK_SIDE_STOP_CM)
+                        for v in (left, right))
+        if (not inside and pose is not None and pose.x < -geometry.REAR_FROM_AXLE_CM
+                and aligned and stationary and us_at_target and side_safe):
+            # The back wall is physically impassable, but wheel odometry can
+            # place the front bumper beyond it. Accept the independent wall
+            # position only when both side fences identify the parking bay.
+            wall_y = geometry.centre_offset(left, right)
+            if wall_y is not None:
+                wall_x = (-geometry.BAY_DEPTH_CM
+                          - (geometry.FRONT_FROM_AXLE_CM + us) * math.cos(pose.th))
+                wall_pose = geometry.Pose(wall_x, wall_y, pose.th)
+                inside = all(
+                    -geometry.BAY_DEPTH_CM < x < 0
+                    and abs(y) < geometry.BAY_HALF_WIDTH_CM
+                    for x, y in geometry.footprint(wall_pose))
+                if inside:
+                    logging.warning("Parking odometry x=%.1f cm disagrees with "
+                                    "the confirmed back-wall and side-IR pose "
+                                    "(x=%.1f, y=%.1f cm); using the measured "
+                                    "bay position for completion.",
+                                    pose.x, wall_x, wall_y)
+        sensor_ok = aligned and us_at_target and side_safe
+        logging.info("Parking verification: pose=%s inside=%s US=%s L=%s R=%s "
+                     "stationary=%s aligned=%s sensor_clearance=%s",
+                     pose, inside, us, left, right, stationary, aligned, sensor_ok)
+        if not (inside and sensor_ok and stationary):
+            logging.error("Parking rejected: inside=%s, sensor_clearance=%s, "
+                          "aligned=%s, stationary=%s", inside, sensor_ok, aligned, stationary)
+        return 0 if inside and sensor_ok and stationary else 1
+
+
+def main():
+    import run_log
+    from communications.android import Android
+    from communications.pc import PC
+    from communications.stm import STM
+    from communications import cal_profile
+    from image_capture.camera import Camera
+
+    # The imported bench engine installs basicConfig; use the shared run logger only.
+    logging.getLogger().handlers.clear()
+    run_log.setup("task2mn", "%(asctime)s [%(threadName)s] %(levelname)s - %(message)s")
+    for handler in logging.getLogger().handlers:
+        handler.addFilter(QuietPolling())
+    stop, go, ready = Event(), Event(), Event()
+    android, pc, stm = Android(), PC(), STM()
+    android_lock = Lock()
+    vision = Vision(pc, stop, uuid.uuid4().hex)
+    workers = []
+    started = [None]
+    def send_android(message):
+        with android_lock:
+            if android.connected:
+                try:
+                    android.send(message)
+                except Exception:
+                    # A tablet disconnect must not abort the autonomous mission.
+                    # The tablet can query Task 2 readiness after reconnecting.
+                    logging.warning("Could not send Android update %s", message, exc_info=True)
+    final_sent = [None]
+    def status(phase):
+        # DONE / FAILED go to the tablet once; the error paths below can
+        # each reach a FAILED of their own.
+        if phase in ("DONE", "FAILED"):
+            if final_sent[0] is not None:
+                return
+            final_sent[0] = phase
+        elapsed = None if started[0] is None else time.monotonic() - started[0]
+        logging.info("Task 2 phase: %s", phase)
+        if elapsed is not None:
+            logging.info("Task 2 competition elapsed: %.3fs (%s)", elapsed, phase)
+        send_android(android_status(phase))
+    def report():
+        pose = stm.read_wpose(timeout=0.5)
+        if pose:
+            logging.info("Task 2 raw WPOSE: %s", pose)
+    motion = Motion(stm, stop, report)
+    def cancel(reason):
+        logging.error("Task 2 stop: %s", reason)
+        stop.set()
+        motion.abort()
+    def worker(name, function):
+        def guarded():
+            try:
+                function()
+            except (Exception, SystemExit):
+                if not stop.is_set():
+                    logging.exception("%s failed", name)
+                    cancel(name + " failed")
+        thread = Thread(target=guarded, name=name, daemon=True)
+        workers.append(thread)
+        thread.start()
+    def android_loop():
+        while not stop.is_set():
+            message = android.receive()
+            if message is None:
+                stop.wait(0.05)
+                continue
+            command = message.strip().upper()
+            if command in ("S", "STOP", "RST"):
+                cancel("Android STOP")
+            elif command == "TASK2,STATUS?":
+                send_android(task2_control_status(ready.is_set(), go.is_set()))
+            elif command == "BEGIN":
+                if ready.is_set() and not go.is_set():
+                    go.set()
+                elif not ready.is_set():
+                    status("NOT_READY")
+    def camera_loop():
+        camera = Camera()
+        try:
+            for jpeg in camera.continuous_images(
+                    stop, exposure_us=int(os.getenv("T2_EXPOSURE_US", "5000"))):
+                vision.publish(jpeg)
+        finally:
+            camera.stop_camera()
+    def pc_loop():
+        pc.connect()
+        if stop.is_set():
+            return
+        pc.client_socket.settimeout(PC_TIMEOUT_S)
+        try:
+            vision.serve()
+        except Exception as exc:
+            # Before READY the run cannot start - let the worker fail it.
+            # After READY, losing recognition must not stop a robot that can
+            # still finish on fallback arrows.
+            if not vision.ready or stop.is_set():
+                raise
+            vision.fail(str(exc))
+    def watchdog():
+        while not stop.wait(0.2):
+            if started[0] is not None:
+                if time.monotonic() - started[0] >= 175:
+                    cancel("175 second mission deadline")
+                elif (vision.active
+                      and time.monotonic() - vision.last_frame_time > 5):
+                    # Only while recognition is waiting on frames: after the
+                    # arrows are known, a stalled camera costs nothing.
+                    vision.fail("camera frame stream stalled")
+    result = 1
+    fast_active = False
+    task = None
+    ir_latch = False
+    try:
+        stm.connect()
+        profile_name = os.getenv("T2T_CAL_PROFILE", "tbricks")
+        profile = cal_profile.load(profile_name)
+        if profile is None or profile.get("arc_profile") != 0:
+            raise RuntimeError("Task 2 requires a saved TIGHT/profile-0 calibration")
+        if not profile.get("verified", False):
+            logging.warning("Calibration %s is marked unverified; nominal route "
+                            "clearance is not a hardware safety guarantee", profile_name)
+        if not cal_profile.prepare_for_task(stm, name=profile_name, required=True):
+            raise RuntimeError("Calibration startup verification failed")
+        if stm.read_wpose() is None:
+            raise RuntimeError("Firmware does not answer ?WPOSE")
+        imu = stm.query_fields("?IMU")
+        deadline = time.monotonic() + GYRO_WAIT_S
+        while imu and imu[0] != "1" and time.monotonic() < deadline:
+            # Current firmware recovers the I2C bus and re-arms a dropped
+            # gyro once the robot is still; older firmware never does.
+            time.sleep(0.25)
+            imu = stm.query_fields("?IMU")
+        if not imu:
+            raise RuntimeError("STM did not answer ?IMU")
+        if imu[0] != "1":
+            raise RuntimeError("Gyro not ready after %.0f s (%s stalls) - keep "
+                               "the robot still, or power-cycle it on the floor"
+                               % (GYRO_WAIT_S, imu[3] if len(imu) > 3 else "?"))
+        ir = stm.query_fields("?IR")
+        us = stm.query_fields("?US")
+        if not ir or len(ir) != 2 or not us:
+            raise RuntimeError("STM IR/US startup queries failed")
+        # Latest uploaded STM source declares protocol 8 with !FAST. Query
+        # the actual board as well: uploaded source need not be flashed firmware.
+        from communications.stm import FAST_MIN_PROTOCOL
+        proto = cal_profile.firmware_protocol(stm)
+        motion.supports_fast = proto is not None and proto >= FAST_MIN_PROTOCOL
+        ir_latch = proto is not None and proto >= link.PROTOCOL
+        if ir_latch:
+            link.enable()
+        logging.info("Board protocol %s: IR edge latch %s.", proto,
+                     "in use" if ir_latch else "unavailable, polled IR scans")
+        if not motion.supports_fast:
+            route.FAST = False
+            logging.info("Board protocol %s: using its existing normal mode; "
+                         "FAST commands will not be sent.", proto)
+        if route.FAST:
+            if not motion.set_fast(True):
+                raise RuntimeError("Board advertised fast mode but refused !FAST1")
+            fast_active = True
+        logging.info("Obstacle-2 configured width cap %.1f cm; PDFs specify "
+                     "minimum 30 cm and no numeric maximum.", route.W2_RANGE[1])
+        if abs(geometry.RADIUS_CM - 30.0) > 0.01:
+            logging.warning("Task 2 radius override: %.2f cm", geometry.RADIUS_CM)
+        logging.info("Task 2 uses %s, profile 0, radius %.2f cm; fast mode %s",
+                     profile_name, geometry.RADIUS_CM,
+                     "enabled" if fast_active else "disabled")
+        logging.info("Geometry (cm): body %.1f x %.1f, axle-to-US %.1f, "
+                     "axle-to-camera %.1f, axle-to-IR %.1f; verify on the robot",
+                     geometry.ROBOT_LENGTH_CM, geometry.ROBOT_WIDTH_CM,
+                     geometry.FRONT_FROM_AXLE_CM, route.CAMERA_FROM_AXLE_CM,
+                     geometry.IR_FROM_AXLE_CM)
+        android.start()
+        worker("t2-android", android_loop)
+        worker("t2-camera", camera_loop)
+        worker("t2-pc", pc_loop)
+        worker("t2-watchdog", watchdog)
+        startup_deadline = time.monotonic() + 120
+        while not stop.is_set():
+            if vision.ready and vision.latest is not None:
+                ready.set()
+                break
+            if time.monotonic() >= startup_deadline:
+                raise RuntimeError("Camera/PC did not become ready within 120 seconds")
+            stop.wait(0.1)
+        if ready.is_set() and not stop.is_set():
+            status("READY")
+            send_android("TASK2,READY")
+        while not stop.is_set() and not go.wait(0.1):
+            pass
+        if not stop.is_set():
+            started[0] = time.monotonic()
+            status("START")
+            if not motion.prepare_start():
+                raise RuntimeError("Could not zero heading at BEGIN; no route movement sent")
+            task = Task2(motion, vision, stop, status, ir_latch=ir_latch)
+            result = task.run()
+            status("DONE" if result == 0 else "FAILED")
+    except KeyboardInterrupt:
+        cancel("Keyboard interrupt")
+    except Exception:
+        logging.exception("Task 2 failed")
+        status("FAILED")
+    finally:
+        stop.set()
+        if result != 0 and task is not None and task.route_finished:
+            # Every line ran and the robot is standing in or by the bay; only
+            # the parking CHECK failed. Nothing is moving, so there is nothing
+            # to abort - and an RST here once let the parked robot roll.
+            logging.warning("Route finished but parking was not verified; "
+                            "leaving the robot where it stopped.")
+        elif result != 0:
+            try:
+                motion.abort()
+            except Exception:
+                logging.exception("Could not send emergency brake")
+        else:
+            # Every movement has completed and parking has been verified.
+            # Firmware v8's RST path changes Motors_Brake() back to coast, so
+            # an unconditional shutdown RST can make a parked robot roll.
+            logging.info("Successful park verified; no shutdown RST sent.")
+        if fast_active:
+            try:
+                if stm.set_fast(False):
+                    logging.info("STM fast mode restored to normal for the next task")
+                else:
+                    logging.warning("STM refused !FAST0 during shutdown")
+            except Exception:
+                logging.exception("Could not disable STM fast mode during shutdown")
+        if result != 0:
+            try:
+                status("FAILED")
+            except Exception:
+                logging.exception("Could not send failure status to Android")
+        # Shutdown sockets wakes blocked network workers before joining them.
+        for sock in (pc.client_socket, pc.server_socket):
+            if sock is None:
+                continue
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+        pc.disconnect()
+        android.stop()
+        for thread in workers:
+            thread.join(timeout=3)
+            if thread.is_alive():
+                logging.error("Worker did not exit within 3s: %s", thread.name)
+        stm.disconnect()
+    return result
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

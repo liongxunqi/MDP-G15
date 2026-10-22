@@ -78,6 +78,7 @@
 #include "imu.h"
 #include "commands.h"
 #include "rpilink.h"
+#include "task2fw.h"
 #include "oled.h"
 #include <stdio.h>
 
@@ -174,10 +175,15 @@ DMA_HandleTypeDef  hdma_adc1;
 
 static volatile uint8_t  g_evtShort = 0, g_evtLong = 0;
 
-/* Boots into DRIVE, not CALIB, deliberately. A stray short press after
-   power-on should cost one straight run, not a five-move sequence nobody is
-   standing next to. Long press once to reach CALIB. */
-static volatile uimode_t g_mode = MODE_DRIVE;
+/* A long press aborts the Task 2 course too (task2fw.h), which blocks the
+   main loop while it runs. Not cleared here: the main loop's own long-press
+   handling still runs once the course has stopped. */
+uint8_t Task2Fw_BoardAbort(void) { return g_evtLong; }
+
+/* Boots into IMU (mode 10): the gyro's health is the first thing to see
+   after power-on, and a stray short press there only zeroes the display -
+   it never moves the robot. Long press to cycle on to CAL, then CALIB. */
+static volatile uimode_t g_mode = MODE_IMU;
 
 /* Calibration cycle state. Touched only from the main loop - the button ISR
    sets g_evtShort and nothing else - so none of it is volatile. */
@@ -344,10 +350,20 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
             (Encoder_A_GetDelta() == 0) && (Encoder_B_GetDelta() == 0))
         {
             IMU_TrackBias();
+
+            /* Re-arming a dropped gyro waits for this too, and also for the
+               queue to be empty: between the primitives of one line the
+               robot is idle but about to move again. */
+            IMU_NoteStill((Cmd_QueueCount() == 0U) ? 1U : 0U);
+        }
+        else
+        {
+            IMU_NoteStill(0U);
         }
 
         Motion_Tick();
         Odom_Update();
+        RpiLink_Tick();   /* ?IRW snapshot and IR edge latch: this tick's pose */
         PID_Update();
 
         Btn_Poll();
@@ -433,6 +449,9 @@ static void Calib_Start(void)
     g_calPrevTrim    = (int32_t)Odom_GetHeadingTrim();
     g_calStep        = 0U;
     g_calState       = CALIB_RUNNING;
+    /* Placed by hand before the press. Between the cycle's own steps the
+       carry-over is wanted; across the handling it is not. */
+    Motion_ZeroHeading();
     RpiLink_Log("\r\ncalib cycle starting\r\n");
     Calib_StartStep();
 }
@@ -824,8 +843,13 @@ static void Display(void)
             snprintf(line, sizeof(line), "addr %02X id %02X",
                      IMU_GetAddress(), IMU_GetWhoAmI());
             ShowLine(24, line);
-            ShowLine(36, "PB12 high?");
-            ShowLine(48, "1.8V rail?");
+            /* Re-arming keeps trying while still - see imu.h. A climbing rc
+               with addr 00 is a bus or wiring fault, not a slow start. */
+            snprintf(line, sizeof(line), "st%lu rc%lu",
+                     (unsigned long)IMU_GetStallCount(),
+                     (unsigned long)IMU_GetRecoveryCount());
+            ShowLine(36, line);
+            ShowLine(48, "PB12? 1.8V?");
         }
         else
         {
@@ -1207,7 +1231,7 @@ int main(void)
     }
     else
     {
-        RpiLink_Log("IMU FAILED - check PB12 high, 1.8V rail\r\n");
+        RpiLink_Log("IMU FAILED - retrying while still; check PB12, 1.8V rail\r\n");
     }
     OLED_Clear();
 
@@ -1317,13 +1341,18 @@ int main(void)
                 g_runStartA   = Encoder_A_GetCount();
                 g_runStartB   = Encoder_B_GetCount();
                 RpiLink_Log("\r\nA.4 turn starting\r\n");
+                Motion_ZeroHeading();   /* placed by hand - see A.3 above */
                 Motion_DriveArc(g_angleList[g_angleIdx], g_turnFwd, g_turnRight);
             }
             else if (g_mode == MODE_PROFILE)
             {
                 char msg[64];
-                uint8_t n = (uint8_t)((Motion_GetArcProfile() + 1U)
-                                      % MOTION_ARC_PROFILE_COUNT);
+                /* Next profile the lock allows - TIGHT <-> SAFE when locked. */
+                uint8_t n = Motion_GetArcProfile();
+                do
+                {
+                    n = (uint8_t)((n + 1U) % MOTION_ARC_PROFILE_COUNT);
+                } while (!Motion_ArcProfileAllowed(n));
                 Motion_SetArcProfile(n);
                 snprintf(msg, sizeof(msg), "arc profile -> %s\r\n",
                          Motion_GetArcProfileInfo(n)->name);
@@ -1381,6 +1410,13 @@ int main(void)
                 g_runStartB   = Encoder_B_GetCount();
 
                 RpiLink_Log("\r\nA.3 run starting\r\n");
+
+                /* A button run starts wherever the robot was put down by
+                   hand, and the gyro saw every bit of that handling. Without
+                   a zero the heading carry-over steers the run back toward
+                   the LAST run's heading - up to 5 deg, ~9 cm off per metre,
+                   growing with distance. This pose is heading 0. */
+                Motion_ZeroHeading();
                 Motion_DriveDistance(g_targetMm);
             }
             else

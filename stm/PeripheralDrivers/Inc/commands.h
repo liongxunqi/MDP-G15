@@ -136,7 +136,7 @@ typedef enum
     CMD_Q_IMU,          /* ?IMU   gyro health                      */
     CMD_Q_XCHK,         /* ?XCHK  last arc cross-check             */
     CMD_Q_VER,          /* ?VER   identity and protocol version    */
-    CMD_SET_PROFILE,    /* !PROFn arg = 0..2                       */
+    CMD_SET_PROFILE,    /* !PROFn arg = 0..3, 3 = SAFE             */
     CMD_SET_ZERO,       /* !ZERO  zero odometry and heading        */
 
     /* --- Calibration, protocol 2 -----------------------------------------
@@ -181,10 +181,42 @@ typedef enum
     CMD_SET_CAL_STEER_L, /* !CALSLn left arc deflection, us        */
     CMD_SET_CAL_STEER_R, /* !CALSRn right arc deflection, us       */
 
-    /* --- Continuous pose, protocol 5 -------------------------------------
-     * Inside the second immediate range: keep CMD_Q_WPOSE last, or move the
-     * endpoint in Cmd_IsImmediate() with it. */
-    CMD_Q_WPOSE          /* ?WPOSE x, y, heading since boot         */
+    /* --- Continuous pose, protocol 5 ------------------------------------- */
+    CMD_Q_WPOSE,         /* ?WPOSE x, y, heading since boot         */
+
+    /* --- Per-wheel encoder counts, protocol 7 ---------------------------- */
+    CMD_Q_ENC,           /* ?ENC   wheel A, wheel B counts since boot */
+
+    /* --- Fast mode, protocol 8 --------------------------------------------
+     * Inside the second immediate range, which now ends at CMD_SET_IR_EDGE. */
+    CMD_SET_FAST,        /* !FASTn arg = 0 normal, 1 fast - see motion.h */
+
+    /* --- Side-IR timing, protocol 9 -----------------------------------------
+     * Keep CMD_SET_IR_EDGE last, or move the endpoint in Cmd_IsImmediate().
+     * See IR SNAPSHOT AND EDGE LATCH in rpilink.h. */
+    CMD_Q_IRW,           /* ?IRW   IR cm + raw counts + WPOSE, one tick */
+    CMD_Q_IRE,           /* ?IRE   edge latch state and latched pose  */
+    CMD_SET_IR_EDGE,     /* !IREn  arm/disarm, n = side*10000+lo*100+hi */
+
+    /* --- Calibration table and move report, protocol 10 ---------------------
+     * Inside the second immediate range, which now ends at CMD_Q_MV. See
+     * CALIBRATION TABLE in caltab.h and MOVE REPORT in motion.h. The V speed
+     * suffix needs no opcode: it rides on the F/R/FR/FL/RR/RL tokens. */
+    CMD_SET_K,           /* !K<key>=<n>  set one table value          */
+    CMD_SET_K_CLR,       /* !KCLR        clear the table (protocol 9)  */
+    CMD_Q_K,             /* ?K<move><anchor> / ?KG  read a table row  */
+    CMD_Q_MV,            /* ?MV          report on the last move       */
+
+    /* --- Task 2 on the STM, protocol 11 -------------------------------------
+     * Inside the second immediate range, which now ends at CMD_T2_LATERAL.
+     * Only meaningful while !t2go runs (task2fw.h): answered with no reply
+     * then, RESEND otherwise. */
+    CMD_T2_ARROW,        /* !t2a<n><d>   arg = n*10 + d, d 0 left 1 right */
+    CMD_T2_LATERAL,      /* !t2y<n><ddd> arg = n*1000 + ddd, mm + 500     */
+
+    /* Outside both immediate ranges, and refused inside a multi-token line
+     * by Cmd_ParseLine(): RpiLink_Poll() runs it alone. */
+    CMD_T2_GO            /* !t2go<s>     run the course, s seconds 1..180 */
 } CmdOpcode_t;
 
 /* Bumped whenever the wire format changes in a way a sender must care about.
@@ -204,8 +236,30 @@ typedef enum
  * appended to ?CAL. Additive: a protocol 4 sender is unaffected.
  * Later added ?WPOSE (continuous pose) without a bump, matching the
  * instruction-segmentation RPi, which probes for it directly: a protocol 5
- * board without it answers RESEND and Task 1 stops before moving. */
-#define CMD_PROTOCOL_VERSION    5
+ * board without it answers RESEND and Task 1 stops before moving.
+ * Later added !PROF3 (SAFE profile), also without a bump: a board without
+ * it answers RESEND, and the RPi refuses to restore a SAFE calibration. */
+/* 6: ?CAL appends the last arc's raw decel measurement (x10, 0 = none), so
+ * calibrate.py can average raw arcs instead of the filtered value. Arcs now
+ * brake on the nearer tick and hold the steering through the coast, and lag
+ * is no longer learned - calibrations taken on 5 should be re-run (brakes). */
+/* 7: added ?ENC, cumulative counts per wheel. On a gyro-held straight both
+ * wheels cover the same ground, so their ratio is the one check that sees an
+ * encoder dropping counts - the pose and distance are built from those same
+ * counts and agree with themselves. Additive. */
+/* 8: added !FAST0/1 (MOTION FAST MODE in motion.h). Additive; off at
+ * power-on, so a sender that never sends it drives exactly as on 7. */
+/* 9: added ?IRW, ?IRE and !IRE (IR SNAPSHOT AND EDGE LATCH, rpilink.h).
+ * Additive; the latch is off at power-on. */
+/* 10: per-move speed (V<n> suffix), the calibration table (!K, !KCLR, ?K -
+ * caltab.h) and the move report (?MV - motion.h). Additive: a token without
+ * V and an empty table drive exactly as on 9, and the table is empty at
+ * power-on. */
+/* 11: the Task 2 course on the STM - !t2go, !t2a, !t2y, the P / D lines
+ * and FAIL,STOP / DEADLINE / GYRO / NOEDGE / NOARROW (task2fw.h, PROTOCOL.md
+ * section 14). Additive: nothing changes for a sender that never sends
+ * !t2go. */
+#define CMD_PROTOCOL_VERSION    11
 #define CMD_FIRMWARE_NAME       "MDPG15-STM32"
 
 /* Replies for a primitive that did not complete. Previously a timed-out move
@@ -213,6 +267,10 @@ typedef enum
  * sender carried on believing the robot had moved. */
 #define CMD_REPLY_FAIL_TIMEOUT   "FAIL,TIMEOUT\n"
 #define CMD_REPLY_FAIL_WRONGWAY  "FAIL,WRONGWAY\n"
+
+/* An arc finished more than MOTION_ARC_FAIL_DEG from its aim (motion.h).
+ * Protocol 7, additive: every FAIL,* is already a failed line to a sender. */
+#define CMD_REPLY_FAIL_SHORT     "FAIL,SHORT\n"
 
 /* FU had nothing to aim at - the ultrasound gave no usable reading when the
  * command started. The robot did NOT move, and that is the point of a
@@ -249,13 +307,42 @@ typedef enum
  * because one line may only ever produce one reply. */
 uint8_t Cmd_IsImmediate(CmdOpcode_t op);
 
+/* ===========================================================================
+ * PER-MOVE SPEED, protocol 10
+ * ===========================================================================
+ * Any F/R/FR/FL/RR/RL token may end in V<n>: cruise for THIS move at
+ * n x 10 rpm at the axle centre (FR90V12 = a right arc at 120 rpm).
+ *
+ *   straights  V4..V25  (40-250 rpm). Ramp up to it, ramp down to the
+ *              40 rpm approach, brake - so the stop is the calibrated one
+ *              whatever the cruise.
+ *   arcs       V6..V17  (60-170 rpm). A TIGHT arc's outer wheel runs ~1.44x
+ *              the centre and the motors run out of headroom past ~250.
+ *              The last approach_deg still slow to the profile's approach
+ *              speed (or V, if that is lower).
+ *
+ * The calibration table (caltab.h) is looked up at the move's speed, which
+ * is the point: a value measured at V8 and one at V15 both apply where they
+ * were measured, and a V12 move gets the interpolation of the two.
+ *
+ * Without V a token is exactly its protocol 9 self, unless the table's vs /
+ * va default speeds are set. F0 and FU take no V. */
+#define CMD_V_MIN_STRAIGHT       4    /*  40 rpm */
+#define CMD_V_MAX_STRAIGHT      25    /* 250 rpm */
+#define CMD_V_MIN_ARC            6    /*  60 rpm */
+#define CMD_V_MAX_ARC           17    /* 170 rpm */
+
 typedef struct
 {
     CmdOpcode_t op;
     int16_t     arg;    /* cm or degrees, positive - direction lives in the
-                         * opcode. The ONE exception is CMD_SET_CAL_TRIM,
-                         * which is a signed servo offset and has no opcode
-                         * to carry its sign. */
+                         * opcode. The exceptions are CMD_SET_CAL_TRIM, a
+                         * signed servo offset with no opcode to carry its
+                         * sign, and CMD_SET_K, whose value may be negative. */
+    uint8_t     speed;  /* protocol 10: V suffix, x10 rpm; 0 = none       */
+    uint8_t     kmove;  /* protocol 10, !K / ?K: CtMove_t (caltab.h)      */
+    uint8_t     kanchor;
+    uint8_t     kfield; /* CtField_t, or CtGlobal_t for the g row         */
 } Command_t;
 
 
